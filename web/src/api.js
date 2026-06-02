@@ -11,13 +11,19 @@ async function req(method, path, body) {
     headers,
     body: body ? JSON.stringify(body) : undefined,
   })
-  if (!res.ok) throw new Error((await res.text()) || res.status)
+  if (!res.ok) {
+    const e = new Error((await res.text()) || String(res.status))
+    e.status = res.status
+    throw e
+  }
   const ct = res.headers.get('content-type') || ''
   return ct.includes('json') ? res.json() : null
 }
 
 export const api = {
+  getToken: token,
   setToken: t => localStorage.setItem('muxapi_token', t),
+  clearToken: () => localStorage.removeItem('muxapi_token'),
   // 上游全局池
   upstreams: () => req('GET', '/upstreams'),
   createUpstream: u => req('POST', '/upstreams', u),

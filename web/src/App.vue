@@ -13,6 +13,8 @@ const members = ref([])           // 当前详情分组的成员
 const keys = ref([])              // 当前详情分组的密钥
 const monitors = ref([])          // 监控项（含探测快照）
 const err = ref('')
+const loggedIn = ref(!!api.getToken())
+const loginForm = reactive({ token: api.getToken() })
 
 async function loadGroups() { groups.value = (await api.groups()) || [] }
 async function loadUpstreams() { upstreams.value = (await api.upstreams()) || [] }
@@ -48,10 +50,20 @@ async function loadDetail(gid) {
 
 async function guard(fn) {
   err.value = ''
-  try { await fn() } catch (e) { err.value = String(e.message || e) }
+  try { await fn() } catch (e) {
+    if (e.status === 401) {
+      loggedIn.value = false
+      api.clearToken()
+      err.value = '未授权，请输入管理 Token'
+      return
+    }
+    err.value = String(e.message || e)
+  }
 }
 
-onMounted(() => guard(async () => { await loadGroups(); await loadUpstreams(); await loadSettings() }))
+onMounted(() => {
+  if (loggedIn.value) guard(async () => { await loadGroups(); await loadUpstreams(); await loadSettings() })
+})
 
 // 看板自动刷新：探测间隔 5min，这里每 60s 拉一次快照即可，离开即停
 let monTimer = null
@@ -279,10 +291,34 @@ function delMonitor(m) {
 function toggleMonitor(m) {
   guard(async () => { await api.updateMonitor(m.id, { ...m, enabled: !m.enabled }); await loadMonitors() })
 }
+
+function login() {
+  api.setToken(loginForm.token.trim())
+  loggedIn.value = true
+  guard(async () => { await loadGroups(); await loadUpstreams(); await loadSettings() })
+}
+function logout() {
+  api.clearToken()
+  loggedIn.value = false
+  loginForm.token = ''
+  groups.value = []; upstreams.value = []; members.value = []; keys.value = []; monitors.value = []
+  stopMonPoll()
+}
 </script>
 
 <template>
-  <div class="layout">
+  <div v-if="!loggedIn" class="login-page">
+    <div class="login-card">
+      <div class="logo login-logo"><Icon name="bolt" :size="22" /><span class="logo-text">MuxAPI</span></div>
+      <h1>管理后台登录</h1>
+      <p>输入服务器环境变量 <code>MUXAPI_TOKEN</code>。</p>
+      <div class="field"><label>Token</label><input v-model="loginForm.token" type="password" placeholder="MUXAPI_TOKEN" @keyup.enter="login" autofocus /></div>
+      <p v-if="err" class="err-banner">{{ err }}</p>
+      <button class="btn login-btn" @click="login"><Icon name="check" :size="16" />进入后台</button>
+    </div>
+  </div>
+
+  <div v-else class="layout">
     <aside class="sidebar">
       <div class="logo"><Icon name="bolt" :size="22" /><span class="logo-text">MuxAPI</span></div>
       <nav class="nav">
@@ -299,7 +335,10 @@ function toggleMonitor(m) {
           <h1 class="header-title">{{ detailGroup ? detailGroup.name : pages[page].title }}</h1>
           <p class="header-desc">{{ detailGroup ? '管理该分组的上游成员与接入密钥' : pages[page].desc }}</p>
         </div>
-        <span class="header-badge">v0.1.0</span>
+        <div class="header-actions">
+          <span class="header-badge">v0.1.0</span>
+          <button class="btn-link sm" @click="logout">退出</button>
+        </div>
       </header>
 
       <main class="main">
@@ -603,4 +642,3 @@ function toggleMonitor(m) {
     </div>
   </div>
 </template>
-

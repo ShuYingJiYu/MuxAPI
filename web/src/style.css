@@ -51,6 +51,15 @@ svg { display: block; flex-shrink: 0; }
 
 /* Main */
 .main { padding: 24px 28px; flex: 1; }
+.header-actions { display: flex; align-items: center; gap: 12px; }
+
+/* Login */
+.login-page { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: radial-gradient(circle at top, var(--p50), var(--g50) 42%); }
+.login-card { width: 100%; max-width: 420px; background: #fff; border: 1px solid var(--g100); border-radius: 18px; padding: 28px; box-shadow: var(--sh-glass); }
+.login-logo { padding: 0 0 16px; }
+.login-card h1 { font-size: 20px; color: var(--g900); margin-bottom: 6px; }
+.login-card p { color: var(--g500); font-size: 13px; margin-bottom: 18px; }
+.login-btn { width: 100%; justify-content: center; }
 
 /* Stat cards (card p-5 + 图标色块) */
 .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
