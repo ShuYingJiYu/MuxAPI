@@ -1,0 +1,17 @@
+# 二进制
+/muxapi
+/muxapi.exe
+
+# 数据库（含明文上游凭证与接入密钥，严禁提交）
+*.db
+
+# 前端依赖与构建产物
+web/node_modules/
+web/dist/
+
+# 日志与临时文件
+*.log
+
+# 工具与 IDE 目录
+.claude/
+.idea/
