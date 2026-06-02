@@ -180,6 +180,7 @@ const newKey = ref('')   // 生成后明文展示一次
 const copied = ref(0)    // 刚点击复制的密钥 id（短暂提示用）
 const probeInterval = ref('')      // 路由探测间隔(页面可配)
 const monitorInterval = ref('')    // 看板探测间隔(页面可配)
+const apiBase = location.origin    // 当前访问地址，用于展示客户端接入端点
 const settingsSaved = ref(false)
 function createKey() { dlg.type = 'keygen'; dlg.form = { name: '' } }
 function saveKey() {
@@ -434,6 +435,14 @@ function toggleMonitor(m) {
               <button class="btn" @click="saveSettings"><Icon name="check" :size="16" />保存</button>
               <span v-if="settingsSaved" style="color:#16a34a;font-size:13px;margin-left:10px">已保存 ✓</span>
             </div>
+          </div>
+
+          <div class="card" style="max-width:560px;margin-top:16px">
+            <h3 style="margin:0 0 4px">接入地址</h3>
+            <p class="hint" style="margin:0 0 12px">客户端用接入密钥访问（请求头 <code>Authorization: Bearer &lt;密钥&gt;</code>）：</p>
+            <div class="field"><label>OpenAI</label><code>{{ apiBase }}/v1/chat/completions</code></div>
+            <div class="field"><label>Responses（Codex）</label><code>{{ apiBase }}/v1/responses</code></div>
+            <div class="field"><label>Claude</label><code>{{ apiBase }}/v1/messages</code></div>
           </div>
         </template>
       </main>

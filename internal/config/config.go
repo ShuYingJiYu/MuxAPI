@@ -1,12 +1,36 @@
 package config
 
 import (
+	"bufio"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
-// Config 全局配置，从环境变量加载（KISS：起步阶段不引配置文件库）
+// loadDotEnv 把同目录 .env 的 KEY=VALUE 注入环境（已存在的真实环境变量优先，不覆盖）。
+func loadDotEnv(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if k, v, ok := strings.Cut(line, "="); ok {
+			k = strings.TrimSpace(k)
+			if os.Getenv(k) == "" {
+				os.Setenv(k, strings.Trim(strings.TrimSpace(v), `"'`))
+			}
+		}
+	}
+}
+
+// Config 全局配置，从环境变量加载（可选 .env 文件提供默认值）
 type Config struct {
 	Addr           string        // 监听地址
 	DBPath         string        // SQLite 路径
@@ -21,6 +45,7 @@ type Config struct {
 }
 
 func Load() *Config {
+	loadDotEnv(".env")
 	return &Config{
 		Addr:           env("MUXAPI_ADDR", ":8080"),
 		DBPath:         env("MUXAPI_DB", "muxapi.db"),

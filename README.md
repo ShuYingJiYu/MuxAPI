@@ -40,28 +40,37 @@ MuxAPI 针对这三点设计：严格优先级、主动探测即时发现故障�
 
 ## 快速开始
 
-### 后端
+前端通过 Go `embed` 内嵌进二进制，**构建顺序：先 build 前端，再 build 后端**。
 
 ```bash
+# 1. 构建前端（产物 web/dist 会被内嵌进后端二进制）
+cd web && npm install && npm run build && cd ..
+
+# 2. 构建后端（单文件，已含前端 + 管理后台）
 go build -o muxapi ./cmd/muxapi
+
+# 3. 运行（可选：复制 .env.example 为 .env 修改端口/token 等）
+cp .env.example .env
 ./muxapi
 ```
 
-默认监听 `:8080`，数据存本地 SQLite（`muxapi.db`）。
+默认监听 `:8080`，数据存本地 SQLite（`muxapi.db`）。浏览器打开 `http://<地址>:<端口>` 即管理后台，「设置」页会显示客户端接入地址。
 
-### 前端（管理后台）
+> `web/dist` 不存在时 `go build` 会因 embed 报错，务必先构建前端。开发模式（前端热更新）：`cd web && npm run dev`。
+
+### 交叉编译
+
+纯 Go 实现（SQLite 驱动用 `modernc.org/sqlite`），无需 cgo：
 
 ```bash
-cd web
-npm install
-npm run build      # 生产构建，产物在 web/dist
-# 或开发模式
-npm run dev
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o muxapi-linux-amd64 ./cmd/muxapi
 ```
+
+产出静态链接二进制，丢到目标机直接运行。
 
 ## 配置
 
-全部通过环境变量配置（探测间隔还可在管理后台「设置」页运行时调整，页面值优先）：
+通过环境变量配置，也可复制 `.env.example` 为 `.env` 写入（**真实环境变量优先于 `.env`**）。探测间隔还能在管理后台「设置」页运行时调整（页面值优先）：
 
 | 变量 | 默认 | 说明 |
 |------|------|------|

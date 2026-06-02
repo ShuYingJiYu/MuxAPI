@@ -2,6 +2,7 @@ package server
 
 import (
 	"io"
+	"io/fs"
 	"net/http"
 	"strings"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/mirainya/muxapi/internal/health"
 	"github.com/mirainya/muxapi/internal/monitor"
 	"github.com/mirainya/muxapi/internal/store"
+	muxweb "github.com/mirainya/muxapi/web"
 )
 
 type Server struct {
@@ -33,6 +35,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/chat/completions", s.messages)  // OpenAI 格式
 	mux.HandleFunc("/v1/responses", s.messages)         // OpenAI Responses API (codex)
 	s.registerAdmin(mux)
+	// 内嵌前端（"/" 兜底，/v1、/admin、/healthz 等更长前缀优先匹配，不冲突）
+	if sub, err := fs.Sub(muxweb.Dist, "dist"); err == nil {
+		mux.Handle("/", http.FileServer(http.FS(sub)))
+	}
 	return mux
 }
 

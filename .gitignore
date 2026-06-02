@@ -1,6 +1,7 @@
 # 二进制
 /muxapi
 /muxapi.exe
+/muxapi-linux-*
 
 # 数据库（含明文上游凭证与接入密钥，严禁提交）
 *.db
@@ -11,6 +12,9 @@ web/dist/
 
 # 日志与临时文件
 *.log
+
+# 真实配置（含 token，按 .env.example 模板自行创建）
+.env
 
 # 工具与 IDE 目录
 .claude/
