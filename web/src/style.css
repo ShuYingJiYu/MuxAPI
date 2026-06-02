@@ -179,8 +179,25 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .dialog-foot { display: flex; justify-content: flex-end; gap: 10px; margin-top: 22px; }
 .save-status { width: 68px; color: #16a34a; font-size: 13px; align-self: center; opacity: 0; transition: opacity .15s; }
 .save-status.show { opacity: 1; }
-.settings-info { background: var(--g50); border: 1px solid var(--g100); border-radius: 12px; padding: 10px 12px; color: var(--g500); font-size: 12px; line-height: 1.8; }
-.settings-info b { color: var(--g900); }
+.settings-grid { display: grid; grid-template-columns: minmax(420px, 560px) minmax(360px, 520px); gap: 18px; align-items: start; max-width: 1100px; }
+.settings-card { padding: 24px; }
+.settings-title { margin-bottom: 18px; }
+.settings-title h3 { margin: 0 0 4px; font-size: 16px; color: var(--g900); }
+.settings-title p { margin: 0; color: var(--g400); font-size: 12px; }
+.settings-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 12px; }
+.settings-fields .field { margin-bottom: 0; }
+.settings-fields .field:nth-child(3), .settings-fields .field:nth-child(4) { grid-column: 1 / -1; }
+.settings-info { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 16px; background: var(--g50); border: 1px solid var(--g100); border-radius: 12px; padding: 12px; color: var(--g500); font-size: 12px; }
+.settings-info div { min-width: 0; }
+.settings-info span { display: block; color: var(--g400); }
+.settings-info b { display: block; color: var(--g900); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.settings-info em { display: block; font-style: normal; color: var(--p600); }
+.settings-actions { display: flex; justify-content: flex-end; align-items: center; gap: 10px; margin-top: 22px; }
+.endpoint-list { display: grid; gap: 14px; }
+.endpoint-list span { display: block; color: var(--g700); font-weight: 600; margin-bottom: 6px; }
+.endpoint-list code { display: inline-block; max-width: 100%; overflow-wrap: anywhere; }
+@media (max-width: 1100px) { .settings-grid { grid-template-columns: 1fr; max-width: 620px; } }
+@media (max-width: 620px) { .settings-fields, .settings-info { grid-template-columns: 1fr; } }
 
 /* 新增 */
 .count { font-size: 13px; color: var(--g500); font-weight: 500; }

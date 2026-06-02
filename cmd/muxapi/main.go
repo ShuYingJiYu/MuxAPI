@@ -52,26 +52,34 @@ func main() {
 	sched := scheduler.New(listByGroup, hm)
 	fwd := forward.New(sched, hm, st, cfg.MaxRetries)
 	mon := monitor.New()
-	monitorInterval := func() time.Duration {
-		if d, err := time.ParseDuration(st.GetSetting("monitor_interval", "")); err == nil && d > 0 {
-			return d
+	settingDuration := func(key string, def time.Duration) func() time.Duration {
+		return func() time.Duration {
+			if d, err := time.ParseDuration(st.GetSetting(key, "")); err == nil && d > 0 {
+				return d
+			}
+			return def
 		}
-		return cfg.MonitorInterval
 	}
-	monProber := monitor.NewProber(mon, st, monitorInterval, cfg.ProbePath)
+	settingString := func(key, def string) func() string {
+		return func() string {
+			if v := st.GetSetting(key, ""); v != "" {
+				return v
+			}
+			return def
+		}
+	}
+	probeInterval := settingDuration("probe_interval", 15*time.Second)
+	monitorInterval := settingDuration("monitor_interval", 5*time.Minute)
+	probeModel := settingString("probe_model", "gpt-4o-mini")
+	probePath := settingString("probe_path", "/v1/chat/completions")
+	monProber := monitor.NewProber(mon, st, monitorInterval, probePath)
 	srv := server.New(fwd, cfg.AdminToken, st, hm, mon, monProber)
 
 	// 收到 SIGINT/SIGTERM 时取消：停探测并触发优雅关闭
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	// 路由用：上游级主动探测，驱动熔断器（间隔页面可配，缺省回退 config）
-	probeInterval := func() time.Duration {
-		if d, err := time.ParseDuration(st.GetSetting("probe_interval", "")); err == nil && d > 0 {
-			return d
-		}
-		return cfg.ProbeInterval
-	}
-	go health.NewProber(hm, listAll, probeInterval, cfg.ProbeModel, cfg.ProbePath).Run(ctx)
+	go health.NewProber(hm, listAll, probeInterval, probeModel, probePath).Run(ctx)
 	// 看板用：监控项级主动探测，记录成功率/延迟/趋势
 	go monProber.Run(ctx)
 

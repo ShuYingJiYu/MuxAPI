@@ -15,13 +15,16 @@ type Prober struct {
 	mgr      *Manager
 	list     func() []*upstream.Upstream
 	interval func() time.Duration // 动态探测间隔(页面可配)
-	model    string
-	path     string // 探测端点，按上游协议配置(OpenAI:/v1/chat/completions, Claude:/v1/messages)
+	model    func() string
+	path     func() string // 探测端点，按上游协议配置(OpenAI:/v1/chat/completions, Claude:/v1/messages)
 }
 
-func NewProber(mgr *Manager, list func() []*upstream.Upstream, interval func() time.Duration, model, path string) *Prober {
-	if path == "" {
-		path = "/v1/chat/completions"
+func NewProber(mgr *Manager, list func() []*upstream.Upstream, interval func() time.Duration, model, path func() string) *Prober {
+	if model == nil {
+		model = func() string { return "gpt-4o-mini" }
+	}
+	if path == nil {
+		path = func() string { return "/v1/chat/completions" }
 	}
 	return &Prober{mgr: mgr, list: list, interval: interval, model: model, path: path}
 }
@@ -43,17 +46,18 @@ func (p *Prober) Run(ctx context.Context) {
 }
 
 // 最小 token 探测请求体
-func (p *Prober) buildBody() []byte {
-	if p.path == "/v1/messages" { // Claude 格式
-		return []byte(`{"model":"` + p.model + `","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`)
+func (p *Prober) buildBody(model, path string) []byte {
+	if path == "/v1/messages" { // Claude 格式
+		return []byte(`{"model":"` + model + `","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`)
 	}
 	// OpenAI 格式（默认）
-	return []byte(`{"model":"` + p.model + `","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`)
+	return []byte(`{"model":"` + model + `","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`)
 }
 
 func (p *Prober) probe(ctx context.Context, u *upstream.Upstream) {
 	p.mgr.markProbe(u.ID)
-	req, err := u.BuildRequest(http.MethodPost, p.path, bytes.NewReader(p.buildBody()), http.Header{})
+	model, path := p.model(), p.path()
+	req, err := u.BuildRequest(http.MethodPost, path, bytes.NewReader(p.buildBody(model, path)), http.Header{})
 	if err != nil {
 		p.mgr.reportProbe(u.ID, false, 0)
 		return

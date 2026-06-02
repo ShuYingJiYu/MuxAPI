@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -47,20 +46,30 @@ func (s *Server) adminLogs(w http.ResponseWriter, r *http.Request) {
 func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		probeValue, probeSource := settingValue(s.store.GetSetting("probe_interval", ""), "MUXAPI_PROBE_INTERVAL", "15s")
-		monitorValue, monitorSource := settingValue(s.store.GetSetting("monitor_interval", ""), "MUXAPI_MONITOR_INTERVAL", "5m")
+		probeValue, probeSource := settingValue(s.store.GetSetting("probe_interval", ""), "15s")
+		monitorValue, monitorSource := settingValue(s.store.GetSetting("monitor_interval", ""), "5m")
+		probeModel, probeModelSource := stringSettingValue(s.store.GetSetting("probe_model", ""), "gpt-4o-mini")
+		probePath, probePathSource := stringSettingValue(s.store.GetSetting("probe_path", ""), "/v1/chat/completions")
 		writeJSON(w, map[string]string{
 			"probe_interval":             s.store.GetSetting("probe_interval", ""),
 			"monitor_interval":           s.store.GetSetting("monitor_interval", ""),
+			"probe_model":                s.store.GetSetting("probe_model", ""),
+			"probe_path":                 s.store.GetSetting("probe_path", ""),
 			"effective_probe_interval":   probeValue,
 			"effective_monitor_interval": monitorValue,
+			"effective_probe_model":      probeModel,
+			"effective_probe_path":       probePath,
 			"probe_source":               probeSource,
 			"monitor_source":             monitorSource,
+			"probe_model_source":         probeModelSource,
+			"probe_path_source":          probePathSource,
 		})
 	case http.MethodPut:
 		var d struct {
 			ProbeInterval   string `json:"probe_interval"`
 			MonitorInterval string `json:"monitor_interval"`
+			ProbeModel      string `json:"probe_model"`
+			ProbePath       string `json:"probe_path"`
 		}
 		json.NewDecoder(r.Body).Decode(&d)
 		for _, v := range []string{d.ProbeInterval, d.MonitorInterval} {
@@ -69,22 +78,30 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if d.ProbeModel == "" || d.ProbePath == "" || !strings.HasPrefix(d.ProbePath, "/") {
+			http.Error(w, "探测模型不能为空，探测路径必须以 / 开头", 400)
+			return
+		}
 		s.store.SetSetting("probe_interval", d.ProbeInterval)
 		s.store.SetSetting("monitor_interval", d.MonitorInterval)
+		s.store.SetSetting("probe_model", d.ProbeModel)
+		s.store.SetSetting("probe_path", d.ProbePath)
 		w.WriteHeader(204)
 	default:
 		http.Error(w, "method not allowed", 405)
 	}
 }
 
-func settingValue(dbValue, envKey, def string) (string, string) {
+func settingValue(dbValue, def string) (string, string) {
 	if d, err := time.ParseDuration(dbValue); err == nil && d > 0 {
 		return dbValue, "settings"
 	}
-	if envValue := os.Getenv(envKey); envValue != "" {
-		if d, err := time.ParseDuration(envValue); err == nil && d > 0 {
-			return envValue, "env"
-		}
+	return def, "default"
+}
+
+func stringSettingValue(dbValue, def string) (string, string) {
+	if dbValue != "" {
+		return dbValue, "settings"
 	}
 	return def, "default"
 }

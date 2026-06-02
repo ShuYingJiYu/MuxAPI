@@ -16,12 +16,12 @@ type Prober struct {
 	mgr      *Manager
 	store    *store.Store
 	interval func() time.Duration // 动态探测间隔(页面可配)
-	path     string
+	path     func() string
 }
 
-func NewProber(mgr *Manager, st *store.Store, interval func() time.Duration, path string) *Prober {
-	if path == "" {
-		path = "/v1/chat/completions"
+func NewProber(mgr *Manager, st *store.Store, interval func() time.Duration, path func() string) *Prober {
+	if path == nil {
+		path = func() string { return "/v1/chat/completions" }
 	}
 	return &Prober{mgr: mgr, store: st, interval: interval, path: path}
 }
@@ -44,7 +44,7 @@ func (p *Prober) Run(ctx context.Context) {
 func (p *Prober) Probe(ctx context.Context, m *store.Monitor) {
 	body := []byte(`{"model":"` + m.Model + `","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		strings.TrimSuffix(m.BaseURL, "/")+p.path, bytes.NewReader(body))
+		strings.TrimSuffix(m.BaseURL, "/")+p.path(), bytes.NewReader(body))
 	if err != nil {
 		p.mgr.Record(m.ID, statDown, 0)
 		return

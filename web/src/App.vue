@@ -198,10 +198,16 @@ const newKey = ref('')   // 生成后明文展示一次
 const copied = ref(0)    // 刚点击复制的密钥 id（短暂提示用）
 const probeInterval = ref('')      // 路由探测间隔(页面可配)
 const monitorInterval = ref('')    // 看板探测间隔(页面可配)
+const probeModel = ref('')
+const probePath = ref('')
 const effectiveProbeInterval = ref('')
 const effectiveMonitorInterval = ref('')
+const effectiveProbeModel = ref('')
+const effectiveProbePath = ref('')
 const probeSource = ref('')
 const monitorSource = ref('')
+const probeModelSource = ref('')
+const probePathSource = ref('')
 const apiBase = location.origin    // 当前访问地址，用于展示客户端接入端点
 const settingsSaved = ref(false)
 function createKey() { dlg.type = 'keygen'; dlg.form = { name: '' } }
@@ -228,17 +234,28 @@ function copyText(t, id) {
 }
 async function loadSettings() {
   const s = await api.getSettings()
-  probeInterval.value = s.probe_interval || ''
-  monitorInterval.value = s.monitor_interval || ''
   effectiveProbeInterval.value = s.effective_probe_interval || ''
   effectiveMonitorInterval.value = s.effective_monitor_interval || ''
+  effectiveProbeModel.value = s.effective_probe_model || ''
+  effectiveProbePath.value = s.effective_probe_path || ''
+  probeInterval.value = s.probe_interval || effectiveProbeInterval.value
+  monitorInterval.value = s.monitor_interval || effectiveMonitorInterval.value
+  probeModel.value = s.probe_model || effectiveProbeModel.value
+  probePath.value = s.probe_path || effectiveProbePath.value
   probeSource.value = s.probe_source || ''
   monitorSource.value = s.monitor_source || ''
+  probeModelSource.value = s.probe_model_source || ''
+  probePathSource.value = s.probe_path_source || ''
 }
-const sourceText = s => s === 'settings' ? '页面设置' : (s === 'env' ? '.env / 环境变量' : '默认值')
+const sourceText = s => s === 'settings' ? '页面设置' : '默认值'
 function saveSettings() {
   guard(async () => {
-    await api.saveSettings({ probe_interval: probeInterval.value, monitor_interval: monitorInterval.value })
+    await api.saveSettings({
+      probe_interval: probeInterval.value,
+      monitor_interval: monitorInterval.value,
+      probe_model: probeModel.value,
+      probe_path: probePath.value,
+    })
     await loadSettings()
     settingsSaved.value = true
     setTimeout(() => { settingsSaved.value = false }, 1500)
@@ -495,25 +512,42 @@ function logout() {
 
         <!-- 设置页 -->
         <template v-else-if="page === 'settings'">
-          <div class="card" style="max-width:520px">
-            <div class="field"><label>路由探测间隔</label><input v-model="probeInterval" placeholder="如 30s / 2m / 1h（驱动熔断与回切）" /></div>
-            <div class="field"><label>看板探测间隔</label><input v-model="monitorInterval" placeholder="如 5m / 1m（监控成功率与延迟）" /></div>
-            <div class="settings-info">
-              <div>路由实际生效：<b>{{ effectiveProbeInterval || '—' }}</b>，来源：{{ sourceText(probeSource) }}</div>
-              <div>看板实际生效：<b>{{ effectiveMonitorInterval || '—' }}</b>，来源：{{ sourceText(monitorSource) }}</div>
+          <div class="settings-grid">
+            <div class="card settings-card">
+              <div class="settings-title">
+                <h3>运行配置</h3>
+                <p>探测参数保存到数据库，立即生效。</p>
+              </div>
+              <div class="settings-fields">
+                <div class="field"><label>路由探测间隔</label><input v-model="probeInterval" placeholder="30s / 2m / 1h" /></div>
+                <div class="field"><label>看板探测间隔</label><input v-model="monitorInterval" placeholder="5m / 1m" /></div>
+                <div class="field"><label>路由探测模型</label><input v-model="probeModel" placeholder="gpt-4o-mini" /></div>
+                <div class="field"><label>探测路径</label><input v-model="probePath" placeholder="/v1/chat/completions" /></div>
+              </div>
+              <div class="settings-info">
+                <div><span>路由</span><b>{{ effectiveProbeInterval || '—' }}</b><em>{{ sourceText(probeSource) }}</em></div>
+                <div><span>看板</span><b>{{ effectiveMonitorInterval || '—' }}</b><em>{{ sourceText(monitorSource) }}</em></div>
+                <div><span>模型</span><b>{{ effectiveProbeModel || '—' }}</b><em>{{ sourceText(probeModelSource) }}</em></div>
+                <div><span>路径</span><b>{{ effectiveProbePath || '—' }}</b><em>{{ sourceText(probePathSource) }}</em></div>
+              </div>
+              <div class="settings-actions">
+                <span class="save-status" :class="{ show: settingsSaved }">已保存 ✓</span>
+                <button class="btn" @click="saveSettings"><Icon name="check" :size="16" />保存</button>
+              </div>
             </div>
-            <div class="dialog-foot">
-              <button class="btn" @click="saveSettings"><Icon name="check" :size="16" />保存</button>
-              <span class="save-status" :class="{ show: settingsSaved }">已保存 ✓</span>
-            </div>
-          </div>
 
-          <div class="card" style="max-width:560px;margin-top:16px">
-            <h3 style="margin:0 0 4px">接入地址</h3>
-            <p class="hint" style="margin:0 0 12px">客户端用接入密钥访问（请求头 <code>Authorization: Bearer &lt;密钥&gt;</code>）：</p>
-            <div class="field"><label>OpenAI</label><code>{{ apiBase }}/v1/chat/completions</code></div>
-            <div class="field"><label>Responses（Codex）</label><code>{{ apiBase }}/v1/responses</code></div>
-            <div class="field"><label>Claude</label><code>{{ apiBase }}/v1/messages</code></div>
+            <div class="card settings-card">
+              <div class="settings-title">
+                <h3>接入地址</h3>
+                <p>客户端使用接入密钥访问。</p>
+              </div>
+              <div class="endpoint-list">
+                <div><span>OpenAI</span><code>{{ apiBase }}/v1/chat/completions</code></div>
+                <div><span>Responses</span><code>{{ apiBase }}/v1/responses</code></div>
+                <div><span>Claude</span><code>{{ apiBase }}/v1/messages</code></div>
+              </div>
+              <p class="hint">请求头：<code>Authorization: Bearer &lt;密钥&gt;</code></p>
+            </div>
           </div>
         </template>
       </main>
