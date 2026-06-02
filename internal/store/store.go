@@ -14,9 +14,16 @@ type Store struct{ db *sql.DB }
 
 // Group 虚拟接入点：拥有自己的上游池(经中间表)和接入密钥。
 type Group struct {
-	ID          int64  `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
+	ID                   int64  `json:"id"`
+	Name                 string `json:"name"`
+	Description          string `json:"description"`
+	UpstreamCount        int    `json:"upstream_count"`
+	EnabledUpstreamCount int    `json:"enabled_upstream_count"`
+	KeyCount             int    `json:"key_count"`
+	EnabledKeyCount      int    `json:"enabled_key_count"`
+	RecentTotal          int    `json:"recent_total"`
+	SuccessRate          int    `json:"success_rate"`
+	AvgLatencyMs         int64  `json:"avg_latency_ms"`
 }
 
 // AccessKey 接入凭证，绑定到某分组：用哪个 key 访问就走哪个分组。
@@ -245,7 +252,22 @@ func (s *Store) DeleteMonitor(id int64) error {
 
 // --- 分组 ---
 func (s *Store) ListGroups() ([]*Group, error) {
-	rows, err := s.db.Query(`SELECT id,name,description FROM groups ORDER BY id`)
+	since := time.Now().Add(-24 * time.Hour).Unix()
+	rows, err := s.db.Query(`SELECT
+		g.id,g.name,g.description,
+		COUNT(DISTINCT gu.upstream_id),
+		COUNT(DISTINCT CASE WHEN u.enabled=1 THEN u.id END),
+		COUNT(DISTINCT ak.id),
+		COUNT(DISTINCT CASE WHEN ak.enabled=1 THEN ak.id END),
+		COALESCE((SELECT COUNT(*) FROM logs l WHERE l.group_id=g.id AND l.created_at>=?),0),
+		COALESCE((SELECT ROUND(100.0 * SUM(CASE WHEN l.status BETWEEN 200 AND 399 THEN 1 ELSE 0 END) / COUNT(*)) FROM logs l WHERE l.group_id=g.id AND l.created_at>=?),0),
+		COALESCE((SELECT ROUND(AVG(l.latency_ms)) FROM logs l WHERE l.group_id=g.id AND l.created_at>=?),0)
+		FROM groups g
+		LEFT JOIN group_upstreams gu ON gu.group_id=g.id
+		LEFT JOIN upstreams u ON u.id=gu.upstream_id
+		LEFT JOIN access_keys ak ON ak.group_id=g.id
+		GROUP BY g.id,g.name,g.description
+		ORDER BY g.id`, since, since, since)
 	if err != nil {
 		return nil, err
 	}
@@ -253,7 +275,12 @@ func (s *Store) ListGroups() ([]*Group, error) {
 	var gs []*Group
 	for rows.Next() {
 		g := &Group{}
-		if err := rows.Scan(&g.ID, &g.Name, &g.Description); err != nil {
+		if err := rows.Scan(
+			&g.ID, &g.Name, &g.Description,
+			&g.UpstreamCount, &g.EnabledUpstreamCount,
+			&g.KeyCount, &g.EnabledKeyCount,
+			&g.RecentTotal, &g.SuccessRate, &g.AvgLatencyMs,
+		); err != nil {
 			return nil, err
 		}
 		gs = append(gs, g)
@@ -267,6 +294,11 @@ func (s *Store) CreateGroup(name, desc string) (int64, error) {
 		return 0, err
 	}
 	return res.LastInsertId()
+}
+
+func (s *Store) UpdateGroup(id int64, name, desc string) error {
+	_, err := s.db.Exec(`UPDATE groups SET name=?, description=? WHERE id=?`, name, desc, id)
+	return err
 }
 
 func (s *Store) DeleteGroup(id int64) error {

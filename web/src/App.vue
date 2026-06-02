@@ -98,8 +98,14 @@ function ask(msg, onOk) { confirmState.show = true; confirmState.msg = msg; conf
 function confirmOk() { confirmState.show = false; confirmState.onOk?.() }
 
 function newGroup() { dlg.type = 'group'; dlg.form = { name: '', description: '' } }
+function editGroup(g) { dlg.type = 'group'; dlg.form = { id: g.id, name: g.name, description: g.description } }
 function saveGroup() {
-  guard(async () => { await api.createGroup({ ...dlg.form }); closeDlg(); await loadGroups() })
+  guard(async () => {
+    const f = { ...dlg.form }
+    if (f.id) await api.updateGroup(f.id, f)
+    else await api.createGroup(f)
+    closeDlg(); await loadGroups()
+  })
 }
 
 function newUpstream() { dlg.type = 'upstream'; dlg.form = { name: '', base_url: '', api_key: '', proxy: '', enabled: true } }
@@ -180,6 +186,10 @@ const newKey = ref('')   // 生成后明文展示一次
 const copied = ref(0)    // 刚点击复制的密钥 id（短暂提示用）
 const probeInterval = ref('')      // 路由探测间隔(页面可配)
 const monitorInterval = ref('')    // 看板探测间隔(页面可配)
+const effectiveProbeInterval = ref('')
+const effectiveMonitorInterval = ref('')
+const probeSource = ref('')
+const monitorSource = ref('')
 const apiBase = location.origin    // 当前访问地址，用于展示客户端接入端点
 const settingsSaved = ref(false)
 function createKey() { dlg.type = 'keygen'; dlg.form = { name: '' } }
@@ -204,10 +214,20 @@ function copyText(t, id) {
   copied.value = id
   setTimeout(() => { if (copied.value === id) copied.value = 0 }, 1200)
 }
-async function loadSettings() { const s = await api.getSettings(); probeInterval.value = s.probe_interval || ''; monitorInterval.value = s.monitor_interval || '' }
+async function loadSettings() {
+  const s = await api.getSettings()
+  probeInterval.value = s.probe_interval || ''
+  monitorInterval.value = s.monitor_interval || ''
+  effectiveProbeInterval.value = s.effective_probe_interval || ''
+  effectiveMonitorInterval.value = s.effective_monitor_interval || ''
+  probeSource.value = s.probe_source || ''
+  monitorSource.value = s.monitor_source || ''
+}
+const sourceText = s => s === 'settings' ? '页面设置' : (s === 'env' ? '.env / 环境变量' : '默认值')
 function saveSettings() {
   guard(async () => {
     await api.saveSettings({ probe_interval: probeInterval.value, monitor_interval: monitorInterval.value })
+    await loadSettings()
     settingsSaved.value = true
     setTimeout(() => { settingsSaved.value = false }, 1500)
   })
@@ -295,9 +315,17 @@ function toggleMonitor(m) {
             <div class="card group-card" v-for="g in groups" :key="g.id" @click="openDetail(g)">
               <div class="card-head">
                 <span class="card-name">{{ g.name }}</span>
-                <button class="icon-btn danger" @click.stop="delGroup(g)"><Icon name="trash" :size="16" /></button>
+                <div class="card-actions">
+                  <button class="icon-btn" @click.stop="editGroup(g)"><Icon name="edit" :size="16" /></button>
+                  <button class="icon-btn danger" @click.stop="delGroup(g)"><Icon name="trash" :size="16" /></button>
+                </div>
               </div>
               <p class="card-desc">{{ g.description || '无描述' }}</p>
+              <div class="group-stats">
+                <div><span>上游</span><b>{{ g.enabled_upstream_count || 0 }}/{{ g.upstream_count || 0 }}</b></div>
+                <div><span>密钥</span><b>{{ g.enabled_key_count || 0 }}/{{ g.key_count || 0 }}</b></div>
+                <div><span>近24h</span><b>{{ g.recent_total ? (g.success_rate + '% · ' + g.avg_latency_ms + 'ms') : '暂无调用' }}</b></div>
+              </div>
               <div class="card-foot"><span>点击管理上游与密钥</span><Icon name="check" :size="14" /></div>
             </div>
             <div v-if="!groups.length" class="empty">还没有分组，点右上角新建一个。</div>
@@ -431,9 +459,13 @@ function toggleMonitor(m) {
           <div class="card" style="max-width:520px">
             <div class="field"><label>路由探测间隔</label><input v-model="probeInterval" placeholder="如 30s / 2m / 1h（驱动熔断与回切）" /></div>
             <div class="field"><label>看板探测间隔</label><input v-model="monitorInterval" placeholder="如 5m / 1m（监控成功率与延迟）" /></div>
+            <div class="settings-info">
+              <div>路由实际生效：<b>{{ effectiveProbeInterval || '—' }}</b>，来源：{{ sourceText(probeSource) }}</div>
+              <div>看板实际生效：<b>{{ effectiveMonitorInterval || '—' }}</b>，来源：{{ sourceText(monitorSource) }}</div>
+            </div>
             <div class="dialog-foot">
               <button class="btn" @click="saveSettings"><Icon name="check" :size="16" />保存</button>
-              <span v-if="settingsSaved" style="color:#16a34a;font-size:13px;margin-left:10px">已保存 ✓</span>
+              <span class="save-status" :class="{ show: settingsSaved }">已保存 ✓</span>
             </div>
           </div>
 
@@ -510,7 +542,7 @@ function toggleMonitor(m) {
     <div class="mask" v-if="dlg.type" @click.self="closeDlg">
       <div class="dialog">
         <template v-if="dlg.type === 'group'">
-          <h3>新建分组</h3>
+          <h3>{{ dlg.form.id ? '编辑分组' : '新建分组' }}</h3>
           <div class="field"><label>名称</label><input v-model="dlg.form.name" placeholder="如 Claude 池" /></div>
           <div class="field"><label>描述</label><input v-model="dlg.form.description" placeholder="可选" /></div>
           <div class="dialog-foot"><button class="btn btn-ghost" @click="closeDlg">取消</button><button class="btn" @click="saveGroup">保存</button></div>
@@ -571,6 +603,4 @@ function toggleMonitor(m) {
     </div>
   </div>
 </template>
-
-
 

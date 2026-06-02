@@ -53,6 +53,7 @@ export const api = {
   // 分组
   groups: () => req('GET', '/groups'),
   createGroup: g => req('POST', '/groups', g),
+  updateGroup: (id, g) => req('PUT', '/groups/' + id, g),
   deleteGroup: id => req('DELETE', '/groups/' + id),
   // 组成员
   members: gid => req('GET', `/groups/${gid}/upstreams`),

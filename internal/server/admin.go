@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +23,7 @@ func (s *Server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/monitors", s.auth(s.adminMonitors))       // GET 监控列表 / POST 新增
 	mux.HandleFunc("/admin/monitors/", s.auth(s.adminMonitorItem))   // PUT 改 / DELETE 删 / {id}/probe 立即探测
 	mux.HandleFunc("/admin/groups", s.auth(s.adminGroups))           // GET 列表 / POST 新增
-	mux.HandleFunc("/admin/groups/", s.auth(s.adminGroupSub))        // /{id} 删 ; /{id}/upstreams 成员 ; /{id}/keys 密钥
+	mux.HandleFunc("/admin/groups/", s.auth(s.adminGroupSub))        // /{id} 改/删 ; /{id}/upstreams 成员 ; /{id}/keys 密钥
 	mux.HandleFunc("/admin/keys/", s.auth(s.adminKeyItem))           // PUT 启停 / DELETE 删
 	mux.HandleFunc("/admin/logs", s.auth(s.adminLogs))               // GET 最近调用日志
 	mux.HandleFunc("/admin/settings", s.auth(s.adminSettings))       // GET/PUT 运行时设置
@@ -46,9 +47,15 @@ func (s *Server) adminLogs(w http.ResponseWriter, r *http.Request) {
 func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		probeValue, probeSource := settingValue(s.store.GetSetting("probe_interval", ""), "MUXAPI_PROBE_INTERVAL", "15s")
+		monitorValue, monitorSource := settingValue(s.store.GetSetting("monitor_interval", ""), "MUXAPI_MONITOR_INTERVAL", "5m")
 		writeJSON(w, map[string]string{
-			"probe_interval":   s.store.GetSetting("probe_interval", ""),
-			"monitor_interval": s.store.GetSetting("monitor_interval", ""),
+			"probe_interval":             s.store.GetSetting("probe_interval", ""),
+			"monitor_interval":           s.store.GetSetting("monitor_interval", ""),
+			"effective_probe_interval":   probeValue,
+			"effective_monitor_interval": monitorValue,
+			"probe_source":               probeSource,
+			"monitor_source":             monitorSource,
 		})
 	case http.MethodPut:
 		var d struct {
@@ -68,6 +75,18 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", 405)
 	}
+}
+
+func settingValue(dbValue, envKey, def string) (string, string) {
+	if d, err := time.ParseDuration(dbValue); err == nil && d > 0 {
+		return dbValue, "settings"
+	}
+	if envValue := os.Getenv(envKey); envValue != "" {
+		if d, err := time.ParseDuration(envValue); err == nil && d > 0 {
+			return envValue, "env"
+		}
+	}
+	return def, "default"
 }
 
 // upstreamDTO 对外视图：api_key 脱敏，不回显完整凭证。
@@ -205,12 +224,12 @@ func (s *Server) testUpstream(w http.ResponseWriter, r *http.Request, id int64) 
 
 // monitorDTO 监控项对外视图：配置字段 + 实时探测快照(展平)。
 type monitorDTO struct {
-	ID           int64           `json:"id"`
-	UpstreamID   int64           `json:"upstream_id"`
-	UpstreamName string          `json:"upstream_name"`
-	Model        string          `json:"model"`
-	Name         string          `json:"name"`
-	Enabled      bool            `json:"enabled"`
+	ID           int64            `json:"id"`
+	UpstreamID   int64            `json:"upstream_id"`
+	UpstreamName string           `json:"upstream_name"`
+	Model        string           `json:"model"`
+	Name         string           `json:"name"`
+	Enabled      bool             `json:"enabled"`
 	Snapshot     monitor.Snapshot `json:"snapshot"`
 }
 
@@ -377,15 +396,31 @@ func (s *Server) adminGroupSub(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case len(parts) == 1: // /{id}
-		if r.Method != http.MethodDelete {
+		switch r.Method {
+		case http.MethodPut:
+			var d struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+			}
+			if json.NewDecoder(r.Body).Decode(&d) != nil || d.Name == "" {
+				http.Error(w, "bad name", 400)
+				return
+			}
+			if err := s.store.UpdateGroup(gid, d.Name, d.Description); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			w.WriteHeader(204)
+		case http.MethodDelete:
+			if err := s.store.DeleteGroup(gid); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			w.WriteHeader(204)
+		default:
 			http.Error(w, "method not allowed", 405)
 			return
 		}
-		if err := s.store.DeleteGroup(gid); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		w.WriteHeader(204)
 	case parts[1] == "upstreams":
 		s.adminGroupUpstreams(w, r, gid, parts)
 	case parts[1] == "keys":
