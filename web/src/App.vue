@@ -43,8 +43,9 @@ async function probeOne(m) {
     m.snapshot = sn
   } finally { probingId.value = 0 }
 }
+async function loadMembers(gid) { members.value = (await api.members(gid)) || [] }
 async function loadDetail(gid) {
-  members.value = (await api.members(gid)) || []
+  await loadMembers(gid)
   keys.value = (await api.keys(gid)) || []
 }
 
@@ -62,7 +63,7 @@ async function guard(fn) {
 }
 
 onMounted(() => {
-  if (loggedIn.value) guard(async () => { await loadGroups(); await loadUpstreams(); await loadSettings() })
+  if (loggedIn.value) guard(async () => { await loadGroups(); await loadUpstreams(); await loadSettings(); startRtPoll(loadGroups) })
 })
 
 // 看板自动刷新：探测间隔 5min，这里每 60s 拉一次快照即可，离开即停
@@ -72,22 +73,35 @@ function startMonPoll() {
   monTimer = setInterval(() => { loadMonitors().catch(() => {}) }, 60000)
 }
 function stopMonPoll() { if (monTimer) { clearInterval(monTimer); monTimer = null } }
-onUnmounted(stopMonPoll)
+
+// 运行时状态轮询：分组列表/分组详情/上游池页，每 8s 刷新健康，离开即停。
+let rtTimer = null
+function startRtPoll(fn) {
+  stopRtPoll()
+  rtTimer = setInterval(() => { fn().catch(() => {}) }, 8000)
+}
+function stopRtPoll() { if (rtTimer) { clearInterval(rtTimer); rtTimer = null } }
+function stopAllPoll() { stopMonPoll(); stopRtPoll() }
+onUnmounted(() => { stopMonPoll(); stopRtPoll() })
 
 function go(p) {
   page.value = p; detailGroup.value = null
-  stopMonPoll()
+  stopAllPoll()
   guard(async () => {
-    if (p === 'groups') await loadGroups()
-    else if (p === 'upstreams') await loadUpstreams()
+    if (p === 'groups') { await loadGroups(); startRtPoll(loadGroups) }
+    else if (p === 'upstreams') { await loadUpstreams(); startRtPoll(loadUpstreams) }
     else if (p === 'monitors') { await loadUpstreams(); await loadMonitors(); startMonPoll() }
   })
 }
 function openDetail(g) {
   detailGroup.value = g
-  guard(async () => { await loadUpstreams(); await loadDetail(g.id) })
+  stopAllPoll()
+  guard(async () => { await loadUpstreams(); await loadDetail(g.id); startRtPoll(() => loadMembers(g.id)) })
 }
-function backToGroups() { detailGroup.value = null; guard(loadGroups) }
+function backToGroups() {
+  detailGroup.value = null; stopAllPoll()
+  guard(async () => { await loadGroups(); startRtPoll(loadGroups) })
+}
 
 // 上游池里未加入当前分组的（供"添加成员"下拉）
 const memberIds = computed(() => new Set(members.value.map(m => m.upstream_id)))
@@ -208,6 +222,9 @@ const probeSource = ref('')
 const monitorSource = ref('')
 const probeModelSource = ref('')
 const probePathSource = ref('')
+const logRetention = ref('')           // 日志保留条数(页面可配)
+const effectiveLogRetention = ref('')
+const logRetentionSource = ref('')
 const apiBase = location.origin    // 当前访问地址，用于展示客户端接入端点
 const settingsSaved = ref(false)
 function createKey() { dlg.type = 'keygen'; dlg.form = { name: '' } }
@@ -238,14 +255,17 @@ async function loadSettings() {
   effectiveMonitorInterval.value = s.effective_monitor_interval || ''
   effectiveProbeModel.value = s.effective_probe_model || ''
   effectiveProbePath.value = s.effective_probe_path || ''
+  effectiveLogRetention.value = s.effective_log_retention || ''
   probeInterval.value = s.probe_interval || effectiveProbeInterval.value
   monitorInterval.value = s.monitor_interval || effectiveMonitorInterval.value
   probeModel.value = s.probe_model || effectiveProbeModel.value
   probePath.value = s.probe_path || effectiveProbePath.value
+  logRetention.value = s.log_retention || effectiveLogRetention.value
   probeSource.value = s.probe_source || ''
   monitorSource.value = s.monitor_source || ''
   probeModelSource.value = s.probe_model_source || ''
   probePathSource.value = s.probe_path_source || ''
+  logRetentionSource.value = s.log_retention_source || ''
 }
 const sourceText = s => s === 'settings' ? '页面设置' : '默认值'
 function saveSettings() {
@@ -255,6 +275,7 @@ function saveSettings() {
       monitor_interval: monitorInterval.value,
       probe_model: probeModel.value,
       probe_path: probePath.value,
+      log_retention: logRetention.value,
     })
     await loadSettings()
     settingsSaved.value = true
@@ -265,6 +286,22 @@ function saveSettings() {
 // 监控项状态映射
 const stateLabel = s => ({ OK: '正常', DEGRADED: '降级', DOWN: '故障' }[s] || '无数据')
 const dotClass = s => ({ OK: 'closed', DEGRADED: 'half', DOWN: 'open' }[s] || 'nodata')
+
+// 路由熔断状态映射（成员表/上游池运行时列用）。未探测过(last_probe=0 且无请求)显示「待探测」。
+const rtUnprobed = h => h && h.state === 'CLOSED' && !h.last_probe && !h.reqs
+const rtLabel = h => rtUnprobed(h) ? '待探测' : ({ CLOSED: '正常', HALF_OPEN: '半开', OPEN: '熔断' }[h?.state] || '待探测')
+const rtClass = h => rtUnprobed(h) ? 'nodata' : ({ CLOSED: 'closed', HALF_OPEN: 'half', OPEN: 'open' }[h?.state] || 'nodata')
+const rtRate = h => (h && h.reqs) ? (h.succ_rate * 100).toFixed(0) + '%' : '—'
+
+// 分组卡片：生效渠道文本 + 健康概览文本
+const effText = rt => (rt && rt.effective && rt.effective.length) ? rt.effective.join(' / ') : '无可用'
+const healthSummary = rt => {
+  if (!rt || !rt.total) return '无成员'
+  const parts = [`${rt.normal} 正常`]
+  if (rt.half_open) parts.push(`${rt.half_open} 半开`)
+  if (rt.open) parts.push(`${rt.open} 熔断`)
+  return parts.join(' · ')
+}
 const upName = id => upstreams.value.find(u => u.id === id)?.name || ('#' + id)
 const monTitle = m => m.name || (m.upstream_name + ' · ' + m.model)
 const initial = m => (m.model || '?').replace(/[^a-zA-Z0-9]/g, '').charAt(0).toUpperCase() || '?'
@@ -312,14 +349,14 @@ function toggleMonitor(m) {
 function login() {
   api.setToken(loginForm.token.trim())
   loggedIn.value = true
-  guard(async () => { await loadGroups(); await loadUpstreams(); await loadSettings() })
+  guard(async () => { await loadGroups(); await loadUpstreams(); await loadSettings(); startRtPoll(loadGroups) })
 }
 function logout() {
   api.clearToken()
   loggedIn.value = false
   loginForm.token = ''
   groups.value = []; upstreams.value = []; members.value = []; keys.value = []; monitors.value = []
-  stopMonPoll()
+  stopAllPoll()
 }
 </script>
 
@@ -378,6 +415,8 @@ function logout() {
               </div>
               <p class="card-desc">{{ g.description || '无描述' }}</p>
               <div class="group-stats">
+                <div><span>生效渠道</span><b :class="{ 'eff-down': !g.runtime?.effective?.length }">{{ effText(g.runtime) }}</b></div>
+                <div><span>上游健康</span><b>{{ healthSummary(g.runtime) }}</b></div>
                 <div><span>上游</span><b>{{ g.enabled_upstream_count || 0 }}/{{ g.upstream_count || 0 }}</b></div>
                 <div><span>密钥</span><b>{{ g.enabled_key_count || 0 }}/{{ g.key_count || 0 }}</b></div>
                 <div><span>近24h</span><b>{{ g.recent_total ? (g.success_rate + '% · ' + g.avg_latency_ms + 'ms') : '暂无调用' }}</b></div>
@@ -398,20 +437,23 @@ function logout() {
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>名称</th><th>地址</th><th>组内优先级</th><th>权重</th><th>状态</th><th>操作</th></tr></thead>
+              <thead><tr><th>名称</th><th>地址</th><th>组内优先级</th><th>权重</th><th>运行时</th><th>成功率</th><th>延迟</th><th>人工开关</th><th>操作</th></tr></thead>
               <tbody>
-                <tr v-for="m in members" :key="m.upstream_id">
-                  <td class="cell-name">{{ m.name }}</td>
+                <tr v-for="m in members" :key="m.upstream_id" :class="{ 'row-eff': m.effective }">
+                  <td class="cell-name">{{ m.name }}<span v-if="m.effective" class="eff-badge">生效中</span></td>
                   <td class="cell-url">{{ m.base_url }}</td>
                   <td>{{ m.priority }}</td>
                   <td>{{ m.weight }}</td>
+                  <td><span class="state-badge" :class="rtClass(m.health)">{{ m.enabled ? rtLabel(m.health) : '已停用' }}</span></td>
+                  <td>{{ rtRate(m.health) }}</td>
+                  <td>{{ m.health && m.health.avg_lat_ms ? m.health.avg_lat_ms + 'ms' : '—' }}</td>
                   <td><span class="tag" :class="m.enabled ? 'on' : 'off'">{{ m.enabled ? '启用' : '停用' }}</span></td>
                   <td>
                     <button class="icon-btn" @click="editMember(m)"><Icon name="edit" :size="16" /></button>
                     <button class="icon-btn danger" @click="removeMember(m)"><Icon name="trash" :size="16" /></button>
                   </td>
                 </tr>
-                <tr v-if="!members.length"><td colspan="6" class="empty-cell">暂无上游，从全局池添加。</td></tr>
+                <tr v-if="!members.length"><td colspan="9" class="empty-cell">暂无上游，从全局池添加。</td></tr>
               </tbody>
             </table>
           </div>
@@ -448,12 +490,14 @@ function logout() {
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>名称</th><th>地址</th><th>凭证</th><th>状态</th><th>操作</th></tr></thead>
+              <thead><tr><th>名称</th><th>地址</th><th>凭证</th><th>运行时</th><th>成功率</th><th>人工开关</th><th>操作</th></tr></thead>
               <tbody>
                 <tr v-for="u in upstreams" :key="u.id">
                   <td class="cell-name">{{ u.name }}</td>
                   <td class="cell-url">{{ u.base_url }}</td>
                   <td><code>{{ u.masked }}</code></td>
+                  <td><span class="state-badge" :class="rtClass(u.health)">{{ u.enabled ? rtLabel(u.health) : '已停用' }}</span></td>
+                  <td>{{ rtRate(u.health) }}</td>
                   <td><span class="tag" :class="u.enabled ? 'on' : 'off'">{{ u.enabled ? '启用' : '停用' }}</span></td>
                   <td>
                     <button class="btn-link sm" @click="testUpstream(u)">测试</button>
@@ -461,7 +505,7 @@ function logout() {
                     <button class="icon-btn danger" @click="delUpstream(u)"><Icon name="trash" :size="16" /></button>
                   </td>
                 </tr>
-                <tr v-if="!upstreams.length"><td colspan="5" class="empty-cell">还没有上游，点右上角新增。</td></tr>
+                <tr v-if="!upstreams.length"><td colspan="7" class="empty-cell">还没有上游，点右上角新增。</td></tr>
               </tbody>
             </table>
           </div>
@@ -523,12 +567,14 @@ function logout() {
                 <div class="field"><label>看板探测间隔</label><input v-model="monitorInterval" placeholder="5m / 1m" /></div>
                 <div class="field"><label>路由探测模型</label><input v-model="probeModel" placeholder="gpt-4o-mini" /></div>
                 <div class="field"><label>探测路径</label><input v-model="probePath" placeholder="/v1/chat/completions" /></div>
+                <div class="field"><label>日志保留条数</label><input v-model="logRetention" type="number" min="100" placeholder="10000" /></div>
               </div>
               <div class="settings-info">
                 <div><span>路由</span><b>{{ effectiveProbeInterval || '—' }}</b><em>{{ sourceText(probeSource) }}</em></div>
                 <div><span>看板</span><b>{{ effectiveMonitorInterval || '—' }}</b><em>{{ sourceText(monitorSource) }}</em></div>
                 <div><span>模型</span><b>{{ effectiveProbeModel || '—' }}</b><em>{{ sourceText(probeModelSource) }}</em></div>
                 <div><span>路径</span><b>{{ effectiveProbePath || '—' }}</b><em>{{ sourceText(probePathSource) }}</em></div>
+                <div><span>日志</span><b>{{ effectiveLogRetention ? effectiveLogRetention + ' 条' : '—' }}</b><em>{{ sourceText(logRetentionSource) }}</em></div>
               </div>
               <div class="settings-actions">
                 <span class="save-status" :class="{ show: settingsSaved }">已保存 ✓</span>

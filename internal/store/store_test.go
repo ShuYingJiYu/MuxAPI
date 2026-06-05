@@ -69,3 +69,45 @@ func TestStoreCRUD(t *testing.T) {
 		t.Fatal("停用 key 不应再解析到分组")
 	}
 }
+
+func TestPruneLogs(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	for i := 0; i < 50; i++ {
+		st.Log(1, 1, 200, 10)
+	}
+
+	// keep<=0：关闭清理，不删任何行
+	if n, _ := st.PruneLogs(0); n != 0 {
+		t.Fatalf("keep=0 应不删，实际删 %d", n)
+	}
+	if got, _ := st.ListLogs(1000); len(got) != 50 {
+		t.Fatalf("应仍有 50 条，实际 %d", len(got))
+	}
+
+	// keep>总数：不删
+	if n, _ := st.PruneLogs(100); n != 0 {
+		t.Fatalf("keep>总数应不删，实际删 %d", n)
+	}
+
+	// 保留最新 20 条：删 30
+	n, err := st.PruneLogs(20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 30 {
+		t.Fatalf("应删 30 条，实际 %d", n)
+	}
+	got, _ := st.ListLogs(1000)
+	if len(got) != 20 {
+		t.Fatalf("应剩 20 条，实际 %d", len(got))
+	}
+	// 保留的应是最新的（id 最大那批），ListLogs 倒序，首条 id 应为 50
+	if got[0].ID != 50 {
+		t.Fatalf("保留的应是最新批次(首条 id=50)，实际 id=%d", got[0].ID)
+	}
+}

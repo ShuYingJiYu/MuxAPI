@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mirainya/muxapi/internal/health"
 	"github.com/mirainya/muxapi/internal/monitor"
 	"github.com/mirainya/muxapi/internal/store"
 	"github.com/mirainya/muxapi/internal/upstream"
@@ -50,19 +51,23 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 		monitorValue, monitorSource := settingValue(s.store.GetSetting("monitor_interval", ""), "5m")
 		probeModel, probeModelSource := stringSettingValue(s.store.GetSetting("probe_model", ""), "gpt-4o-mini")
 		probePath, probePathSource := stringSettingValue(s.store.GetSetting("probe_path", ""), "/v1/chat/completions")
+		logRetention, logRetentionSource := intSettingValue(s.store.GetSetting("log_retention", ""), 10000)
 		writeJSON(w, map[string]string{
 			"probe_interval":             s.store.GetSetting("probe_interval", ""),
 			"monitor_interval":           s.store.GetSetting("monitor_interval", ""),
 			"probe_model":                s.store.GetSetting("probe_model", ""),
 			"probe_path":                 s.store.GetSetting("probe_path", ""),
+			"log_retention":              s.store.GetSetting("log_retention", ""),
 			"effective_probe_interval":   probeValue,
 			"effective_monitor_interval": monitorValue,
 			"effective_probe_model":      probeModel,
 			"effective_probe_path":       probePath,
+			"effective_log_retention":    logRetention,
 			"probe_source":               probeSource,
 			"monitor_source":             monitorSource,
 			"probe_model_source":         probeModelSource,
 			"probe_path_source":          probePathSource,
+			"log_retention_source":       logRetentionSource,
 		})
 	case http.MethodPut:
 		var d struct {
@@ -70,6 +75,7 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 			MonitorInterval string `json:"monitor_interval"`
 			ProbeModel      string `json:"probe_model"`
 			ProbePath       string `json:"probe_path"`
+			LogRetention    string `json:"log_retention"`
 		}
 		json.NewDecoder(r.Body).Decode(&d)
 		for _, v := range []string{d.ProbeInterval, d.MonitorInterval} {
@@ -82,10 +88,15 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "探测模型不能为空，探测路径必须以 / 开头", 400)
 			return
 		}
+		if n, err := strconv.Atoi(d.LogRetention); err != nil || n < 100 {
+			http.Error(w, "日志保留条数须为 >=100 的整数", 400)
+			return
+		}
 		s.store.SetSetting("probe_interval", d.ProbeInterval)
 		s.store.SetSetting("monitor_interval", d.MonitorInterval)
 		s.store.SetSetting("probe_model", d.ProbeModel)
 		s.store.SetSetting("probe_path", d.ProbePath)
+		s.store.SetSetting("log_retention", d.LogRetention)
 		w.WriteHeader(204)
 	default:
 		http.Error(w, "method not allowed", 405)
@@ -106,15 +117,114 @@ func stringSettingValue(dbValue, def string) (string, string) {
 	return def, "default"
 }
 
+func intSettingValue(dbValue string, def int) (string, string) {
+	if n, err := strconv.Atoi(dbValue); err == nil && n > 0 {
+		return dbValue, "settings"
+	}
+	return strconv.Itoa(def), "default"
+}
+
+// healthView 运行时健康精简视图（成员/上游列表用，不含趋势数组，省带宽）。
+type healthView struct {
+	State     string  `json:"state"`      // CLOSED 正常 / OPEN 熔断 / HALF_OPEN 半开
+	Fails     int     `json:"fails"`      // 当前连续失败数
+	Reqs      int64   `json:"reqs"`       // 业务请求总数
+	SuccRate  float64 `json:"succ_rate"`  // 成功率 0..1（无请求为 0）
+	AvgLatMs  int64   `json:"avg_lat_ms"` // 成功请求平均延迟
+	LastProbe int64   `json:"last_probe"` // 最后探测 unix 秒，0=从未探测
+}
+
+func toHealthView(sn health.Snapshot) healthView {
+	var lastProbe int64
+	if !sn.LastProbe.IsZero() {
+		lastProbe = sn.LastProbe.Unix()
+	}
+	return healthView{
+		State: sn.State, Fails: sn.Fails, Reqs: sn.Reqs,
+		SuccRate: sn.SuccRate, AvgLatMs: sn.AvgLatMs, LastProbe: lastProbe,
+	}
+}
+
+// effectivePriority 返回分组「生效层」的优先级值。
+// 生效层 = enabled 且未熔断(CLOSED/HALF_OPEN 都算可用，与调度 IsAvailable 一致)中优先级最小的那层。
+func effectivePriority(ms []*store.Member, state func(int64) string) (int, bool) {
+	best, ok := 0, false
+	for _, m := range ms {
+		if !m.Enabled || state(m.UpstreamID) == "OPEN" {
+			continue
+		}
+		if !ok || m.Priority < best {
+			best, ok = m.Priority, true
+		}
+	}
+	return best, ok
+}
+
+// memberOut 组成员 + 运行时健康 + 是否生效层。
+type memberOut struct {
+	*store.Member
+	Health    healthView `json:"health"`
+	Effective bool       `json:"effective"`
+}
+
+// groupRuntime 分组运行时概览：生效渠道名 + 各健康档计数（只统计 enabled 成员）。
+type groupRuntime struct {
+	Effective []string `json:"effective"` // 生效层渠道名（同层多个全列）
+	Normal    int      `json:"normal"`    // CLOSED
+	HalfOpen  int      `json:"half_open"` // HALF_OPEN
+	Open      int      `json:"open"`      // OPEN 熔断
+	Total     int      `json:"total"`     // enabled 成员总数
+}
+
+// groupOut 分组 + 运行时概览。
+type groupOut struct {
+	*store.Group
+	Runtime groupRuntime `json:"runtime"`
+}
+
+// computeGroupRuntime 算一个分组的运行时概览。
+func (s *Server) computeGroupRuntime(gid int64) groupRuntime {
+	ms, _ := s.store.ListGroupMembers(gid)
+	snaps := make(map[int64]health.Snapshot, len(ms))
+	for _, m := range ms {
+		snaps[m.UpstreamID] = s.health.Snapshot(m.UpstreamID)
+	}
+	rt := groupRuntime{Effective: []string{}}
+	for _, m := range ms {
+		if !m.Enabled {
+			continue
+		}
+		rt.Total++
+		switch snaps[m.UpstreamID].State {
+		case "OPEN":
+			rt.Open++
+		case "HALF_OPEN":
+			rt.HalfOpen++
+		default:
+			rt.Normal++
+		}
+	}
+	best, hasEff := effectivePriority(ms, func(id int64) string { return snaps[id].State })
+	if hasEff {
+		for _, m := range ms {
+			if m.Enabled && m.Priority == best && snaps[m.UpstreamID].State != "OPEN" {
+				rt.Effective = append(rt.Effective, m.Name)
+			}
+		}
+	}
+	return rt
+}
+
 // upstreamDTO 对外视图：api_key 脱敏，不回显完整凭证。
 type upstreamDTO struct {
-	ID      int64  `json:"id"`
-	Name    string `json:"name"`
-	BaseURL string `json:"base_url"`
-	Proxy   string `json:"proxy"`
-	APIKey  string `json:"api_key,omitempty"` // 输入用；输出时脱敏到 masked
-	Masked  string `json:"masked,omitempty"`
-	Enabled bool   `json:"enabled"`
+	ID      int64      `json:"id"`
+	Name    string     `json:"name"`
+	BaseURL string     `json:"base_url"`
+	Proxy   string     `json:"proxy"`
+	APIKey  string     `json:"api_key,omitempty"` // 输入用；输出时脱敏到 masked
+	Masked  string     `json:"masked,omitempty"`
+	Enabled bool       `json:"enabled"`
+	Health  healthView `json:"health"` // 运行时健康（仅 GET 列表填充）
 }
 
 func mask(key string) string {
@@ -134,7 +244,11 @@ func (s *Server) adminUpstreams(w http.ResponseWriter, r *http.Request) {
 		}
 		out := make([]upstreamDTO, 0, len(list))
 		for _, u := range list {
-			out = append(out, upstreamDTO{u.ID, u.Name, u.BaseURL, u.Proxy, "", mask(u.APIKey), u.Enabled})
+			out = append(out, upstreamDTO{
+				ID: u.ID, Name: u.Name, BaseURL: u.BaseURL, Proxy: u.Proxy,
+				Masked: mask(u.APIKey), Enabled: u.Enabled,
+				Health: toHealthView(s.health.Snapshot(u.ID)),
+			})
 		}
 		writeJSON(w, out)
 	case http.MethodPost:
@@ -382,7 +496,11 @@ func (s *Server) adminGroups(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		writeJSON(w, gs)
+		out := make([]groupOut, 0, len(gs))
+		for _, g := range gs {
+			out = append(out, groupOut{Group: g, Runtime: s.computeGroupRuntime(g.ID)})
+		}
+		writeJSON(w, out)
 	case http.MethodPost:
 		var d struct {
 			Name        string `json:"name"`
@@ -469,7 +587,23 @@ func (s *Server) adminGroupUpstreams(w http.ResponseWriter, r *http.Request, gid
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		writeJSON(w, ms)
+		// 先缓存各成员健康快照，避免重复加锁查询
+		snaps := make(map[int64]health.Snapshot, len(ms))
+		for _, m := range ms {
+			snaps[m.UpstreamID] = s.health.Snapshot(m.UpstreamID)
+		}
+		state := func(id int64) string { return snaps[id].State }
+		best, hasEff := effectivePriority(ms, state)
+		out := make([]memberOut, 0, len(ms))
+		for _, m := range ms {
+			sn := snaps[m.UpstreamID]
+			out = append(out, memberOut{
+				Member:    m,
+				Health:    toHealthView(sn),
+				Effective: hasEff && m.Enabled && m.Priority == best && sn.State != "OPEN",
+			})
+		}
+		writeJSON(w, out)
 	case http.MethodPost, http.MethodPut: // 加入或更新组内策略（UPSERT）
 		var d struct {
 			UpstreamID int64 `json:"upstream_id"`

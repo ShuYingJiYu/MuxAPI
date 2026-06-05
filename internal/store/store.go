@@ -456,6 +456,23 @@ func (s *Store) ListLogs(limit int) ([]*LogEntry, error) {
 	return out, rows.Err()
 }
 
+// PruneLogs 只保留最新 keep 条调用日志，删除更旧的，返回删除行数。
+// keep<=0 视为关闭清理。利用主键自增有序：取第 keep 新的 id 当阈值，删比它更小的。
+// 日志数 <= keep 时子查询取到的最小 id 即全表最小，id < 它删不到任何行。
+func (s *Store) PruneLogs(keep int) (int64, error) {
+	if keep <= 0 {
+		return 0, nil
+	}
+	res, err := s.db.Exec(
+		`DELETE FROM logs WHERE id < (SELECT MIN(id) FROM (SELECT id FROM logs ORDER BY id DESC LIMIT ?))`,
+		keep)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // --- 运行时设置（页面可配，key-value）---
 
 func (s *Store) GetSetting(key, def string) string {

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -68,6 +69,14 @@ func main() {
 			return def
 		}
 	}
+	settingInt := func(key string, def int) func() int {
+		return func() int {
+			if n, err := strconv.Atoi(st.GetSetting(key, "")); err == nil && n > 0 {
+				return n
+			}
+			return def
+		}
+	}
 	probeInterval := settingDuration("probe_interval", 15*time.Second)
 	monitorInterval := settingDuration("monitor_interval", 5*time.Minute)
 	probeModel := settingString("probe_model", "gpt-4o-mini")
@@ -82,6 +91,9 @@ func main() {
 	go health.NewProber(hm, listAll, probeInterval, probeModel, probePath).Run(ctx)
 	// 看板用：监控项级主动探测，记录成功率/延迟/趋势
 	go monProber.Run(ctx)
+	// 日志清理：按条数保留最新 N 条，定时裁剪防止 logs 表无限增长（页面可配，缺省 1 万条）。
+	logRetention := settingInt("log_retention", 10000)
+	go runLogJanitor(ctx, st, logRetention)
 
 	httpSrv := &http.Server{Addr: cfg.Addr, Handler: srv.Handler()}
 	go func() {
@@ -98,5 +110,32 @@ func main() {
 	defer cancel()
 	if err := httpSrv.Shutdown(shutCtx); err != nil {
 		slog.Error("shutdown failed", "err", err)
+	}
+}
+
+// runLogJanitor 定时裁剪 logs 表：启动先清一次，之后每 10 分钟一轮。
+// keep() 每轮取最新值，页面改保留条数下一轮生效；返回 0 表示关闭清理。
+func runLogJanitor(ctx context.Context, st *store.Store, keep func() int) {
+	prune := func() {
+		n := keep()
+		if n <= 0 {
+			return
+		}
+		if deleted, err := st.PruneLogs(n); err != nil {
+			slog.Error("log janitor prune failed", "err", err)
+		} else if deleted > 0 {
+			slog.Info("log janitor pruned", "deleted", deleted, "keep", n)
+		}
+	}
+	prune() // 启动即清一次，立刻收敛历史堆积
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			prune()
+		}
 	}
 }

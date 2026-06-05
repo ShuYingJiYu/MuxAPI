@@ -211,6 +211,10 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .group-stats div { display: flex; align-items: center; justify-content: space-between; font-size: 12px; }
 .group-stats span { color: var(--g500); }
 .group-stats b { color: var(--g900); font-weight: 600; }
+.group-stats b.eff-down { color: var(--red); }
+.group-stats b { max-width: 60%; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.eff-badge { display: inline-block; margin-left: 8px; font-size: 11px; font-weight: 600; color: var(--p700); background: var(--p50); padding: 1px 7px; border-radius: 999px; vertical-align: middle; }
+.row-eff { background: var(--p50); }
 .card-foot { display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: var(--p600); padding-top: 12px; border-top: 1px solid var(--g100); }
 .btn-sm { padding: 6px 12px; font-size: 12px; border-radius: 10px; }
 .btn-link { background: none; border: none; color: var(--p600); cursor: pointer; font-size: 13px; font-weight: 500; padding: 4px 0; margin-bottom: 16px; }
