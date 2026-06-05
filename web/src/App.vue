@@ -325,17 +325,17 @@ function loadMonModels(uid) {
 }
 function newMonitor() {
   const uid = upstreams.value[0]?.id || 0
-  dlg.type = 'monitor'; dlg.form = { upstream_id: uid, model: '', name: '', enabled: true }
+  dlg.type = 'monitor'; dlg.form = { upstream_id: uid, model: '', name: '', enabled: true, stream: false, probe_text: '', max_tokens: 0, interval_sec: 0, path: '' }
   loadMonModels(uid)
 }
 function editMonitor(m) {
   dlg.type = 'monitor'
-  dlg.form = { id: m.id, upstream_id: m.upstream_id, model: m.model, name: m.name, enabled: m.enabled }
+  dlg.form = { id: m.id, upstream_id: m.upstream_id, model: m.model, name: m.name, enabled: m.enabled, stream: !!m.stream, probe_text: m.probe_text || '', max_tokens: m.max_tokens || 0, interval_sec: m.interval_sec || 0, path: m.path || '' }
   loadMonModels(m.upstream_id)
 }
 function saveMonitor() {
   guard(async () => {
-    const f = { ...dlg.form, upstream_id: Number(dlg.form.upstream_id) }
+    const f = { ...dlg.form, upstream_id: Number(dlg.form.upstream_id), max_tokens: Number(dlg.form.max_tokens) || 0, interval_sec: Number(dlg.form.interval_sec) || 0 }
     if (f.id) await api.updateMonitor(f.id, f)
     else await api.createMonitor(f)
     closeDlg(); await loadMonitors()
@@ -539,7 +539,7 @@ function logout() {
                 <span class="mon-avatar" :class="dotClass(m.snapshot.state)">{{ initial(m) }}</span>
                 <div class="mon-id">
                   <span class="mon-name">{{ monTitle(m) }}</span>
-                  <span class="mon-sub">{{ m.upstream_name }} · {{ m.model }}</span>
+                  <span class="mon-sub">{{ m.upstream_name }} · {{ m.model }}<span v-if="m.stream" class="tag on" style="margin-left:6px">流式</span></span>
                 </div>
                 <span class="state-badge" :class="dotClass(m.snapshot.state)">{{ m.enabled ? stateLabel(m.snapshot.state) : '已停用' }}</span>
               </div>
@@ -705,6 +705,13 @@ function logout() {
             <datalist id="mon-models"><option v-for="m in monModels" :key="m" :value="m" /></datalist>
           </div>
           <div class="field"><label>备注名</label><input v-model="dlg.form.name" placeholder="可选，留空则显示「渠道 · 模型」" /></div>
+          <div class="field-row">
+            <div class="field"><label>探测间隔(秒)</label><input v-model="dlg.form.interval_sec" type="number" min="0" placeholder="留空/0 用全局" /></div>
+            <div class="field"><label>max_tokens</label><input v-model="dlg.form.max_tokens" type="number" min="0" placeholder="留空/0 用默认 1" /></div>
+          </div>
+          <div class="field"><label>探测路径</label><input v-model="dlg.form.path" placeholder="留空用全局，如 /v1/messages" /></div>
+          <div class="field"><label>探测消息</label><input v-model="dlg.form.probe_text" placeholder="留空用默认「hi」" /></div>
+          <label class="check"><input type="checkbox" v-model="dlg.form.stream" /> 流式探测（请求体加 stream:true）</label>
           <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>
           <div class="dialog-foot"><button class="btn btn-ghost" @click="closeDlg">取消</button><button class="btn" @click="saveMonitor">保存</button></div>
         </template>

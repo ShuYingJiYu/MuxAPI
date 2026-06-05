@@ -37,12 +37,19 @@ type AccessKey struct {
 
 // Monitor 监控项：对某渠道的某个模型主动探测。凭证用渠道自带的 api_key。
 // UpstreamName/BaseURL/APIKey 为 JOIN 出的渠道视图字段（探测/展示用）。
+// Stream/ProbeText/MaxTokens/IntervalSec/Path 为可配探测参数，
+// 空字符串/0 一律表示「沿用全局默认」（见 monitor.Prober）。
 type Monitor struct {
 	ID           int64  `json:"id"`
 	UpstreamID   int64  `json:"upstream_id"`
 	Model        string `json:"model"`
 	Name         string `json:"name"`
 	Enabled      bool   `json:"enabled"`
+	Stream       bool   `json:"stream"`       // 探测是否走流式（请求体加 stream:true）
+	ProbeText    string `json:"probe_text"`   // 探测消息内容，空=默认 "hi"
+	MaxTokens    int    `json:"max_tokens"`   // 探测 max_tokens，0=默认 1
+	IntervalSec  int    `json:"interval_sec"` // 该项探测周期(秒)，0=用全局
+	Path         string `json:"path"`         // 该项探测端点，空=用全局
 	UpstreamName string `json:"upstream_name,omitempty"`
 	BaseURL      string `json:"-"`
 	APIKey       string `json:"-"`
@@ -61,6 +68,12 @@ func Open(path string) (*Store, error) {
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN proxy TEXT NOT NULL DEFAULT ''`)
 	// 迁移：旧库 group_upstreams 补 enabled 列（组内成员开关，默认启用）
 	db.Exec(`ALTER TABLE group_upstreams ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`)
+	// 迁移：旧库 monitors 补可配探测列（空/0 表示沿用全局默认）
+	db.Exec(`ALTER TABLE monitors ADD COLUMN stream INTEGER NOT NULL DEFAULT 0`)
+	db.Exec(`ALTER TABLE monitors ADD COLUMN probe_text TEXT NOT NULL DEFAULT ''`)
+	db.Exec(`ALTER TABLE monitors ADD COLUMN max_tokens INTEGER NOT NULL DEFAULT 0`)
+	db.Exec(`ALTER TABLE monitors ADD COLUMN interval_sec INTEGER NOT NULL DEFAULT 0`)
+	db.Exec(`ALTER TABLE monitors ADD COLUMN path TEXT NOT NULL DEFAULT ''`)
 	return &Store{db: db}, nil
 }
 
@@ -94,11 +107,16 @@ CREATE TABLE IF NOT EXISTS access_keys (
 	enabled  INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS monitors (
-	id          INTEGER PRIMARY KEY AUTOINCREMENT,
-	upstream_id INTEGER NOT NULL,
-	model       TEXT NOT NULL,
-	name        TEXT NOT NULL DEFAULT '',
-	enabled     INTEGER NOT NULL DEFAULT 1
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	upstream_id  INTEGER NOT NULL,
+	model        TEXT NOT NULL,
+	name         TEXT NOT NULL DEFAULT '',
+	enabled      INTEGER NOT NULL DEFAULT 1,
+	stream       INTEGER NOT NULL DEFAULT 0,
+	probe_text   TEXT NOT NULL DEFAULT '',
+	max_tokens   INTEGER NOT NULL DEFAULT 0,
+	interval_sec INTEGER NOT NULL DEFAULT 0,
+	path         TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS logs (
 	id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -197,6 +215,7 @@ func scanMonitors(rows *sql.Rows) ([]*Monitor, error) {
 	for rows.Next() {
 		m := &Monitor{}
 		if err := rows.Scan(&m.ID, &m.UpstreamID, &m.Model, &m.Name, &m.Enabled,
+			&m.Stream, &m.ProbeText, &m.MaxTokens, &m.IntervalSec, &m.Path,
 			&m.UpstreamName, &m.BaseURL, &m.APIKey, &m.Proxy); err != nil {
 			return nil, err
 		}
@@ -205,7 +224,7 @@ func scanMonitors(rows *sql.Rows) ([]*Monitor, error) {
 	return ms, rows.Err()
 }
 
-const monitorJoin = `SELECT m.id,m.upstream_id,m.model,m.name,m.enabled,u.name,u.base_url,u.api_key,u.proxy
+const monitorJoin = `SELECT m.id,m.upstream_id,m.model,m.name,m.enabled,m.stream,m.probe_text,m.max_tokens,m.interval_sec,m.path,u.name,u.base_url,u.api_key,u.proxy
 	FROM monitors m JOIN upstreams u ON u.id=m.upstream_id`
 
 // ListMonitors 全部监控项；enabledOnly 时只返回启用且渠道也启用的（探测用）。
@@ -234,8 +253,9 @@ func (s *Store) GetMonitor(id int64) (*Monitor, error) {
 }
 
 func (s *Store) CreateMonitor(m *Monitor) (int64, error) {
-	res, err := s.db.Exec(`INSERT INTO monitors(upstream_id,model,name,enabled) VALUES(?,?,?,?)`,
-		m.UpstreamID, m.Model, m.Name, m.Enabled)
+	res, err := s.db.Exec(`INSERT INTO monitors(upstream_id,model,name,enabled,stream,probe_text,max_tokens,interval_sec,path)
+		VALUES(?,?,?,?,?,?,?,?,?)`,
+		m.UpstreamID, m.Model, m.Name, m.Enabled, m.Stream, m.ProbeText, m.MaxTokens, m.IntervalSec, m.Path)
 	if err != nil {
 		return 0, err
 	}
@@ -243,8 +263,8 @@ func (s *Store) CreateMonitor(m *Monitor) (int64, error) {
 }
 
 func (s *Store) UpdateMonitor(m *Monitor) error {
-	_, err := s.db.Exec(`UPDATE monitors SET upstream_id=?,model=?,name=?,enabled=? WHERE id=?`,
-		m.UpstreamID, m.Model, m.Name, m.Enabled, m.ID)
+	_, err := s.db.Exec(`UPDATE monitors SET upstream_id=?,model=?,name=?,enabled=?,stream=?,probe_text=?,max_tokens=?,interval_sec=?,path=? WHERE id=?`,
+		m.UpstreamID, m.Model, m.Name, m.Enabled, m.Stream, m.ProbeText, m.MaxTokens, m.IntervalSec, m.Path, m.ID)
 	return err
 }
 

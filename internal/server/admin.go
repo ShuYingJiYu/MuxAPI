@@ -361,15 +361,25 @@ type monitorDTO struct {
 	Model        string           `json:"model"`
 	Name         string           `json:"name"`
 	Enabled      bool             `json:"enabled"`
+	Stream       bool             `json:"stream"`
+	ProbeText    string           `json:"probe_text"`
+	MaxTokens    int              `json:"max_tokens"`
+	IntervalSec  int              `json:"interval_sec"`
+	Path         string           `json:"path"`
 	Snapshot     monitor.Snapshot `json:"snapshot"`
 }
 
 // monitorInput 新增/编辑入参。
 type monitorInput struct {
-	UpstreamID int64  `json:"upstream_id"`
-	Model      string `json:"model"`
-	Name       string `json:"name"`
-	Enabled    bool   `json:"enabled"`
+	UpstreamID  int64  `json:"upstream_id"`
+	Model       string `json:"model"`
+	Name        string `json:"name"`
+	Enabled     bool   `json:"enabled"`
+	Stream      bool   `json:"stream"`
+	ProbeText   string `json:"probe_text"`
+	MaxTokens   int    `json:"max_tokens"`
+	IntervalSec int    `json:"interval_sec"`
+	Path        string `json:"path"`
 }
 
 func (s *Server) adminMonitors(w http.ResponseWriter, r *http.Request) {
@@ -385,6 +395,8 @@ func (s *Server) adminMonitors(w http.ResponseWriter, r *http.Request) {
 			out = append(out, monitorDTO{
 				ID: m.ID, UpstreamID: m.UpstreamID, UpstreamName: m.UpstreamName,
 				Model: m.Model, Name: m.Name, Enabled: m.Enabled,
+				Stream: m.Stream, ProbeText: m.ProbeText, MaxTokens: m.MaxTokens,
+				IntervalSec: m.IntervalSec, Path: m.Path,
 				Snapshot: s.mon.Snapshot(m.ID),
 			})
 		}
@@ -466,9 +478,17 @@ func decodeMonitor(r *http.Request) (*store.Monitor, error) {
 	if in.UpstreamID <= 0 || strings.TrimSpace(in.Model) == "" {
 		return nil, errBadMonitor
 	}
+	if in.MaxTokens < 0 {
+		in.MaxTokens = 0
+	}
+	if in.IntervalSec < 0 {
+		in.IntervalSec = 0
+	}
 	return &store.Monitor{
 		UpstreamID: in.UpstreamID, Model: strings.TrimSpace(in.Model),
 		Name: strings.TrimSpace(in.Name), Enabled: in.Enabled,
+		Stream: in.Stream, ProbeText: in.ProbeText, MaxTokens: in.MaxTokens,
+		IntervalSec: in.IntervalSec, Path: strings.TrimSpace(in.Path),
 	}, nil
 }
 

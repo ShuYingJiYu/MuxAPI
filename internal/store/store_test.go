@@ -119,6 +119,43 @@ func TestMemberEnabled(t *testing.T) {
 	}
 }
 
+func TestMonitorConfigFields(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	st.Create(&upstream.Upstream{Name: "A", BaseURL: "http://a", APIKey: "k", Enabled: true})
+	ups, _ := st.List()
+	uid := ups[0].ID
+
+	// 建带全部可配字段的监控项
+	id, err := st.CreateMonitor(&Monitor{
+		UpstreamID: uid, Model: "gpt-5.5", Enabled: true,
+		Stream: true, ProbeText: "ping", MaxTokens: 8, IntervalSec: 120, Path: "/v1/messages",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.GetMonitor(id)
+	if !got.Stream || got.ProbeText != "ping" || got.MaxTokens != 8 || got.IntervalSec != 120 || got.Path != "/v1/messages" {
+		t.Fatalf("可配字段未持久化: %+v", got)
+	}
+
+	// 更新这些字段
+	got.Stream = false
+	got.IntervalSec = 0
+	got.Path = ""
+	if err := st.UpdateMonitor(got); err != nil {
+		t.Fatal(err)
+	}
+	got2, _ := st.GetMonitor(id)
+	if got2.Stream || got2.IntervalSec != 0 || got2.Path != "" {
+		t.Fatalf("更新后字段不符(空/0=继承全局): %+v", got2)
+	}
+}
+
 func TestPruneLogs(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
