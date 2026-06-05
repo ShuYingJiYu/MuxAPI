@@ -59,6 +59,8 @@ func Open(path string) (*Store, error) {
 	}
 	// 迁移：旧库 upstreams 补 proxy 列（已存在则忽略报错）
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN proxy TEXT NOT NULL DEFAULT ''`)
+	// 迁移：旧库 group_upstreams 补 enabled 列（组内成员开关，默认启用）
+	db.Exec(`ALTER TABLE group_upstreams ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`)
 	return &Store{db: db}, nil
 }
 
@@ -81,6 +83,7 @@ CREATE TABLE IF NOT EXISTS group_upstreams (
 	upstream_id INTEGER NOT NULL,
 	priority    INTEGER NOT NULL DEFAULT 50,
 	weight      INTEGER NOT NULL DEFAULT 1,
+	enabled     INTEGER NOT NULL DEFAULT 1,
 	PRIMARY KEY (group_id, upstream_id)
 );
 CREATE TABLE IF NOT EXISTS access_keys (
@@ -131,7 +134,7 @@ func scanUps(rows *sql.Rows) ([]*upstream.Upstream, error) {
 func (s *Store) ListEnabledByGroup(groupID int64) ([]*upstream.Upstream, error) {
 	rows, err := s.db.Query(`SELECT u.id,u.name,u.base_url,u.api_key,u.proxy,u.enabled,gu.priority,gu.weight
 		FROM upstreams u JOIN group_upstreams gu ON gu.upstream_id=u.id
-		WHERE gu.group_id=? AND u.enabled=1 ORDER BY gu.priority ASC`, groupID)
+		WHERE gu.group_id=? AND u.enabled=1 AND gu.enabled=1 ORDER BY gu.priority ASC`, groupID)
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +259,7 @@ func (s *Store) ListGroups() ([]*Group, error) {
 	rows, err := s.db.Query(`SELECT
 		g.id,g.name,g.description,
 		COUNT(DISTINCT gu.upstream_id),
-		COUNT(DISTINCT CASE WHEN u.enabled=1 THEN u.id END),
+		COUNT(DISTINCT CASE WHEN u.enabled=1 AND gu.enabled=1 THEN u.id END),
 		COUNT(DISTINCT ak.id),
 		COUNT(DISTINCT CASE WHEN ak.enabled=1 THEN ak.id END),
 		COALESCE((SELECT COUNT(*) FROM logs l WHERE l.group_id=g.id AND l.created_at>=?),0),
@@ -316,17 +319,21 @@ func (s *Store) DeleteGroup(id int64) error {
 
 // --- 组成员（M:N 中间表）---
 // Member 组内成员视图：上游基本信息 + 组内 priority/weight。
+// Enabled 是上游全局开关（upstreams.enabled，所有分组共享）；
+// GroupEnabled 是该上游在本分组内的开关（group_upstreams.enabled）。
+// 两者皆为真才参与本组调度，见 ListEnabledByGroup。
 type Member struct {
-	UpstreamID int64  `json:"upstream_id"`
-	Name       string `json:"name"`
-	BaseURL    string `json:"base_url"`
-	Enabled    bool   `json:"enabled"`
-	Priority   int    `json:"priority"`
-	Weight     int    `json:"weight"`
+	UpstreamID   int64  `json:"upstream_id"`
+	Name         string `json:"name"`
+	BaseURL      string `json:"base_url"`
+	Enabled      bool   `json:"enabled"`       // 全局开关
+	GroupEnabled bool   `json:"group_enabled"` // 组内开关
+	Priority     int    `json:"priority"`
+	Weight       int    `json:"weight"`
 }
 
 func (s *Store) ListGroupMembers(groupID int64) ([]*Member, error) {
-	rows, err := s.db.Query(`SELECT u.id,u.name,u.base_url,u.enabled,gu.priority,gu.weight
+	rows, err := s.db.Query(`SELECT u.id,u.name,u.base_url,u.enabled,gu.enabled,gu.priority,gu.weight
 		FROM upstreams u JOIN group_upstreams gu ON gu.upstream_id=u.id
 		WHERE gu.group_id=? ORDER BY gu.priority ASC`, groupID)
 	if err != nil {
@@ -336,7 +343,7 @@ func (s *Store) ListGroupMembers(groupID int64) ([]*Member, error) {
 	var ms []*Member
 	for rows.Next() {
 		m := &Member{}
-		if err := rows.Scan(&m.UpstreamID, &m.Name, &m.BaseURL, &m.Enabled, &m.Priority, &m.Weight); err != nil {
+		if err := rows.Scan(&m.UpstreamID, &m.Name, &m.BaseURL, &m.Enabled, &m.GroupEnabled, &m.Priority, &m.Weight); err != nil {
 			return nil, err
 		}
 		ms = append(ms, m)
@@ -357,6 +364,13 @@ func (s *Store) AddMember(groupID, upstreamID int64, priority, weight int) error
 
 func (s *Store) RemoveMember(groupID, upstreamID int64) error {
 	_, err := s.db.Exec(`DELETE FROM group_upstreams WHERE group_id=? AND upstream_id=?`, groupID, upstreamID)
+	return err
+}
+
+// SetMemberEnabled 启停某上游在本分组内的成员资格（不影响其全局开关与其他分组）。
+func (s *Store) SetMemberEnabled(groupID, upstreamID int64, enabled bool) error {
+	_, err := s.db.Exec(`UPDATE group_upstreams SET enabled=? WHERE group_id=? AND upstream_id=?`,
+		enabled, groupID, upstreamID)
 	return err
 }
 

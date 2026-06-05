@@ -206,6 +206,9 @@ function editMember(m) { dlg.type = 'member'; dlg.form = { upstream_id: m.upstre
 function removeMember(m) {
   guard(async () => { await api.removeMember(detailGroup.value.id, m.upstream_id); await loadDetail(detailGroup.value.id) })
 }
+function toggleMember(m) {
+  guard(async () => { await api.setMemberEnabled(detailGroup.value.id, m.upstream_id, !m.group_enabled); await loadDetail(detailGroup.value.id) })
+}
 
 // 密钥
 const newKey = ref('')   // 生成后明文展示一次
@@ -437,18 +440,22 @@ function logout() {
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>名称</th><th>地址</th><th>组内优先级</th><th>权重</th><th>运行时</th><th>成功率</th><th>延迟</th><th>人工开关</th><th>操作</th></tr></thead>
+              <thead><tr><th>名称</th><th>地址</th><th>组内优先级</th><th>权重</th><th>运行时</th><th>成功率</th><th>延迟</th><th>组内开关</th><th>操作</th></tr></thead>
               <tbody>
                 <tr v-for="m in members" :key="m.upstream_id" :class="{ 'row-eff': m.effective }">
                   <td class="cell-name">{{ m.name }}<span v-if="m.effective" class="eff-badge">生效中</span></td>
                   <td class="cell-url">{{ m.base_url }}</td>
                   <td>{{ m.priority }}</td>
                   <td>{{ m.weight }}</td>
-                  <td><span class="state-badge" :class="rtClass(m.health)">{{ m.enabled ? rtLabel(m.health) : '已停用' }}</span></td>
+                  <td><span class="state-badge" :class="rtClass(m.health)">{{ m.enabled && m.group_enabled ? rtLabel(m.health) : '已停用' }}</span></td>
                   <td>{{ rtRate(m.health) }}</td>
                   <td>{{ m.health && m.health.avg_lat_ms ? m.health.avg_lat_ms + 'ms' : '—' }}</td>
-                  <td><span class="tag" :class="m.enabled ? 'on' : 'off'">{{ m.enabled ? '启用' : '停用' }}</span></td>
                   <td>
+                    <span v-if="!m.enabled" class="tag off" title="该上游已全局停用，请到上游池页启用">全局停用</span>
+                    <span v-else class="tag" :class="m.group_enabled ? 'on' : 'off'">{{ m.group_enabled ? '启用' : '停用' }}</span>
+                  </td>
+                  <td>
+                    <button v-if="m.enabled" class="btn-link sm" @click="toggleMember(m)">{{ m.group_enabled ? '停用' : '启用' }}</button>
                     <button class="icon-btn" @click="editMember(m)"><Icon name="edit" :size="16" /></button>
                     <button class="icon-btn danger" @click="removeMember(m)"><Icon name="trash" :size="16" /></button>
                   </td>

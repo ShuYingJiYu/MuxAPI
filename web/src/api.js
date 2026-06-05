@@ -64,6 +64,7 @@ export const api = {
   // 组成员
   members: gid => req('GET', `/groups/${gid}/upstreams`),
   addMember: (gid, m) => req('POST', `/groups/${gid}/upstreams`, m),
+  setMemberEnabled: (gid, uid, enabled) => req('PUT', `/groups/${gid}/upstreams/${uid}`, { enabled }),
   removeMember: (gid, uid) => req('DELETE', `/groups/${gid}/upstreams/${uid}`),
   // 组密钥
   keys: gid => req('GET', `/groups/${gid}/keys`),

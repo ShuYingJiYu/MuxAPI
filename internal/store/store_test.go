@@ -70,6 +70,55 @@ func TestStoreCRUD(t *testing.T) {
 	}
 }
 
+func TestMemberEnabled(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	g1, _ := st.CreateGroup("g1", "")
+	g2, _ := st.CreateGroup("g2", "")
+	st.Create(&upstream.Upstream{Name: "A", BaseURL: "http://a", APIKey: "ka", Enabled: true})
+	ups, _ := st.List()
+	idA := ups[0].ID
+
+	// A 同时加入 g1、g2，默认组内启用
+	st.AddMember(g1, idA, 10, 1)
+	st.AddMember(g2, idA, 10, 1)
+	if list, _ := st.ListEnabledByGroup(g1); len(list) != 1 {
+		t.Fatalf("默认组内启用，g1 应调度到 A，实际 %d", len(list))
+	}
+
+	// 仅在 g1 内停用 A
+	if err := st.SetMemberEnabled(g1, idA, false); err != nil {
+		t.Fatal(err)
+	}
+	// g1 调度不再返回 A
+	if list, _ := st.ListEnabledByGroup(g1); len(list) != 0 {
+		t.Fatalf("g1 内停用后不应调度到 A，实际 %d", len(list))
+	}
+	// 但成员列表仍可见，GroupEnabled=false（保留 priority/weight）
+	ms, _ := st.ListGroupMembers(g1)
+	if len(ms) != 1 || ms[0].GroupEnabled || ms[0].Priority != 10 {
+		t.Fatalf("g1 成员应仍可见且 GroupEnabled=false、prio 保留，实际 %+v", ms)
+	}
+	// 全局开关不受影响
+	if !ms[0].Enabled {
+		t.Fatal("组内停用不应改动全局 enabled")
+	}
+	// 其他分组 g2 不受影响，照常调度
+	if list, _ := st.ListEnabledByGroup(g2); len(list) != 1 {
+		t.Fatalf("g2 不应受 g1 组内停用影响，实际 %d", len(list))
+	}
+
+	// 恢复 g1 内启用
+	st.SetMemberEnabled(g1, idA, true)
+	if list, _ := st.ListEnabledByGroup(g1); len(list) != 1 {
+		t.Fatalf("恢复后 g1 应重新调度到 A，实际 %d", len(list))
+	}
+}
+
 func TestPruneLogs(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {

@@ -150,7 +150,7 @@ func toHealthView(sn health.Snapshot) healthView {
 func effectivePriority(ms []*store.Member, state func(int64) string) (int, bool) {
 	best, ok := 0, false
 	for _, m := range ms {
-		if !m.Enabled || state(m.UpstreamID) == "OPEN" {
+		if !m.Enabled || !m.GroupEnabled || state(m.UpstreamID) == "OPEN" {
 			continue
 		}
 		if !ok || m.Priority < best {
@@ -565,20 +565,38 @@ func (s *Server) adminGroupSub(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// adminGroupUpstreams 组成员：GET 列表 / POST 加入(带组内prio/weight) / DELETE 移除(/upstreams/{uid})。
+// adminGroupUpstreams 组成员：GET 列表 / POST 加入(带组内prio/weight) /
+// PUT 启停(/upstreams/{uid} 带 {enabled}) / DELETE 移除(/upstreams/{uid})。
 func (s *Server) adminGroupUpstreams(w http.ResponseWriter, r *http.Request, gid int64, parts []string) {
-	if len(parts) == 3 && r.Method == http.MethodDelete { // /{id}/upstreams/{uid}
+	if len(parts) == 3 { // /{id}/upstreams/{uid}
 		uid, err := strconv.ParseInt(parts[2], 10, 64)
 		if err != nil {
 			http.Error(w, "bad upstream id", 400)
 			return
 		}
-		if err := s.store.RemoveMember(gid, uid); err != nil {
-			http.Error(w, err.Error(), 500)
+		switch r.Method {
+		case http.MethodPut: // 组内启停
+			var d struct {
+				Enabled bool `json:"enabled"`
+			}
+			json.NewDecoder(r.Body).Decode(&d)
+			if err := s.store.SetMemberEnabled(gid, uid, d.Enabled); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			w.WriteHeader(204)
+			return
+		case http.MethodDelete: // 移除成员
+			if err := s.store.RemoveMember(gid, uid); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			w.WriteHeader(204)
+			return
+		default:
+			http.Error(w, "method not allowed", 405)
 			return
 		}
-		w.WriteHeader(204)
-		return
 	}
 	switch r.Method {
 	case http.MethodGet:
@@ -600,7 +618,7 @@ func (s *Server) adminGroupUpstreams(w http.ResponseWriter, r *http.Request, gid
 			out = append(out, memberOut{
 				Member:    m,
 				Health:    toHealthView(sn),
-				Effective: hasEff && m.Enabled && m.Priority == best && sn.State != "OPEN",
+				Effective: hasEff && m.Enabled && m.GroupEnabled && m.Priority == best && sn.State != "OPEN",
 			})
 		}
 		writeJSON(w, out)
