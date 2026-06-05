@@ -21,9 +21,9 @@ type Logger interface {
 	Log(groupID, upstreamID int64, status int, latencyMs int64)
 }
 
-// Picker 调度层在指定分组内选上游
+// Picker 调度层在指定分组内选上游（exclude 为本次请求已试过、需跳过的上游）
 type Picker interface {
-	Pick(groupID int64) (*upstream.Upstream, error)
+	PickExcluding(groupID int64, exclude map[int64]bool) (*upstream.Upstream, error)
 }
 
 type Forwarder struct {
@@ -37,18 +37,14 @@ func New(p Picker, h Health, l Logger, maxRetries int) *Forwarder {
 	return &Forwarder{picker: p, health: h, logger: l, maxRetries: maxRetries}
 }
 
-// Forward 在指定分组内转发请求：失败则换上游重试（依赖调度层下次 Pick 自动避开已熔断的）。
+// Forward 在指定分组内转发请求：失败则换上游重试（每次跳过本次已试过的，立即切换到下一优先级层）。
 func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte, groupID int64) {
 	var lastErr error
 	tried := map[int64]bool{}
 	for attempt := 0; attempt <= f.maxRetries; attempt++ {
-		u, err := f.picker.Pick(groupID)
+		u, err := f.picker.PickExcluding(groupID, tried)
 		if err != nil {
-			http.Error(w, "no upstream available", http.StatusServiceUnavailable)
-			return
-		}
-		if tried[u.ID] { // 同一上游不重复试，等熔断生效后下次 Pick 会换
-			break
+			break // 没有更多可用上游了
 		}
 		tried[u.ID] = true
 
@@ -70,8 +66,8 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			lastErr = err
 			continue
 		}
-		// 上游 5xx/429 视为失败，反馈并重试下一个
-		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
+		// 上游级失败(5xx/429/401/402/403/408)：反馈并切换下一个上游
+		if upstream.IsFailureStatus(resp.StatusCode) {
 			lat := time.Since(start).Milliseconds()
 			f.health.Report(u.ID, false, lat)
 			f.logger.Log(groupID, u.ID, resp.StatusCode, lat)
@@ -83,6 +79,11 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		f.health.Report(u.ID, true, lat)
 		f.logger.Log(groupID, u.ID, resp.StatusCode, lat)
 		relayResponse(w, resp)
+		return
+	}
+	// 循环结束仍没成功：分两种情况
+	if len(tried) == 0 {
+		http.Error(w, "no upstream available", http.StatusServiceUnavailable)
 		return
 	}
 	if lastErr != nil {

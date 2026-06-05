@@ -149,6 +149,89 @@ func TestForwardSSEIncrementalFlush(t *testing.T) {
 	pr.Close()
 }
 
+// 回归：默认熔断阈值(>1)下，单次请求内首个上游失败也应立即切到下一个。
+// 旧实现依赖「失败即熔断」才能换上游，阈值3时一次失败不熔断 → Pick 又选回 A → 误判 502。
+func TestForwardFailoverWithHighThreshold(t *testing.T) {
+	var aHits, bHits int32
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&aHits, 1)
+		w.WriteHeader(503)
+	}))
+	defer srvA.Close()
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&bHits, 1)
+		w.WriteHeader(200)
+		io.WriteString(w, `{"text":"from-B"}`)
+	}))
+	defer srvB.Close()
+
+	ups := []*upstream.Upstream{
+		{ID: 1, Name: "A", BaseURL: srvA.URL, APIKey: "k", Priority: 10, Enabled: true},
+		{ID: 2, Name: "B", BaseURL: srvB.URL, APIKey: "k", Priority: 20, Enabled: true},
+	}
+	hm := health.New(3, time.Hour) // 默认阈值3：A 一次失败不熔断，仍须切到 B
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, noopLogger{}, 3)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
+	fwd.Forward(rec, req, []byte(`{}`), 0)
+
+	res := rec.Result()
+	if res.StatusCode != 200 {
+		t.Fatalf("阈值3下首个上游失败也应切到 B 返回 200，实际 %d", res.StatusCode)
+	}
+	body, _ := io.ReadAll(res.Body)
+	if !strings.Contains(string(body), "from-B") {
+		t.Fatalf("应切到 B，实际:\n%s", body)
+	}
+	if atomic.LoadInt32(&aHits) != 1 || atomic.LoadInt32(&bHits) != 1 {
+		t.Fatalf("A 应被试 1 次、B 1 次，实际 A=%d B=%d", aHits, bHits)
+	}
+}
+
+// 回归(生产事故还原)：上游返回 403(余额不足/凭证失效)应触发故障切换，
+// 而非把 403 当「成功」透传给客户端。旧实现只把 5xx/429 当失败，导致
+// 余额耗尽的首选上游持续 403、永不切换到有余额的备用上游。
+func TestForward403Failover(t *testing.T) {
+	var aHits, bHits int32
+	// 上游 A：优先级高，但余额不足返回 403
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&aHits, 1)
+		w.WriteHeader(403)
+		io.WriteString(w, `{"code":"INSUFFICIENT_BALANCE"}`)
+	}))
+	defer srvA.Close()
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&bHits, 1)
+		w.WriteHeader(200)
+		io.WriteString(w, `{"text":"from-B"}`)
+	}))
+	defer srvB.Close()
+
+	ups := []*upstream.Upstream{
+		{ID: 1, Name: "A", BaseURL: srvA.URL, APIKey: "k", Priority: 10, Enabled: true},
+		{ID: 2, Name: "B", BaseURL: srvB.URL, APIKey: "k", Priority: 20, Enabled: true},
+	}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, noopLogger{}, 3)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
+	fwd.Forward(rec, req, []byte(`{}`), 0)
+
+	res := rec.Result()
+	if res.StatusCode != 200 {
+		t.Fatalf("A 返回 403 应切到 B 得 200，实际 %d", res.StatusCode)
+	}
+	body, _ := io.ReadAll(res.Body)
+	if !strings.Contains(string(body), "from-B") {
+		t.Fatalf("应切到 B，实际:\n%s", body)
+	}
+	if atomic.LoadInt32(&aHits) != 1 || atomic.LoadInt32(&bHits) != 1 {
+		t.Fatalf("A 应被试 1 次、B 1 次，实际 A=%d B=%d", aHits, bHits)
+	}
+}
+
 // flushRecorder 把写入接到 io.Pipe，并记录每次 Flush，用于验证增量透传。
 type flushRecorder struct {
 	header  http.Header

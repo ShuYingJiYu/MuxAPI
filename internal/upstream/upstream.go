@@ -35,6 +35,27 @@ func ProxyTransport(proxy string) *http.Transport {
 // NewTransport 该上游专属 Transport（含其代理出口）。
 func (u *Upstream) NewTransport() *http.Transport { return ProxyTransport(u.Proxy) }
 
+// IsFailureStatus 判断上游响应码是否表示「该上游此刻不可用」，需触发故障切换/熔断摘除。
+// 涵盖：5xx 服务端错误、429 限流，以及 401/402/403/408 这类凭证/余额/超时问题。
+// MuxAPI 用自存 api_key 转发（客户端只提供接入 key），故 401/402/403 必为上游侧
+// 凭证或账户余额问题，切换到下一上游是安全且正确的。
+// 400/404 视为请求内容本身的问题（畸形参数/模型不存在），透传给客户端，
+// 不触发切换——避免无意义重试，也避免把客户端错误误判成上游故障而熔断健康上游。
+func IsFailureStatus(code int) bool {
+	if code >= 500 {
+		return true
+	}
+	switch code {
+	case http.StatusUnauthorized, // 401
+		http.StatusPaymentRequired, // 402
+		http.StatusForbidden,       // 403
+		http.StatusRequestTimeout,  // 408
+		http.StatusTooManyRequests: // 429
+		return true
+	}
+	return false
+}
+
 // BuildRequest 构建发往上游的请求：黑名单透传客户端请求头（保留 User-Agent/x-stainless-* 等），
 // 仅覆盖凭证为上游 key、重算 Content-Length。URL = TrimSuffix(base_url,"/") + 客户端原始路径(path)。
 func (u *Upstream) BuildRequest(method, path string, body io.Reader, clientHeader http.Header) (*http.Request, error) {

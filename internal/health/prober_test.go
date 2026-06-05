@@ -25,7 +25,8 @@ func TestProberDetectsDownAndRecover(t *testing.T) {
 	up := &upstream.Upstream{ID: 1, Name: "A", BaseURL: srv.URL, APIKey: "k", Enabled: true}
 	m := New(1, 30*time.Millisecond) // 失败1次即熔断
 	p := NewProber(m, func() []*upstream.Upstream { return []*upstream.Upstream{up} },
-		func() time.Duration { return 20 * time.Millisecond }, "claude-test", "/v1/chat/completions")
+		func() time.Duration { return 20 * time.Millisecond },
+		func() string { return "claude-test" }, func() string { return "/v1/chat/completions" })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

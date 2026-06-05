@@ -72,7 +72,7 @@ func (p *Prober) probe(ctx context.Context, u *upstream.Upstream) {
 		return
 	}
 	defer resp.Body.Close()
-	ok := resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests
+	ok := !upstream.IsFailureStatus(resp.StatusCode)
 	p.mgr.reportProbe(u.ID, ok, latency)
 	slog.Debug("probe", "upstream", u.Name, "status", resp.StatusCode, "ok", ok, "ms", latency)
 }
