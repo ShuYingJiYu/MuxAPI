@@ -715,7 +715,7 @@ function logout() {
                 <div class="metric-item"><span class="metric-label">平均延迟<small class="mh">24h</small></span><span class="metric-value">{{ m.snapshot.avg_ms || m.snapshot.last_ms || 0 }}<small>ms</small></span></div>
                 <div class="metric-item"><span class="metric-label">最后探测</span><span class="metric-value sm">{{ sinceText(m.snapshot.last_ts) }}</span></div>
               </div>
-              <Fence :trend="m.snapshot.trend || []" />
+              <Fence :trend="m.snapshot.trend || []" unit="探测" />
               <div class="mon-foot">
                 <button class="btn-link sm" :disabled="probingId === m.id" @click="guard(() => probeOne(m))">{{ probingId === m.id ? '探测中…' : '立即探测' }}</button>
                 <span class="hspacer" />
@@ -801,7 +801,7 @@ function logout() {
           <div class="dw-m"><span>平均延迟</span><b>{{ cellDrawer.snapshot.avg_ms || cellDrawer.snapshot.last_ms || 0 }}<small>ms</small></b></div>
           <div class="dw-m"><span>最后探测</span><b>{{ sinceText(cellDrawer.snapshot.last_ts) }}</b></div>
         </div>
-        <Fence :trend="cellDrawer.snapshot.trend || []" />
+        <Fence :trend="cellDrawer.snapshot.trend || []" unit="探测" />
         <div class="dw-foot">
           <button class="btn" :disabled="probingId === cellDrawer.id" @click="guard(probeCell)">{{ probingId === cellDrawer.id ? '探测中…' : '立即探测' }}</button>
         </div>

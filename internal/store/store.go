@@ -35,6 +35,7 @@ type HourPoint struct {
 	Status   int     `json:"status"`    // 0/1/2/3
 	SuccRate float64 `json:"succ_rate"` // 0..1，无调用为 0
 	Total    int     `json:"total"`     // 该小时调用数
+	Succ     int     `json:"succ"`      // 该小时成功数（2xx-3xx / 探测 status=1）
 }
 
 // AccessKey 接入凭证，绑定到某分组：用哪个 key 访问就走哪个分组。
@@ -411,6 +412,7 @@ func (s *Store) groupHourlyTrend(groupID int64) []HourPoint {
 		p := HourPoint{Ts: ts}
 		if a := buckets[ts]; a != nil && a.total > 0 {
 			p.Total = a.total
+			p.Succ = a.succ
 			p.SuccRate = float64(a.succ) / float64(a.total)
 			switch {
 			case p.SuccRate >= 0.95:
@@ -464,6 +466,7 @@ func (s *Store) MonitorHourlyTrend(monitorID int64) []HourPoint {
 		p := HourPoint{Ts: ts}
 		if a := buckets[ts]; a != nil && a.total > 0 {
 			p.Total = a.total
+			p.Succ = a.succ
 			p.SuccRate = float64(a.succ) / float64(a.total)
 			switch {
 			case p.SuccRate >= 0.95:

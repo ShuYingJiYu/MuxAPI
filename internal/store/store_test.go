@@ -237,11 +237,11 @@ func TestMonitorHourlyTrendAndRecent(t *testing.T) {
 	if cur.Ts != curHour || prev.Ts != prevHour {
 		t.Fatalf("末两桶时刻应为 当前/上一小时，得到 %d/%d", cur.Ts, prev.Ts)
 	}
-	if cur.Total != 2 || cur.SuccRate != 1 || cur.Status != 1 {
-		t.Fatalf("当前小时应 2次/100%%/status1，得到 %+v", cur)
+	if cur.Total != 2 || cur.Succ != 2 || cur.SuccRate != 1 || cur.Status != 1 {
+		t.Fatalf("当前小时应 2次/2成功/100%%/status1，得到 %+v", cur)
 	}
-	if prev.Total != 4 || prev.SuccRate != 0.75 || prev.Status != 3 {
-		t.Fatalf("上一小时应 4次/75%%/status3，得到 %+v", prev)
+	if prev.Total != 4 || prev.Succ != 3 || prev.SuccRate != 0.75 || prev.Status != 3 {
+		t.Fatalf("上一小时应 4次/3成功/75%%/status3，得到 %+v", prev)
 	}
 	// 更早的桶应为空（status0）
 	if trend[0].Total != 0 || trend[0].Status != 0 {
