@@ -72,8 +72,6 @@ func main() {
 			return def
 		}
 	}
-	monitorInterval := settingDuration("monitor_interval", 5*time.Minute)
-	probePath := settingString("probe_path", "/v1/chat/completions")
 	// 健康事件主动告警：熔断翻转时推送 Webhook（URL 空则关闭）。
 	// id→name 解析用现成 List()，解析不到回退 id 字符串。
 	upstreamName := func(id int64) string {
@@ -91,8 +89,9 @@ func main() {
 		upstreamName,
 	))
 	// 探测系统统一：monitor 探测器是唯一主动探测源，注入 hm 后一次探测双写
-	//（看板统计 + 路由熔断器）。原 health.Prober 已废弃。
-	monProber := monitor.NewProber(mon, st, hm, monitorInterval, probePath)
+	//（看板统计 + 路由熔断器）。探测间隔/路径已全下放到各监控项，
+	// 传 nil 让 prober 用内置默认（5m / /v1/chat/completions），监控项可逐项覆盖。
+	monProber := monitor.NewProber(mon, st, hm, nil, nil)
 	srv := server.New(fwd, cfg.AdminToken, st, hm, mon, monProber)
 
 	// 收到 SIGINT/SIGTERM 时取消：停探测并触发优雅关闭

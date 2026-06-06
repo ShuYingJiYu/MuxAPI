@@ -4,7 +4,7 @@ import Icon from './Icon.vue'
 import Fence from './Fence.vue'
 import { api } from './api.js'
 
-const page = ref('groups')        // groups | upstreams | monitors
+const page = ref('overview')      // overview | groups | upstreams | monitors
 const detailGroup = ref(null)     // 进入分组详情时设置
 
 const groups = ref([])
@@ -43,6 +43,51 @@ async function probeOne(m) {
     m.snapshot = sn
   } finally { probingId.value = 0 }
 }
+
+// ===== 总览：上游×模型健康矩阵 =====
+// 数据源 = monitors（每项 = 一个 (上游,模型)，含探测快照）。
+// 行 = 上游，列 = 全部出现过的模型并集，格子 = 对应监控项快照（无则空格）。
+const matrix = computed(() => {
+  const ms = monitors.value
+  // 列：模型并集，按字母序
+  const models = [...new Set(ms.map(m => m.model))].sort()
+  // 行：按上游分组
+  const byUp = new Map()
+  for (const m of ms) {
+    if (!byUp.has(m.upstream_id)) byUp.set(m.upstream_id, { id: m.upstream_id, name: m.upstream_name, cells: {} })
+    byUp.get(m.upstream_id).cells[m.model] = m
+  }
+  const rows = [...byUp.values()].sort((a, b) => a.name.localeCompare(b.name))
+  return { models, rows }
+})
+// 总览汇总卡（粉/薄荷/黄/紫 四色块）
+const ovSummary = computed(() => {
+  const ms = monitors.value.filter(m => m.enabled)
+  const st = m => m.snapshot.state
+  const down = ms.filter(m => st(m) === 'DOWN').length
+  const degraded = ms.filter(m => st(m) === 'DEGRADED').length
+  const rated = ms.filter(m => m.snapshot.reqs > 0)
+  const rate = rated.length ? rated.reduce((a, m) => a + m.snapshot.succ_rate, 0) / rated.length : 1
+  const lats = rated.filter(m => m.snapshot.avg_ms).map(m => m.snapshot.avg_ms)
+  const avgLat = lats.length ? Math.round(lats.reduce((a, b) => a + b, 0) / lats.length) : 0
+  return {
+    upstreams: matrix.value.rows.length,
+    combos: ms.length,
+    models: matrix.value.models.length,
+    healthy: ms.length - down - degraded, degraded, down,
+    rate, avgLat,
+  }
+})
+// 点格子 → 抽屉看详情（含趋势 + 立即探测）
+const cellDrawer = ref(null)
+function openCell(m) { if (m) cellDrawer.value = m }
+function closeCell() { cellDrawer.value = null }
+async function probeCell() {
+  const m = cellDrawer.value
+  if (!m) return
+  await probeOne(m)
+  cellDrawer.value = monitors.value.find(x => x.id === m.id) || m
+}
 async function loadMembers(gid) { members.value = (await api.members(gid)) || [] }
 async function loadDetail(gid) {
   await loadMembers(gid)
@@ -63,7 +108,7 @@ async function guard(fn) {
 }
 
 onMounted(() => {
-  if (loggedIn.value) guard(async () => { await loadGroups(); await loadUpstreams(); await loadSettings(); startRtPoll(loadGroups) })
+  if (loggedIn.value) guard(async () => { await loadUpstreams(); await loadMonitors(); await loadSettings(); startMonPoll() })
 })
 
 // 看板自动刷新：探测间隔 5min，这里每 60s 拉一次快照即可，离开即停
@@ -88,7 +133,8 @@ function go(p) {
   page.value = p; detailGroup.value = null
   stopAllPoll()
   guard(async () => {
-    if (p === 'groups') { await loadGroups(); startRtPoll(loadGroups) }
+    if (p === 'overview') { await loadUpstreams(); await loadMonitors(); startMonPoll() }
+    else if (p === 'groups') { await loadGroups(); startRtPoll(loadGroups) }
     else if (p === 'upstreams') { await loadUpstreams(); startRtPoll(loadUpstreams) }
     else if (p === 'monitors') { await loadUpstreams(); await loadMonitors(); startMonPoll() }
   })
@@ -108,6 +154,7 @@ const memberIds = computed(() => new Set(members.value.map(m => m.upstream_id)))
 const addable = computed(() => upstreams.value.filter(u => !memberIds.value.has(u.id)))
 
 const pages = {
+  overview: { title: '总览', desc: '上游 × 模型健康矩阵，一屏看全所有渠道的实时状态' },
   groups: { title: '分组管理', desc: '每个分组是一个独立的调度池，拥有自己的上游与接入密钥' },
   upstreams: { title: '上游池', desc: '全局上游凭证，可被多个分组复用' },
   monitors: { title: '监控看板', desc: '为「渠道+模型」配置监控项，主动探测成功率与延迟' },
@@ -213,12 +260,6 @@ function toggleMember(m) {
 // 密钥
 const newKey = ref('')   // 生成后明文展示一次
 const copied = ref(0)    // 刚点击复制的密钥 id（短暂提示用）
-const monitorInterval = ref('')    // 监控探测间隔(页面可配)
-const probePath = ref('')
-const effectiveMonitorInterval = ref('')
-const effectiveProbePath = ref('')
-const monitorSource = ref('')
-const probePathSource = ref('')
 const logRetention = ref('')           // 日志保留条数(页面可配)
 const effectiveLogRetention = ref('')
 const logRetentionSource = ref('')
@@ -230,6 +271,7 @@ const alertWebhookSource = ref('')
 const alertDebounceSource = ref('')
 const apiBase = location.origin    // 当前访问地址，用于展示客户端接入端点
 const settingsSaved = ref(false)
+const settingsSection = ref('logs')  // 设置页左锚点：logs | alert | endpoint
 function createKey() { dlg.type = 'keygen'; dlg.form = { name: '' } }
 function saveKey() {
   guard(async () => {
@@ -254,28 +296,25 @@ function copyText(t, id) {
 }
 async function loadSettings() {
   const s = await api.getSettings()
-  effectiveMonitorInterval.value = s.effective_monitor_interval || ''
-  effectiveProbePath.value = s.effective_probe_path || ''
   effectiveLogRetention.value = s.effective_log_retention || ''
   effectiveAlertWebhook.value = s.effective_alert_webhook || ''
   effectiveAlertDebounce.value = s.effective_alert_debounce || ''
-  monitorInterval.value = s.monitor_interval || effectiveMonitorInterval.value
-  probePath.value = s.probe_path || effectiveProbePath.value
   logRetention.value = s.log_retention || effectiveLogRetention.value
   alertWebhook.value = s.alert_webhook || ''
   alertDebounce.value = s.alert_debounce || effectiveAlertDebounce.value
-  monitorSource.value = s.monitor_source || ''
-  probePathSource.value = s.probe_path_source || ''
   logRetentionSource.value = s.log_retention_source || ''
   alertWebhookSource.value = s.alert_webhook_source || ''
   alertDebounceSource.value = s.alert_debounce_source || ''
 }
 const sourceText = s => s === 'settings' ? '页面设置' : '默认值'
+// 设置页左锚点点击：滚动到对应 section 并高亮
+function gotoSection(id) {
+  settingsSection.value = id
+  document.getElementById('set-' + id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
 function saveSettings() {
   guard(async () => {
     await api.saveSettings({
-      monitor_interval: monitorInterval.value,
-      probe_path: probePath.value,
       log_retention: logRetention.value,
       alert_webhook: alertWebhook.value,
       alert_debounce: alertDebounce.value,
@@ -301,6 +340,12 @@ const mhClass = mh => (!mh || (mh.state === 'CLOSED' && !mh.last_probe)) ? 'noda
 
 // 分组卡片：生效渠道文本 + 健康概览文本
 const effText = rt => (rt && rt.effective && rt.effective.length) ? rt.effective.join(' / ') : '无可用'
+// 分组卡片成功率数值配色，阈值与栅栏一致：绿≥95 / 黄≥80 / 红<80
+function rateClass(g) {
+  if (!g.recent_total) return 'rate-none'
+  const r = Number(g.success_rate) || 0
+  return r >= 95 ? 'rate-ok' : r >= 80 ? 'rate-warn' : 'rate-bad'
+}
 const healthSummary = rt => {
   if (!rt || !rt.total) return '无成员'
   const parts = [`${rt.normal} 正常`]
@@ -355,7 +400,7 @@ function toggleMonitor(m) {
 function login() {
   api.setToken(loginForm.token.trim())
   loggedIn.value = true
-  guard(async () => { await loadGroups(); await loadUpstreams(); await loadSettings(); startRtPoll(loadGroups) })
+  guard(async () => { await loadUpstreams(); await loadMonitors(); await loadSettings(); startMonPoll() })
 }
 function logout() {
   api.clearToken()
@@ -382,6 +427,7 @@ function logout() {
     <aside class="sidebar">
       <div class="logo"><Icon name="bolt" :size="22" /><span class="logo-text">MuxAPI</span></div>
       <nav class="nav">
+        <div class="nav-item" :class="{ active: page === 'overview' }" @click="go('overview')"><Icon class="ic" name="bolt" :size="18" />总览</div>
         <div class="nav-item" :class="{ active: page === 'groups' }" @click="go('groups')"><Icon class="ic" name="cube" :size="18" />分组管理</div>
         <div class="nav-item" :class="{ active: page === 'upstreams' }" @click="go('upstreams')"><Icon class="ic" name="server" :size="18" />上游池</div>
         <div class="nav-item" :class="{ active: page === 'monitors' }" @click="go('monitors')"><Icon class="ic" name="heart" :size="18" />监控看板</div>
@@ -404,30 +450,87 @@ function logout() {
       <main class="main">
         <p v-if="err" class="err-banner">{{ err }}</p>
 
+        <!-- 总览：上游 × 模型健康矩阵 -->
+        <template v-if="page === 'overview'">
+          <div class="ov-stats">
+            <div class="ov-stat mint"><div class="ov-num">{{ ovSummary.healthy }}</div><div class="ov-lbl">正常组合</div></div>
+            <div class="ov-stat amber"><div class="ov-num">{{ ovSummary.degraded }}</div><div class="ov-lbl">降级</div></div>
+            <div class="ov-stat pink"><div class="ov-num">{{ ovSummary.down }}</div><div class="ov-lbl">故障</div></div>
+            <div class="ov-stat violet"><div class="ov-num">{{ (ovSummary.rate * 100).toFixed(0) }}<small>%</small></div><div class="ov-lbl">平均成功率</div></div>
+            <div class="ov-stat blue"><div class="ov-num">{{ ovSummary.avgLat || '—' }}<small v-if="ovSummary.avgLat">ms</small></div><div class="ov-lbl">平均延迟</div></div>
+          </div>
+
+          <div class="ov-meta">{{ ovSummary.upstreams }} 个上游 · {{ ovSummary.models }} 个模型 · {{ ovSummary.combos }} 个监控组合 · 点格子看详情</div>
+
+          <div v-if="!matrix.rows.length" class="empty">还没有监控项，去「监控看板」为渠道+模型建监控，矩阵就会亮起来 ✨</div>
+
+          <div v-else class="matrix-wrap">
+            <table class="matrix">
+              <thead>
+                <tr>
+                  <th class="mx-corner">上游 \ 模型</th>
+                  <th v-for="md in matrix.models" :key="md" class="mx-colh" :title="md">{{ md }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in matrix.rows" :key="row.id">
+                  <td class="mx-rowh" :title="row.name">{{ row.name }}</td>
+                  <td v-for="md in matrix.models" :key="md" class="mx-cell">
+                    <button v-if="row.cells[md]" class="mx-dot" :class="[dotClass(row.cells[md].snapshot.state), { off: !row.cells[md].enabled }]"
+                      :title="md + ' · ' + stateLabel(row.cells[md].snapshot.state) + (row.cells[md].snapshot.avg_ms ? ' · ' + row.cells[md].snapshot.avg_ms + 'ms' : '')"
+                      @click="openCell(row.cells[md])">
+                      <span class="mx-lat" v-if="row.cells[md].snapshot.avg_ms || row.cells[md].snapshot.last_ms">{{ row.cells[md].snapshot.avg_ms || row.cells[md].snapshot.last_ms }}</span>
+                    </button>
+                    <span v-else class="mx-empty">·</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
+
         <!-- 分组列表 -->
         <template v-if="page === 'groups' && !detailGroup">
           <div class="toolbar">
             <div class="toolbar-left"><span class="count">{{ groups.length }} 个分组</span></div>
             <button class="btn" @click="newGroup"><Icon name="plus" :size="16" />新建分组</button>
           </div>
-          <div class="cards">
+          <div class="cards group-cards">
             <div class="card group-card" v-for="g in groups" :key="g.id" @click="openDetail(g)">
               <div class="card-head">
-                <span class="card-name">{{ g.name }}</span>
+                <div class="gc-id">
+                  <span class="gc-avatar">{{ (g.name || '?').slice(0,1) }}</span>
+                  <div class="gc-titlewrap">
+                    <span class="card-name">{{ g.name }}</span>
+                    <p class="card-desc">{{ g.description || '无描述' }}</p>
+                  </div>
+                </div>
                 <div class="card-actions">
                   <button class="icon-btn" @click.stop="editGroup(g)"><Icon name="edit" :size="16" /></button>
                   <button class="icon-btn danger" @click.stop="delGroup(g)"><Icon name="trash" :size="16" /></button>
                 </div>
               </div>
-              <p class="card-desc">{{ g.description || '无描述' }}</p>
-              <div class="group-stats">
-                <div><span>生效渠道</span><b :class="{ 'eff-down': !g.runtime?.effective?.length }">{{ effText(g.runtime) }}</b></div>
-                <div><span>上游健康</span><b>{{ healthSummary(g.runtime) }}</b></div>
-                <div><span>上游</span><b>{{ g.enabled_upstream_count || 0 }}/{{ g.upstream_count || 0 }}</b></div>
-                <div><span>密钥</span><b>{{ g.enabled_key_count || 0 }}/{{ g.key_count || 0 }}</b></div>
-                <div><span>近24h</span><b>{{ g.recent_total ? (g.success_rate + '% · ' + g.avg_latency_ms + 'ms') : '暂无调用' }}</b></div>
+
+              <div class="gc-body">
+                <div class="gc-stat">
+                  <b :class="rateClass(g)">{{ g.recent_total ? g.success_rate + '%' : '—' }}</b>
+                  <span>近 24h 成功率</span>
+                </div>
+                <div class="gc-stat-sub">
+                  <div><span>调用</span><b>{{ g.recent_total || 0 }}</b></div>
+                  <div><span>延迟</span><b>{{ g.recent_total ? g.avg_latency_ms + 'ms' : '—' }}</b></div>
+                </div>
               </div>
-              <div class="card-foot"><span>点击管理上游与密钥</span><Icon name="check" :size="14" /></div>
+              <Fence :trend="g.trend || []" />
+              <div class="gc-fence-cap">每格 = 最近 1 小时成功率</div>
+              <div class="gc-pills">
+                <span class="gc-pill mint"><i></i>{{ healthSummary(g.runtime) }}</span>
+                <span class="gc-pill blue">上游 {{ g.enabled_upstream_count || 0 }}/{{ g.upstream_count || 0 }}</span>
+                <span class="gc-pill violet">密钥 {{ g.enabled_key_count || 0 }}/{{ g.key_count || 0 }}</span>
+                <span class="gc-pill" :class="g.runtime?.effective?.length ? 'amber' : 'gray'">生效 {{ effText(g.runtime) }}</span>
+              </div>
+
+              <div class="card-foot"><span>点击管理上游与密钥</span><Icon name="chevron-right" :size="15" /></div>
             </div>
             <div v-if="!groups.length" class="empty">还没有分组，点右上角新建一个。</div>
           </div>
@@ -574,64 +677,84 @@ function logout() {
           </div>
         </template>
 
-        <!-- 设置页 -->
+        <!-- 设置页：左锚点菜单 + 右内容 -->
         <template v-else-if="page === 'settings'">
-          <div class="settings-grid">
-            <div class="card settings-card">
-              <div class="settings-title">
-                <h3>运行配置</h3>
-                <p>探测参数保存到数据库，立即生效。</p>
-              </div>
-              <div class="settings-fields">
-                <div class="field"><label>探测间隔</label><input v-model="monitorInterval" placeholder="5m / 1m" /></div>
-                <div class="field"><label>探测路径</label><input v-model="probePath" placeholder="/v1/chat/completions" /></div>
-                <div class="field"><label>日志保留条数</label><input v-model="logRetention" type="number" min="100" placeholder="10000" /></div>
-              </div>
-              <div class="settings-info">
-                <div><span>探测</span><b>{{ effectiveMonitorInterval || '—' }}</b><em>{{ sourceText(monitorSource) }}</em></div>
-                <div><span>路径</span><b>{{ effectiveProbePath || '—' }}</b><em>{{ sourceText(probePathSource) }}</em></div>
-                <div><span>日志</span><b>{{ effectiveLogRetention ? effectiveLogRetention + ' 条' : '—' }}</b><em>{{ sourceText(logRetentionSource) }}</em></div>
-              </div>
-              <div class="settings-actions">
-                <span class="save-status" :class="{ show: settingsSaved }">已保存 ✓</span>
-                <button class="btn" @click="saveSettings"><Icon name="check" :size="16" />保存</button>
-              </div>
-            </div>
+          <div class="settings-layout">
+            <aside class="settings-nav">
+              <div class="set-navitem" :class="{ active: settingsSection === 'logs' }" @click="gotoSection('logs')"><Icon name="refresh" :size="16" />日志清理</div>
+              <div class="set-navitem" :class="{ active: settingsSection === 'alert' }" @click="gotoSection('alert')"><Icon name="alert" :size="16" />健康告警</div>
+              <div class="set-navitem" :class="{ active: settingsSection === 'endpoint' }" @click="gotoSection('endpoint')"><Icon name="link" :size="16" />接入地址</div>
+              <p class="set-navhint">探测间隔 / 路径已下放到各监控项，在「监控看板」逐项配置。</p>
+            </aside>
 
-            <div class="card settings-card">
-              <div class="settings-title">
-                <h3>健康告警</h3>
-                <p>上游/模型熔断翻转时推送 Webhook，URL 留空则关闭。</p>
-              </div>
-              <div class="settings-fields">
-                <div class="field"><label>告警 Webhook</label><input v-model="alertWebhook" placeholder="https://... 留空关闭" /></div>
-                <div class="field"><label>去抖间隔</label><input v-model="alertDebounce" placeholder="60s / 5m" /></div>
-              </div>
-              <div class="settings-info">
-                <div><span>Webhook</span><b>{{ effectiveAlertWebhook || '已关闭' }}</b><em>{{ sourceText(alertWebhookSource) }}</em></div>
-                <div><span>去抖</span><b>{{ effectiveAlertDebounce || '—' }}</b><em>{{ sourceText(alertDebounceSource) }}</em></div>
-              </div>
-              <div class="settings-actions">
-                <span class="save-status" :class="{ show: settingsSaved }">已保存 ✓</span>
-                <button class="btn" @click="saveSettings"><Icon name="check" :size="16" />保存</button>
-              </div>
-            </div>
+            <div class="settings-body">
+              <section id="set-logs" class="card settings-card">
+                <div class="settings-title"><h3>日志清理</h3><p>按条数保留最新调用日志，超出自动裁剪。</p></div>
+                <div class="settings-fields">
+                  <div class="field"><label>日志保留条数</label><input v-model="logRetention" type="number" min="100" placeholder="10000" /></div>
+                </div>
+                <div class="settings-info">
+                  <div><span>日志</span><b>{{ effectiveLogRetention ? effectiveLogRetention + ' 条' : '—' }}</b><em>{{ sourceText(logRetentionSource) }}</em></div>
+                </div>
+                <div class="settings-actions">
+                  <span class="save-status" :class="{ show: settingsSaved }">已保存 ✓</span>
+                  <button class="btn" @click="saveSettings"><Icon name="check" :size="16" />保存</button>
+                </div>
+              </section>
 
-            <div class="card settings-card">
-              <div class="settings-title">
-                <h3>接入地址</h3>
-                <p>客户端使用接入密钥访问。</p>
-              </div>
-              <div class="endpoint-list">
-                <div><span>OpenAI</span><code>{{ apiBase }}/v1/chat/completions</code></div>
-                <div><span>Responses</span><code>{{ apiBase }}/v1/responses</code></div>
-                <div><span>Claude</span><code>{{ apiBase }}/v1/messages</code></div>
-              </div>
-              <p class="hint">请求头：<code>Authorization: Bearer &lt;密钥&gt;</code></p>
+              <section id="set-alert" class="card settings-card">
+                <div class="settings-title"><h3>健康告警</h3><p>上游/模型熔断翻转时推送 Webhook，URL 留空则关闭。</p></div>
+                <div class="settings-fields">
+                  <div class="field"><label>告警 Webhook</label><input v-model="alertWebhook" placeholder="https://... 留空关闭" /></div>
+                  <div class="field"><label>去抖间隔</label><input v-model="alertDebounce" placeholder="60s / 5m" /></div>
+                </div>
+                <div class="settings-info">
+                  <div><span>Webhook</span><b>{{ effectiveAlertWebhook || '已关闭' }}</b><em>{{ sourceText(alertWebhookSource) }}</em></div>
+                  <div><span>去抖</span><b>{{ effectiveAlertDebounce || '—' }}</b><em>{{ sourceText(alertDebounceSource) }}</em></div>
+                </div>
+                <div class="settings-actions">
+                  <span class="save-status" :class="{ show: settingsSaved }">已保存 ✓</span>
+                  <button class="btn" @click="saveSettings"><Icon name="check" :size="16" />保存</button>
+                </div>
+              </section>
+
+              <section id="set-endpoint" class="card settings-card">
+                <div class="settings-title"><h3>接入地址</h3><p>客户端使用接入密钥访问。</p></div>
+                <div class="endpoint-list">
+                  <div><span>OpenAI</span><code>{{ apiBase }}/v1/chat/completions</code></div>
+                  <div><span>Responses</span><code>{{ apiBase }}/v1/responses</code></div>
+                  <div><span>Claude</span><code>{{ apiBase }}/v1/messages</code></div>
+                </div>
+                <p class="hint">请求头：<code>Authorization: Bearer &lt;密钥&gt;</code></p>
+              </section>
             </div>
           </div>
         </template>
       </main>
+    </div>
+
+    <!-- 矩阵格子详情抽屉 -->
+    <div class="drawer-mask" v-if="cellDrawer" @click.self="closeCell">
+      <div class="drawer">
+        <div class="dw-head">
+          <span class="mx-dot lg" :class="dotClass(cellDrawer.snapshot.state)"></span>
+          <div class="dw-id">
+            <div class="dw-title">{{ cellDrawer.model }}</div>
+            <div class="dw-sub">{{ cellDrawer.upstream_name }}<span v-if="cellDrawer.stream" class="tag on" style="margin-left:6px">流式</span></div>
+          </div>
+          <button class="icon-btn" @click="closeCell"><Icon name="x" :size="18" /></button>
+        </div>
+        <div class="dw-metrics">
+          <div class="dw-m"><span>状态</span><b :class="dotClass(cellDrawer.snapshot.state)">{{ cellDrawer.enabled ? stateLabel(cellDrawer.snapshot.state) : '已停用' }}</b></div>
+          <div class="dw-m"><span>成功率</span><b>{{ cellDrawer.snapshot.reqs ? (cellDrawer.snapshot.succ_rate * 100).toFixed(0) + '%' : '—' }}</b></div>
+          <div class="dw-m"><span>平均延迟</span><b>{{ cellDrawer.snapshot.avg_ms || cellDrawer.snapshot.last_ms || 0 }}<small>ms</small></b></div>
+          <div class="dw-m"><span>最后探测</span><b>{{ sinceText(cellDrawer.snapshot.last_ts) }}</b></div>
+        </div>
+        <Fence :trend="cellDrawer.snapshot.trend || []" />
+        <div class="dw-foot">
+          <button class="btn" :disabled="probingId === cellDrawer.id" @click="guard(probeCell)">{{ probingId === cellDrawer.id ? '探测中…' : '立即探测' }}</button>
+        </div>
+      </div>
     </div>
 
     <!-- 新密钥明文展示（生成后一次性） -->
@@ -734,10 +857,10 @@ function logout() {
           </div>
           <div class="field"><label>备注名</label><input v-model="dlg.form.name" placeholder="可选，留空则显示「渠道 · 模型」" /></div>
           <div class="field-row">
-            <div class="field"><label>探测间隔(秒)</label><input v-model="dlg.form.interval_sec" type="number" min="0" placeholder="留空/0 用全局" /></div>
+            <div class="field"><label>探测间隔(秒)</label><input v-model="dlg.form.interval_sec" type="number" min="0" placeholder="留空/0 用默认 5 分钟" /></div>
             <div class="field"><label>max_tokens</label><input v-model="dlg.form.max_tokens" type="number" min="0" placeholder="留空/0 用默认 1" /></div>
           </div>
-          <div class="field"><label>探测路径</label><input v-model="dlg.form.path" placeholder="留空用全局，如 /v1/messages" /></div>
+          <div class="field"><label>探测路径</label><input v-model="dlg.form.path" placeholder="留空用默认 /v1/chat/completions，Claude 填 /v1/messages" /></div>
           <div class="field"><label>探测消息</label><input v-model="dlg.form.probe_text" placeholder="留空用默认「hi」" /></div>
           <label class="check"><input type="checkbox" v-model="dlg.form.stream" /> 流式探测（请求体加 stream:true）</label>
           <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>

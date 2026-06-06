@@ -22,16 +22,19 @@ type breakerReporter interface {
 //   - mgr.Record：记看板统计(成功率/延迟/趋势)，429 算「降级」
 //   - breaker.ObserveProbe：驱动路由熔断器，按熔断口径 429 算失败
 // 每项可配自己的探测周期(interval_sec)、端点(path)、消息内容、max_tokens、是否流式；
-// 这些字段为空/0 时回退到全局默认(interval/path)。
+// 这些字段为空/0 时回退到内置默认(间隔 5m、路径 /v1/chat/completions)。
 type Prober struct {
 	mgr      *Manager
 	store    *store.Store
 	breaker  breakerReporter      // 探测结果同时驱动路由熔断器；nil 则只记看板
-	interval func() time.Duration // 全局默认探测间隔(页面可配)；监控项 interval_sec=0 时用它
-	path     func() string        // 全局默认探测端点；监控项 path 为空时用它
+	interval func() time.Duration // 内置默认探测间隔；监控项 interval_sec=0 时用它
+	path     func() string        // 内置默认探测端点；监控项 path 为空时用它
 }
 
 func NewProber(mgr *Manager, st *store.Store, breaker breakerReporter, interval func() time.Duration, path func() string) *Prober {
+	if interval == nil {
+		interval = func() time.Duration { return 5 * time.Minute }
+	}
 	if path == nil {
 		path = func() string { return "/v1/chat/completions" }
 	}

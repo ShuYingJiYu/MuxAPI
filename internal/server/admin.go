@@ -47,45 +47,27 @@ func (s *Server) adminLogs(w http.ResponseWriter, r *http.Request) {
 func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		monitorValue, monitorSource := settingValue(s.store.GetSetting("monitor_interval", ""), "5m")
-		probePath, probePathSource := stringSettingValue(s.store.GetSetting("probe_path", ""), "/v1/chat/completions")
 		logRetention, logRetentionSource := intSettingValue(s.store.GetSetting("log_retention", ""), 10000)
 		alertWebhook, alertWebhookSource := stringSettingValue(s.store.GetSetting("alert_webhook", ""), "")
 		alertDebounce, alertDebounceSource := settingValue(s.store.GetSetting("alert_debounce", ""), "60s")
 		writeJSON(w, map[string]string{
-			"monitor_interval":           s.store.GetSetting("monitor_interval", ""),
-			"probe_path":                 s.store.GetSetting("probe_path", ""),
-			"log_retention":              s.store.GetSetting("log_retention", ""),
-			"alert_webhook":              s.store.GetSetting("alert_webhook", ""),
-			"alert_debounce":             s.store.GetSetting("alert_debounce", ""),
-			"effective_monitor_interval": monitorValue,
-			"effective_probe_path":       probePath,
-			"effective_log_retention":    logRetention,
-			"effective_alert_webhook":    alertWebhook,
-			"effective_alert_debounce":   alertDebounce,
-			"monitor_source":             monitorSource,
-			"probe_path_source":          probePathSource,
-			"log_retention_source":       logRetentionSource,
-			"alert_webhook_source":       alertWebhookSource,
-			"alert_debounce_source":      alertDebounceSource,
+			"log_retention":            s.store.GetSetting("log_retention", ""),
+			"alert_webhook":            s.store.GetSetting("alert_webhook", ""),
+			"alert_debounce":           s.store.GetSetting("alert_debounce", ""),
+			"effective_log_retention":  logRetention,
+			"effective_alert_webhook":  alertWebhook,
+			"effective_alert_debounce": alertDebounce,
+			"log_retention_source":     logRetentionSource,
+			"alert_webhook_source":     alertWebhookSource,
+			"alert_debounce_source":    alertDebounceSource,
 		})
 	case http.MethodPut:
 		var d struct {
-			MonitorInterval string `json:"monitor_interval"`
-			ProbePath       string `json:"probe_path"`
-			LogRetention    string `json:"log_retention"`
-			AlertWebhook    string `json:"alert_webhook"`
-			AlertDebounce   string `json:"alert_debounce"`
+			LogRetention  string `json:"log_retention"`
+			AlertWebhook  string `json:"alert_webhook"`
+			AlertDebounce string `json:"alert_debounce"`
 		}
 		json.NewDecoder(r.Body).Decode(&d)
-		if _, err := time.ParseDuration(d.MonitorInterval); err != nil {
-			http.Error(w, "无效间隔，用 30s/2m/1h 格式", 400)
-			return
-		}
-		if d.ProbePath == "" || !strings.HasPrefix(d.ProbePath, "/") {
-			http.Error(w, "探测路径必须以 / 开头", 400)
-			return
-		}
 		if n, err := strconv.Atoi(d.LogRetention); err != nil || n < 100 {
 			http.Error(w, "日志保留条数须为 >=100 的整数", 400)
 			return
@@ -99,8 +81,6 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "无效去抖间隔，用 30s/1m 格式", 400)
 			return
 		}
-		s.store.SetSetting("monitor_interval", d.MonitorInterval)
-		s.store.SetSetting("probe_path", d.ProbePath)
 		s.store.SetSetting("log_retention", d.LogRetention)
 		s.store.SetSetting("alert_webhook", d.AlertWebhook)
 		s.store.SetSetting("alert_debounce", d.AlertDebounce)

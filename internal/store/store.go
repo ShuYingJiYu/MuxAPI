@@ -24,6 +24,16 @@ type Group struct {
 	RecentTotal          int    `json:"recent_total"`
 	SuccessRate          int    `json:"success_rate"`
 	AvgLatencyMs         int64  `json:"avg_latency_ms"`
+	Trend                []HourPoint `json:"trend"` // 近 24h 按小时分桶的成功率序列（喂给前端栅栏）
+}
+
+// HourPoint 分组成功率栅栏的一格：代表某 1 小时的请求成功率。
+// Status 复用探测栅栏语义：0 无调用 / 1 正常(≥95%) / 2 降级(≥80%) / 3 故障(<80%)。
+type HourPoint struct {
+	Ts       int64   `json:"ts"`        // 该小时起始 Unix 秒
+	Status   int     `json:"status"`    // 0/1/2/3
+	SuccRate float64 `json:"succ_rate"` // 0..1，无调用为 0
+	Total    int     `json:"total"`     // 该小时调用数
 }
 
 // AccessKey 接入凭证，绑定到某分组：用哪个 key 访问就走哪个分组。
@@ -308,7 +318,60 @@ func (s *Store) ListGroups() ([]*Group, error) {
 		}
 		gs = append(gs, g)
 	}
-	return gs, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, g := range gs {
+		g.Trend = s.groupHourlyTrend(g.ID)
+	}
+	return gs, nil
+}
+
+// groupHourlyTrend 取某分组近 24 小时、按小时分桶的成功率栅栏（24 格，旧→新）。
+// 无调用的小时补 status=0 灰格，保证栅栏宽度恒定。
+func (s *Store) groupHourlyTrend(groupID int64) []HourPoint {
+	const hours = 24
+	now := time.Now()
+	// 对齐到整点，作为最后一格的起始
+	curHour := now.Truncate(time.Hour)
+	start := curHour.Add(-time.Duration(hours-1) * time.Hour)
+	// 按小时桶聚合：总数 + 成功数
+	type agg struct{ total, succ int }
+	buckets := make(map[int64]*agg, hours)
+	rows, err := s.db.Query(`SELECT
+		(created_at/3600)*3600 AS hour, COUNT(*),
+		SUM(CASE WHEN status BETWEEN 200 AND 399 THEN 1 ELSE 0 END)
+		FROM logs WHERE group_id=? AND created_at>=?
+		GROUP BY hour`, groupID, start.Unix())
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var h int64
+			var total, succ int
+			if rows.Scan(&h, &total, &succ) == nil {
+				buckets[h] = &agg{total, succ}
+			}
+		}
+	}
+	out := make([]HourPoint, hours)
+	for i := 0; i < hours; i++ {
+		ts := start.Add(time.Duration(i) * time.Hour).Unix()
+		p := HourPoint{Ts: ts}
+		if a := buckets[ts]; a != nil && a.total > 0 {
+			p.Total = a.total
+			p.SuccRate = float64(a.succ) / float64(a.total)
+			switch {
+			case p.SuccRate >= 0.95:
+				p.Status = 1
+			case p.SuccRate >= 0.80:
+				p.Status = 2
+			default:
+				p.Status = 3
+			}
+		}
+		out[i] = p
+	}
+	return out
 }
 
 func (s *Store) CreateGroup(name, desc string) (int64, error) {
