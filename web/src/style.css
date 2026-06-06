@@ -139,6 +139,7 @@ svg { display: block; flex-shrink: 0; }
 .card-metrics { display: flex; flex-direction: column; gap: 9px; }
 .metric-item { display: flex; justify-content: space-between; align-items: center; font-size: 13px; }
 .metric-label { color: var(--g500); }
+.metric-label .mh { margin-left: 4px; font-size: 9px; padding: 1px 4px; border-radius: 5px; background: var(--g100); color: var(--g400); vertical-align: middle; }
 .metric-value { font-weight: 600; color: var(--g900); }
 .metric-value.warn { color: var(--amber); }
 .metric-value small { font-size: 11px; color: var(--g400); font-weight: 400; margin-left: 1px; }
@@ -283,6 +284,13 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .empty { grid-column: 1/-1; text-align: center; color: var(--g400); padding: 40px; font-size: 13px; }
 .empty-cell { text-align: center; color: var(--g400); padding: 28px; }
 .err-banner { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; border-radius: 12px; padding: 10px 14px; margin-bottom: 16px; font-size: 13px; }
+.ok-banner { background: #f0fdf4; color: #15803d; border: 1px solid #bbf7d0; border-radius: 12px; padding: 10px 14px; margin-bottom: 16px; font-size: 13px; }
+.batch-tools { margin: 6px 0 4px; }
+.batch-list { max-height: 260px; overflow-y: auto; border: 1px solid var(--g200); border-radius: 12px; padding: 4px; margin-bottom: 14px; }
+.batch-item { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 8px; cursor: pointer; }
+.batch-item:hover { background: var(--g50); }
+.batch-item.done { opacity: .55; cursor: default; }
+.batch-item .bm-name { flex: 1; font-size: 13px; word-break: break-all; }
 .key-reveal { background: var(--g50); border: 1px solid var(--g200); border-radius: 12px; padding: 14px; margin: 14px 0; word-break: break-all; }
 .key-reveal code { background: none; padding: 0; font-size: 13px; color: var(--g900); }
 .check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--g700); cursor: pointer; }
@@ -362,6 +370,29 @@ table.matrix th, table.matrix td { padding: 0; }
 .mx-dot.off { opacity: .4; filter: grayscale(.5); }
 .mx-dot.lg { width: 34px; height: 34px; border-radius: 11px; }
 .mx-empty { color: var(--g300); font-size: 18px; }
+
+/* ===== 总览：按上游分组的探活状态 ===== */
+.ov-groups { display: flex; flex-direction: column; gap: 14px; }
+.ov-group { border: 1px solid var(--g200); border-radius: 18px; background: rgba(255,255,255,.82); backdrop-filter: blur(8px); box-shadow: var(--sh-card); padding: 14px 16px; }
+.ovg-head { display: flex; align-items: center; gap: 9px; margin-bottom: 12px; }
+.ovg-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.ovg-dot.closed { background: var(--green); box-shadow: 0 0 6px #5fd3a0; }
+.ovg-dot.half { background: var(--amber); box-shadow: 0 0 6px #ffc56b; }
+.ovg-dot.open { background: var(--red); box-shadow: 0 0 6px #ff8fa3; animation: pulse 1.4s ease-in-out infinite; }
+.ovg-dot.nodata { background: var(--g300); }
+.ovg-name { font-size: 14px; font-weight: 700; color: var(--g900); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ovg-meta { font-size: 12px; color: var(--g500); margin-left: auto; flex: none; }
+.ovg-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.ov-chip { display: inline-flex; align-items: center; gap: 7px; padding: 7px 12px; border-radius: 12px; border: 1px solid var(--g200); background: var(--g50); cursor: pointer; font-size: 12.5px; color: var(--g900); transition: all .16s; }
+.ov-chip:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(168,120,160,.2); }
+.ov-chip.closed { background: linear-gradient(135deg, #f0fffb, #e2fff5); border-color: #b7eee2; }
+.ov-chip.half { background: linear-gradient(135deg, #fffaf0, #fff4dc); border-color: #ffe6ad; }
+.ov-chip.open { background: linear-gradient(135deg, #fff5f7, #ffe1e8); border-color: #ffc6d1; }
+.ov-chip.off { opacity: .5; filter: grayscale(.5); }
+.ovc-led { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.ovc-led.closed { background: var(--green); } .ovc-led.half { background: var(--amber); } .ovc-led.open { background: var(--red); } .ovc-led.nodata { background: var(--g300); }
+.ovc-name { font-weight: 600; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ovc-lat { font-size: 11px; color: var(--g500); font-variant-numeric: tabular-nums; }
 
 /* ===== 格子详情抽屉 ===== */
 .drawer-mask { position: fixed; inset: 0; background: rgba(42,35,48,.28); backdrop-filter: blur(3px); z-index: 60; display: flex; justify-content: flex-end; }

@@ -44,21 +44,36 @@ async function probeOne(m) {
   } finally { probingId.value = 0 }
 }
 
-// ===== 总览：上游×模型健康矩阵 =====
+// ===== 总览：按上游分组的模型探活状态 =====
 // 数据源 = monitors（每项 = 一个 (上游,模型)，含探测快照）。
-// 行 = 上游，列 = 全部出现过的模型并集，格子 = 对应监控项快照（无则空格）。
+// 监控只是探活子集，各上游监控的模型数不同 —— 故不拼矩阵，
+// 而是按上游分组，每组平铺它实际监控的模型芯片（有几个显几个）。
+const stateRank = { DOWN: 0, DEGRADED: 1, OK: 2 } // 故障置顶用
 const matrix = computed(() => {
-  const ms = monitors.value
-  // 列：模型并集，按字母序
-  const models = [...new Set(ms.map(m => m.model))].sort()
-  // 行：按上游分组
   const byUp = new Map()
-  for (const m of ms) {
-    if (!byUp.has(m.upstream_id)) byUp.set(m.upstream_id, { id: m.upstream_id, name: m.upstream_name, cells: {} })
-    byUp.get(m.upstream_id).cells[m.model] = m
+  for (const m of monitors.value) {
+    if (!byUp.has(m.upstream_id)) byUp.set(m.upstream_id, { id: m.upstream_id, name: m.upstream_name, items: [] })
+    byUp.get(m.upstream_id).items.push(m)
   }
-  const rows = [...byUp.values()].sort((a, b) => a.name.localeCompare(b.name))
-  return { models, rows }
+  const rows = [...byUp.values()].map(g => {
+    // 组内健康汇总 + 模型按状态排序（故障/降级置顶，停用沉底）
+    let down = 0, degraded = 0
+    for (const m of g.items) {
+      if (!m.enabled) continue
+      const s = m.snapshot.state
+      if (s === 'DOWN') down++
+      else if (s === 'DEGRADED') degraded++
+    }
+    g.items.sort((a, b) => {
+      if (a.enabled !== b.enabled) return a.enabled ? -1 : 1
+      const ra = stateRank[a.snapshot.state] ?? 3, rb = stateRank[b.snapshot.state] ?? 3
+      return ra - rb || a.model.localeCompare(b.model)
+    })
+    return { ...g, down, degraded, worst: down ? 0 : degraded ? 1 : 2 }
+  })
+  // 组排序：有故障的上游置顶，其次降级，再按名字
+  rows.sort((a, b) => a.worst - b.worst || a.name.localeCompare(b.name))
+  return { rows }
 })
 // 总览汇总卡（粉/薄荷/黄/紫 四色块）
 const ovSummary = computed(() => {
@@ -73,7 +88,7 @@ const ovSummary = computed(() => {
   return {
     upstreams: matrix.value.rows.length,
     combos: ms.length,
-    models: matrix.value.models.length,
+    models: new Set(ms.map(m => m.model)).size,
     healthy: ms.length - down - degraded, degraded, down,
     rate, avgLat,
   }
@@ -371,6 +386,44 @@ function loadMonModels(uid) {
   if (!uid) return
   api.testUpstream(uid).then(r => { monModels.value = r.models || [] }).catch(() => {})
 }
+
+// 批量建监控对话框状态：拉模型/勾选/共享探测参数
+const batchMon = reactive({ loading: false, error: '', models: [], picked: {}, monitored: {} })
+const notice = ref('')  // 轻量成功提示，3s 自动消失
+function flash(msg) { notice.value = msg; setTimeout(() => { if (notice.value === msg) notice.value = '' }, 3000) }
+
+function openBatchMonitors(u) {
+  dlg.type = 'upstream-monitors'
+  dlg.form = { upstream_id: u.id, upstream_name: u.name, enabled: true, stream: false, probe_text: '', max_tokens: 0, interval_sec: 0, path: '' }
+  // 该上游已建监控的模型集合（前端标“已监控”、避免重复勾选）
+  batchMon.monitored = {}
+  monitors.value.filter(m => m.upstream_id === u.id).forEach(m => { batchMon.monitored[m.model] = true })
+  batchMon.models = []; batchMon.picked = {}; batchMon.error = ''; batchMon.loading = true
+  api.testUpstream(u.id)
+    .then(r => { batchMon.models = r.models || []; if (r.error) batchMon.error = r.error })
+    .catch(e => { batchMon.error = String(e.message || e) })
+    .finally(() => { batchMon.loading = false })
+}
+// 可勾选模型（排除已监控的）
+const batchSelectable = computed(() => batchMon.models.filter(m => !batchMon.monitored[m]))
+const batchPickedCount = computed(() => batchSelectable.value.filter(m => batchMon.picked[m]).length)
+function batchToggleAll() {
+  const all = batchPickedCount.value === batchSelectable.value.length && batchSelectable.value.length > 0
+  batchSelectable.value.forEach(m => { batchMon.picked[m] = !all })
+}
+function saveBatchMonitors() {
+  const models = batchSelectable.value.filter(m => batchMon.picked[m])
+  if (!models.length) return
+  guard(async () => {
+    const f = dlg.form
+    const r = await api.createMonitorsBatch(f.upstream_id, {
+      models, enabled: f.enabled, stream: f.stream, probe_text: f.probe_text,
+      max_tokens: Number(f.max_tokens) || 0, interval_sec: Number(f.interval_sec) || 0, path: f.path,
+    })
+    closeDlg(); await loadMonitors()
+    flash(`已为「${f.upstream_name}」创建 ${r.created} 个监控${r.skipped ? `，跳过 ${r.skipped} 个已存在` : ''}`)
+  })
+}
 function newMonitor() {
   const uid = upstreams.value[0]?.id || 0
   dlg.type = 'monitor'; dlg.form = { upstream_id: uid, model: '', name: '', enabled: true, stream: false, probe_text: '', max_tokens: 0, interval_sec: 0, path: '' }
@@ -449,6 +502,7 @@ function logout() {
 
       <main class="main">
         <p v-if="err" class="err-banner">{{ err }}</p>
+        <p v-if="notice" class="ok-banner">{{ notice }}</p>
 
         <!-- 总览：上游 × 模型健康矩阵 -->
         <template v-if="page === 'overview'">
@@ -460,32 +514,28 @@ function logout() {
             <div class="ov-stat blue"><div class="ov-num">{{ ovSummary.avgLat || '—' }}<small v-if="ovSummary.avgLat">ms</small></div><div class="ov-lbl">平均延迟</div></div>
           </div>
 
-          <div class="ov-meta">{{ ovSummary.upstreams }} 个上游 · {{ ovSummary.models }} 个模型 · {{ ovSummary.combos }} 个监控组合 · 点格子看详情</div>
+          <div class="ov-meta">{{ ovSummary.upstreams }} 个上游 · {{ ovSummary.models }} 个模型 · {{ ovSummary.combos }} 个监控组合 · 点芯片看详情</div>
 
-          <div v-if="!matrix.rows.length" class="empty">还没有监控项，去「监控看板」为渠道+模型建监控，矩阵就会亮起来 ✨</div>
+          <div v-if="!matrix.rows.length" class="empty">还没有监控项，去「监控看板」为渠道+模型建监控，这里就会亮起来 ✨</div>
 
-          <div v-else class="matrix-wrap">
-            <table class="matrix">
-              <thead>
-                <tr>
-                  <th class="mx-corner">上游 \ 模型</th>
-                  <th v-for="md in matrix.models" :key="md" class="mx-colh" :title="md">{{ md }}</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="row in matrix.rows" :key="row.id">
-                  <td class="mx-rowh" :title="row.name">{{ row.name }}</td>
-                  <td v-for="md in matrix.models" :key="md" class="mx-cell">
-                    <button v-if="row.cells[md]" class="mx-dot" :class="[dotClass(row.cells[md].snapshot.state), { off: !row.cells[md].enabled }]"
-                      :title="md + ' · ' + stateLabel(row.cells[md].snapshot.state) + (row.cells[md].snapshot.avg_ms ? ' · ' + row.cells[md].snapshot.avg_ms + 'ms' : '')"
-                      @click="openCell(row.cells[md])">
-                      <span class="mx-lat" v-if="row.cells[md].snapshot.avg_ms || row.cells[md].snapshot.last_ms">{{ row.cells[md].snapshot.avg_ms || row.cells[md].snapshot.last_ms }}</span>
-                    </button>
-                    <span v-else class="mx-empty">·</span>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
+          <div v-else class="ov-groups">
+            <section class="ov-group" v-for="g in matrix.rows" :key="g.id">
+              <header class="ovg-head">
+                <span class="ovg-dot" :class="dotClass(g.down ? 'DOWN' : g.degraded ? 'DEGRADED' : 'OK')"></span>
+                <span class="ovg-name" :title="g.name">{{ g.name }}</span>
+                <span class="ovg-meta">{{ g.items.length }} 模型<template v-if="g.down"> · {{ g.down }} 故障</template><template v-if="g.degraded"> · {{ g.degraded }} 降级</template></span>
+              </header>
+              <div class="ovg-chips">
+                <button v-for="m in g.items" :key="m.id" class="ov-chip"
+                  :class="[dotClass(m.snapshot.state), { off: !m.enabled }]"
+                  :title="m.model + ' · ' + (m.enabled ? stateLabel(m.snapshot.state) : '已停用') + (m.snapshot.avg_ms ? ' · ' + m.snapshot.avg_ms + 'ms' : '')"
+                  @click="openCell(m)">
+                  <span class="ovc-led" :class="dotClass(m.snapshot.state)"></span>
+                  <span class="ovc-name">{{ m.model }}</span>
+                  <span class="ovc-lat" v-if="m.snapshot.avg_ms || m.snapshot.last_ms">{{ m.snapshot.avg_ms || m.snapshot.last_ms }}ms</span>
+                </button>
+              </div>
+            </section>
           </div>
         </template>
 
@@ -624,6 +674,7 @@ function logout() {
                   <td><span class="tag" :class="u.enabled ? 'on' : 'off'">{{ u.enabled ? '启用' : '停用' }}</span></td>
                   <td>
                     <button class="btn-link sm" @click="testUpstream(u)">测试</button>
+                    <button class="btn-link sm" @click="openBatchMonitors(u)">建监控</button>
                     <button class="icon-btn" @click="editUpstream(u)"><Icon name="edit" :size="16" /></button>
                     <button class="icon-btn danger" @click="delUpstream(u)"><Icon name="trash" :size="16" /></button>
                   </td>
@@ -660,8 +711,8 @@ function logout() {
                 <span class="state-badge" :class="dotClass(m.snapshot.state)">{{ m.enabled ? stateLabel(m.snapshot.state) : '已停用' }}</span>
               </div>
               <div class="card-metrics">
-                <div class="metric-item"><span class="metric-label">成功率</span><span class="metric-value" :class="m.snapshot.reqs && m.snapshot.succ_rate < 1 ? 'warn' : ''">{{ m.snapshot.reqs ? (m.snapshot.succ_rate * 100).toFixed(0) + '%' : '—' }}</span></div>
-                <div class="metric-item"><span class="metric-label">平均延迟</span><span class="metric-value">{{ m.snapshot.avg_ms || m.snapshot.last_ms || 0 }}<small>ms</small></span></div>
+                <div class="metric-item"><span class="metric-label">成功率<small class="mh">24h</small></span><span class="metric-value" :class="m.snapshot.reqs && m.snapshot.succ_rate < 1 ? 'warn' : ''">{{ m.snapshot.reqs ? (m.snapshot.succ_rate * 100).toFixed(0) + '%' : '—' }}</span></div>
+                <div class="metric-item"><span class="metric-label">平均延迟<small class="mh">24h</small></span><span class="metric-value">{{ m.snapshot.avg_ms || m.snapshot.last_ms || 0 }}<small>ms</small></span></div>
                 <div class="metric-item"><span class="metric-label">最后探测</span><span class="metric-value sm">{{ sinceText(m.snapshot.last_ts) }}</span></div>
               </div>
               <Fence :trend="m.snapshot.trend || []" />
@@ -865,6 +916,38 @@ function logout() {
           <label class="check"><input type="checkbox" v-model="dlg.form.stream" /> 流式探测（请求体加 stream:true）</label>
           <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>
           <div class="dialog-foot"><button class="btn btn-ghost" @click="closeDlg">取消</button><button class="btn" @click="saveMonitor">保存</button></div>
+        </template>
+
+        <template v-else-if="dlg.type === 'upstream-monitors'">
+          <h3>为「{{ dlg.form.upstream_name }}」批量建监控</h3>
+          <p class="hint">勾选要探活的模型，下方探测参数对所有选中项共享。已监控的模型自动跳过。监控只是探活子集，不影响下游 /v1/models 能看到的全部模型。</p>
+          <div v-if="batchMon.loading" class="hint">正在拉取模型列表…</div>
+          <div v-else-if="batchMon.error" class="err-banner">拉取模型失败：{{ batchMon.error }}</div>
+          <div v-else-if="!batchMon.models.length" class="hint">该上游 /v1/models 没有返回任何模型。</div>
+          <template v-else>
+            <div class="batch-tools">
+              <label class="check"><input type="checkbox" :checked="batchPickedCount === batchSelectable.length && batchSelectable.length > 0" @change="batchToggleAll" /> 全选可用（{{ batchPickedCount }}/{{ batchSelectable.length }}）</label>
+            </div>
+            <div class="batch-list">
+              <label v-for="m in batchMon.models" :key="m" class="batch-item" :class="{ done: batchMon.monitored[m] }">
+                <input type="checkbox" :disabled="batchMon.monitored[m]" v-model="batchMon.picked[m]" />
+                <span class="bm-name">{{ m }}</span>
+                <span v-if="batchMon.monitored[m]" class="tag off">已监控</span>
+              </label>
+            </div>
+            <div class="field-row">
+              <div class="field"><label>探测间隔(秒)</label><input v-model="dlg.form.interval_sec" type="number" min="0" placeholder="留空/0 用默认 5 分钟" /></div>
+              <div class="field"><label>max_tokens</label><input v-model="dlg.form.max_tokens" type="number" min="0" placeholder="留空/0 用默认 1" /></div>
+            </div>
+            <div class="field"><label>探测路径</label><input v-model="dlg.form.path" placeholder="留空用默认 /v1/chat/completions，Claude 填 /v1/messages" /></div>
+            <div class="field"><label>探测消息</label><input v-model="dlg.form.probe_text" placeholder="留空用默认「hi」" /></div>
+            <label class="check"><input type="checkbox" v-model="dlg.form.stream" /> 流式探测（请求体加 stream:true）</label>
+            <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>
+          </template>
+          <div class="dialog-foot">
+            <button class="btn btn-ghost" @click="closeDlg">取消</button>
+            <button class="btn" :disabled="batchPickedCount === 0" @click="saveBatchMonitors">为选中 {{ batchPickedCount }} 个模型创建监控</button>
+          </div>
         </template>
 
         <template v-else-if="dlg.type === 'member'">

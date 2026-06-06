@@ -19,3 +19,6 @@ web/dist/
 # 工具与 IDE 目录
 .claude/
 .idea/
+
+# 助手记忆目录（本地上下文，非项目产物）
+memory/

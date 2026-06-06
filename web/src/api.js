@@ -30,6 +30,7 @@ export const api = {
   updateUpstream: (id, u) => req('PUT', '/upstreams/' + id, u),
   deleteUpstream: id => req('DELETE', '/upstreams/' + id),
   testUpstream: id => req('GET', `/upstreams/${id}/models`),
+  createMonitorsBatch: (id, payload) => req('POST', `/upstreams/${id}/monitors`, payload),
   // 真实对话测试：发 hi 请求，SSE 逐块回调 onEvent({type,text,...})。EventSource 不能带鉴权头，故用 fetch 流式解析。
   testUpstreamStream: async (id, model, onEvent, signal) => {
     const headers = {}

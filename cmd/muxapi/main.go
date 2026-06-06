@@ -47,7 +47,7 @@ func main() {
 	hm := health.New(cfg.FailThreshold, cfg.Cooldown)
 	sched := scheduler.New(listByGroup, hm)
 	fwd := forward.New(sched, hm, st, cfg.MaxRetries)
-	mon := monitor.New()
+	mon := monitor.New(st)
 	settingDuration := func(key string, def time.Duration) func() time.Duration {
 		return func() time.Duration {
 			if d, err := time.ParseDuration(st.GetSetting(key, "")); err == nil && d > 0 {
@@ -121,18 +121,24 @@ func main() {
 	}
 }
 
-// runLogJanitor 定时裁剪 logs 表：启动先清一次，之后每 10 分钟一轮。
-// keep() 每轮取最新值，页面改保留条数下一轮生效；返回 0 表示关闭清理。
+// runLogJanitor 定时裁剪 logs 表 + 探测结果：启动先清一次，之后每 10 分钟一轮。
+// keep() 每轮取最新值，页面改保留条数下一轮生效；返回 0 表示关闭日志清理。
+// 探测结果固定保留 48h（覆盖看板 24h 展示窗口有余），防 probe_results 表无限增长。
 func runLogJanitor(ctx context.Context, st *store.Store, keep func() int) {
+	const probeKeepHours = 48
 	prune := func() {
 		n := keep()
-		if n <= 0 {
-			return
+		if n > 0 {
+			if deleted, err := st.PruneLogs(n); err != nil {
+				slog.Error("log janitor prune failed", "err", err)
+			} else if deleted > 0 {
+				slog.Info("log janitor pruned", "deleted", deleted, "keep", n)
+			}
 		}
-		if deleted, err := st.PruneLogs(n); err != nil {
-			slog.Error("log janitor prune failed", "err", err)
+		if deleted, err := st.PruneProbes(probeKeepHours); err != nil {
+			slog.Error("probe janitor prune failed", "err", err)
 		} else if deleted > 0 {
-			slog.Info("log janitor pruned", "deleted", deleted, "keep", n)
+			slog.Info("probe janitor pruned", "deleted", deleted, "keepHours", probeKeepHours)
 		}
 	}
 	prune() // 启动即清一次，立刻收敛历史堆积

@@ -1,10 +1,12 @@
 package upstream
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // Upstream 上游抽象。MVP 只做 relay 中转透传一种实现。
@@ -90,3 +92,44 @@ func (u *Upstream) BuildRequest(method, path string, body io.Reader, clientHeade
 	req.Header.Set("x-api-key", u.APIKey)
 	return req, nil
 }
+
+// FetchModels 实时拉该上游的 /v1/models，解析 OpenAI 风格 {"data":[{"id":...}]}
+// 返回模型 ID 列表。既用于上游连通测试，也用于下游 /v1/models 汇总。
+// 返回 (models, status, error)：status 是上游 HTTP 状态码（网络错误为 0）。
+func (u *Upstream) FetchModels(timeout time.Duration) ([]string, int, error) {
+	req, err := u.BuildRequest(http.MethodGet, "/v1/models", nil, http.Header{})
+	if err != nil {
+		return nil, 0, err
+	}
+	client := &http.Client{Timeout: timeout, Transport: ProxyTransport(u.Proxy)}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return nil, resp.StatusCode, &HTTPError{Status: resp.StatusCode, Body: strings.TrimSpace(string(body))}
+	}
+	var parsed struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	json.Unmarshal(body, &parsed)
+	models := make([]string, 0, len(parsed.Data))
+	for _, m := range parsed.Data {
+		if m.ID != "" {
+			models = append(models, m.ID)
+		}
+	}
+	return models, resp.StatusCode, nil
+}
+
+// HTTPError 上游返回非 2xx 时携带状态码与响应体片段。
+type HTTPError struct {
+	Status int
+	Body   string
+}
+
+func (e *HTTPError) Error() string { return e.Body }

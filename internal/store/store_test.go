@@ -3,6 +3,7 @@ package store
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/mirainya/muxapi/internal/upstream"
 )
@@ -195,5 +196,106 @@ func TestPruneLogs(t *testing.T) {
 	// 保留的应是最新的（id 最大那批），ListLogs 倒序，首条 id 应为 50
 	if got[0].ID != 50 {
 		t.Fatalf("保留的应是最新批次(首条 id=50)，实际 id=%d", got[0].ID)
+	}
+}
+
+// 直接按指定时刻插探测行（绕过 InsertProbe 的 now），便于构造跨小时桶。
+func insertProbeAt(t *testing.T, st *Store, monitorID int64, status int, latMs, ts int64) {
+	t.Helper()
+	if _, err := st.db.Exec(`INSERT INTO probe_results(monitor_id,status,latency_ms,created_at) VALUES(?,?,?,?)`,
+		monitorID, status, latMs, ts); err != nil {
+		t.Fatalf("插探测行失败: %v", err)
+	}
+}
+
+func TestMonitorHourlyTrendAndRecent(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	now := time.Now()
+	curHour := now.Truncate(time.Hour).Unix()
+	prevHour := curHour - 3600
+
+	// 上一小时：4 次探测，3 成功 1 故障 → succ_rate=.75 → status=3(<.80)
+	insertProbeAt(t, st, 1, 1, 100, prevHour+10)
+	insertProbeAt(t, st, 1, 1, 200, prevHour+20)
+	insertProbeAt(t, st, 1, 1, 300, prevHour+30)
+	insertProbeAt(t, st, 1, 3, 0, prevHour+40)
+	// 当前小时：2 次全成功 → succ_rate=1 → status=1
+	insertProbeAt(t, st, 1, 1, 150, curHour+10)
+	insertProbeAt(t, st, 1, 1, 250, curHour+20)
+
+	trend := st.MonitorHourlyTrend(1)
+	if len(trend) != 24 {
+		t.Fatalf("趋势应 24 桶，实际 %d", len(trend))
+	}
+	// 最后一桶=当前小时，倒数第二=上一小时
+	cur, prev := trend[23], trend[22]
+	if cur.Ts != curHour || prev.Ts != prevHour {
+		t.Fatalf("末两桶时刻应为 当前/上一小时，得到 %d/%d", cur.Ts, prev.Ts)
+	}
+	if cur.Total != 2 || cur.SuccRate != 1 || cur.Status != 1 {
+		t.Fatalf("当前小时应 2次/100%%/status1，得到 %+v", cur)
+	}
+	if prev.Total != 4 || prev.SuccRate != 0.75 || prev.Status != 3 {
+		t.Fatalf("上一小时应 4次/75%%/status3，得到 %+v", prev)
+	}
+	// 更早的桶应为空（status0）
+	if trend[0].Total != 0 || trend[0].Status != 0 {
+		t.Fatalf("最早桶应空，得到 %+v", trend[0])
+	}
+
+	// 近 24h 汇总：6 次，5 成功；成功均延迟 = (100+200+300+150+250)/5 = 200
+	reqs, succ, avgMs, lastMs, lastTS, lastStatus := st.MonitorRecent(1)
+	if reqs != 6 || succ != 5 {
+		t.Fatalf("应 6次5成功，得到 %d/%d", reqs, succ)
+	}
+	if avgMs != 200 {
+		t.Fatalf("成功均延迟应 200，得到 %d", avgMs)
+	}
+	if lastStatus != 1 || lastTS != curHour+20 || lastMs != 250 {
+		t.Fatalf("最近一次应 成功/curHour+20/250ms，得到 status=%d ts=%d ms=%d", lastStatus, lastTS, lastMs)
+	}
+
+	// 空监控项：全零
+	if reqs, _, _, _, lastTS, _ := st.MonitorRecent(999); reqs != 0 || lastTS != 0 {
+		t.Fatalf("空监控项应全零，得到 reqs=%d lastTS=%d", reqs, lastTS)
+	}
+}
+
+func TestPruneProbes(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	now := time.Now().Unix()
+	insertProbeAt(t, st, 1, 1, 10, now-1*3600)   // 1h 前，保留
+	insertProbeAt(t, st, 1, 1, 10, now-47*3600)  // 47h 前，保留
+	insertProbeAt(t, st, 1, 1, 10, now-49*3600)  // 49h 前，删
+	insertProbeAt(t, st, 1, 1, 10, now-100*3600) // 100h 前，删
+
+	// keepHours<=0：不删
+	if n, _ := st.PruneProbes(0); n != 0 {
+		t.Fatalf("keep=0 应不删，实际 %d", n)
+	}
+	n, err := st.PruneProbes(48)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("应删 2 条(>48h)，实际 %d", n)
+	}
+
+	// ForgetProbes 清空该监控项
+	if err := st.ForgetProbes(1); err != nil {
+		t.Fatal(err)
+	}
+	if reqs, _, _, _, _, _ := st.MonitorRecent(1); reqs != 0 {
+		t.Fatalf("ForgetProbes 后应无记录，实际 %d", reqs)
 	}
 }

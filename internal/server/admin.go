@@ -3,7 +3,6 @@ package server
 import (
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -297,6 +296,10 @@ func (s *Server) adminUpstreamItem(w http.ResponseWriter, r *http.Request) {
 		s.testUpstreamChat(w, r, id)
 		return
 	}
+	if len(parts) == 2 && parts[1] == "monitors" && r.Method == http.MethodPost { // 批量建监控
+		s.batchCreateMonitors(w, r, id)
+		return
+	}
 	switch r.Method {
 	case http.MethodPut:
 		u, err := decodeUpstream(r)
@@ -335,39 +338,47 @@ func (s *Server) testUpstream(w http.ResponseWriter, r *http.Request, id int64) 
 		Models    []string `json:"models,omitempty"`
 		Error     string   `json:"error,omitempty"`
 	}
-	req, err := u.BuildRequest(http.MethodGet, "/v1/models", nil, http.Header{})
-	if err != nil {
-		writeJSON(w, result{Error: err.Error()})
-		return
-	}
 	start := time.Now()
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	models, status, err := u.FetchModels(10 * time.Second)
 	lat := time.Since(start).Milliseconds()
 	if err != nil {
-		writeJSON(w, result{LatencyMs: lat, Error: err.Error()})
+		writeJSON(w, result{Status: status, LatencyMs: lat, Error: err.Error()})
 		return
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode >= 400 {
-		writeJSON(w, result{Status: resp.StatusCode, LatencyMs: lat, Error: strings.TrimSpace(string(body))})
-		return
-	}
-	// 解析 OpenAI 风格 {"data":[{"id":...}]}
-	var parsed struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	json.Unmarshal(body, &parsed)
-	models := make([]string, 0, len(parsed.Data))
-	for _, m := range parsed.Data {
-		models = append(models, m.ID)
-	}
-	writeJSON(w, result{OK: true, Status: resp.StatusCode, LatencyMs: lat, Models: models})
+	writeJSON(w, result{OK: true, Status: status, LatencyMs: lat, Models: models})
 }
 
-// monitorDTO 监控项对外视图：配置字段 + 实时探测快照(展平)。
+// batchCreateMonitors 为某上游的一批模型批量建监控，已存在的跳过。
+// body: {models:[], stream, probe_text, max_tokens, interval_sec, path, enabled}
+func (s *Server) batchCreateMonitors(w http.ResponseWriter, r *http.Request, id int64) {
+	var in struct {
+		Models      []string `json:"models"`
+		Enabled     bool     `json:"enabled"`
+		Stream      bool     `json:"stream"`
+		ProbeText   string   `json:"probe_text"`
+		MaxTokens   int      `json:"max_tokens"`
+		IntervalSec int      `json:"interval_sec"`
+		Path        string   `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if len(in.Models) == 0 {
+		http.Error(w, "no models selected", 400)
+		return
+	}
+	tmpl := store.Monitor{
+		Enabled: in.Enabled, Stream: in.Stream, ProbeText: strings.TrimSpace(in.ProbeText),
+		MaxTokens: in.MaxTokens, IntervalSec: in.IntervalSec, Path: strings.TrimSpace(in.Path),
+	}
+	created, skipped, err := s.store.BatchCreateMonitors(id, in.Models, tmpl)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	writeJSON(w, map[string]int{"created": created, "skipped": skipped})
+}
 type monitorDTO struct {
 	ID           int64            `json:"id"`
 	UpstreamID   int64            `json:"upstream_id"`

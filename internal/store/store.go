@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"strings"
 	"time"
 
 	"github.com/mirainya/muxapi/internal/upstream"
@@ -139,7 +140,15 @@ CREATE TABLE IF NOT EXISTS logs (
 CREATE TABLE IF NOT EXISTS settings (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
-);`
+);
+CREATE TABLE IF NOT EXISTS probe_results (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	monitor_id INTEGER NOT NULL,
+	status     INTEGER NOT NULL,   -- 栅栏档位：1正常 2降级 3故障
+	latency_ms INTEGER NOT NULL,
+	created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_probe_mon_time ON probe_results(monitor_id, created_at);`
 
 // --- 上游全局池 ---
 
@@ -272,6 +281,49 @@ func (s *Store) CreateMonitor(m *Monitor) (int64, error) {
 	return res.LastInsertId()
 }
 
+// MonitoredModels 返回某上游已建监控的模型集合（用于批量建监控时去重）。
+func (s *Store) MonitoredModels(upstreamID int64) (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT model FROM monitors WHERE upstream_id=?`, upstreamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	set := make(map[string]bool)
+	for rows.Next() {
+		var m string
+		if err := rows.Scan(&m); err == nil {
+			set[m] = true
+		}
+	}
+	return set, rows.Err()
+}
+
+// BatchCreateMonitors 为某上游的一批模型批量建监控，已存在 (upstream,model) 的跳过。
+// tmpl 提供共享探测参数（model 字段被逐个模型覆盖）。返回 (created, skipped)。
+func (s *Store) BatchCreateMonitors(upstreamID int64, models []string, tmpl Monitor) (int, int, error) {
+	existing, err := s.MonitoredModels(upstreamID)
+	if err != nil {
+		return 0, 0, err
+	}
+	created, skipped := 0, 0
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if model == "" || existing[model] {
+			skipped++
+			continue
+		}
+		m := tmpl // 复制模板
+		m.UpstreamID = upstreamID
+		m.Model = model
+		if _, err := s.CreateMonitor(&m); err != nil {
+			return created, skipped, err
+		}
+		existing[model] = true // 防同批重复
+		created++
+	}
+	return created, skipped, nil
+}
+
 func (s *Store) UpdateMonitor(m *Monitor) error {
 	_, err := s.db.Exec(`UPDATE monitors SET upstream_id=?,model=?,name=?,enabled=?,stream=?,probe_text=?,max_tokens=?,interval_sec=?,path=? WHERE id=?`,
 		m.UpstreamID, m.Model, m.Name, m.Enabled, m.Stream, m.ProbeText, m.MaxTokens, m.IntervalSec, m.Path, m.ID)
@@ -372,6 +424,97 @@ func (s *Store) groupHourlyTrend(groupID int64) []HourPoint {
 		out[i] = p
 	}
 	return out
+}
+
+// --- 探测结果（监控看板按小时统计，落库持久化）---
+
+// InsertProbe 记录一次探测结果。status 为栅栏档位：1正常 2降级 3故障。
+func (s *Store) InsertProbe(monitorID int64, status int, latMs int64) error {
+	_, err := s.db.Exec(`INSERT INTO probe_results(monitor_id,status,latency_ms,created_at) VALUES(?,?,?,?)`,
+		monitorID, status, latMs, time.Now().Unix())
+	return err
+}
+
+// MonitorHourlyTrend 取某监控项近 24 小时、按小时分桶的探测成功率栅栏（24 格，旧→新）。
+// 与 groupHourlyTrend 同口径：succ=status=1 的次数；空桶补 status=0 灰格。
+func (s *Store) MonitorHourlyTrend(monitorID int64) []HourPoint {
+	const hours = 24
+	curHour := time.Now().Truncate(time.Hour)
+	start := curHour.Add(-time.Duration(hours-1) * time.Hour)
+	type agg struct{ total, succ int }
+	buckets := make(map[int64]*agg, hours)
+	rows, err := s.db.Query(`SELECT
+		(created_at/3600)*3600 AS hour, COUNT(*),
+		SUM(CASE WHEN status=1 THEN 1 ELSE 0 END)
+		FROM probe_results WHERE monitor_id=? AND created_at>=?
+		GROUP BY hour`, monitorID, start.Unix())
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var h int64
+			var total, succ int
+			if rows.Scan(&h, &total, &succ) == nil {
+				buckets[h] = &agg{total, succ}
+			}
+		}
+	}
+	out := make([]HourPoint, hours)
+	for i := 0; i < hours; i++ {
+		ts := start.Add(time.Duration(i) * time.Hour).Unix()
+		p := HourPoint{Ts: ts}
+		if a := buckets[ts]; a != nil && a.total > 0 {
+			p.Total = a.total
+			p.SuccRate = float64(a.succ) / float64(a.total)
+			switch {
+			case p.SuccRate >= 0.95:
+				p.Status = 1
+			case p.SuccRate >= 0.80:
+				p.Status = 2
+			default:
+				p.Status = 3
+			}
+		}
+		out[i] = p
+	}
+	return out
+}
+
+// MonitorRecent 近 24h 探测汇总 + 最近一行。
+// reqs/succ：总数与成功(status=1)数；avgMs：成功探测的平均延迟。
+// lastStatus/lastMs/lastTS：最近一次探测（决定当前 State）；无探测时 reqs=0。
+func (s *Store) MonitorRecent(monitorID int64) (reqs, succ int, avgMs, lastMs, lastTS int64, lastStatus int) {
+	since := time.Now().Add(-24 * time.Hour).Unix()
+	s.db.QueryRow(`SELECT
+		COUNT(*),
+		COALESCE(SUM(CASE WHEN status=1 THEN 1 ELSE 0 END),0),
+		COALESCE(CAST(ROUND(AVG(CASE WHEN status=1 THEN latency_ms END)) AS INTEGER),0)
+		FROM probe_results WHERE monitor_id=? AND created_at>=?`, monitorID, since).
+		Scan(&reqs, &succ, &avgMs)
+	// 最近一行不受 24h 窗口限制，保证刚重启也能显示上次状态
+	s.db.QueryRow(`SELECT status, latency_ms, created_at FROM probe_results
+		WHERE monitor_id=? ORDER BY id DESC LIMIT 1`, monitorID).
+		Scan(&lastStatus, &lastMs, &lastTS)
+	return
+}
+
+// PruneProbes 删除早于 keepHours 小时的探测行，返回删除数。keepHours<=0 关闭清理。
+func (s *Store) PruneProbes(keepHours int) (int64, error) {
+	if keepHours <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-time.Duration(keepHours) * time.Hour).Unix()
+	res, err := s.db.Exec(`DELETE FROM probe_results WHERE created_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// ForgetProbes 删除某监控项的全部探测记录（删监控项时清理）。
+func (s *Store) ForgetProbes(monitorID int64) error {
+	_, err := s.db.Exec(`DELETE FROM probe_results WHERE monitor_id=?`, monitorID)
+	return err
 }
 
 func (s *Store) CreateGroup(name, desc string) (int64, error) {
