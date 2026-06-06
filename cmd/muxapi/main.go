@@ -81,6 +81,22 @@ func main() {
 	monitorInterval := settingDuration("monitor_interval", 5*time.Minute)
 	probeModel := settingString("probe_model", "gpt-4o-mini")
 	probePath := settingString("probe_path", "/v1/chat/completions")
+	// 健康事件主动告警：熔断翻转时推送 Webhook（URL 空则关闭）。
+	// id→name 解析用现成 List()，解析不到回退 id 字符串。
+	upstreamName := func(id int64) string {
+		ups, _ := st.List()
+		for _, u := range ups {
+			if u.ID == id {
+				return u.Name
+			}
+		}
+		return ""
+	}
+	hm.SetAlerter(health.NewWebhookAlerter(
+		settingString("alert_webhook", ""),
+		settingDuration("alert_debounce", 60*time.Second),
+		upstreamName,
+	))
 	monProber := monitor.NewProber(mon, st, monitorInterval, probePath)
 	srv := server.New(fwd, cfg.AdminToken, st, hm, mon, monProber)
 

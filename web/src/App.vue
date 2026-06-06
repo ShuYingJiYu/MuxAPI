@@ -228,6 +228,12 @@ const probePathSource = ref('')
 const logRetention = ref('')           // 日志保留条数(页面可配)
 const effectiveLogRetention = ref('')
 const logRetentionSource = ref('')
+const alertWebhook = ref('')           // 告警 Webhook URL(空=关闭)
+const alertDebounce = ref('')          // 告警去抖窗口
+const effectiveAlertWebhook = ref('')
+const effectiveAlertDebounce = ref('')
+const alertWebhookSource = ref('')
+const alertDebounceSource = ref('')
 const apiBase = location.origin    // 当前访问地址，用于展示客户端接入端点
 const settingsSaved = ref(false)
 function createKey() { dlg.type = 'keygen'; dlg.form = { name: '' } }
@@ -259,16 +265,22 @@ async function loadSettings() {
   effectiveProbeModel.value = s.effective_probe_model || ''
   effectiveProbePath.value = s.effective_probe_path || ''
   effectiveLogRetention.value = s.effective_log_retention || ''
+  effectiveAlertWebhook.value = s.effective_alert_webhook || ''
+  effectiveAlertDebounce.value = s.effective_alert_debounce || ''
   probeInterval.value = s.probe_interval || effectiveProbeInterval.value
   monitorInterval.value = s.monitor_interval || effectiveMonitorInterval.value
   probeModel.value = s.probe_model || effectiveProbeModel.value
   probePath.value = s.probe_path || effectiveProbePath.value
   logRetention.value = s.log_retention || effectiveLogRetention.value
+  alertWebhook.value = s.alert_webhook || ''
+  alertDebounce.value = s.alert_debounce || effectiveAlertDebounce.value
   probeSource.value = s.probe_source || ''
   monitorSource.value = s.monitor_source || ''
   probeModelSource.value = s.probe_model_source || ''
   probePathSource.value = s.probe_path_source || ''
   logRetentionSource.value = s.log_retention_source || ''
+  alertWebhookSource.value = s.alert_webhook_source || ''
+  alertDebounceSource.value = s.alert_debounce_source || ''
 }
 const sourceText = s => s === 'settings' ? '页面设置' : '默认值'
 function saveSettings() {
@@ -279,6 +291,8 @@ function saveSettings() {
       probe_model: probeModel.value,
       probe_path: probePath.value,
       log_retention: logRetention.value,
+      alert_webhook: alertWebhook.value,
+      alert_debounce: alertDebounce.value,
     })
     await loadSettings()
     settingsSaved.value = true
@@ -582,6 +596,25 @@ function logout() {
                 <div><span>模型</span><b>{{ effectiveProbeModel || '—' }}</b><em>{{ sourceText(probeModelSource) }}</em></div>
                 <div><span>路径</span><b>{{ effectiveProbePath || '—' }}</b><em>{{ sourceText(probePathSource) }}</em></div>
                 <div><span>日志</span><b>{{ effectiveLogRetention ? effectiveLogRetention + ' 条' : '—' }}</b><em>{{ sourceText(logRetentionSource) }}</em></div>
+              </div>
+              <div class="settings-actions">
+                <span class="save-status" :class="{ show: settingsSaved }">已保存 ✓</span>
+                <button class="btn" @click="saveSettings"><Icon name="check" :size="16" />保存</button>
+              </div>
+            </div>
+
+            <div class="card settings-card">
+              <div class="settings-title">
+                <h3>健康告警</h3>
+                <p>上游/模型熔断翻转时推送 Webhook，URL 留空则关闭。</p>
+              </div>
+              <div class="settings-fields">
+                <div class="field"><label>告警 Webhook</label><input v-model="alertWebhook" placeholder="https://... 留空关闭" /></div>
+                <div class="field"><label>去抖间隔</label><input v-model="alertDebounce" placeholder="60s / 5m" /></div>
+              </div>
+              <div class="settings-info">
+                <div><span>Webhook</span><b>{{ effectiveAlertWebhook || '已关闭' }}</b><em>{{ sourceText(alertWebhookSource) }}</em></div>
+                <div><span>去抖</span><b>{{ effectiveAlertDebounce || '—' }}</b><em>{{ sourceText(alertDebounceSource) }}</em></div>
               </div>
               <div class="settings-actions">
                 <span class="save-status" :class="{ show: settingsSaved }">已保存 ✓</span>

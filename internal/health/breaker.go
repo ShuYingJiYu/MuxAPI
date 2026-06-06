@@ -69,12 +69,29 @@ type breakerKey struct {
 	model      string
 }
 
+// AlertEvent 一次熔断状态翻转事件（载荷已在锁内拷出，可安全异步发送）。
+type AlertEvent struct {
+	UpstreamID int64  `json:"upstream_id"`
+	Model      string `json:"model"` // ""=上游级
+	FromState  string `json:"from_state"`
+	ToState    string `json:"to_state"`
+	Fails      int    `json:"fails"`
+	TS         int64  `json:"ts"` // unix 秒
+}
+
+// Alerter 告警钩子：drive 检测到翻转后，由调用方在释放 m.mu 后 go Notify。
+// 实现须自行保证非阻塞安全（内部带超时、失败不 panic）。
+type Alerter interface {
+	Notify(ev AlertEvent)
+}
+
 // Manager 健康管理：调度层只依赖 IsAvailable，转发层调 Report。
 type Manager struct {
 	mu            sync.Mutex
 	breakers      map[breakerKey]*breaker
 	failThreshold int
 	cooldown      time.Duration
+	alerter       Alerter // 可选告警钩子；nil 表示不告警
 }
 
 func New(failThreshold int, cooldown time.Duration) *Manager {
@@ -84,6 +101,9 @@ func New(failThreshold int, cooldown time.Duration) *Manager {
 		cooldown:      cooldown,
 	}
 }
+
+// SetAlerter 注入告警钩子（启动时一次性设置，运行期不再改）。
+func (m *Manager) SetAlerter(a Alerter) { m.alerter = a }
 
 func (m *Manager) get(k breakerKey) *breaker {
 	b := m.breakers[k]
@@ -123,7 +143,6 @@ func (m *Manager) IsAvailable(id int64, model string) bool {
 // 无论哪种，流量统计都累计到上游级键，供看板按上游聚合展示。
 func (m *Manager) Report(id int64, model string, ok bool, latencyMs int64) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	up := m.get(breakerKey{id, ""}) // 上游级：承载看板统计
 	up.reqs++
 	if !ok {
@@ -133,31 +152,67 @@ func (m *Manager) Report(id int64, model string, ok bool, latencyMs int64) {
 		up.latencyMs = latencyMs
 	}
 	// 状态机驱动到对应粒度的键：model=="" → 上游级；否则 → 模型级
-	m.drive(m.get(breakerKey{id, model}), ok, latencyMs)
+	b := m.get(breakerKey{id, model})
+	from, to := m.drive(b, ok, latencyMs)
+	ev, flipped := transitionEvent(id, model, from, to, b.fails)
+	m.mu.Unlock()
+	if flipped {
+		m.dispatch(ev)
+	}
 }
 
 // reportProbe 主动探测反馈：只驱动熔断状态机，不计入业务统计。
 func (m *Manager) reportProbe(id int64, model string, ok bool, latencyMs int64) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.drive(m.get(breakerKey{id, model}), ok, latencyMs)
+	b := m.get(breakerKey{id, model})
+	from, to := m.drive(b, ok, latencyMs)
+	ev, flipped := transitionEvent(id, model, from, to, b.fails)
+	m.mu.Unlock()
+	if flipped {
+		m.dispatch(ev)
+	}
 }
 
-// drive 熔断状态机（调用方须持有 m.mu）。
-func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) {
+// dispatch 异步派发告警：drive 持锁、此处已释放锁，仍 go 出去防 webhook 慢阻塞调用方。
+func (m *Manager) dispatch(ev AlertEvent) {
+	if m.alerter == nil {
+		return
+	}
+	go m.alerter.Notify(ev)
+}
+
+// transitionEvent 仅在「真正翻转」时构造事件：
+// Closed→Open=熔断、(Open|HalfOpen)→Closed=恢复；HalfOpen 中间态与同态不发。
+// 载荷字段均为值拷贝，可安全带出锁外异步发送。
+func transitionEvent(id int64, model string, from, to State, fails int) (AlertEvent, bool) {
+	flip := (from == Closed && to == Open) || (from != Closed && to == Closed)
+	if !flip {
+		return AlertEvent{}, false
+	}
+	return AlertEvent{
+		UpstreamID: id, Model: model,
+		FromState: from.String(), ToState: to.String(),
+		Fails: fails, TS: time.Now().Unix(),
+	}, true
+}
+
+// drive 熔断状态机（调用方须持有 m.mu）。返回 (旧状态, 新状态) 供调用方判翻转。
+func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) (from, to State) {
+	from = b.state
 	if ok {
 		b.fails = 0
 		b.state = Closed
 		if latencyMs > 0 {
 			b.latencyMs = latencyMs
 		}
-		return
+		return from, b.state
 	}
 	b.fails++
 	if b.fails >= m.failThreshold || b.state == HalfOpen {
 		b.state = Open
 		b.openUntil = time.Now().Add(m.cooldown)
 	}
+	return from, b.state
 }
 
 // Snapshot 健康看板用：返回各上游状态快照。
