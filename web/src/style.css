@@ -162,6 +162,15 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .state-badge.open { background: #fef2f2; color: #b91c1c; }
 .state-badge.open::before { background: var(--red); }
 
+/* 模型级健康徽章：state-badge 下方的紧凑小点组，复用同一套配色档 */
+.model-dots { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.model-dot { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--g600); background: var(--g100); padding: 1px 7px; border-radius: 999px; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-dot::before { content: ''; width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0; background: var(--g300); }
+.model-dot.closed::before { background: var(--green); }
+.model-dot.half::before { background: var(--amber); }
+.model-dot.open::before { background: var(--red); }
+.model-dot.nodata::before { background: var(--g300); }
+
 .hint { color: var(--g500); font-size: 13px; margin: 14px 0; }
 
 /* Dialog */

@@ -1,6 +1,7 @@
 package health
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -277,6 +278,38 @@ func (m *Manager) Snapshot(id int64) Snapshot {
 		sn.AvgLatMs = b.totLatency / succ
 	}
 	return sn
+}
+
+// ModelHealth 模型级健康精简状态（看板按上游展开模型徽章用，不含趋势数组省带宽）。
+type ModelHealth struct {
+	Model     string `json:"model"`      // 模型名
+	State     string `json:"state"`      // CLOSED 正常 / OPEN 熔断 / HALF_OPEN 半开
+	Fails     int    `json:"fails"`      // 当前连续失败数
+	LatencyMs int64  `json:"latency_ms"` // 最近一次延迟(ms)
+	LastProbe int64  `json:"last_probe"` // 最后探测 unix 秒，0=从未探测
+}
+
+// ModelStates 返回该上游下所有模型级(model!="")键的精简状态，按模型名排序输出稳定。
+// 只读：持锁拷贝返回，避免外部读到并发改的内部状态。上游无模型级键时返回空切片。
+func (m *Manager) ModelStates(id int64) []ModelHealth {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]ModelHealth, 0)
+	for k, b := range m.breakers {
+		if k.upstreamID != id || k.model == "" {
+			continue
+		}
+		var lastProbe int64
+		if !b.lastProbe.IsZero() {
+			lastProbe = b.lastProbe.Unix()
+		}
+		out = append(out, ModelHealth{
+			Model: k.model, State: b.state.String(), Fails: b.fails,
+			LatencyMs: b.latencyMs, LastProbe: lastProbe,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Model < out[j].Model })
+	return out
 }
 
 func (m *Manager) markProbe(id int64, model string) {

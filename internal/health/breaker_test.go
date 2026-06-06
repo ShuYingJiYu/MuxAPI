@@ -242,3 +242,42 @@ func TestLatencyEWMAFallback(t *testing.T) {
 		t.Fatalf("模型级无数据应回退上游级 80，实际 %d", e)
 	}
 }
+
+// ModelStates：只返回模型级(model!="")键、按模型名排序稳定、空上游返回空切片。
+func TestModelStates(t *testing.T) {
+	m := New(1, time.Minute) // 一次失败即熔断
+	const id = int64(20)
+
+	// 上游级键(model="")不应出现在结果里
+	m.Report(id, "", true, 50)
+	// modelB 成功一次（CLOSED，延迟 120）
+	m.Report(id, "modelB", true, 120)
+	// modelA 失败一次（阈值 1 → OPEN，fails=1）
+	m.Report(id, "modelA", false, 0)
+	// modelC 探测一次（标记 lastProbe）
+	m.markProbe(id, "modelC")
+
+	got := m.ModelStates(id)
+	if len(got) != 3 {
+		t.Fatalf("应有 3 个模型级键(上游级不计)，实际 %d：%+v", len(got), got)
+	}
+	// 排序稳定：A < B < C
+	if got[0].Model != "modelA" || got[1].Model != "modelB" || got[2].Model != "modelC" {
+		t.Fatalf("应按模型名排序 A/B/C，实际 %s/%s/%s", got[0].Model, got[1].Model, got[2].Model)
+	}
+	// 各状态正确
+	if got[0].State != "OPEN" || got[0].Fails != 1 {
+		t.Fatalf("modelA 应 OPEN fails=1，实际 %+v", got[0])
+	}
+	if got[1].State != "CLOSED" || got[1].LatencyMs != 120 {
+		t.Fatalf("modelB 应 CLOSED 延迟 120，实际 %+v", got[1])
+	}
+	if got[2].LastProbe == 0 {
+		t.Fatalf("modelC 应有探测时间戳，实际 %+v", got[2])
+	}
+
+	// 空上游：返回空切片（非 nil 误用也允许，len 为 0 即可）
+	if z := m.ModelStates(999); len(z) != 0 {
+		t.Fatalf("空上游应返回空，实际 %+v", z)
+	}
+}

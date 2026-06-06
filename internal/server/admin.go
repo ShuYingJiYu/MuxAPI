@@ -166,6 +166,30 @@ func toHealthView(sn health.Snapshot) healthView {
 	}
 }
 
+// modelHealthView 模型级健康精简视图（上游/成员列表展开模型徽章用）。
+type modelHealthView struct {
+	Model     string `json:"model"`
+	State     string `json:"state"`
+	Fails     int    `json:"fails"`
+	LatencyMs int64  `json:"latency_ms"`
+	LastProbe int64  `json:"last_probe"`
+}
+
+// toModelHealthViews 把模型级状态拷成对外视图；无模型级键时返回 nil（前端据此不渲染该区块）。
+func toModelHealthViews(ms []health.ModelHealth) []modelHealthView {
+	if len(ms) == 0 {
+		return nil
+	}
+	out := make([]modelHealthView, 0, len(ms))
+	for _, mh := range ms {
+		out = append(out, modelHealthView{
+			Model: mh.Model, State: mh.State, Fails: mh.Fails,
+			LatencyMs: mh.LatencyMs, LastProbe: mh.LastProbe,
+		})
+	}
+	return out
+}
+
 // effectivePriority 返回分组「生效层」的优先级值。
 // 生效层 = enabled 且未熔断(CLOSED/HALF_OPEN 都算可用，与调度 IsAvailable 一致)中优先级最小的那层。
 func effectivePriority(ms []*store.Member, state func(int64) string) (int, bool) {
@@ -184,8 +208,9 @@ func effectivePriority(ms []*store.Member, state func(int64) string) (int, bool)
 // memberOut 组成员 + 运行时健康 + 是否生效层。
 type memberOut struct {
 	*store.Member
-	Health    healthView `json:"health"`
-	Effective bool       `json:"effective"`
+	Health      healthView        `json:"health"`
+	ModelHealth []modelHealthView `json:"model_health,omitempty"` // 该上游模型级健康（仅 GET 填充，无则省略）
+	Effective   bool              `json:"effective"`
 }
 
 // groupRuntime 分组运行时概览：生效渠道名 + 各健康档计数（只统计 enabled 成员）。
@@ -238,14 +263,15 @@ func (s *Server) computeGroupRuntime(gid int64) groupRuntime {
 
 // upstreamDTO 对外视图：api_key 脱敏，不回显完整凭证。
 type upstreamDTO struct {
-	ID      int64      `json:"id"`
-	Name    string     `json:"name"`
-	BaseURL string     `json:"base_url"`
-	Proxy   string     `json:"proxy"`
-	APIKey  string     `json:"api_key,omitempty"` // 输入用；输出时脱敏到 masked
-	Masked  string     `json:"masked,omitempty"`
-	Enabled bool       `json:"enabled"`
-	Health  healthView `json:"health"` // 运行时健康（仅 GET 列表填充）
+	ID          int64             `json:"id"`
+	Name        string            `json:"name"`
+	BaseURL     string            `json:"base_url"`
+	Proxy       string            `json:"proxy"`
+	APIKey      string            `json:"api_key,omitempty"` // 输入用；输出时脱敏到 masked
+	Masked      string            `json:"masked,omitempty"`
+	Enabled     bool              `json:"enabled"`
+	Health      healthView        `json:"health"`                 // 运行时健康（仅 GET 列表填充）
+	ModelHealth []modelHealthView `json:"model_health,omitempty"` // 模型级健康（仅 GET 列表填充，无则省略）
 }
 
 func mask(key string) string {
@@ -268,7 +294,8 @@ func (s *Server) adminUpstreams(w http.ResponseWriter, r *http.Request) {
 			out = append(out, upstreamDTO{
 				ID: u.ID, Name: u.Name, BaseURL: u.BaseURL, Proxy: u.Proxy,
 				Masked: mask(u.APIKey), Enabled: u.Enabled,
-				Health: toHealthView(s.health.Snapshot(u.ID)),
+				Health:      toHealthView(s.health.Snapshot(u.ID)),
+				ModelHealth: toModelHealthViews(s.health.ModelStates(u.ID)),
 			})
 		}
 		writeJSON(w, out)
@@ -657,9 +684,10 @@ func (s *Server) adminGroupUpstreams(w http.ResponseWriter, r *http.Request, gid
 		for _, m := range ms {
 			sn := snaps[m.UpstreamID]
 			out = append(out, memberOut{
-				Member:    m,
-				Health:    toHealthView(sn),
-				Effective: hasEff && m.Enabled && m.GroupEnabled && m.Priority == best && sn.State != "OPEN",
+				Member:      m,
+				Health:      toHealthView(sn),
+				ModelHealth: toModelHealthViews(s.health.ModelStates(m.UpstreamID)),
+				Effective:   hasEff && m.Enabled && m.GroupEnabled && m.Priority == best && sn.State != "OPEN",
 			})
 		}
 		writeJSON(w, out)

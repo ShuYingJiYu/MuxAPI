@@ -310,6 +310,9 @@ const rtLabel = h => rtUnprobed(h) ? '待探测' : ({ CLOSED: '正常', HALF_OPE
 const rtClass = h => rtUnprobed(h) ? 'nodata' : ({ CLOSED: 'closed', HALF_OPEN: 'half', OPEN: 'open' }[h?.state] || 'nodata')
 const rtRate = h => (h && h.reqs) ? (h.succ_rate * 100).toFixed(0) + '%' : '—'
 
+// 模型级徽章：复用 rtClass 的配色档（closed/half/open/nodata），未探测过显示灰点。
+const mhClass = mh => (!mh || (mh.state === 'CLOSED' && !mh.last_probe)) ? 'nodata' : ({ CLOSED: 'closed', HALF_OPEN: 'half', OPEN: 'open' }[mh.state] || 'nodata')
+
 // 分组卡片：生效渠道文本 + 健康概览文本
 const effText = rt => (rt && rt.effective && rt.effective.length) ? rt.effective.join(' / ') : '无可用'
 const healthSummary = rt => {
@@ -461,7 +464,12 @@ function logout() {
                   <td class="cell-url">{{ m.base_url }}</td>
                   <td>{{ m.priority }}</td>
                   <td>{{ m.weight }}</td>
-                  <td><span class="state-badge" :class="rtClass(m.health)">{{ m.enabled && m.group_enabled ? rtLabel(m.health) : '已停用' }}</span></td>
+                  <td>
+                    <span class="state-badge" :class="rtClass(m.health)">{{ m.enabled && m.group_enabled ? rtLabel(m.health) : '已停用' }}</span>
+                    <div v-if="m.model_health && m.model_health.length" class="model-dots">
+                      <span v-for="mh in m.model_health" :key="mh.model" class="model-dot" :class="mhClass(mh)" :title="mh.model + ' · ' + rtLabel(mh)">{{ mh.model }}</span>
+                    </div>
+                  </td>
                   <td>{{ rtRate(m.health) }}</td>
                   <td>{{ m.health && m.health.avg_lat_ms ? m.health.avg_lat_ms + 'ms' : '—' }}</td>
                   <td>
@@ -517,7 +525,12 @@ function logout() {
                   <td class="cell-name">{{ u.name }}</td>
                   <td class="cell-url">{{ u.base_url }}</td>
                   <td><code>{{ u.masked }}</code></td>
-                  <td><span class="state-badge" :class="rtClass(u.health)">{{ u.enabled ? rtLabel(u.health) : '已停用' }}</span></td>
+                  <td>
+                    <span class="state-badge" :class="rtClass(u.health)">{{ u.enabled ? rtLabel(u.health) : '已停用' }}</span>
+                    <div v-if="u.model_health && u.model_health.length" class="model-dots">
+                      <span v-for="mh in u.model_health" :key="mh.model" class="model-dot" :class="mhClass(mh)" :title="mh.model + ' · ' + rtLabel(mh)">{{ mh.model }}</span>
+                    </div>
+                  </td>
                   <td>{{ rtRate(u.health) }}</td>
                   <td><span class="tag" :class="u.enabled ? 'on' : 'off'">{{ u.enabled ? '启用' : '停用' }}</span></td>
                   <td>
