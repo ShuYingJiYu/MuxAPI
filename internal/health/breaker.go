@@ -197,6 +197,15 @@ func (m *Manager) reportProbe(id int64, model string, ok bool, latencyMs int64) 
 	}
 }
 
+// ObserveProbe 供外部探测器(monitor)反馈一次探测结果：标记探测时刻 + 驱动熔断状态机，
+// 不计入业务流量统计。是 markProbe+reportProbe 的导出合并版——探测系统统一后，
+// monitor 探测器是唯一主动探测源，一次探测既记看板(Record)又驱动熔断(本方法)。
+// scope 由调用方按熔断器口径决定：凭证类(401/402/403)传 model="" 熔整上游，其余传具体 model。
+func (m *Manager) ObserveProbe(id int64, model string, ok bool, latencyMs int64) {
+	m.markProbe(id, model)
+	m.reportProbe(id, model, ok, latencyMs)
+}
+
 // dispatch 异步派发告警：drive 持锁、此处已释放锁，仍 go 出去防 webhook 慢阻塞调用方。
 func (m *Manager) dispatch(ev AlertEvent) {
 	if m.alerter == nil {

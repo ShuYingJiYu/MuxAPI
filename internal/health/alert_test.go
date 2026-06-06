@@ -167,3 +167,15 @@ func itoa(n int64) string {
 	}
 	return string(b)
 }
+
+// waitFor 轮询等待 cond 成立或超时（探测/告警类异步断言用）。
+func waitFor(cond func() bool, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return cond()
+}

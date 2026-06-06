@@ -213,17 +213,11 @@ function toggleMember(m) {
 // 密钥
 const newKey = ref('')   // 生成后明文展示一次
 const copied = ref(0)    // 刚点击复制的密钥 id（短暂提示用）
-const probeInterval = ref('')      // 路由探测间隔(页面可配)
-const monitorInterval = ref('')    // 看板探测间隔(页面可配)
-const probeModel = ref('')
+const monitorInterval = ref('')    // 监控探测间隔(页面可配)
 const probePath = ref('')
-const effectiveProbeInterval = ref('')
 const effectiveMonitorInterval = ref('')
-const effectiveProbeModel = ref('')
 const effectiveProbePath = ref('')
-const probeSource = ref('')
 const monitorSource = ref('')
-const probeModelSource = ref('')
 const probePathSource = ref('')
 const logRetention = ref('')           // 日志保留条数(页面可配)
 const effectiveLogRetention = ref('')
@@ -260,23 +254,17 @@ function copyText(t, id) {
 }
 async function loadSettings() {
   const s = await api.getSettings()
-  effectiveProbeInterval.value = s.effective_probe_interval || ''
   effectiveMonitorInterval.value = s.effective_monitor_interval || ''
-  effectiveProbeModel.value = s.effective_probe_model || ''
   effectiveProbePath.value = s.effective_probe_path || ''
   effectiveLogRetention.value = s.effective_log_retention || ''
   effectiveAlertWebhook.value = s.effective_alert_webhook || ''
   effectiveAlertDebounce.value = s.effective_alert_debounce || ''
-  probeInterval.value = s.probe_interval || effectiveProbeInterval.value
   monitorInterval.value = s.monitor_interval || effectiveMonitorInterval.value
-  probeModel.value = s.probe_model || effectiveProbeModel.value
   probePath.value = s.probe_path || effectiveProbePath.value
   logRetention.value = s.log_retention || effectiveLogRetention.value
   alertWebhook.value = s.alert_webhook || ''
   alertDebounce.value = s.alert_debounce || effectiveAlertDebounce.value
-  probeSource.value = s.probe_source || ''
   monitorSource.value = s.monitor_source || ''
-  probeModelSource.value = s.probe_model_source || ''
   probePathSource.value = s.probe_path_source || ''
   logRetentionSource.value = s.log_retention_source || ''
   alertWebhookSource.value = s.alert_webhook_source || ''
@@ -286,9 +274,7 @@ const sourceText = s => s === 'settings' ? '页面设置' : '默认值'
 function saveSettings() {
   guard(async () => {
     await api.saveSettings({
-      probe_interval: probeInterval.value,
       monitor_interval: monitorInterval.value,
-      probe_model: probeModel.value,
       probe_path: probePath.value,
       log_retention: logRetention.value,
       alert_webhook: alertWebhook.value,
@@ -597,16 +583,12 @@ function logout() {
                 <p>探测参数保存到数据库，立即生效。</p>
               </div>
               <div class="settings-fields">
-                <div class="field"><label>路由探测间隔</label><input v-model="probeInterval" placeholder="30s / 2m / 1h" /></div>
-                <div class="field"><label>看板探测间隔</label><input v-model="monitorInterval" placeholder="5m / 1m" /></div>
-                <div class="field"><label>路由探测模型</label><input v-model="probeModel" placeholder="gpt-4o-mini" /></div>
+                <div class="field"><label>探测间隔</label><input v-model="monitorInterval" placeholder="5m / 1m" /></div>
                 <div class="field"><label>探测路径</label><input v-model="probePath" placeholder="/v1/chat/completions" /></div>
                 <div class="field"><label>日志保留条数</label><input v-model="logRetention" type="number" min="100" placeholder="10000" /></div>
               </div>
               <div class="settings-info">
-                <div><span>路由</span><b>{{ effectiveProbeInterval || '—' }}</b><em>{{ sourceText(probeSource) }}</em></div>
-                <div><span>看板</span><b>{{ effectiveMonitorInterval || '—' }}</b><em>{{ sourceText(monitorSource) }}</em></div>
-                <div><span>模型</span><b>{{ effectiveProbeModel || '—' }}</b><em>{{ sourceText(probeModelSource) }}</em></div>
+                <div><span>探测</span><b>{{ effectiveMonitorInterval || '—' }}</b><em>{{ sourceText(monitorSource) }}</em></div>
                 <div><span>路径</span><b>{{ effectiveProbePath || '—' }}</b><em>{{ sourceText(probePathSource) }}</em></div>
                 <div><span>日志</span><b>{{ effectiveLogRetention ? effectiveLogRetention + ' 条' : '—' }}</b><em>{{ sourceText(logRetentionSource) }}</em></div>
               </div>

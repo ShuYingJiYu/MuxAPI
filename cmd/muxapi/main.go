@@ -42,11 +42,6 @@ func main() {
 		}
 		return ups
 	}
-	// 探测用：全部上游（探测是上游级，与分组无关）
-	listAll := func() []*upstream.Upstream {
-		ups, _ := st.List()
-		return ups
-	}
 
 	// 组装四层
 	hm := health.New(cfg.FailThreshold, cfg.Cooldown)
@@ -77,9 +72,7 @@ func main() {
 			return def
 		}
 	}
-	probeInterval := settingDuration("probe_interval", 15*time.Second)
 	monitorInterval := settingDuration("monitor_interval", 5*time.Minute)
-	probeModel := settingString("probe_model", "gpt-4o-mini")
 	probePath := settingString("probe_path", "/v1/chat/completions")
 	// 健康事件主动告警：熔断翻转时推送 Webhook（URL 空则关闭）。
 	// id→name 解析用现成 List()，解析不到回退 id 字符串。
@@ -97,15 +90,15 @@ func main() {
 		settingDuration("alert_debounce", 60*time.Second),
 		upstreamName,
 	))
-	monProber := monitor.NewProber(mon, st, monitorInterval, probePath)
+	// 探测系统统一：monitor 探测器是唯一主动探测源，注入 hm 后一次探测双写
+	//（看板统计 + 路由熔断器）。原 health.Prober 已废弃。
+	monProber := monitor.NewProber(mon, st, hm, monitorInterval, probePath)
 	srv := server.New(fwd, cfg.AdminToken, st, hm, mon, monProber)
 
 	// 收到 SIGINT/SIGTERM 时取消：停探测并触发优雅关闭
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	// 路由用：上游级主动探测，驱动熔断器（间隔页面可配，缺省回退 config）
-	go health.NewProber(hm, listAll, probeInterval, probeModel, probePath).Run(ctx)
-	// 看板用：监控项级主动探测，记录成功率/延迟/趋势
+	// 监控项级主动探测：记看板(成功率/延迟/趋势) + 驱动路由熔断器。
 	go monProber.Run(ctx)
 	// 日志清理：按条数保留最新 N 条，定时裁剪防止 logs 表无限增长（页面可配，缺省 1 万条）。
 	logRetention := settingInt("log_retention", 10000)
