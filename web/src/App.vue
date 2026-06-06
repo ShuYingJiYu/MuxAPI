@@ -20,6 +20,30 @@ async function loadGroups() { groups.value = (await api.groups()) || [] }
 async function loadUpstreams() { upstreams.value = (await api.upstreams()) || [] }
 async function loadMonitors() { monitors.value = (await api.monitors()) || [] }
 
+// —— 监控卡片拖拽排序（仅监控管理页）——
+const dragId = ref(null)   // 正在拖的监控 id
+const dragOverId = ref(null)
+function onDragStart(m, e) {
+  dragId.value = m.id
+  e.dataTransfer.effectAllowed = 'move'
+}
+function onDragOver(m, e) {
+  e.preventDefault()
+  if (m.id !== dragId.value) dragOverId.value = m.id
+}
+function onDrop(target) {
+  const from = monitors.value.findIndex(x => x.id === dragId.value)
+  const to = monitors.value.findIndex(x => x.id === target.id)
+  if (from < 0 || to < 0 || from === to) { dragId.value = dragOverId.value = null; return }
+  const arr = monitors.value.slice()
+  const [moved] = arr.splice(from, 1)
+  arr.splice(to, 0, moved)
+  monitors.value = arr // 乐观更新
+  dragId.value = dragOverId.value = null
+  guard(() => api.reorderMonitors(arr.map(x => x.id))) // 持久化，失败下次轮询会校正
+}
+function onDragEnd() { dragId.value = dragOverId.value = null }
+
 // 看板汇总：监控项可用性概览（顶部状态条用）
 const summary = computed(() => {
   const ms = monitors.value.filter(m => m.enabled)
@@ -130,7 +154,7 @@ onMounted(() => {
 let monTimer = null
 function startMonPoll() {
   stopMonPoll()
-  monTimer = setInterval(() => { loadMonitors().catch(() => {}) }, 60000)
+  monTimer = setInterval(() => { if (!dragId.value) loadMonitors().catch(() => {}) }, 60000)
 }
 function stopMonPoll() { if (monTimer) { clearInterval(monTimer); monTimer = null } }
 
@@ -701,8 +725,13 @@ function logout() {
 
           <!-- 监控项卡片网格 -->
           <div class="cards cards-sm">
-            <div class="card mon-card" v-for="m in monitors" :key="m.id" :class="{ disabled: !m.enabled }">
+            <div class="card mon-card" v-for="m in monitors" :key="m.id"
+              :class="{ disabled: !m.enabled, dragging: dragId === m.id, dragover: dragOverId === m.id }"
+              draggable="true"
+              @dragstart="onDragStart(m, $event)" @dragover="onDragOver(m, $event)"
+              @drop="onDrop(m)" @dragend="onDragEnd">
               <div class="mon-head">
+                <span class="mon-grip" title="拖拽调整顺序"><Icon name="grip" :size="16" /></span>
                 <span class="mon-avatar" :class="dotClass(m.snapshot.state)">{{ initial(m) }}</span>
                 <div class="mon-id">
                   <span class="mon-name">{{ monTitle(m) }}</span>

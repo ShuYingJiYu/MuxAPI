@@ -446,6 +446,10 @@ func (s *Server) adminMonitors(w http.ResponseWriter, r *http.Request) {
 func (s *Server) adminMonitorItem(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/admin/monitors/")
 	parts := strings.Split(rest, "/")
+	if parts[0] == "reorder" && r.Method == http.MethodPost { // 拖拽保存顺序
+		s.reorderMonitors(w, r)
+		return
+	}
 	id, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
 		http.Error(w, "bad id", 400)
@@ -478,6 +482,22 @@ func (s *Server) adminMonitorItem(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", 405)
 	}
+}
+
+// reorderMonitors 持久化拖拽后的卡片顺序。body: {ids:[3,1,2,...]}
+func (s *Server) reorderMonitors(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if err := s.store.ReorderMonitors(in.IDs); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.WriteHeader(204)
 }
 
 // probeMonitorNow 立即同步探测该监控项一次，返回最新快照。

@@ -157,6 +157,45 @@ func TestMonitorConfigFields(t *testing.T) {
 	}
 }
 
+func TestReorderMonitors(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	st.Create(&upstream.Upstream{Name: "A", BaseURL: "http://a", APIKey: "k", Enabled: true})
+	uid := func() int64 { ups, _ := st.List(); return ups[0].ID }()
+
+	// 建 3 个监控项，默认 sort=0 → 按 id 升序
+	var ids []int64
+	for _, m := range []string{"m1", "m2", "m3"} {
+		id, _ := st.CreateMonitor(&Monitor{UpstreamID: uid, Model: m, Enabled: true})
+		ids = append(ids, id)
+	}
+	list, _ := st.ListMonitors(false)
+	if len(list) != 3 || list[0].ID != ids[0] || list[2].ID != ids[2] {
+		t.Fatalf("默认应按 id 升序，得到 %v", modelOrder(list))
+	}
+
+	// 倒序保存
+	if err := st.ReorderMonitors([]int64{ids[2], ids[1], ids[0]}); err != nil {
+		t.Fatal(err)
+	}
+	list, _ = st.ListMonitors(false)
+	if list[0].ID != ids[2] || list[1].ID != ids[1] || list[2].ID != ids[0] {
+		t.Fatalf("应按保存顺序倒序，得到 %v", modelOrder(list))
+	}
+}
+
+func modelOrder(ms []*Monitor) []string {
+	out := make([]string, len(ms))
+	for i, m := range ms {
+		out[i] = m.Model
+	}
+	return out
+}
+
 func TestPruneLogs(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {

@@ -77,6 +77,7 @@ export const api = {
   createMonitor: m => req('POST', '/monitors', m),
   updateMonitor: (id, m) => req('PUT', '/monitors/' + id, m),
   deleteMonitor: id => req('DELETE', '/monitors/' + id),
+  reorderMonitors: ids => req('POST', '/monitors/reorder', { ids }), // 持久化拖拽顺序
   probeMonitor: id => req('POST', `/monitors/${id}/probe`), // 立即探测一次，返回最新快照
   // 运行时设置
   getSettings: () => req('GET', '/settings'),

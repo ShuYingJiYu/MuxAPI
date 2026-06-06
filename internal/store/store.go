@@ -86,6 +86,8 @@ func Open(path string) (*Store, error) {
 	db.Exec(`ALTER TABLE monitors ADD COLUMN max_tokens INTEGER NOT NULL DEFAULT 0`)
 	db.Exec(`ALTER TABLE monitors ADD COLUMN interval_sec INTEGER NOT NULL DEFAULT 0`)
 	db.Exec(`ALTER TABLE monitors ADD COLUMN path TEXT NOT NULL DEFAULT ''`)
+	// 迁移：旧库 monitors 补 sort 列（拖拽排序权重，0=未排过按 id）
+	db.Exec(`ALTER TABLE monitors ADD COLUMN sort INTEGER NOT NULL DEFAULT 0`)
 	return &Store{db: db}, nil
 }
 
@@ -128,7 +130,8 @@ CREATE TABLE IF NOT EXISTS monitors (
 	probe_text   TEXT NOT NULL DEFAULT '',
 	max_tokens   INTEGER NOT NULL DEFAULT 0,
 	interval_sec INTEGER NOT NULL DEFAULT 0,
-	path         TEXT NOT NULL DEFAULT ''
+	path         TEXT NOT NULL DEFAULT '',
+	sort         INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS logs (
 	id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -253,7 +256,7 @@ func (s *Store) ListMonitors(enabledOnly bool) ([]*Monitor, error) {
 	if enabledOnly {
 		q += ` WHERE m.enabled=1 AND u.enabled=1`
 	}
-	rows, err := s.db.Query(q + ` ORDER BY m.id`)
+	rows, err := s.db.Query(q + ` ORDER BY m.sort, m.id`)
 	if err != nil {
 		return nil, err
 	}
@@ -282,7 +285,21 @@ func (s *Store) CreateMonitor(m *Monitor) (int64, error) {
 	return res.LastInsertId()
 }
 
-// MonitoredModels 返回某上游已建监控的模型集合（用于批量建监控时去重）。
+// ReorderMonitors 按给定 id 顺序写入 sort 权重（从 1 起，下标即权重）。
+// 一次事务内全量更新；未出现在 ids 中的监控项保持原 sort，会排在已排项之后或之间。
+func (s *Store) ReorderMonitors(ids []int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for i, id := range ids {
+		if _, err := tx.Exec(`UPDATE monitors SET sort=? WHERE id=?`, i+1, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
 func (s *Store) MonitoredModels(upstreamID int64) (map[string]bool, error) {
 	rows, err := s.db.Query(`SELECT model FROM monitors WHERE upstream_id=?`, upstreamID)
 	if err != nil {

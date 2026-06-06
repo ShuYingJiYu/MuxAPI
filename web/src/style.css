@@ -328,6 +328,13 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 /* ===== 监控卡片 ===== */
 .mon-card { display: flex; flex-direction: column; }
 .mon-card.disabled { opacity: .6; }
+/* 拖拽排序 */
+.mon-card { transition: box-shadow .15s, transform .15s, opacity .15s; }
+.mon-card.dragging { opacity: .45; }
+.mon-card.dragover { box-shadow: 0 0 0 2px var(--p400, #d9a8d0); transform: translateY(-2px); }
+.mon-grip { display: grid; place-items: center; color: var(--g300); cursor: grab; margin: -2px -4px -2px -6px; flex-shrink: 0; }
+.mon-grip:active { cursor: grabbing; }
+.mon-card:hover .mon-grip { color: var(--g500); }
 .mon-head { display: flex; align-items: center; gap: 11px; }
 .mon-avatar { width: 38px; height: 38px; border-radius: 10px; display: grid; place-items: center; font-weight: 700; font-size: 15px; color: #fff; flex-shrink: 0; background: var(--g400); }
 .mon-avatar.closed { background: var(--green); } .mon-avatar.half { background: var(--amber); } .mon-avatar.open { background: var(--red); } .mon-avatar.nodata { background: var(--g300); }
