@@ -30,7 +30,8 @@ func (s State) String() string {
 type breaker struct {
 	state       State
 	fails       int       // 连续失败次数
-	openUntil   time.Time // 冷却到期时间
+	openUntil   time.Time // Open：冷却到期时间；HalfOpen：本次试探的超时时间（防闸门空占永久卡死）
+	probing     bool      // 半开单请求闸门：已放出一个试探请求、其余业务请求一律拦住，直到该试探有结果
 	lastProbe   time.Time
 	latencyMs   int64
 	latencyEWMA float64 // 成功请求延迟的指数加权移动平均(ms)，供 P2C 选路；0=尚无数据
@@ -121,28 +122,61 @@ func (m *Manager) get(k breakerKey) *breaker {
 	return b
 }
 
-// isOpen 判断单个键当前是否处于 Open（冷却中）；冷却到期自动转半开放行。
-// 调用方须持有 m.mu。
-func (m *Manager) isOpen(k breakerKey) bool {
-	b := m.get(k)
-	if b.state == Open && time.Now().After(b.openUntil) {
-		b.state = HalfOpen // 冷却结束，放一个请求/探测试探
+// canServe 只读判定：该键现在能否承接【一个】业务请求（调用方须持有 m.mu）。
+// 半开单请求闸门的「判定」阶段——不在此占用闸门（占用在 markServed），
+// 避免 scheduler 过滤多个候选时，对最终未被选中的上游误占名额。
+//
+//   - Closed：可服务。
+//   - Open 未到冷却：不可服务（死渠道不吃业务流量）。
+//   - Open 冷却到期：翻 HalfOpen 并清空闸门，准备放一个试探 → 可服务。
+//   - HalfOpen 且闸门空闲：可服务（这一个就是试探）。
+//   - HalfOpen 且闸门占用：默认不可服务；但若试探已超时(openUntil 已过)，
+//     说明上一个试探请求没回执(被 scheduler 落选/未发出)，强制释放闸门重新放行，
+//     防止业务永久不再试探、又恰好无探测覆盖的死渠道卡死。
+func (m *Manager) canServe(b *breaker) bool {
+	if b.state == Open {
+		if !time.Now().After(b.openUntil) {
+			return false
+		}
+		b.state = HalfOpen // 冷却结束，准备放一个试探
+		b.probing = false
 	}
-	return b.state == Open
+	if b.state == HalfOpen && b.probing {
+		return time.Now().After(b.openUntil) // 试探超时则重新放行，否则拦住
+	}
+	return true
 }
 
 // IsAvailable 调度层询问：该上游的该模型现在能用吗？
-// 双层判定：上游级(凭证类故障)与模型级任一 Open 即不可用。
+// 双层判定：上游级(凭证类故障)与模型级须都能服务。
+// 两阶段提交：先 canServe 全通过，再 markServed 占用半开闸门——
+// 避免「上游级放行但模型级拦截」时空占上游级的试探名额。
 func (m *Manager) IsAvailable(id int64, model string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.isOpen(breakerKey{id, ""}) { // 上游级：凭证/余额坏了，所有模型连坐
-		return false
+	bs := []*breaker{m.get(breakerKey{id, ""})} // 上游级：凭证/余额坏了，所有模型连坐
+	if model != "" {
+		bs = append(bs, m.get(breakerKey{id, model})) // 模型级：仅该模型局部故障
 	}
-	if model != "" && m.isOpen(breakerKey{id, model}) { // 模型级：仅该模型局部故障
-		return false
+	for _, b := range bs {
+		if !m.canServe(b) {
+			return false
+		}
 	}
+	m.markServed(bs)
 	return true
+}
+
+// markServed 占用闸门：对处于 HalfOpen 的键标记「试探在途」，并以 openUntil 记下试探超时
+// (= now + cooldown)，供 canServe 的空占自愈用。调用方须持有 m.mu。
+func (m *Manager) markServed(bs []*breaker) {
+	now := time.Now()
+	for _, b := range bs {
+		if b.state == HalfOpen && !b.probing {
+			b.probing = true
+			b.openUntil = now.Add(m.cooldown)
+		}
+	}
 }
 
 // LatencyEWMA 返回该 (上游,模型) 成功延迟的 EWMA(ms)，供调度层 P2C 比较。
@@ -230,8 +264,11 @@ func transitionEvent(id int64, model string, from, to State, fails int) (AlertEv
 }
 
 // drive 熔断状态机（调用方须持有 m.mu）。返回 (旧状态, 新状态) 供调用方判翻转。
+// 无论成功失败，只要有结果回来就复位半开闸门(probing=false)——本次试探已落地，
+// 闸门交还：成功则随 Closed 一并清空，失败则让下一个冷却周期能再放一个试探。
 func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) (from, to State) {
 	from = b.state
+	b.probing = false
 	if ok {
 		b.fails = 0
 		b.state = Closed

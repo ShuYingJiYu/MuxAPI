@@ -281,3 +281,54 @@ func TestModelStates(t *testing.T) {
 		t.Fatalf("空上游应返回空，实际 %+v", z)
 	}
 }
+
+// 半开单请求闸门：熔断冷却到期后，并发探测只放【一个】试探请求，其余一律不可用；
+// 直到该试探有结果(成功/失败)闸门才释放。防止死渠道半开期被一片业务流量涌入。
+func TestHalfOpenSingleProbeGate(t *testing.T) {
+	m := New(1, 30*time.Millisecond) // 一次失败即熔断，冷却 30ms
+	const id = int64(30)
+
+	m.Report(id, "", false, 0) // → OPEN
+	if m.IsAvailable(id, "") {
+		t.Fatal("熔断后应不可用")
+	}
+	time.Sleep(40 * time.Millisecond) // 冷却到期
+
+	// 第一次询问：放行(这一个就是试探)；闸门随即占用
+	if !m.IsAvailable(id, "") {
+		t.Fatal("冷却到期应放行一个试探")
+	}
+	if m.Snapshot(id).State != "HALF_OPEN" {
+		t.Fatal("放行后应处于半开")
+	}
+	// 第二、三次询问：闸门已占用、试探未回执 → 一律不可用
+	if m.IsAvailable(id, "") || m.IsAvailable(id, "") {
+		t.Fatal("半开闸门占用期间，后续请求应一律不可用（只放一个试探）")
+	}
+	// 试探失败回执 → 重新 OPEN，闸门释放（但冷却未到仍不可用）
+	m.Report(id, "", false, 0)
+	if m.IsAvailable(id, "") {
+		t.Fatal("试探失败应重新熔断")
+	}
+}
+
+// 探测是死渠道的恢复主路径：业务流量在 Open 期间打不进去(IsAvailable=false)，
+// 但探测器 ObserveProbe 不经 IsAvailable，探成功即把 Open/HalfOpen 翻回 Closed。
+func TestProbeRecoversDeadUpstream(t *testing.T) {
+	m := New(1, time.Hour) // 冷却极长：业务流量在冷却内永远试探不到
+	const id = int64(31)
+	const model = "gpt-5.4"
+
+	m.Report(id, model, false, 0) // → 模型级 OPEN
+	if m.IsAvailable(id, model) {
+		t.Fatal("熔断后业务流量应打不进（冷却极长，业务无法自行试探）")
+	}
+	// 探测成功 → 立即恢复 Closed，无需等冷却
+	m.ObserveProbe(id, model, true, 120)
+	if !m.IsAvailable(id, model) {
+		t.Fatal("探测成功应立即恢复可用（探测是恢复主路径，不受业务冷却限制）")
+	}
+	if s := m.ModelStates(id); len(s) != 1 || s[0].State != "CLOSED" {
+		t.Fatalf("探测恢复后该模型应 CLOSED，实际 %+v", s)
+	}
+}

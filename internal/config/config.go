@@ -47,7 +47,10 @@ func Load() *Config {
 		DBPath:        env("MUXAPI_DB", "muxapi.db"),
 		AdminToken:    env("MUXAPI_TOKEN", ""),
 		FailThreshold: envInt("MUXAPI_FAIL_THRESHOLD", 3),
-		Cooldown:      envDur("MUXAPI_COOLDOWN", 30*time.Second),
+		// 冷却时长：熔断后多久才允许半开放【一个】业务请求试探。
+		// 取 2min 而非更短——死渠道的恢复主路径是探测器(不受此冷却限制)，
+		// 业务半开只是无探测覆盖时的兜底，冷却越长越能减少业务流量去试探死渠道的频率。
+		Cooldown:      envDur("MUXAPI_COOLDOWN", 2*time.Minute),
 		MaxRetries:    envInt("MUXAPI_MAX_RETRIES", 3),
 	}
 }
