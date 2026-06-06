@@ -96,3 +96,57 @@ func TestSamePriorityWeighted(t *testing.T) {
 	}
 }
 
+// P2C：同层等权两候选，给 B 灌高延迟、A 灌低延迟，
+// 选路应统计上明显偏向低延迟的 A（P2C 是 2 选 1，偏向≠绝对，给宽阈值）。
+func TestP2CLatencyAware(t *testing.T) {
+	ups := []*upstream.Upstream{
+		{ID: 1, Name: "A", Priority: 1, Weight: 1, Enabled: true},
+		{ID: 2, Name: "B", Priority: 1, Weight: 1, Enabled: true},
+	}
+	hm := health.New(100, time.Hour) // 高阈值避免熔断
+	s := New(func(int64) []*upstream.Upstream { return ups }, hm)
+
+	// A 低延迟 50ms、B 高延迟 500ms，各喂多次让 EWMA 稳定
+	for i := 0; i < 20; i++ {
+		hm.Report(1, "", true, 50)
+		hm.Report(2, "", true, 500)
+	}
+
+	cnt := map[string]int{}
+	for i := 0; i < 4000; i++ {
+		u, _ := s.Pick(0, "")
+		cnt[u.Name]++
+	}
+	// 两候选等权时各以 1/2 概率成为抽样对，配对后必选 A：
+	// 仅当两次都抽到 B(约 1/4)才会得到 B。理论 A≈75%，给保守阈值。
+	ratioA := float64(cnt["A"]) / 4000.0
+	if ratioA < 0.6 {
+		t.Fatalf("P2C 应明显偏向低延迟的 A，实际 A=%.2f (A=%d B=%d)", ratioA, cnt["A"], cnt["B"])
+	}
+}
+
+// P2C 冷启动：新上游 EWMA 未知(0) 视为最优，确保能拿到流量探数据。
+func TestP2CColdStart(t *testing.T) {
+	ups := []*upstream.Upstream{
+		{ID: 1, Name: "Old", Priority: 1, Weight: 1, Enabled: true},
+		{ID: 2, Name: "New", Priority: 1, Weight: 1, Enabled: true},
+	}
+	hm := health.New(100, time.Hour)
+	s := New(func(int64) []*upstream.Upstream { return ups }, hm)
+
+	// Old 已有延迟数据，New 完全没有(EWMA=0)
+	for i := 0; i < 10; i++ {
+		hm.Report(1, "", true, 100)
+	}
+
+	cnt := map[string]int{}
+	for i := 0; i < 4000; i++ {
+		u, _ := s.Pick(0, "")
+		cnt[u.Name]++
+	}
+	// New 冷启动视为最优 → 配对后必胜，应明显多于 Old（理论 New≈75%）
+	if cnt["New"] < cnt["Old"] {
+		t.Fatalf("冷启动新上游应优先探数据，New 应多于 Old，实际 New=%d Old=%d", cnt["New"], cnt["Old"])
+	}
+}
+

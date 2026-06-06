@@ -12,6 +12,8 @@ var ErrNoUpstream = errors.New("no healthy upstream available")
 // Health 调度层只依赖这个接口（解耦：不关心熔断如何实现）
 type Health interface {
 	IsAvailable(id int64, model string) bool
+	// LatencyEWMA 返回该 (上游,模型) 成功延迟的 EWMA(ms)，供同层 P2C 选路比较；0=未知。
+	LatencyEWMA(id int64, model string) int64
 }
 
 // Scheduler 严格优先级调度 + 回切。
@@ -57,8 +59,50 @@ func (s *Scheduler) PickExcluding(groupID int64, model string, exclude map[int64
 			tier = append(tier, u)
 		}
 	}
-	// 3. 同层内按权重随机分流
-	return weightedPick(tier), nil
+	// 3. 同层内 P2C（power-of-two-choices）延迟感知选路
+	return s.pickP2C(tier, model), nil
+}
+
+// pickP2C 在同优先级层内做延迟感知选择：
+// 按权重随机抽 2 个不同候选，选 EWMA 延迟较低者；只剩 1 个则直选。
+//
+// 为何不「永远选最快」：单点贪心会把全部流量灌给当前最快的上游，
+// 反而把它压垮、延迟飙升后又集体倒戈下一个——羊群效应导致负载震荡。
+// P2C 只在「随机两个」里挑较优，天然分散负载、避免共振，是经典的负载均衡折中。
+//
+// 冷启动：EWMA==0 表示该上游尚无成功样本，视为「最优」（返回较小者时它必胜），
+// 主动给新上游放一点流量去探延迟数据，否则它永远抢不到样本、永远是 0。
+func (s *Scheduler) pickP2C(tier []*upstream.Upstream, model string) *upstream.Upstream {
+	if len(tier) == 1 {
+		return tier[0]
+	}
+	a := weightedPick(tier)
+	// 抽第二个，要求与 a 不同（最多重试几次，避免权重悬殊时死循环）
+	var b *upstream.Upstream
+	for i := 0; i < 4; i++ {
+		c := weightedPick(tier)
+		if c.ID != a.ID {
+			b = c
+			break
+		}
+	}
+	if b == nil { // 极端权重下没抽到不同的，退化为单选
+		return a
+	}
+	// EWMA==0(未知) 视为延迟极低 → 冷启动上游优先被选中探数据
+	la, lb := s.ewmaOrBest(a.ID, model), s.ewmaOrBest(b.ID, model)
+	if lb < la {
+		return b
+	}
+	return a
+}
+
+// ewmaOrBest 取延迟 EWMA；未知(0)映射为 -1，比任何真实延迟都小 → 冷启动视为最优。
+func (s *Scheduler) ewmaOrBest(id int64, model string) int64 {
+	if e := s.health.LatencyEWMA(id, model); e > 0 {
+		return e
+	}
+	return -1
 }
 
 func weightedPick(tier []*upstream.Upstream) *upstream.Upstream {

@@ -181,8 +181,7 @@ func TestUpstreamLevelEquivalence(t *testing.T) {
 }
 
 // 模型级失败的流量统计仍累计到上游级 Snapshot（看板按上游聚合，不漏计）。
-func TestModelFailCountsToUpstreamSnapshot(t *testing.T) {
-	m := New(100, time.Minute) // 高阈值避免熔断干扰
+func TestModelFailCountsToUpstreamSnapshot(t *testing.T) {	m := New(100, time.Minute) // 高阈值避免熔断干扰
 	const id = int64(3)
 	m.Report(id, "modelA", true, 100)
 	m.Report(id, "modelA", false, 0)
@@ -190,5 +189,56 @@ func TestModelFailCountsToUpstreamSnapshot(t *testing.T) {
 	s := m.Snapshot(id)
 	if s.Reqs != 3 || s.FailReqs != 1 {
 		t.Fatalf("上游级 Snapshot 应聚合所有模型流量，实际 reqs=%d fail=%d", s.Reqs, s.FailReqs)
+	}
+}
+
+// EWMA：首次直接赋值；后续按 α=0.3 平滑；失败不计入；新趋势能被逐步跟上。
+func TestLatencyEWMA(t *testing.T) {
+	m := New(100, time.Minute) // 高阈值避免熔断干扰
+	const id = int64(11)
+	const model = "m"
+
+	// 尚无数据 → 未知(0)
+	if e := m.LatencyEWMA(id, model); e != 0 {
+		t.Fatalf("无数据应返回 0，实际 %d", e)
+	}
+
+	// 首次成功 100ms → EWMA 直接赋值 100
+	m.Report(id, model, true, 100)
+	if e := m.LatencyEWMA(id, model); e != 100 {
+		t.Fatalf("首次应直接赋值 100，实际 %d", e)
+	}
+
+	// 第二次 200ms → 0.3*200 + 0.7*100 = 130
+	m.Report(id, model, true, 200)
+	if e := m.LatencyEWMA(id, model); e != 130 {
+		t.Fatalf("EWMA 应为 130，实际 %d", e)
+	}
+
+	// 失败请求不计入 EWMA（延迟无意义），应仍是 130
+	m.Report(id, model, false, 0)
+	if e := m.LatencyEWMA(id, model); e != 130 {
+		t.Fatalf("失败不应改变 EWMA，应仍 130，实际 %d", e)
+	}
+
+	// 持续灌入低延迟 10ms，EWMA 应逐步衰减贴近 10（验证能跟上新趋势）
+	for i := 0; i < 30; i++ {
+		m.Report(id, model, true, 10)
+	}
+	if e := m.LatencyEWMA(id, model); e > 15 {
+		t.Fatalf("持续低延迟后 EWMA 应衰减贴近 10，实际 %d", e)
+	}
+}
+
+// LatencyEWMA 回退：模型级无数据时回退上游级键。
+func TestLatencyEWMAFallback(t *testing.T) {
+	m := New(100, time.Minute)
+	const id = int64(12)
+
+	// 只喂上游级(model="")延迟
+	m.Report(id, "", true, 80)
+	// 查询某个从未上报过的模型 → 回退上游级 80
+	if e := m.LatencyEWMA(id, "neverSeen"); e != 80 {
+		t.Fatalf("模型级无数据应回退上游级 80，实际 %d", e)
 	}
 }

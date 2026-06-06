@@ -27,11 +27,12 @@ func (s State) String() string {
 
 // breaker 单个上游的熔断器（仅内存）
 type breaker struct {
-	state     State
-	fails     int       // 连续失败次数
-	openUntil time.Time // 冷却到期时间
-	lastProbe time.Time
-	latencyMs int64
+	state       State
+	fails       int       // 连续失败次数
+	openUntil   time.Time // 冷却到期时间
+	lastProbe   time.Time
+	latencyMs   int64
+	latencyEWMA float64 // 成功请求延迟的指数加权移动平均(ms)，供 P2C 选路；0=尚无数据
 	// 业务流量统计（仅转发层计入，探测不算；进程级、重启清零）
 	reqs       int64 // 总请求数
 	failReqs   int64 // 失败请求数
@@ -59,6 +60,11 @@ const (
 )
 
 const trendCap = 60 // 环形缓冲容量
+
+// ewmaAlpha EWMA 平滑系数：新样本权重 0.3、历史权重 0.7。
+// 取值越大越灵敏（更快跟上延迟变化、但易被偶发抖动带偏），越小越平滑（更稳、但反应慢）。
+// 0.3 是常见折中：约 3~4 个样本就能体现一次趋势变化，又能压住单次毛刺。
+const ewmaAlpha = 0.3
 
 // breakerKey 熔断键：(上游, 模型)。model=="" 表示「上游级」键——
 // 承载凭证/余额类(401/402/403)的整上游熔断，以及看板的上游级流量统计聚合。
@@ -138,6 +144,23 @@ func (m *Manager) IsAvailable(id int64, model string) bool {
 	return true
 }
 
+// LatencyEWMA 返回该 (上游,模型) 成功延迟的 EWMA(ms)，供调度层 P2C 比较。
+// 优先取模型级键（与第二步选路粒度一致）；该粒度尚无数据时回退上游级键。
+// 返回 0 表示「未知」——调度层据此给新上游探数据的机会（视为最优）。
+func (m *Manager) LatencyEWMA(id int64, model string) int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if model != "" {
+		if b := m.breakers[breakerKey{id, model}]; b != nil && b.latencyEWMA > 0 {
+			return int64(b.latencyEWMA)
+		}
+	}
+	if b := m.breakers[breakerKey{id, ""}]; b != nil {
+		return int64(b.latencyEWMA)
+	}
+	return 0
+}
+
 // Report 转发层反馈业务请求结果：驱动熔断状态机 + 计入流量统计。
 // model 为空时驱动上游级键（凭证类失败应熔断整上游）；非空时驱动该模型键。
 // 无论哪种，流量统计都累计到上游级键，供看板按上游聚合展示。
@@ -204,6 +227,12 @@ func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) (from, to State) {
 		b.state = Closed
 		if latencyMs > 0 {
 			b.latencyMs = latencyMs
+			// 仅成功请求计入 EWMA（失败延迟无意义）。首次直接赋值，避免被 0 拖低。
+			if b.latencyEWMA == 0 {
+				b.latencyEWMA = float64(latencyMs)
+			} else {
+				b.latencyEWMA = ewmaAlpha*float64(latencyMs) + (1-ewmaAlpha)*b.latencyEWMA
+			}
 		}
 		return from, b.state
 	}
