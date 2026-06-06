@@ -60,61 +60,87 @@ const (
 
 const trendCap = 60 // 环形缓冲容量
 
+// breakerKey 熔断键：(上游, 模型)。model=="" 表示「上游级」键——
+// 承载凭证/余额类(401/402/403)的整上游熔断，以及看板的上游级流量统计聚合。
+// model!="" 表示「模型级」键——承载 429/5xx 这类某上游某模型的局部故障，
+// 使「gpt-5.5 挂了」不再连累同上游的 claude。
+type breakerKey struct {
+	upstreamID int64
+	model      string
+}
+
 // Manager 健康管理：调度层只依赖 IsAvailable，转发层调 Report。
 type Manager struct {
 	mu            sync.Mutex
-	breakers      map[int64]*breaker
+	breakers      map[breakerKey]*breaker
 	failThreshold int
 	cooldown      time.Duration
 }
 
 func New(failThreshold int, cooldown time.Duration) *Manager {
 	return &Manager{
-		breakers:      make(map[int64]*breaker),
+		breakers:      make(map[breakerKey]*breaker),
 		failThreshold: failThreshold,
 		cooldown:      cooldown,
 	}
 }
 
-func (m *Manager) get(id int64) *breaker {
-	b := m.breakers[id]
+func (m *Manager) get(k breakerKey) *breaker {
+	b := m.breakers[k]
 	if b == nil {
 		b = &breaker{state: Closed}
-		m.breakers[id] = b
+		m.breakers[k] = b
 	}
 	return b
 }
 
-// IsAvailable 调度层询问：该上游现在能用吗？冷却到期自动转半开。
-func (m *Manager) IsAvailable(id int64) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	b := m.get(id)
+// isOpen 判断单个键当前是否处于 Open（冷却中）；冷却到期自动转半开放行。
+// 调用方须持有 m.mu。
+func (m *Manager) isOpen(k breakerKey) bool {
+	b := m.get(k)
 	if b.state == Open && time.Now().After(b.openUntil) {
 		b.state = HalfOpen // 冷却结束，放一个请求/探测试探
 	}
-	return b.state != Open
+	return b.state == Open
+}
+
+// IsAvailable 调度层询问：该上游的该模型现在能用吗？
+// 双层判定：上游级(凭证类故障)与模型级任一 Open 即不可用。
+func (m *Manager) IsAvailable(id int64, model string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.isOpen(breakerKey{id, ""}) { // 上游级：凭证/余额坏了，所有模型连坐
+		return false
+	}
+	if model != "" && m.isOpen(breakerKey{id, model}) { // 模型级：仅该模型局部故障
+		return false
+	}
+	return true
 }
 
 // Report 转发层反馈业务请求结果：驱动熔断状态机 + 计入流量统计。
-func (m *Manager) Report(id int64, ok bool, latencyMs int64) {
+// model 为空时驱动上游级键（凭证类失败应熔断整上游）；非空时驱动该模型键。
+// 无论哪种，流量统计都累计到上游级键，供看板按上游聚合展示。
+func (m *Manager) Report(id int64, model string, ok bool, latencyMs int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	b := m.get(id)
-	b.reqs++
+	up := m.get(breakerKey{id, ""}) // 上游级：承载看板统计
+	up.reqs++
 	if !ok {
-		b.failReqs++
+		up.failReqs++
 	} else if latencyMs > 0 {
-		b.totLatency += latencyMs
+		up.totLatency += latencyMs
+		up.latencyMs = latencyMs
 	}
-	m.drive(b, ok, latencyMs)
+	// 状态机驱动到对应粒度的键：model=="" → 上游级；否则 → 模型级
+	m.drive(m.get(breakerKey{id, model}), ok, latencyMs)
 }
 
 // reportProbe 主动探测反馈：只驱动熔断状态机，不计入业务统计。
-func (m *Manager) reportProbe(id int64, ok bool, latencyMs int64) {
+func (m *Manager) reportProbe(id int64, model string, ok bool, latencyMs int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.drive(m.get(id), ok, latencyMs)
+	m.drive(m.get(breakerKey{id, model}), ok, latencyMs)
 }
 
 // drive 熔断状态机（调用方须持有 m.mu）。
@@ -149,10 +175,11 @@ type Snapshot struct {
 	Trend    []TrendPoint // 趋势采样序列（旧→新）
 }
 
+// Snapshot 健康看板用：返回该上游的「上游级」键快照（按上游聚合，流量统计在此累计）。
 func (m *Manager) Snapshot(id int64) Snapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	b := m.get(id)
+	b := m.get(breakerKey{id, ""})
 	sn := Snapshot{
 		State: b.state.String(), Fails: b.fails, LatencyMs: b.latencyMs,
 		OpenUntil: b.openUntil, LastProbe: b.lastProbe,
@@ -168,9 +195,9 @@ func (m *Manager) Snapshot(id int64) Snapshot {
 	return sn
 }
 
-func (m *Manager) markProbe(id int64) {
+func (m *Manager) markProbe(id int64, model string) {
 	m.mu.Lock()
-	m.get(id).lastProbe = time.Now()
+	m.get(breakerKey{id, model}).lastProbe = time.Now()
 	m.mu.Unlock()
 }
 

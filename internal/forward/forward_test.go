@@ -102,8 +102,42 @@ func TestForwardSSEFailover(t *testing.T) {
 	if atomic.LoadInt32(&aHits) != 1 || atomic.LoadInt32(&bHits) != 1 {
 		t.Fatalf("A 应被试 1 次、B 1 次，实际 A=%d B=%d", aHits, bHits)
 	}
-	if !hm.IsAvailable(2) || hm.IsAvailable(1) {
+	if !hm.IsAvailable(2, "") || hm.IsAvailable(1, "") {
 		t.Fatal("失败后 A 应熔断、B 应可用")
+	}
+}
+
+// 验证按失败原因区分熔断范围：5xx 仅熔断 (上游,模型)，401 熔断整上游。
+func TestForwardFailScope(t *testing.T) {
+	// 503 上游：触发模型级熔断
+	srv503 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
+	defer srv503.Close()
+	ups := []*upstream.Upstream{{ID: 1, Name: "A", BaseURL: srv503.URL, APIKey: "k", Priority: 1, Enabled: true}}
+	hm := health.New(1, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, noopLogger{}, 0)
+
+	body := []byte(`{"model":"gpt-x","stream":false}`)
+	fwd.Forward(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body))), body, 0)
+	if hm.IsAvailable(1, "gpt-x") {
+		t.Fatal("503 应熔断 (A, gpt-x)")
+	}
+	if !hm.IsAvailable(1, "gpt-y") {
+		t.Fatal("503 只熔断 gpt-x，gpt-y 不应受影响 ← 模型级隔离")
+	}
+	if !hm.IsAvailable(1, "") {
+		t.Fatal("503 是模型级，上游级不应熔断")
+	}
+
+	// 401 上游：触发上游级熔断（所有模型连坐）
+	srv401 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(401) }))
+	defer srv401.Close()
+	ups2 := []*upstream.Upstream{{ID: 2, Name: "C", BaseURL: srv401.URL, APIKey: "k", Priority: 1, Enabled: true}}
+	hm2 := health.New(1, time.Hour)
+	fwd2 := New(scheduler.New(func(int64) []*upstream.Upstream { return ups2 }, hm2), hm2, noopLogger{}, 0)
+	body2 := []byte(`{"model":"gpt-x"}`)
+	fwd2.Forward(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body2))), body2, 0)
+	if hm2.IsAvailable(2, "anything") {
+		t.Fatal("401 应熔断整个上游，所有模型连坐")
 	}
 }
 

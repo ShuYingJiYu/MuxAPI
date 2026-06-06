@@ -56,6 +56,20 @@ func IsFailureStatus(code int) bool {
 	return false
 }
 
+// FailIsUpstreamLevel 判断「失败」是否属于上游级（应熔断整个上游、所有模型连坐），
+// 而非仅当前模型。仅 401/402/403 这类凭证/余额问题如此——它们与具体模型无关，
+// 是渠道本身坏了。其余失败（5xx 服务故障、429 限流、408 超时、网络错误）一律视为
+// 模型级局部故障，只熔断 (上游,模型)，避免单个模型抖动误伤整个上游的其他模型。
+func FailIsUpstreamLevel(code int) bool {
+	switch code {
+	case http.StatusUnauthorized, // 401
+		http.StatusPaymentRequired, // 402
+		http.StatusForbidden:       // 403
+		return true
+	}
+	return false
+}
+
 // BuildRequest 构建发往上游的请求：黑名单透传客户端请求头（保留 User-Agent/x-stainless-* 等），
 // 仅覆盖凭证为上游 key、重算 Content-Length。URL = TrimSuffix(base_url,"/") + 客户端原始路径(path)。
 func (u *Upstream) BuildRequest(method, path string, body io.Reader, clientHeader http.Header) (*http.Request, error) {

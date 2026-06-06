@@ -34,17 +34,17 @@ func TestProberDetectsDownAndRecover(t *testing.T) {
 
 	// 初始健康
 	time.Sleep(40 * time.Millisecond)
-	if !m.IsAvailable(1) {
+	if !m.IsAvailable(1, "claude-test") {
 		t.Fatal("探测应判定健康")
 	}
 	// 模拟挂掉 → 探测应发现并熔断
 	down.Store(true)
-	if !waitFor(func() bool { return !m.IsAvailable(1) }, 300*time.Millisecond) {
+	if !waitFor(func() bool { return !m.IsAvailable(1, "claude-test") }, 300*time.Millisecond) {
 		t.Fatal("挂掉后探测应发现并熔断")
 	}
 	// 模拟恢复 → 探测应发现并解熔断（自动回切的基础）
 	down.Store(false)
-	if !waitFor(func() bool { return m.IsAvailable(1) }, 300*time.Millisecond) {
+	if !waitFor(func() bool { return m.IsAvailable(1, "claude-test") }, 300*time.Millisecond) {
 		t.Fatal("恢复后探测应发现并解熔断 ← failback 基础")
 	}
 }

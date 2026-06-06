@@ -3,6 +3,7 @@ package forward
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -11,9 +12,9 @@ import (
 	"github.com/mirainya/muxapi/internal/upstream"
 )
 
-// Health 转发层反馈结果给健康层
+// Health 转发层反馈结果给健康层（model 为空时按上游级处理）
 type Health interface {
-	Report(id int64, ok bool, latencyMs int64)
+	Report(id int64, model string, ok bool, latencyMs int64)
 }
 
 // Logger 转发层记调用日志（status=HTTP码，网络失败为 0）
@@ -21,9 +22,9 @@ type Logger interface {
 	Log(groupID, upstreamID int64, status int, latencyMs int64)
 }
 
-// Picker 调度层在指定分组内选上游（exclude 为本次请求已试过、需跳过的上游）
+// Picker 调度层在指定分组内按模型选上游（exclude 为本次请求已试过、需跳过的上游）
 type Picker interface {
-	PickExcluding(groupID int64, exclude map[int64]bool) (*upstream.Upstream, error)
+	PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, error)
 }
 
 type Forwarder struct {
@@ -39,10 +40,11 @@ func New(p Picker, h Health, l Logger, maxRetries int) *Forwarder {
 
 // Forward 在指定分组内转发请求：失败则换上游重试（每次跳过本次已试过的，立即切换到下一优先级层）。
 func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte, groupID int64) {
+	model := parseModel(body) // 解析请求模型用于 (上游,模型) 级健康判定；解析失败为 "" 回退上游级
 	var lastErr error
 	tried := map[int64]bool{}
 	for attempt := 0; attempt <= f.maxRetries; attempt++ {
-		u, err := f.picker.PickExcluding(groupID, tried)
+		u, err := f.picker.PickExcluding(groupID, model, tried)
 		if err != nil {
 			break // 没有更多可用上游了
 		}
@@ -60,8 +62,8 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		client := &http.Client{Timeout: 0, Transport: tr}
 		start := time.Now()
 		resp, err := client.Do(req)
-		if err != nil {
-			f.health.Report(u.ID, false, 0)
+		if err != nil { // 网络错误：模型级失败（不连坐整上游）
+			f.health.Report(u.ID, model, false, 0)
 			f.logger.Log(groupID, u.ID, 0, 0)
 			lastErr = err
 			continue
@@ -69,14 +71,14 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		// 上游级失败(5xx/429/401/402/403/408)：反馈并切换下一个上游
 		if upstream.IsFailureStatus(resp.StatusCode) {
 			lat := time.Since(start).Milliseconds()
-			f.health.Report(u.ID, false, lat)
+			f.health.Report(u.ID, failScope(model, resp.StatusCode), false, lat)
 			f.logger.Log(groupID, u.ID, resp.StatusCode, lat)
 			resp.Body.Close()
 			continue
 		}
 		// 成功：反馈 + 透传响应
 		lat := time.Since(start).Milliseconds()
-		f.health.Report(u.ID, true, lat)
+		f.health.Report(u.ID, model, true, lat)
 		f.logger.Log(groupID, u.ID, resp.StatusCode, lat)
 		relayResponse(w, resp)
 		return
@@ -91,6 +93,25 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		return
 	}
 	http.Error(w, "all upstreams failed", http.StatusBadGateway)
+}
+
+// parseModel 从请求体浅解析 model 字段，用于 (上游,模型) 级健康判定。
+// 解析失败/缺失返回 ""，调用方据此回退到上游级（行为等价于改造前）。
+func parseModel(body []byte) string {
+	var m struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &m)
+	return m.Model
+}
+
+// failScope 按失败原因决定熔断范围：凭证/余额类(401/402/403)熔断整上游(返回"")，
+// 其余(5xx/429/408)仅熔断当前模型(返回 model)。见 upstream.FailIsUpstreamLevel。
+func failScope(model string, code int) string {
+	if upstream.FailIsUpstreamLevel(code) {
+		return ""
+	}
+	return model
 }
 
 // relayResponse 原样透传上游响应，流式则逐行 flush（照抄 sub2api 思路）。

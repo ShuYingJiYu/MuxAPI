@@ -55,11 +55,11 @@ func (p *Prober) buildBody(model, path string) []byte {
 }
 
 func (p *Prober) probe(ctx context.Context, u *upstream.Upstream) {
-	p.mgr.markProbe(u.ID)
 	model, path := p.model(), p.path()
+	p.mgr.markProbe(u.ID, model)
 	req, err := u.BuildRequest(http.MethodPost, path, bytes.NewReader(p.buildBody(model, path)), http.Header{})
 	if err != nil {
-		p.mgr.reportProbe(u.ID, false, 0)
+		p.mgr.reportProbe(u.ID, model, false, 0)
 		return
 	}
 	req = req.WithContext(ctx)
@@ -67,12 +67,17 @@ func (p *Prober) probe(ctx context.Context, u *upstream.Upstream) {
 	start := time.Now()
 	resp, err := client.Do(req)
 	latency := time.Since(start).Milliseconds()
-	if err != nil {
-		p.mgr.reportProbe(u.ID, false, 0)
+	if err != nil { // 网络错误：模型级（探测模型），不连坐整上游
+		p.mgr.reportProbe(u.ID, model, false, 0)
 		return
 	}
 	defer resp.Body.Close()
 	ok := !upstream.IsFailureStatus(resp.StatusCode)
-	p.mgr.reportProbe(u.ID, ok, latency)
-	slog.Debug("probe", "upstream", u.Name, "status", resp.StatusCode, "ok", ok, "ms", latency)
+	// 失败按原因定范围：凭证类(401/402/403)熔断整上游(model="")，其余仅探测模型。
+	scope := model
+	if !ok && upstream.FailIsUpstreamLevel(resp.StatusCode) {
+		scope = ""
+	}
+	p.mgr.reportProbe(u.ID, scope, ok, latency)
+	slog.Debug("probe", "upstream", u.Name, "model", model, "status", resp.StatusCode, "ok", ok, "ms", latency)
 }

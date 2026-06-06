@@ -11,7 +11,7 @@ var ErrNoUpstream = errors.New("no healthy upstream available")
 
 // Health 调度层只依赖这个接口（解耦：不关心熔断如何实现）
 type Health interface {
-	IsAvailable(id int64) bool
+	IsAvailable(id int64, model string) bool
 }
 
 // Scheduler 严格优先级调度 + 回切。
@@ -27,21 +27,22 @@ func New(list func(groupID int64) []*upstream.Upstream, h Health) *Scheduler {
 }
 
 // Pick 在指定分组内选一个上游。严格优先级：只在最高优先级的健康层内选；同层多个按权重随机。
-func (s *Scheduler) Pick(groupID int64) (*upstream.Upstream, error) {
-	return s.PickExcluding(groupID, nil)
+func (s *Scheduler) Pick(groupID int64, model string) (*upstream.Upstream, error) {
+	return s.PickExcluding(groupID, model, nil)
 }
 
 // PickExcluding 同 Pick，但跳过 exclude 中的上游（本次请求已试过的）。
 // 单次请求内失败重试用它「立即换下一个」，与熔断阈值无关——
 // 熔断负责跨请求的长期摘除，单请求重试只需避开本次已试过的。
-func (s *Scheduler) PickExcluding(groupID int64, exclude map[int64]bool) (*upstream.Upstream, error) {
+// model 用于按 (上游,模型) 粒度判定健康：某上游的某模型熔断，不影响该上游的其他模型。
+func (s *Scheduler) PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, error) {
 	// 1. 过滤出该分组健康、且未被本次请求排除的上游
 	var healthy []*upstream.Upstream
 	for _, u := range s.list(groupID) {
 		if exclude[u.ID] {
 			continue
 		}
-		if s.health.IsAvailable(u.ID) {
+		if s.health.IsAvailable(u.ID, model) {
 			healthy = append(healthy, u)
 		}
 	}
