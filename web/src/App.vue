@@ -40,7 +40,8 @@ function onDrop(target) {
   arr.splice(to, 0, moved)
   monitors.value = arr // 乐观更新
   dragId.value = dragOverId.value = null
-  guard(() => api.reorderMonitors(arr.map(x => x.id))) // 持久化，失败下次轮询会校正
+  // 持久化失败时主动重拉还原顺序（而非等下次轮询才校正）
+  guard(() => api.reorderMonitors(arr.map(x => x.id)).catch(e => { loadMonitors().catch(() => {}); throw e }))
 }
 function onDragEnd() { dragId.value = dragOverId.value = null }
 
@@ -59,13 +60,14 @@ const summary = computed(() => {
   }
 })
 // 单项「立即探测」：探完用返回的快照原地更新该卡片
-const probingId = ref(0)
+// 用 Set 记录正在探测的卡片 id，支持多卡并发互不串台
+const probing = reactive(new Set())
 async function probeOne(m) {
-  probingId.value = m.id
+  probing.add(m.id)
   try {
     const sn = await api.probeMonitor(m.id)
     m.snapshot = sn
-  } finally { probingId.value = 0 }
+  } finally { probing.delete(m.id) }
 }
 
 // ===== 总览：按上游分组的模型探活状态 =====
@@ -88,12 +90,13 @@ const matrix = computed(() => {
       if (s === 'DOWN') down++
       else if (s === 'DEGRADED') degraded++
     }
-    g.items.sort((a, b) => {
+    // 排序副本，避免在 computed 内原地改 monitors 派生数组（保 computed 纯净）
+    const items = [...g.items].sort((a, b) => {
       if (a.enabled !== b.enabled) return a.enabled ? -1 : 1
       const ra = stateRank[a.snapshot.state] ?? 3, rb = stateRank[b.snapshot.state] ?? 3
       return ra - rb || a.model.localeCompare(b.model)
     })
-    return { ...g, down, degraded, worst: down ? 0 : degraded ? 1 : 2 }
+    return { ...g, items, down, degraded, worst: down ? 0 : degraded ? 1 : 2 }
   })
   // 组排序：有故障的上游置顶，其次降级，再按名字
   rows.sort((a, b) => a.worst - b.worst || a.name.localeCompare(b.name))
@@ -118,16 +121,25 @@ const ovSummary = computed(() => {
   }
 })
 // 点格子 → 抽屉看详情（含趋势 + 立即探测）
-const cellDrawer = ref(null)
-function openCell(m) { if (m) cellDrawer.value = m }
-function closeCell() { cellDrawer.value = null }
+// 只存 id，抽屉对象用 computed 从 monitors 实时 find——
+// 这样 60s 轮询整替 monitors 后，抽屉内容随之刷新而非冻结在旧引用。
+const cellDrawerId = ref(null)
+const cellDrawer = computed(() => cellDrawerId.value == null ? null : monitors.value.find(x => x.id === cellDrawerId.value) || null)
+function openCell(m) { if (m) cellDrawerId.value = m.id }
+function closeCell() { cellDrawerId.value = null }
 async function probeCell() {
   const m = cellDrawer.value
   if (!m) return
   await probeOne(m)
-  cellDrawer.value = monitors.value.find(x => x.id === m.id) || m
 }
-async function loadMembers(gid) { members.value = (await api.members(gid)) || [] }
+// 分组详情加载守卫：每次切换详情/返回都自增 epoch，
+// 参数化加载(members/keys)返回时校验 epoch 未变才写入，避免快速切换短暂错配。
+let loadEpoch = 0
+async function loadMembers(gid) {
+  const ep = loadEpoch
+  const data = (await api.members(gid)) || []
+  if (ep === loadEpoch) members.value = data
+}
 // 流量分配预估：把生效层成员的 route_preview 按模型重组（同模型各成员占比加和≈100）。
 const routeDist = computed(() => {
   const byModel = new Map()
@@ -150,8 +162,10 @@ const mhTitle = mh => {
   return t
 }
 async function loadDetail(gid) {
+  const ep = loadEpoch
   await loadMembers(gid)
-  keys.value = (await api.keys(gid)) || []
+  const ks = (await api.keys(gid)) || []
+  if (ep === loadEpoch) keys.value = ks
 }
 
 async function guard(fn) {
@@ -191,6 +205,7 @@ onUnmounted(() => { stopMonPoll(); stopRtPoll() })
 
 function go(p) {
   page.value = p; detailGroup.value = null
+  loadEpoch++   // 离开详情，作废在途的 members/keys 加载
   stopAllPoll()
   guard(async () => {
     if (p === 'overview') { await loadUpstreams(); await loadMonitors(); startMonPoll() }
@@ -198,15 +213,17 @@ function go(p) {
     else if (p === 'upstreams') { await loadUpstreams(); startRtPoll(loadUpstreams) }
     else if (p === 'monitors') { await loadUpstreams(); await loadMonitors(); startMonPoll() }
     else if (p === 'logs') { await loadLogOptions(); await loadLogs(false) }
+    else if (p === 'settings') { await loadSettings() }
   })
 }
 function openDetail(g) {
   detailGroup.value = g
+  loadEpoch++   // 切入新分组详情，作废上一组在途加载
   stopAllPoll()
   guard(async () => { await loadUpstreams(); await loadDetail(g.id); startRtPoll(() => loadMembers(g.id)) })
 }
 function backToGroups() {
-  detailGroup.value = null; stopAllPoll()
+  detailGroup.value = null; loadEpoch++; stopAllPoll()
   guard(async () => { await loadGroups(); startRtPoll(loadGroups) })
 }
 
@@ -294,7 +311,14 @@ async function runTest() {
     testState.status = { ok: false, error: String(e.message || e) }
   } finally {
     testState.running = false
-    if (!testState.status) testState.status = { ok: true } // 流正常结束但没收到 complete
+    // 流正常结束但没收到 test_complete：
+    //  - 有 content → 视为「部分成功」（连上了且有回复，只是缺收尾事件）
+    //  - 完全无数据 → 不能判成功，标记失败避免假阳性
+    if (!testState.status) {
+      testState.status = testState.output
+        ? { ok: true, partial: true }
+        : { ok: false, error: '上游无任何响应（未收到内容或完成事件）' }
+    }
   }
 }
 
@@ -570,6 +594,7 @@ function toggleMonitor(m) {
 }
 
 function login() {
+  if (!loginForm.token.trim()) { err.value = '请输入管理 Token'; return }
   api.setToken(loginForm.token.trim())
   loggedIn.value = true
   guard(async () => { await loadUpstreams(); await loadMonitors(); await loadSettings(); startMonPoll() })
@@ -870,7 +895,7 @@ function logout() {
               </div>
               <Fence :trend="m.snapshot.trend || []" unit="探测" />
               <div class="mon-foot">
-                <button class="btn-link sm" :disabled="probingId === m.id" @click="guard(() => probeOne(m))">{{ probingId === m.id ? '探测中…' : '立即探测' }}</button>
+                <button class="btn-link sm" :disabled="probing.has(m.id)" @click="guard(() => probeOne(m))">{{ probing.has(m.id) ? '探测中…' : '立即探测' }}</button>
                 <span class="hspacer" />
                 <button class="btn-link sm" @click="toggleMonitor(m)">{{ m.enabled ? '停用' : '启用' }}</button>
                 <button class="icon-btn" @click="editMonitor(m)"><Icon name="edit" :size="16" /></button>
@@ -1023,7 +1048,7 @@ function logout() {
         </div>
         <Fence :trend="cellDrawer.snapshot.trend || []" unit="探测" />
         <div class="dw-foot">
-          <button class="btn" :disabled="probingId === cellDrawer.id" @click="guard(probeCell)">{{ probingId === cellDrawer.id ? '探测中…' : '立即探测' }}</button>
+          <button class="btn" :disabled="probing.has(cellDrawer.id)" @click="guard(probeCell)">{{ probing.has(cellDrawer.id) ? '探测中…' : '立即探测' }}</button>
         </div>
       </div>
     </div>
