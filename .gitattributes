@@ -1,0 +1,18 @@
+# 统一换行：仓库内所有文本文件一律使用 LF。
+# 防止 Windows 下 core.autocrlf=true 把工作区转成 CRLF 造成混乱，
+# 也保证跨平台协作与交叉编译到 Linux 时换行一致。
+* text=auto eol=lf
+
+# 明确二进制类型：禁止换行转换与文本 diff（即使未来引入也不被误处理）。
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.eot   binary
+*.db    binary
+*.exe   binary
