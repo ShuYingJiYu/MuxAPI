@@ -1,6 +1,8 @@
 package scheduler
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,6 +43,61 @@ func TestStrictPriorityFailback(t *testing.T) {
 	hm.Report(1, "", true, 100) // 探测成功 → Closed
 	if u, _ := s.Pick(0, ""); u.Name != "A" {
 		t.Fatalf("A 恢复后应回切到 A，实际 %s ← 这是核心痛点", u.Name)
+	}
+}
+
+// 回归：半开放行后，多个同层上游同时半开时，连续 Pick 都应选出上游（不再有单闸门占满问题）。
+func TestHalfOpenGateNotExhaustedAcrossUpstreams(t *testing.T) {
+	ups := []*upstream.Upstream{
+		{ID: 1, Name: "A", Priority: 1, Weight: 1, Enabled: true},
+		{ID: 2, Name: "B", Priority: 1, Weight: 1, Enabled: true},
+		{ID: 3, Name: "C", Priority: 1, Weight: 1, Enabled: true},
+	}
+	hm := health.New(1, 20*time.Millisecond) // 一次失败即熔断，冷却 20ms
+	s := New(func(int64) []*upstream.Upstream { return ups }, hm)
+	// 三个全部熔断 → 冷却到期后都进半开
+	for _, id := range []int64{1, 2, 3} {
+		hm.Report(id, "", false, 0)
+	}
+	time.Sleep(30 * time.Millisecond)
+	// 连续 Pick：半开放行后每次都能选出上游（旧单闸门设计下第2次起会 ErrNoUpstream）
+	for i := 0; i < 5; i++ {
+		if _, err := s.Pick(0, ""); err != nil {
+			t.Fatalf("第 %d 次 Pick 不应失败（半开放行），实际 %v", i+1, err)
+		}
+	}
+}
+
+// 回归(核心 503 修复)：严格优先级主备拓扑，主力刚进半开恢复期时，
+// codex 式并发重试不应被选路阶段 503——半开放行使主力始终可选，绝不 no upstream available。
+func TestHalfOpenPrimaryConcurrentNo503(t *testing.T) {
+	ups := []*upstream.Upstream{
+		{ID: 1, Name: "primary", Priority: 1, Weight: 1, Enabled: true},
+		{ID: 2, Name: "backup", Priority: 10, Weight: 1, Enabled: true},
+	}
+	hm := health.New(1, time.Hour) // 冷却极长：排除"靠冷却到期自愈"，纯验半开放行
+	s := New(func(int64) []*upstream.Upstream { return ups }, hm)
+	// 主力 + 备份都熔断（模拟生产 503 时刻三上游全不可用的极端态），再让主力恢复到半开
+	hm.Report(1, "", false, 0)
+	hm.Report(2, "", false, 0)
+	hm.ObserveProbe(1, "", true, 50) // 探测把主力 Open→Closed（模拟"探测恢复"）
+	// 8 并发 Pick：应全部成功选出上游、无一 ErrNoUpstream
+	var ok, fail int64
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.Pick(0, ""); err == nil {
+				atomic.AddInt64(&ok, 1)
+			} else {
+				atomic.AddInt64(&fail, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	if fail != 0 {
+		t.Fatalf("主力恢复后 8 并发不应有 no upstream available，实际成功=%d 失败=%d", ok, fail)
 	}
 }
 
@@ -125,7 +182,134 @@ func TestP2CLatencyAware(t *testing.T) {
 	}
 }
 
-// P2C 冷启动：新上游 EWMA 未知(0) 视为最优，确保能拿到流量探数据。
+// 智能路由：开启延迟加权后，对延迟差距大的同层渠道，应比 P2C 更激进地偏向快的。
+// A 稳定 50ms、B 稳定 5000ms（均 100% 成功），权重比≈100:1，A 应拿绝大多数流量。
+func TestWeightedRoutingFavorsFast(t *testing.T) {
+	ups := []*upstream.Upstream{
+		{ID: 1, Name: "A", Priority: 1, Weight: 1, Enabled: true},
+		{ID: 2, Name: "B", Priority: 1, Weight: 1, Enabled: true},
+	}
+	hm := health.New(10000, time.Hour) // 高阈值避免熔断，纯看加权
+	s := New(func(int64) []*upstream.Upstream { return ups }, hm)
+	s.SetRouting(func() float64 { return 30000 }, func() bool { return true })
+
+	for i := 0; i < 20; i++ {
+		hm.Report(1, "", true, 50)
+		hm.Report(2, "", true, 5000)
+	}
+	cnt := map[string]int{}
+	for i := 0; i < 4000; i++ {
+		u, _ := s.Pick(0, "")
+		cnt[u.Name]++
+	}
+	ratioA := float64(cnt["A"]) / 4000.0
+	if ratioA < 0.9 { // 1/50 vs 1/5000 → A 理论≈99%
+		t.Fatalf("延迟加权应压倒性偏向快的 A，实际 A=%.2f (A=%d B=%d)", ratioA, cnt["A"], cnt["B"])
+	}
+}
+
+// 智能路由：成功率折进有效延迟——「快但常失败」应被压制。
+// A 100ms@100%；B 100ms 但大量失败→成功率极低→有效延迟被失败超时成本拉爆→几乎不被选。
+func TestWeightedRoutingPenalizesFailures(t *testing.T) {
+	ups := []*upstream.Upstream{
+		{ID: 1, Name: "A", Priority: 1, Weight: 1, Enabled: true},
+		{ID: 2, Name: "B", Priority: 1, Weight: 1, Enabled: true},
+	}
+	hm := health.New(100000, time.Hour) // 阈值极高，连续失败也不熔断，纯看加权
+	s := New(func(int64) []*upstream.Upstream { return ups }, hm)
+	s.SetRouting(func() float64 { return 30000 }, func() bool { return true })
+
+	for i := 0; i < 20; i++ {
+		hm.Report(1, "", true, 100)
+	}
+	hm.Report(2, "", true, 100) // B 给一次成功定个低延迟基准
+	for i := 0; i < 40; i++ {
+		hm.Report(2, "", false, 0) // 然后狂失败，succ EWMA 趋近 0
+	}
+	cnt := map[string]int{}
+	for i := 0; i < 4000; i++ {
+		u, _ := s.Pick(0, "")
+		cnt[u.Name]++
+	}
+	ratioA := float64(cnt["A"]) / 4000.0
+	if ratioA < 0.95 { // B 有效延迟≈100+(0.99/0.01)*30000 巨大 → 几乎不被选
+		t.Fatalf("快但常失败的 B 应被压制，A 实际=%.2f (A=%d B=%d)", ratioA, cnt["A"], cnt["B"])
+	}
+}
+
+// PreviewShares：占比加和=1、慢渠道占比小、与实际选路同源。
+func TestPreviewShares(t *testing.T) {
+	tier := []*upstream.Upstream{
+		{ID: 1, Name: "A", Weight: 1, Enabled: true},
+		{ID: 2, Name: "B", Weight: 1, Enabled: true},
+		{ID: 3, Name: "C", Weight: 1, Enabled: true},
+	}
+	stats := func(id int64) (float64, float64) {
+		switch id {
+		case 1:
+			return 50, 1
+		case 2:
+			return 200, 1
+		default:
+			return 5000, 1
+		}
+	}
+	sh := PreviewShares(tier, stats, 30000)
+	sum := sh[1].Share + sh[2].Share + sh[3].Share
+	if sum < 0.999 || sum > 1.001 {
+		t.Fatalf("占比加和应=1，实际 %.4f", sum)
+	}
+	if !(sh[1].Share > sh[2].Share && sh[2].Share > sh[3].Share) {
+		t.Fatalf("应 A>B>C，实际 A=%.3f B=%.3f C=%.3f", sh[1].Share, sh[2].Share, sh[3].Share)
+	}
+	if sh[1].EffLatencyMs != 50 {
+		t.Fatalf("A 有效延迟应=50，实际 %.1f", sh[1].EffLatencyMs)
+	}
+}
+
+// PreviewShares 全失败渠道：有失败无成功(不是冷启动)，有效延迟应远大于正常渠道、占比趋零。
+// 这是修复「死渠道被误当冷启动给最低延迟」的回归测试。
+func TestPreviewSharesAllFail(t *testing.T) {
+	tier := []*upstream.Upstream{
+		{ID: 1, Name: "Good", Weight: 1, Enabled: true},
+		{ID: 2, Name: "Dead", Weight: 1, Enabled: true},
+	}
+	stats := func(id int64) (float64, float64) {
+		if id == 1 {
+			return 1000, 1 // Good 正常 1s @100%
+		}
+		return 0, 0 // Dead 全失败：无成功延迟样本、成功率 0
+	}
+	sh := PreviewShares(tier, stats, 30000)
+	if sh[2].EffLatencyMs <= sh[1].EffLatencyMs {
+		t.Fatalf("死渠道有效延迟应远大于正常，实际 Dead=%.0f Good=%.0f", sh[2].EffLatencyMs, sh[1].EffLatencyMs)
+	}
+	if sh[2].Share > 0.05 {
+		t.Fatalf("死渠道占比应趋零(<5%%)，实际 %.3f", sh[2].Share)
+	}
+	if sh[1].Share < 0.95 {
+		t.Fatalf("正常渠道应吃下绝大多数流量(>95%%)，实际 %.3f", sh[1].Share)
+	}
+}
+
+// PreviewShares 冷启动：无数据渠道代入同层最优，与已知最优公平竞争(占比相当)。
+func TestPreviewSharesColdStart(t *testing.T) {
+	tier := []*upstream.Upstream{
+		{ID: 1, Name: "Old", Weight: 1, Enabled: true},
+		{ID: 2, Name: "New", Weight: 1, Enabled: true},
+	}
+	stats := func(id int64) (float64, float64) {
+		if id == 1 {
+			return 100, 1
+		}
+		return 0, 1
+	}
+	sh := PreviewShares(tier, stats, 30000)
+	if sh[2].Share < 0.4 || sh[2].Share > 0.6 {
+		t.Fatalf("冷启动 New 应与 Old 公平竞争(约0.5)，实际 New=%.3f", sh[2].Share)
+	}
+}
+
 func TestP2CColdStart(t *testing.T) {
 	ups := []*upstream.Upstream{
 		{ID: 1, Name: "Old", Priority: 1, Weight: 1, Enabled: true},

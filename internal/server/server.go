@@ -83,7 +83,7 @@ func clientKey(r *http.Request) string {
 
 // messages 转发入口：按接入 key 找到分组，在组内调度转发。
 func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
-	groupID, ok := s.store.GroupByKey(clientKey(r))
+	groupID, keyName, ok := s.store.GroupAndKeyByKey(clientKey(r))
 	if !ok {
 		http.Error(w, "unauthorized: unknown access key", http.StatusUnauthorized)
 		return
@@ -93,7 +93,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "read body failed", http.StatusBadRequest)
 		return
 	}
-	s.fwd.Forward(w, r, body, groupID)
+	s.fwd.Forward(w, r, body, groupID, keyName)
 }
 
 // listModels 下游模型清单：按接入 key 找到分组，实时汇总分组内各启用上游的

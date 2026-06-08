@@ -30,11 +30,12 @@ func (s State) String() string {
 type breaker struct {
 	state       State
 	fails       int       // 连续失败次数
-	openUntil   time.Time // Open：冷却到期时间；HalfOpen：本次试探的超时时间（防闸门空占永久卡死）
-	probing     bool      // 半开单请求闸门：已放出一个试探请求、其余业务请求一律拦住，直到该试探有结果
+	openUntil   time.Time // Open 冷却到期时间：到期后 canServe 翻 HalfOpen 放行恢复流量
 	lastProbe   time.Time
 	latencyMs   int64
 	latencyEWMA float64 // 成功请求延迟的指数加权移动平均(ms)，供 P2C 选路；0=尚无数据
+	succEWMA    float64 // 成功率的指数加权移动平均(0..1)：成功样本=1、失败=0。供延迟加权选路算「有效延迟」；
+	// 用 EWMA 而非全历史比例——能快速反映「正在变差」，不被陈旧好成绩稀释。-1=尚无样本(新键乐观，视为 1)。
 	// 业务流量统计（仅转发层计入，探测不算；进程级、重启清零）
 	reqs       int64 // 总请求数
 	failReqs   int64 // 失败请求数
@@ -116,41 +117,38 @@ func (m *Manager) SetAlerter(a Alerter) { m.alerter = a }
 func (m *Manager) get(k breakerKey) *breaker {
 	b := m.breakers[k]
 	if b == nil {
-		b = &breaker{state: Closed}
+		b = &breaker{state: Closed, succEWMA: -1} // succEWMA=-1：尚无样本，RouteStats 据此乐观视为 1
 		m.breakers[k] = b
 	}
 	return b
 }
 
-// canServe 只读判定：该键现在能否承接【一个】业务请求（调用方须持有 m.mu）。
-// 半开单请求闸门的「判定」阶段——不在此占用闸门（占用在 markServed），
-// 避免 scheduler 过滤多个候选时，对最终未被选中的上游误占名额。
+// canServe 只读判定：该键现在能否承接业务请求（调用方须持有 m.mu）。
 //
 //   - Closed：可服务。
 //   - Open 未到冷却：不可服务（死渠道不吃业务流量）。
-//   - Open 冷却到期：翻 HalfOpen 并清空闸门，准备放一个试探 → 可服务。
-//   - HalfOpen 且闸门空闲：可服务（这一个就是试探）。
-//   - HalfOpen 且闸门占用：默认不可服务；但若试探已超时(openUntil 已过)，
-//     说明上一个试探请求没回执(被 scheduler 落选/未发出)，强制释放闸门重新放行，
-//     防止业务永久不再试探、又恰好无探测覆盖的死渠道卡死。
+//   - Open 冷却到期：翻 HalfOpen → 可服务（恢复期放行业务流量自证）。
+//   - HalfOpen：可服务（不限并发）。半开期放行所有请求去试这个上游——
+//     健康渠道刚恢复时并发能立即满血；真死渠道则被一波请求各打一次、
+//     drive 对半开态失败立即重新 Open，死渠道保护仍在。
+//
+// 不再用「半开单请求闸门」：在严格优先级(主备)拓扑下，单闸门会把主力上游
+// 恢复期的并发请求拦成不可用→选路 no upstream available→503，且备份失败转移
+// 也被选路阶段短路。放行让恢复瞬间不丢流量、失败也能正常下沉备份。
 func (m *Manager) canServe(b *breaker) bool {
 	if b.state == Open {
 		if !time.Now().After(b.openUntil) {
 			return false
 		}
-		b.state = HalfOpen // 冷却结束，准备放一个试探
-		b.probing = false
-	}
-	if b.state == HalfOpen && b.probing {
-		return time.Now().After(b.openUntil) // 试探超时则重新放行，否则拦住
+		b.state = HalfOpen // 冷却结束，进入恢复期，放行业务流量自证
 	}
 	return true
 }
 
 // IsAvailable 调度层询问：该上游的该模型现在能用吗？
 // 双层判定：上游级(凭证类故障)与模型级须都能服务。
-// 两阶段提交：先 canServe 全通过，再 markServed 占用半开闸门——
-// 避免「上游级放行但模型级拦截」时空占上游级的试探名额。
+// canServe 在 Open 冷却到期时会把状态翻 HalfOpen(放行恢复流量)，故非纯只读，
+// 但无并发名额占用——半开期所有候选都可用，不再有「单试探闸门」。
 func (m *Manager) IsAvailable(id int64, model string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -163,20 +161,7 @@ func (m *Manager) IsAvailable(id int64, model string) bool {
 			return false
 		}
 	}
-	m.markServed(bs)
 	return true
-}
-
-// markServed 占用闸门：对处于 HalfOpen 的键标记「试探在途」，并以 openUntil 记下试探超时
-// (= now + cooldown)，供 canServe 的空占自愈用。调用方须持有 m.mu。
-func (m *Manager) markServed(bs []*breaker) {
-	now := time.Now()
-	for _, b := range bs {
-		if b.state == HalfOpen && !b.probing {
-			b.probing = true
-			b.openUntil = now.Add(m.cooldown)
-		}
-	}
 }
 
 // LatencyEWMA 返回该 (上游,模型) 成功延迟的 EWMA(ms)，供调度层 P2C 比较。
@@ -194,6 +179,34 @@ func (m *Manager) LatencyEWMA(id int64, model string) int64 {
 		return int64(b.latencyEWMA)
 	}
 	return 0
+}
+
+// RouteStats 返回该 (上游,模型) 的「成功延迟 EWMA(ms) + 成功率(0..1)」，供调度层算有效延迟做延迟加权选路。
+// 模型级键优先(与选路粒度一致)、该粒度无数据时回退上游级键。
+// 约定：ewmaMs=0 表示延迟未知(冷启动)，调度层据此给新渠道探数据的机会；
+// succRate 在 succEWMA=-1(无样本)时乐观返回 1，避免新渠道一上来就被判低成功率压死。
+func (m *Manager) RouteStats(id int64, model string) (ewmaMs float64, succRate float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pick := func(b *breaker) (float64, float64, bool) {
+		if b == nil || (b.latencyEWMA == 0 && b.succEWMA < 0) {
+			return 0, 1, false // 该键完全无数据
+		}
+		sr := b.succEWMA
+		if sr < 0 {
+			sr = 1 // 有延迟样本但无成功率样本(理论少见)：乐观
+		}
+		return b.latencyEWMA, sr, true
+	}
+	if model != "" {
+		if lat, sr, ok := pick(m.breakers[breakerKey{id, model}]); ok {
+			return lat, sr
+		}
+	}
+	if lat, sr, ok := pick(m.breakers[breakerKey{id, ""}]); ok {
+		return lat, sr
+	}
+	return 0, 1 // 全无数据：冷启动，延迟未知 + 成功率乐观
 }
 
 // Report 转发层反馈业务请求结果：驱动熔断状态机 + 计入流量统计。
@@ -264,11 +277,11 @@ func transitionEvent(id int64, model string, from, to State, fails int) (AlertEv
 }
 
 // drive 熔断状态机（调用方须持有 m.mu）。返回 (旧状态, 新状态) 供调用方判翻转。
-// 无论成功失败，只要有结果回来就复位半开闸门(probing=false)——本次试探已落地，
-// 闸门交还：成功则随 Closed 一并清空，失败则让下一个冷却周期能再放一个试探。
+// 半开态(HalfOpen)只要失败一次即重新 Open——这是死渠道保护：半开期放行的并发
+// 业务流量若打到真死渠道，每个失败回执都会立即把它打回 Open，重新进入冷却。
 func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) (from, to State) {
 	from = b.state
-	b.probing = false
+	b.succEWMA = mixEWMA(b.succEWMA, boolToF(ok)) // 成功率 EWMA：成功=1 失败=0，首样本直赋(见 mixEWMA)
 	if ok {
 		b.fails = 0
 		b.state = Closed
@@ -289,6 +302,55 @@ func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) (from, to State) {
 		b.openUntil = time.Now().Add(m.cooldown)
 	}
 	return from, b.state
+}
+
+// mixEWMA 指数加权移动平均：哨兵 prev<0 表示「尚无样本」，直接取新值(避免被 0 拖低)；
+// 否则按 ewmaAlpha 混合。供 succEWMA 用(成功率范围 0..1，-1 作无样本哨兵)。
+func mixEWMA(prev, sample float64) float64 {
+	if prev < 0 {
+		return sample
+	}
+	return ewmaAlpha*sample + (1-ewmaAlpha)*prev
+}
+
+func boolToF(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// RouteSample 一条历史路由样本，用于 Seed 回放重建 EWMA（与 store.RouteSample 同构，避免跨包依赖）。
+type RouteSample struct {
+	UpstreamID int64
+	Model      string
+	OK         bool
+	LatencyMs  int64
+}
+
+// Seed 启动时用历史样本【按正序回放】重建各 (上游,模型) 的延迟/成功率 EWMA，
+// 让「流量分配预估」在重启后不归零。只重建选路所需的统计(latencyEWMA/succEWMA)，
+// 【不重建熔断状态】——重启后一律从 Closed 起，开关交给重启后的新流量决定，
+// 不把历史故障态强加给新世界(那会导致重启即误熔断)。上游级键同步累积，供看板与上游级选路回退。
+func (m *Manager) Seed(samples []RouteSample) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	apply := func(b *breaker, s RouteSample) {
+		b.succEWMA = mixEWMA(b.succEWMA, boolToF(s.OK))
+		if s.OK && s.LatencyMs > 0 { // 仅成功请求计入延迟 EWMA（与 drive 一致）
+			if b.latencyEWMA == 0 {
+				b.latencyEWMA = float64(s.LatencyMs)
+			} else {
+				b.latencyEWMA = ewmaAlpha*float64(s.LatencyMs) + (1-ewmaAlpha)*b.latencyEWMA
+			}
+		}
+	}
+	for _, s := range samples {
+		apply(m.get(breakerKey{s.UpstreamID, ""}), s) // 上游级
+		if s.Model != "" {
+			apply(m.get(breakerKey{s.UpstreamID, s.Model}), s) // 模型级
+		}
+	}
 }
 
 // Snapshot 健康看板用：返回各上游状态快照。
@@ -328,11 +390,13 @@ func (m *Manager) Snapshot(id int64) Snapshot {
 
 // ModelHealth 模型级健康精简状态（看板按上游展开模型徽章用，不含趋势数组省带宽）。
 type ModelHealth struct {
-	Model     string `json:"model"`      // 模型名
-	State     string `json:"state"`      // CLOSED 正常 / OPEN 熔断 / HALF_OPEN 半开
-	Fails     int    `json:"fails"`      // 当前连续失败数
-	LatencyMs int64  `json:"latency_ms"` // 最近一次延迟(ms)
-	LastProbe int64  `json:"last_probe"` // 最后探测 unix 秒，0=从未探测
+	Model     string  `json:"model"`      // 模型名
+	State     string  `json:"state"`      // CLOSED 正常 / OPEN 熔断 / HALF_OPEN 半开
+	Fails     int     `json:"fails"`      // 当前连续失败数
+	LatencyMs int64   `json:"latency_ms"` // 最近一次延迟(ms)
+	LastProbe int64   `json:"last_probe"` // 最后探测 unix 秒，0=从未探测
+	LatEWMA   float64 `json:"lat_ewma"`   // 成功延迟 EWMA(ms)，供智能路由展示；0=未知
+	SuccEWMA  float64 `json:"succ_ewma"`  // 成功率 EWMA(0..1)，供智能路由展示；无样本归一为 1
 }
 
 // ModelStates 返回该上游下所有模型级(model!="")键的精简状态，按模型名排序输出稳定。
@@ -349,9 +413,14 @@ func (m *Manager) ModelStates(id int64) []ModelHealth {
 		if !b.lastProbe.IsZero() {
 			lastProbe = b.lastProbe.Unix()
 		}
+		succ := b.succEWMA
+		if succ < 0 {
+			succ = 1 // 无样本：智能路由展示口径乐观为 1（与 RouteStats 一致）
+		}
 		out = append(out, ModelHealth{
 			Model: k.model, State: b.state.String(), Fails: b.fails,
 			LatencyMs: b.latencyMs, LastProbe: lastProbe,
+			LatEWMA: b.latencyEWMA, SuccEWMA: succ,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Model < out[j].Model })
@@ -360,7 +429,14 @@ func (m *Manager) ModelStates(id int64) []ModelHealth {
 
 func (m *Manager) markProbe(id int64, model string) {
 	m.mu.Lock()
-	m.get(breakerKey{id, model}).lastProbe = time.Now()
+	now := time.Now()
+	m.get(breakerKey{id, model}).lastProbe = now
+	if model != "" {
+		// 上游级键(model="")是看板「上游池/成员行」运行时列的数据源；它本身从不被直接探测，
+		// 但「该上游下任一模型被探测过」在上游级聚合视图里即成立——同步它的 lastProbe，
+		// 否则上游池行会因 lastProbe==0 永久显示「待探测」(即使模型徽章已探到、显示正常)。
+		m.get(breakerKey{id, ""}).lastProbe = now
+	}
 	m.mu.Unlock()
 }
 

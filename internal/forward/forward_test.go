@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,7 +19,8 @@ import (
 // noopLogger 测试用空日志器
 type noopLogger struct{}
 
-func (noopLogger) Log(groupID, upstreamID int64, status int, latencyMs int64) {}
+func (noopLogger) Log(groupID, upstreamID int64, model, endpoint, keyName string, retries, status int, latencyMs int64) {
+}
 
 // 验证 SSE 流式逐行透传不丢事件、不破坏格式。
 func TestForwardSSEStreaming(t *testing.T) {
@@ -46,7 +48,7 @@ func TestForwardSSEStreaming(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"stream":true}`))
-	fwd.Forward(rec, req, []byte(`{"stream":true}`), 0)
+	fwd.Forward(rec, req, []byte(`{"stream":true}`), 0, "")
 
 	res := rec.Result()
 	if ct := res.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
@@ -89,7 +91,7 @@ func TestForwardSSEFailover(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"stream":true}`))
-	fwd.Forward(rec, req, []byte(`{"stream":true}`), 0)
+	fwd.Forward(rec, req, []byte(`{"stream":true}`), 0, "")
 
 	res := rec.Result()
 	if res.StatusCode != 200 {
@@ -117,7 +119,7 @@ func TestForwardFailScope(t *testing.T) {
 	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, noopLogger{}, 0)
 
 	body := []byte(`{"model":"gpt-x","stream":false}`)
-	fwd.Forward(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body))), body, 0)
+	fwd.Forward(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body))), body, 0, "")
 	if hm.IsAvailable(1, "gpt-x") {
 		t.Fatal("503 应熔断 (A, gpt-x)")
 	}
@@ -135,7 +137,7 @@ func TestForwardFailScope(t *testing.T) {
 	hm2 := health.New(1, time.Hour)
 	fwd2 := New(scheduler.New(func(int64) []*upstream.Upstream { return ups2 }, hm2), hm2, noopLogger{}, 0)
 	body2 := []byte(`{"model":"gpt-x"}`)
-	fwd2.Forward(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body2))), body2, 0)
+	fwd2.Forward(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body2))), body2, 0, "")
 	if hm2.IsAvailable(2, "anything") {
 		t.Fatal("401 应熔断整个上游，所有模型连坐")
 	}
@@ -163,7 +165,7 @@ func TestForwardSSEIncrementalFlush(t *testing.T) {
 	pr, pw := io.Pipe()
 	rec := &flushRecorder{header: http.Header{}, w: pw, flushed: make(chan struct{}, 8)}
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"stream":true}`))
-	go fwd.Forward(rec, req, []byte(`{"stream":true}`), 0)
+	go fwd.Forward(rec, req, []byte(`{"stream":true}`), 0, "")
 
 	br := bufio.NewReader(pr)
 	line1, _ := br.ReadString('\n')
@@ -208,7 +210,7 @@ func TestForwardFailoverWithHighThreshold(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
-	fwd.Forward(rec, req, []byte(`{}`), 0)
+	fwd.Forward(rec, req, []byte(`{}`), 0, "")
 
 	res := rec.Result()
 	if res.StatusCode != 200 {
@@ -251,7 +253,7 @@ func TestForward403Failover(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
-	fwd.Forward(rec, req, []byte(`{}`), 0)
+	fwd.Forward(rec, req, []byte(`{}`), 0, "")
 
 	res := rec.Result()
 	if res.StatusCode != 200 {
@@ -282,5 +284,50 @@ func (f *flushRecorder) Flush() {
 	select {
 	case f.flushed <- struct{}{}:
 	default:
+	}
+}
+
+// 端到端回归(核心 503 修复)：主力上游恢复到半开后，codex 式并发突发请求
+// 应全部 200、零 503。复现并验证「半开放行」修复——旧单闸门设计下并发只 1 个能进、
+// 其余在选路阶段拿不到上游而 503(no upstream available)。
+func TestForwardHalfOpenConcurrentNo503(t *testing.T) {
+	// 健康主力上游：始终 200，带真实时延拉长并发重叠窗口
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(15 * time.Millisecond)
+		w.WriteHeader(200)
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+	ups := []*upstream.Upstream{{ID: 1, Name: "primary", BaseURL: srv.URL, APIKey: "k", Priority: 1, Enabled: true}}
+	hm := health.New(1, 20*time.Millisecond) // 短冷却便于进入半开恢复窗口
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, noopLogger{}, 0)
+
+	// 主力先熔断（模拟一次抖动开了熔断器），等冷却到期 → 下次判定翻半开恢复期
+	hm.Report(1, "gpt-5.5", false, 0) // 模型级 OPEN
+	time.Sleep(30 * time.Millisecond) // 冷却到期
+
+	body := []byte(`{"model":"gpt-5.5","stream":false}`)
+	var ok200, got503 int64
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ { // codex 式并发突发
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			fwd.Forward(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body))), body, 0, "")
+			switch rec.Code {
+			case 200:
+				atomic.AddInt64(&ok200, 1)
+			case 503:
+				atomic.AddInt64(&got503, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	if got503 != 0 {
+		t.Fatalf("半开恢复期 8 并发不应有 503，实际 200=%d 503=%d", ok200, got503)
+	}
+	if ok200 != 8 {
+		t.Fatalf("半开恢复期 8 并发应全部 200(主力健康)，实际仅 %d", ok200)
 	}
 }

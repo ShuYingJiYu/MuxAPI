@@ -45,6 +45,17 @@ func main() {
 
 	// 组装四层
 	hm := health.New(cfg.FailThreshold, cfg.Cooldown)
+	// 重启恢复：用最近的转发样本重建选路预估(延迟/成功率 EWMA)，不重建熔断状态
+	if samples, err := st.RecentSamples(2000); err != nil {
+		slog.Warn("seed route stats from logs failed", "err", err)
+	} else if len(samples) > 0 {
+		hs := make([]health.RouteSample, len(samples))
+		for i, s := range samples {
+			hs[i] = health.RouteSample{UpstreamID: s.UpstreamID, Model: s.Model, OK: s.OK, LatencyMs: s.LatencyMs}
+		}
+		hm.Seed(hs)
+		slog.Info("seeded route stats from logs", "samples", len(hs))
+	}
 	sched := scheduler.New(listByGroup, hm)
 	fwd := forward.New(sched, hm, st, cfg.MaxRetries)
 	mon := monitor.New(st)
@@ -72,6 +83,16 @@ func main() {
 			return def
 		}
 	}
+	// 智能路由(延迟加权选路)：容忍线 route_tolerance_ms 一个参数两处用——
+	// ① 调度层算「有效延迟」时的失败成本；② 转发层首响应头超时(超时即换源)。
+	// route_smart 总开关默认开，置 "off" 即一键退回经典 P2C(灰度/回滚)。
+	toleranceMs := settingInt("route_tolerance_ms", 30000)
+	sched.SetRouting(
+		func() float64 { return float64(toleranceMs()) },
+		func() bool { return st.GetSetting("route_smart", "on") != "off" },
+	)
+	fwd.SetTolerance(func() time.Duration { return time.Duration(toleranceMs()) * time.Millisecond })
+
 	// 健康事件主动告警：熔断翻转时推送 Webhook（URL 空则关闭）。
 	// id→name 解析用现成 List()，解析不到回退 id 字符串。
 	upstreamName := func(id int64) string {

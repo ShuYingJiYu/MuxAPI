@@ -1,6 +1,8 @@
 package health
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -284,7 +286,10 @@ func TestModelStates(t *testing.T) {
 
 // 半开单请求闸门：熔断冷却到期后，并发探测只放【一个】试探请求，其余一律不可用；
 // 直到该试探有结果(成功/失败)闸门才释放。防止死渠道半开期被一片业务流量涌入。
-func TestHalfOpenSingleProbeGate(t *testing.T) {
+// 半开恢复期放行并发（方案A）：Open 冷却到期后翻 HalfOpen，
+// 此后【所有】请求都可服务（不再「单试探闸门」只放一个）。
+// 这修复了严格优先级主备拓扑下，主力上游恢复瞬间并发请求被 503 拦的问题。
+func TestHalfOpenServesConcurrent(t *testing.T) {
 	m := New(1, 30*time.Millisecond) // 一次失败即熔断，冷却 30ms
 	const id = int64(30)
 
@@ -294,21 +299,48 @@ func TestHalfOpenSingleProbeGate(t *testing.T) {
 	}
 	time.Sleep(40 * time.Millisecond) // 冷却到期
 
-	// 第一次询问：放行(这一个就是试探)；闸门随即占用
+	// 冷却到期：翻 HalfOpen
 	if !m.IsAvailable(id, "") {
-		t.Fatal("冷却到期应放行一个试探")
+		t.Fatal("冷却到期应放行")
 	}
 	if m.Snapshot(id).State != "HALF_OPEN" {
 		t.Fatal("放行后应处于半开")
 	}
-	// 第二、三次询问：闸门已占用、试探未回执 → 一律不可用
-	if m.IsAvailable(id, "") || m.IsAvailable(id, "") {
-		t.Fatal("半开闸门占用期间，后续请求应一律不可用（只放一个试探）")
+	// 半开期连续多次询问都应可用（不再单闸门拦后续）——这是与旧设计的关键差异
+	for i := 0; i < 5; i++ {
+		if !m.IsAvailable(id, "") {
+			t.Fatalf("半开期第 %d 次询问应可用（并发放行，不再单试探闸门）", i+1)
+		}
 	}
-	// 试探失败回执 → 重新 OPEN，闸门释放（但冷却未到仍不可用）
+	// 半开期任一失败回执 → 立即重新 OPEN（死渠道保护仍在），冷却未到则不可用
 	m.Report(id, "", false, 0)
 	if m.IsAvailable(id, "") {
-		t.Fatal("试探失败应重新熔断")
+		t.Fatal("半开失败应立即重新熔断")
+	}
+}
+
+// 半开放行的并发安全：恢复瞬间 N 个并发请求应【全部】放行（旧单闸门设计下只 1 个、其余被拦）。
+func TestHalfOpenConcurrentBurstAllServed(t *testing.T) {
+	m := New(1, 30*time.Millisecond)
+	const id = int64(32)
+	m.Report(id, "", false, 0) // OPEN
+	time.Sleep(40 * time.Millisecond)
+	var served, blocked int64
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if m.IsAvailable(id, "") {
+				atomic.AddInt64(&served, 1)
+			} else {
+				atomic.AddInt64(&blocked, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	if blocked != 0 {
+		t.Fatalf("半开恢复瞬间 8 并发应全放行，实际放行=%d 被拦=%d", served, blocked)
 	}
 }
 
@@ -330,5 +362,33 @@ func TestProbeRecoversDeadUpstream(t *testing.T) {
 	}
 	if s := m.ModelStates(id); len(s) != 1 || s[0].State != "CLOSED" {
 		t.Fatalf("探测恢复后该模型应 CLOSED，实际 %+v", s)
+	}
+}
+
+// Seed 回放历史样本重建选路预估：恢复 latency/succ EWMA，但不触碰熔断状态(保持 Closed)。
+func TestSeedRebuildsRouteStats(t *testing.T) {
+	m := New(3, time.Minute)
+	const id, model = int64(7), "gpt-5.5"
+	// 回放：3 次成功(延迟100/120/110) + 1 次失败
+	m.Seed([]RouteSample{
+		{UpstreamID: id, Model: model, OK: true, LatencyMs: 100},
+		{UpstreamID: id, Model: model, OK: true, LatencyMs: 120},
+		{UpstreamID: id, Model: model, OK: false, LatencyMs: 0},
+		{UpstreamID: id, Model: model, OK: true, LatencyMs: 110},
+	})
+	// 模型级应重建出非零延迟 EWMA 与 <1 的成功率
+	lat, sr := m.RouteStats(id, model)
+	if lat <= 0 {
+		t.Fatalf("Seed 后延迟 EWMA 应 >0，实际 %v", lat)
+	}
+	if sr <= 0 || sr >= 1 {
+		t.Fatalf("有失败样本，成功率应在 (0,1)，实际 %v", sr)
+	}
+	// 关键：不重建熔断状态——重启后从 Closed 起，仍可用
+	if !m.IsAvailable(id, model) {
+		t.Fatal("Seed 不应改变熔断状态，应保持可用(Closed)")
+	}
+	if st := m.Snapshot(id); st.State != "CLOSED" {
+		t.Fatalf("Seed 后上游级应 CLOSED，实际 %s", st.State)
 	}
 }

@@ -88,6 +88,11 @@ func Open(path string) (*Store, error) {
 	db.Exec(`ALTER TABLE monitors ADD COLUMN path TEXT NOT NULL DEFAULT ''`)
 	// 迁移：旧库 monitors 补 sort 列（拖拽排序权重，0=未排过按 id）
 	db.Exec(`ALTER TABLE monitors ADD COLUMN sort INTEGER NOT NULL DEFAULT 0`)
+	// 迁移：旧库 logs 补 model 列（请求记录按模型维度展示，旧行为空）
+	db.Exec(`ALTER TABLE logs ADD COLUMN model TEXT NOT NULL DEFAULT ''`)
+	db.Exec(`ALTER TABLE logs ADD COLUMN endpoint TEXT NOT NULL DEFAULT ''`)
+	db.Exec(`ALTER TABLE logs ADD COLUMN key_name TEXT NOT NULL DEFAULT ''`)
+	db.Exec(`ALTER TABLE logs ADD COLUMN retries INTEGER NOT NULL DEFAULT 0`)
 	return &Store{db: db}, nil
 }
 
@@ -139,7 +144,11 @@ CREATE TABLE IF NOT EXISTS logs (
 	upstream_id INTEGER NOT NULL,
 	status      INTEGER NOT NULL,
 	latency_ms  INTEGER NOT NULL,
-	created_at  INTEGER NOT NULL
+	created_at  INTEGER NOT NULL,
+	model       TEXT NOT NULL DEFAULT '',
+	endpoint    TEXT NOT NULL DEFAULT '',
+	key_name    TEXT NOT NULL DEFAULT '',
+	retries     INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS settings (
 	key   TEXT PRIMARY KEY,
@@ -628,6 +637,12 @@ func (s *Store) GroupByKey(key string) (int64, bool) {
 	return gid, err == nil
 }
 
+// GroupAndKeyByKey 同 GroupByKey，但一并返回密钥名(供请求记录展示来源客户端)。
+func (s *Store) GroupAndKeyByKey(key string) (gid int64, name string, ok bool) {
+	err := s.db.QueryRow(`SELECT group_id,COALESCE(name,'') FROM access_keys WHERE key=? AND enabled=1`, key).Scan(&gid, &name)
+	return gid, name, err == nil
+}
+
 // CreateKey 系统生成 sk-mux-<random> 凭证，返回明文（仅此一次可见）。
 func (s *Store) CreateKey(name string, groupID int64) (string, error) {
 	b := make([]byte, 24)
@@ -677,21 +692,166 @@ func (s *Store) DeleteKey(id int64) error {
 
 // --- 调用日志 ---
 
-// LogEntry 一条转发日志（JOIN 出上游名供展示）。
+// LogEntry 一条转发日志（JOIN 出上游名、分组名供展示）。
 type LogEntry struct {
 	ID           int64  `json:"id"`
 	GroupID      int64  `json:"group_id"`
+	GroupName    string `json:"group_name"`
 	UpstreamID   int64  `json:"upstream_id"`
 	UpstreamName string `json:"upstream_name"`
+	Model        string `json:"model"`  // 请求模型；旧数据/解析失败为空
 	Status       int    `json:"status"` // HTTP 状态码；网络失败为 0
 	LatencyMs    int64  `json:"latency_ms"`
 	CreatedAt    int64  `json:"created_at"`
+	Endpoint     string `json:"endpoint"` // 请求端点路径，如 /v1/messages；旧数据为空
+	KeyName      string `json:"key_name"` // 命中的接入密钥名；旧数据为空
+	Retries      int    `json:"retries"`  // 本次落库时已重试次数(0=首次命中)
 }
 
 // Log 记一条转发调用日志（异步友好：忽略写入错误，不阻塞转发）。
-func (s *Store) Log(groupID, upstreamID int64, status int, latencyMs int64) {
-	s.db.Exec(`INSERT INTO logs(group_id,upstream_id,status,latency_ms,created_at) VALUES(?,?,?,?,?)`,
-		groupID, upstreamID, status, latencyMs, time.Now().Unix())
+func (s *Store) Log(groupID, upstreamID int64, model, endpoint, keyName string, retries, status int, latencyMs int64) {
+	s.db.Exec(`INSERT INTO logs(group_id,upstream_id,model,endpoint,key_name,retries,status,latency_ms,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+		groupID, upstreamID, model, endpoint, keyName, retries, status, latencyMs, time.Now().Unix())
+}
+
+// LogPage 一页日志 + 游标分页元信息。
+type LogPage struct {
+	Entries    []*LogEntry `json:"entries"`
+	HasMore    bool        `json:"has_more"`
+	NextCursor int64       `json:"next_cursor"` // 下一页传 before=此值；0=没有更多
+}
+
+// ListLogsPage 游标分页 + 服务端筛选。
+// beforeID<=0 从最新开始；否则取 id<beforeID 的更旧一页（倒序）。
+// model/group 非空按精确匹配；statusClass: "ok"=2xx/3xx, "fail"=其余(含网络失败0)，空=不限。
+// 多取一条判断 hasMore，并以本页最后一条 id 作为下一页游标。
+func (s *Store) ListLogsPage(beforeID int64, limit int, model, group, statusClass string) (*LogPage, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	q := `SELECT l.id,l.group_id,COALESCE(g.name,''),l.upstream_id,COALESCE(u.name,''),l.model,l.status,l.latency_ms,l.created_at,l.endpoint,l.key_name,l.retries
+		FROM logs l LEFT JOIN upstreams u ON u.id=l.upstream_id LEFT JOIN groups g ON g.id=l.group_id WHERE 1=1`
+	var args []any
+	if beforeID > 0 {
+		q += " AND l.id < ?"
+		args = append(args, beforeID)
+	}
+	if model != "" {
+		q += " AND l.model = ?"
+		args = append(args, model)
+	}
+	if group != "" {
+		q += " AND g.name = ?"
+		args = append(args, group)
+	}
+	switch statusClass {
+	case "ok":
+		q += " AND l.status >= 200 AND l.status < 400"
+	case "fail":
+		q += " AND (l.status < 200 OR l.status >= 400)"
+	}
+	q += " ORDER BY l.id DESC LIMIT ?"
+	args = append(args, limit+1) // 多取一条探测 hasMore
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	page := &LogPage{Entries: []*LogEntry{}}
+	for rows.Next() {
+		e := &LogEntry{}
+		if err := rows.Scan(&e.ID, &e.GroupID, &e.GroupName, &e.UpstreamID, &e.UpstreamName, &e.Model, &e.Status, &e.LatencyMs, &e.CreatedAt, &e.Endpoint, &e.KeyName, &e.Retries); err != nil {
+			return nil, err
+		}
+		page.Entries = append(page.Entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(page.Entries) > limit { // 取到了探测行 → 还有更多
+		page.Entries = page.Entries[:limit]
+		page.HasMore = true
+	}
+	if n := len(page.Entries); n > 0 {
+		page.NextCursor = page.Entries[n-1].ID
+	}
+	return page, nil
+}
+
+// LogFilterOptions 日志里出现过的模型/分组名（去重排序），供前端筛选下拉用全量值。
+type LogFilterOptions struct {
+	Models []string `json:"models"`
+	Groups []string `json:"groups"`
+}
+
+func (s *Store) LogFilterOptions() (*LogFilterOptions, error) {
+	opt := &LogFilterOptions{Models: []string{}, Groups: []string{}}
+	collect := func(q string) ([]string, error) {
+		rows, err := s.db.Query(q)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var v string
+			if err := rows.Scan(&v); err != nil {
+				return nil, err
+			}
+			if v != "" {
+				out = append(out, v)
+			}
+		}
+		return out, rows.Err()
+	}
+	var err error
+	if opt.Models, err = collect(`SELECT DISTINCT model FROM logs WHERE model<>'' ORDER BY model`); err != nil {
+		return nil, err
+	}
+	if opt.Groups, err = collect(`SELECT DISTINCT g.name FROM logs l JOIN groups g ON g.id=l.group_id ORDER BY g.name`); err != nil {
+		return nil, err
+	}
+	if opt.Models == nil {
+		opt.Models = []string{}
+	}
+	if opt.Groups == nil {
+		opt.Groups = []string{}
+	}
+	return opt, nil
+}
+
+// RouteSample 一条历史路由样本，供启动时重建 (上游,模型) 的延迟/成功率 EWMA。
+type RouteSample struct {
+	UpstreamID int64
+	Model      string
+	OK         bool
+	LatencyMs  int64
+}
+
+// RecentSamples 取最近 limit 条日志、按时间【正序】(旧→新)返回，供 EWMA 顺序回放。
+// 只取真实转发记录用于重建选路预估；网络失败(status=0)也算样本(OK=false、延迟不计)。
+func (s *Store) RecentSamples(limit int) ([]RouteSample, error) {
+	if limit <= 0 {
+		limit = 2000
+	}
+	// 先按 id 倒序取最近 limit 条，再正序回放（子查询取最近、外层翻正序）
+	rows, err := s.db.Query(`SELECT upstream_id,model,status,latency_ms FROM
+		(SELECT id,upstream_id,model,status,latency_ms FROM logs ORDER BY id DESC LIMIT ?) ORDER BY id ASC`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RouteSample
+	for rows.Next() {
+		var s RouteSample
+		var status int
+		if err := rows.Scan(&s.UpstreamID, &s.Model, &status, &s.LatencyMs); err != nil {
+			return nil, err
+		}
+		s.OK = status >= 200 && status < 400
+		out = append(out, s)
+	}
+	return out, rows.Err()
 }
 
 // ListLogs 倒序返回最近 limit 条日志（limit<=0 时默认 100）。
@@ -699,8 +859,8 @@ func (s *Store) ListLogs(limit int) ([]*LogEntry, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.db.Query(`SELECT l.id,l.group_id,l.upstream_id,COALESCE(u.name,''),l.status,l.latency_ms,l.created_at
-		FROM logs l LEFT JOIN upstreams u ON u.id=l.upstream_id ORDER BY l.id DESC LIMIT ?`, limit)
+	rows, err := s.db.Query(`SELECT l.id,l.group_id,COALESCE(g.name,''),l.upstream_id,COALESCE(u.name,''),l.model,l.status,l.latency_ms,l.created_at
+		FROM logs l LEFT JOIN upstreams u ON u.id=l.upstream_id LEFT JOIN groups g ON g.id=l.group_id ORDER BY l.id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -708,7 +868,7 @@ func (s *Store) ListLogs(limit int) ([]*LogEntry, error) {
 	var out []*LogEntry
 	for rows.Next() {
 		e := &LogEntry{}
-		if err := rows.Scan(&e.ID, &e.GroupID, &e.UpstreamID, &e.UpstreamName, &e.Status, &e.LatencyMs, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.GroupID, &e.GroupName, &e.UpstreamID, &e.UpstreamName, &e.Model, &e.Status, &e.LatencyMs, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, e)

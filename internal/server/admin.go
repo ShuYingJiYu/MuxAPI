@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/mirainya/muxapi/internal/health"
 	"github.com/mirainya/muxapi/internal/monitor"
+	"github.com/mirainya/muxapi/internal/scheduler"
 	"github.com/mirainya/muxapi/internal/store"
 	"github.com/mirainya/muxapi/internal/upstream"
 )
@@ -24,22 +26,33 @@ func (s *Server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/groups", s.auth(s.adminGroups))           // GET 列表 / POST 新增
 	mux.HandleFunc("/admin/groups/", s.auth(s.adminGroupSub))        // /{id} 改/删 ; /{id}/upstreams 成员 ; /{id}/keys 密钥
 	mux.HandleFunc("/admin/keys/", s.auth(s.adminKeyItem))           // PUT 启停 / DELETE 删
-	mux.HandleFunc("/admin/logs", s.auth(s.adminLogs))               // GET 最近调用日志
+	mux.HandleFunc("/admin/logs", s.auth(s.adminLogs))               // GET 调用日志(游标分页+筛选)
+	mux.HandleFunc("/admin/logs/options", s.auth(s.adminLogOptions)) // GET 筛选下拉选项(全量去重)
 	mux.HandleFunc("/admin/settings", s.auth(s.adminSettings))       // GET/PUT 运行时设置
 }
 
-// adminLogs 返回最近调用日志(?limit=N，默认100)。
+// adminLogs 游标分页返回调用日志。
+// 查询参: before(游标,id<此值;0=最新), limit(默认50,上限500), model/group(精确), status(ok|fail)。
 func (s *Server) adminLogs(w http.ResponseWriter, r *http.Request) {
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	logs, err := s.store.ListLogs(limit)
+	q := r.URL.Query()
+	before, _ := strconv.ParseInt(q.Get("before"), 10, 64)
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	page, err := s.store.ListLogsPage(before, limit, q.Get("model"), q.Get("group"), q.Get("status"))
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	if logs == nil {
-		logs = []*store.LogEntry{}
+	writeJSON(w, page)
+}
+
+// adminLogOptions 返回日志筛选下拉的全量去重选项(模型/分组)。
+func (s *Server) adminLogOptions(w http.ResponseWriter, r *http.Request) {
+	opt, err := s.store.LogFilterOptions()
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
 	}
-	writeJSON(w, logs)
+	writeJSON(w, opt)
 }
 
 // adminSettings GET 返回 / PUT 保存运行时设置。
@@ -49,22 +62,30 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 		logRetention, logRetentionSource := intSettingValue(s.store.GetSetting("log_retention", ""), 10000)
 		alertWebhook, alertWebhookSource := stringSettingValue(s.store.GetSetting("alert_webhook", ""), "")
 		alertDebounce, alertDebounceSource := settingValue(s.store.GetSetting("alert_debounce", ""), "60s")
+		routeTolerance, routeToleranceSource := intSettingValue(s.store.GetSetting("route_tolerance_ms", ""), 30000)
+		routeSmart := s.store.GetSetting("route_smart", "on") // 默认开
 		writeJSON(w, map[string]string{
 			"log_retention":            s.store.GetSetting("log_retention", ""),
 			"alert_webhook":            s.store.GetSetting("alert_webhook", ""),
 			"alert_debounce":           s.store.GetSetting("alert_debounce", ""),
+			"route_tolerance_ms":       s.store.GetSetting("route_tolerance_ms", ""),
+			"route_smart":              routeSmart,
 			"effective_log_retention":  logRetention,
 			"effective_alert_webhook":  alertWebhook,
 			"effective_alert_debounce": alertDebounce,
+			"effective_route_tolerance_ms": routeTolerance,
 			"log_retention_source":     logRetentionSource,
 			"alert_webhook_source":     alertWebhookSource,
 			"alert_debounce_source":    alertDebounceSource,
+			"route_tolerance_ms_source": routeToleranceSource,
 		})
 	case http.MethodPut:
 		var d struct {
 			LogRetention  string `json:"log_retention"`
 			AlertWebhook  string `json:"alert_webhook"`
 			AlertDebounce string `json:"alert_debounce"`
+			RouteToleranceMs string `json:"route_tolerance_ms"`
+			RouteSmart       string `json:"route_smart"`
 		}
 		json.NewDecoder(r.Body).Decode(&d)
 		if n, err := strconv.Atoi(d.LogRetention); err != nil || n < 100 {
@@ -80,9 +101,20 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "无效去抖间隔，用 30s/1m 格式", 400)
 			return
 		}
+		// 容忍线：1~300 秒(1000~300000ms)，太小会误杀正常首字节、太大失去切换意义
+		if n, err := strconv.Atoi(d.RouteToleranceMs); err != nil || n < 1000 || n > 300000 {
+			http.Error(w, "容忍线须为 1000~300000 的毫秒数(1~300 秒)", 400)
+			return
+		}
+		if d.RouteSmart != "on" && d.RouteSmart != "off" {
+			http.Error(w, "智能路由开关须为 on 或 off", 400)
+			return
+		}
 		s.store.SetSetting("log_retention", d.LogRetention)
 		s.store.SetSetting("alert_webhook", d.AlertWebhook)
 		s.store.SetSetting("alert_debounce", d.AlertDebounce)
+		s.store.SetSetting("route_tolerance_ms", d.RouteToleranceMs)
+		s.store.SetSetting("route_smart", d.RouteSmart)
 		w.WriteHeader(204)
 	default:
 		http.Error(w, "method not allowed", 405)
@@ -133,11 +165,13 @@ func toHealthView(sn health.Snapshot) healthView {
 
 // modelHealthView 模型级健康精简视图（上游/成员列表展开模型徽章用）。
 type modelHealthView struct {
-	Model     string `json:"model"`
-	State     string `json:"state"`
-	Fails     int    `json:"fails"`
-	LatencyMs int64  `json:"latency_ms"`
-	LastProbe int64  `json:"last_probe"`
+	Model     string  `json:"model"`
+	State     string  `json:"state"`
+	Fails     int     `json:"fails"`
+	LatencyMs int64   `json:"latency_ms"`
+	LastProbe int64   `json:"last_probe"`
+	LatEWMA   float64 `json:"lat_ewma"`  // 选路用成功延迟 EWMA(ms)，徽章 hover 展示
+	SuccEWMA  float64 `json:"succ_ewma"` // 选路用成功率 EWMA(0..1)
 }
 
 // toModelHealthViews 把模型级状态拷成对外视图；无模型级键时返回 nil（前端据此不渲染该区块）。
@@ -150,6 +184,7 @@ func toModelHealthViews(ms []health.ModelHealth) []modelHealthView {
 		out = append(out, modelHealthView{
 			Model: mh.Model, State: mh.State, Fails: mh.Fails,
 			LatencyMs: mh.LatencyMs, LastProbe: mh.LastProbe,
+			LatEWMA: mh.LatEWMA, SuccEWMA: mh.SuccEWMA,
 		})
 	}
 	return out
@@ -176,6 +211,18 @@ type memberOut struct {
 	Health      healthView        `json:"health"`
 	ModelHealth []modelHealthView `json:"model_health,omitempty"` // 该上游模型级健康（仅 GET 填充，无则省略）
 	Effective   bool              `json:"effective"`
+	// 智能路由流量分配预估：仅生效层成员填充，按模型逐条给「有效延迟+占比」。
+	// 占比由 scheduler.PreviewShares 算(与实际选路同源)，前端按 model 重组渲染。
+	RoutePreview []routeShareView `json:"route_preview,omitempty"`
+}
+
+// routeShareView 某成员在某模型下的智能路由预估（同模型同层各成员占比加和=100）。
+type routeShareView struct {
+	Model        string  `json:"model"`
+	LatEWMAMs    float64 `json:"lat_ewma_ms"`    // 选路用成功延迟 EWMA(ms)
+	SuccRate     float64 `json:"succ_rate"`      // 选路用成功率(0..1)
+	EffLatencyMs float64 `json:"eff_latency_ms"` // 有效延迟(ms)，越小越优先
+	SharePct     float64 `json:"share_pct"`      // 预估流量占比 0..100
 }
 
 // groupRuntime 分组运行时概览：生效渠道名 + 各健康档计数（只统计 enabled 成员）。
@@ -224,6 +271,55 @@ func (s *Server) computeGroupRuntime(gid int64) groupRuntime {
 		}
 	}
 	return rt
+}
+
+// routeTolerance 当前容忍线(ms)，settings 无效则回退默认 30000（与 main 注入口径一致）。
+func (s *Server) routeTolerance() float64 {
+	if n, err := strconv.Atoi(s.store.GetSetting("route_tolerance_ms", "")); err == nil && n > 0 {
+		return float64(n)
+	}
+	return 30000
+}
+
+// computeRoutePreviews 算生效层成员的「按模型」智能路由占比预估。
+// 返回 upstreamID → 该成员各模型的占比视图（同模型同层各成员占比加和=100）。
+// 占比由 scheduler.PreviewShares 算，与实际选路同源——前端展示=真实分流。
+func (s *Server) computeRoutePreviews(eff []*store.Member) map[int64][]routeShareView {
+	out := map[int64][]routeShareView{}
+	if len(eff) < 1 {
+		return out
+	}
+	// 候选层(只需 ID/Weight，PreviewShares 据此算权重)
+	tier := make([]*upstream.Upstream, 0, len(eff))
+	for _, m := range eff {
+		tier = append(tier, &upstream.Upstream{ID: m.UpstreamID, Weight: m.Weight})
+	}
+	// 生效层成员的模型并集（稳定排序），逐模型算占比
+	seen := map[string]bool{}
+	models := make([]string, 0)
+	for _, m := range eff {
+		for _, mh := range s.health.ModelStates(m.UpstreamID) {
+			if !seen[mh.Model] {
+				seen[mh.Model] = true
+				models = append(models, mh.Model)
+			}
+		}
+	}
+	sort.Strings(models)
+	tol := s.routeTolerance()
+	for _, model := range models {
+		shares := scheduler.PreviewShares(tier,
+			func(id int64) (float64, float64) { return s.health.RouteStats(id, model) }, tol)
+		for _, m := range eff {
+			ewma, sr := s.health.RouteStats(m.UpstreamID, model)
+			sh := shares[m.UpstreamID]
+			out[m.UpstreamID] = append(out[m.UpstreamID], routeShareView{
+				Model: model, LatEWMAMs: ewma, SuccRate: sr,
+				EffLatencyMs: sh.EffLatencyMs, SharePct: sh.Share * 100,
+			})
+		}
+	}
+	return out
 }
 
 // upstreamDTO 对外视图：api_key 脱敏，不回显完整凭证。
@@ -677,14 +773,24 @@ func (s *Server) adminGroupUpstreams(w http.ResponseWriter, r *http.Request, gid
 		}
 		state := func(id int64) string { return snaps[id].State }
 		best, hasEff := effectivePriority(ms, state)
+		// 生效层成员集合 → 算智能路由流量占比预估
+		eff := make([]*store.Member, 0)
+		for _, m := range ms {
+			if hasEff && m.Enabled && m.GroupEnabled && m.Priority == best && snaps[m.UpstreamID].State != "OPEN" {
+				eff = append(eff, m)
+			}
+		}
+		previews := s.computeRoutePreviews(eff)
 		out := make([]memberOut, 0, len(ms))
 		for _, m := range ms {
 			sn := snaps[m.UpstreamID]
+			isEff := hasEff && m.Enabled && m.GroupEnabled && m.Priority == best && sn.State != "OPEN"
 			out = append(out, memberOut{
-				Member:      m,
-				Health:      toHealthView(sn),
-				ModelHealth: toModelHealthViews(s.health.ModelStates(m.UpstreamID)),
-				Effective:   hasEff && m.Enabled && m.GroupEnabled && m.Priority == best && sn.State != "OPEN",
+				Member:       m,
+				Health:       toHealthView(sn),
+				ModelHealth:  toModelHealthViews(s.health.ModelStates(m.UpstreamID)),
+				Effective:    isEff,
+				RoutePreview: previews[m.UpstreamID],
 			})
 		}
 		writeJSON(w, out)

@@ -82,4 +82,17 @@ export const api = {
   // 运行时设置
   getSettings: () => req('GET', '/settings'),
   saveSettings: s => req('PUT', '/settings', s),
+
+  // 请求记录（游标分页 + 服务端筛选）。opts: {before, limit, model, group, status}
+  logs: (opts = {}) => {
+    const p = new URLSearchParams()
+    if (opts.before) p.set('before', opts.before)
+    if (opts.limit) p.set('limit', opts.limit)
+    if (opts.model) p.set('model', opts.model)
+    if (opts.group) p.set('group', opts.group)
+    if (opts.status) p.set('status', opts.status)
+    const qs = p.toString()
+    return req('GET', '/logs' + (qs ? '?' + qs : ''))
+  },
+  logOptions: () => req('GET', '/logs/options'),
 }

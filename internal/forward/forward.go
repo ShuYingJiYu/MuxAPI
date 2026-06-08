@@ -17,9 +17,9 @@ type Health interface {
 	Report(id int64, model string, ok bool, latencyMs int64)
 }
 
-// Logger 转发层记调用日志（status=HTTP码，网络失败为 0）
+// Logger 转发层记调用日志（status=HTTP码，网络失败为 0；model 为请求模型，解析失败为空）
 type Logger interface {
-	Log(groupID, upstreamID int64, status int, latencyMs int64)
+	Log(groupID, upstreamID int64, model, endpoint, keyName string, retries, status int, latencyMs int64)
 }
 
 // Picker 调度层在指定分组内按模型选上游（exclude 为本次请求已试过、需跳过的上游）
@@ -32,15 +32,34 @@ type Forwarder struct {
 	health     Health
 	logger     Logger
 	maxRetries int
+	// 首响应头超时(容忍线)：超过即视为该上游失败、cancel 换源。
+	// 用首响应头而非总时长——流式长输出总时长几十秒正常，砍总时长会误杀；
+	// 首字节(TTFT)能切掉「上游号池轮询卡住」这类慢。nil 时回退默认 60s。
+	tolerance func() time.Duration
 }
 
 func New(p Picker, h Health, l Logger, maxRetries int) *Forwarder {
 	return &Forwarder{picker: p, health: h, logger: l, maxRetries: maxRetries}
 }
 
+// SetTolerance 注入首响应头超时(容忍线)，读 settings 即时生效。
+func (f *Forwarder) SetTolerance(d func() time.Duration) { f.tolerance = d }
+
+// headerTimeout 当前容忍线；未注入或非正值时回退默认 60s。
+func (f *Forwarder) headerTimeout() time.Duration {
+	if f.tolerance != nil {
+		if d := f.tolerance(); d > 0 {
+			return d
+		}
+	}
+	return 60 * time.Second
+}
+
 // Forward 在指定分组内转发请求：失败则换上游重试（每次跳过本次已试过的，立即切换到下一优先级层）。
-func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte, groupID int64) {
+// keyName 为命中的接入密钥名，仅用于请求记录展示来源客户端。
+func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte, groupID int64, keyName string) {
 	model := parseModel(body) // 解析请求模型用于 (上游,模型) 级健康判定；解析失败为 "" 回退上游级
+	endpoint := r.URL.Path     // 请求端点(如 /v1/messages)，落库供按协议区分
 	var lastErr error
 	tried := map[int64]bool{}
 	for attempt := 0; attempt <= f.maxRetries; attempt++ {
@@ -56,15 +75,15 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			continue
 		}
 		req = req.WithContext(r.Context())
-		// 每个上游用自己的代理出口；响应头超时防上游卡死(不影响已开始的流式)
+		// 每个上游用自己的代理出口；首响应头超时=容忍线，超时即换源(不影响已开始的流式)
 		tr := u.NewTransport()
-		tr.ResponseHeaderTimeout = 60 * time.Second
+		tr.ResponseHeaderTimeout = f.headerTimeout()
 		client := &http.Client{Timeout: 0, Transport: tr}
 		start := time.Now()
 		resp, err := client.Do(req)
 		if err != nil { // 网络错误：模型级失败（不连坐整上游）
 			f.health.Report(u.ID, model, false, 0)
-			f.logger.Log(groupID, u.ID, 0, 0)
+			f.logger.Log(groupID, u.ID, model, endpoint, keyName, attempt, 0, 0)
 			lastErr = err
 			continue
 		}
@@ -72,14 +91,14 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		if upstream.IsFailureStatus(resp.StatusCode) {
 			lat := time.Since(start).Milliseconds()
 			f.health.Report(u.ID, failScope(model, resp.StatusCode), false, lat)
-			f.logger.Log(groupID, u.ID, resp.StatusCode, lat)
+			f.logger.Log(groupID, u.ID, model, endpoint, keyName, attempt, resp.StatusCode, lat)
 			resp.Body.Close()
 			continue
 		}
 		// 成功：反馈 + 透传响应
 		lat := time.Since(start).Milliseconds()
 		f.health.Report(u.ID, model, true, lat)
-		f.logger.Log(groupID, u.ID, resp.StatusCode, lat)
+		f.logger.Log(groupID, u.ID, model, endpoint, keyName, attempt, resp.StatusCode, lat)
 		relayResponse(w, resp)
 		return
 	}
