@@ -1,7 +1,9 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"io"
 	"io/fs"
 	"net/http"
@@ -33,13 +35,14 @@ type Server struct {
 	health     *health.Manager
 	mon        *monitor.Manager
 	monProber  *monitor.Prober
+	maxBody    int64 // 请求体字节上限（<=0 表示不限制）
 
-	modelMu    sync.Mutex                 // 保护 modelCache
-	modelCache map[int64]modelCacheEntry  // 按 upstream_id 缓存其 /v1/models 结果，TTL=modelsTTL
+	modelMu    sync.Mutex                // 保护 modelCache
+	modelCache map[int64]modelCacheEntry // 按 upstream_id 缓存其 /v1/models 结果，TTL=modelsTTL
 }
 
-func New(fwd *forward.Forwarder, adminToken string, st *store.Store, hm *health.Manager, mon *monitor.Manager, mp *monitor.Prober) *Server {
-	return &Server{fwd: fwd, adminToken: adminToken, store: st, health: hm, mon: mon, monProber: mp,
+func New(fwd *forward.Forwarder, adminToken string, st *store.Store, hm *health.Manager, mon *monitor.Manager, mp *monitor.Prober, maxBody int64) *Server {
+	return &Server{fwd: fwd, adminToken: adminToken, store: st, health: hm, mon: mon, monProber: mp, maxBody: maxBody,
 		modelCache: make(map[int64]modelCacheEntry)}
 }
 
@@ -48,10 +51,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
-	mux.HandleFunc("/v1/messages", s.messages)          // Claude 格式
-	mux.HandleFunc("/v1/chat/completions", s.messages)  // OpenAI 格式
-	mux.HandleFunc("/v1/responses", s.messages)         // OpenAI Responses API (codex)
-	mux.HandleFunc("/v1/models", s.listModels)          // 模型清单：汇总分组内各上游
+	mux.HandleFunc("/v1/messages", s.messages)         // Claude 格式
+	mux.HandleFunc("/v1/chat/completions", s.messages) // OpenAI 格式
+	mux.HandleFunc("/v1/responses", s.messages)        // OpenAI Responses API (codex)
+	mux.HandleFunc("/v1/models", s.listModels)         // 模型清单：汇总分组内各上游
 	s.registerAdmin(mux)
 	// 内嵌前端（"/" 兜底，/v1、/admin、/healthz 等更长前缀优先匹配，不冲突）
 	if sub, err := fs.Sub(muxweb.Dist, "dist"); err == nil {
@@ -61,11 +64,16 @@ func (s *Server) Handler() http.Handler {
 }
 
 // auth 后台管理鉴权（adminToken）。AdminToken 为空时跳过（仅本地调试）。
+// 用常量时间比较防 token 计时侧信道；长度不等时 ConstantTimeCompare 返回 0，
+// 故两路候选(Authorization / x-api-key)分别比较再 OR。
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.adminToken != "" {
-			tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if tok != s.adminToken && r.Header.Get("x-api-key") != s.adminToken {
+			want := []byte(s.adminToken)
+			bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			okBearer := subtle.ConstantTimeCompare([]byte(bearer), want) == 1
+			okKey := subtle.ConstantTimeCompare([]byte(r.Header.Get("x-api-key")), want) == 1
+			if !okBearer && !okKey {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
@@ -88,8 +96,17 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized: unknown access key", http.StatusUnauthorized)
 		return
 	}
+	// 限制请求体大小，防无上限 io.ReadAll 被超大 body 打爆内存(DoS)。
+	if s.maxBody > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, s.maxBody)
+	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var mbErr *http.MaxBytesError
+		if errors.As(err, &mbErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "read body failed", http.StatusBadRequest)
 		return
 	}

@@ -45,7 +45,7 @@ func TestEndToEndForward(t *testing.T) {
 	fwd := forward.New(sched, hm, st, 3)
 	gid, _ := st.CreateGroup("test", "")
 	key, _ := st.CreateKey("test-key", gid)
-	srv := New(fwd, "", st, hm, monitor.New(st), nil)
+	srv := New(fwd, "", st, hm, monitor.New(st), nil, 32<<20)
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -95,7 +95,7 @@ func TestListModels(t *testing.T) {
 	hm := health.New(1, time.Hour)
 	sched := scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm)
 	fwd := forward.New(sched, hm, st, 3)
-	srv := New(fwd, "", st, hm, monitor.New(st), nil)
+	srv := New(fwd, "", st, hm, monitor.New(st), nil, 32<<20)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -123,5 +123,83 @@ func TestListModels(t *testing.T) {
 	}
 	if strings.Count(s, `"id":"shared"`) != 1 {
 		t.Fatalf("shared 应去重为 1 个，body=%s", s)
+	}
+}
+
+// H4 回归：超过 maxBody 的请求体应被拒（413），不会被 io.ReadAll 无限读爆内存。
+func TestMaxBodyLimit(t *testing.T) {
+	st, _ := store.Open(":memory:")
+	defer st.Close()
+	hm := health.New(1, time.Hour)
+	sched := scheduler.New(func(int64) []*upstream.Upstream { return nil }, hm)
+	fwd := forward.New(sched, hm, st, 3)
+	gid, _ := st.CreateGroup("g", "")
+	key, _ := st.CreateKey("k", gid)
+
+	// 故意把上限设小（1KB），便于用小 body 触发 413。
+	srv := New(fwd, "", st, hm, monitor.New(st), nil, 1024)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	big := strings.Repeat("a", 4096) // 4KB > 1KB 上限
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/messages", strings.NewReader(big))
+	req.Header.Set("Authorization", "Bearer "+key)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("超限体应返回 413，实际 %d", resp.StatusCode)
+	}
+}
+
+// L16 回归：管理鉴权用常量时间比较，错误 token 必须被拒（401），正确 token 放行。
+func TestAdminAuthRejectsWrongToken(t *testing.T) {
+	st, _ := store.Open(":memory:")
+	defer st.Close()
+	hm := health.New(1, time.Hour)
+	sched := scheduler.New(func(int64) []*upstream.Upstream { return nil }, hm)
+	fwd := forward.New(sched, hm, st, 3)
+
+	const adminTok = "s3cret-admin-token"
+	srv := New(fwd, adminTok, st, hm, monitor.New(st), nil, 32<<20)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 错误 token（且长度不等，验证 ConstantTimeCompare 长度不等返回 0 的分支）→ 401
+	bad, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/upstreams", nil)
+	bad.Header.Set("Authorization", "Bearer wrong")
+	resp, err := http.DefaultClient.Do(bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("错误 token 应 401，实际 %d", resp.StatusCode)
+	}
+
+	// 正确 token → 放行（非 401）
+	good, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/upstreams", nil)
+	good.Header.Set("Authorization", "Bearer "+adminTok)
+	resp2, err := http.DefaultClient.Do(good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("正确 token 不应 401")
+	}
+
+	// 正确 token 走 x-api-key 头 → 同样放行
+	good2, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/upstreams", nil)
+	good2.Header.Set("x-api-key", adminTok)
+	resp3, err := http.DefaultClient.Do(good2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("x-api-key 正确 token 不应 401")
 	}
 }

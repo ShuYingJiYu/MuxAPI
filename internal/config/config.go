@@ -38,6 +38,7 @@ type Config struct {
 	FailThreshold int           // 连续失败多少次熔断
 	Cooldown      time.Duration // 熔断冷却时长
 	MaxRetries    int           // 同上游重试次数
+	MaxBody       int64         // 请求体最大字节数（防 DoS），默认 32MB
 }
 
 func Load() *Config {
@@ -50,8 +51,10 @@ func Load() *Config {
 		// 冷却时长：熔断后多久才允许半开放【一个】业务请求试探。
 		// 取 2min 而非更短——死渠道的恢复主路径是探测器(不受此冷却限制)，
 		// 业务半开只是无探测覆盖时的兜底，冷却越长越能减少业务流量去试探死渠道的频率。
-		Cooldown:      envDur("MUXAPI_COOLDOWN", 2*time.Minute),
-		MaxRetries:    envInt("MUXAPI_MAX_RETRIES", 3),
+		Cooldown:   envDur("MUXAPI_COOLDOWN", 2*time.Minute),
+		MaxRetries: envInt("MUXAPI_MAX_RETRIES", 3),
+		// 请求体上限：防 io.ReadAll 无限读导致 OOM/DoS。默认 32MB，单位字节。
+		MaxBody: envInt64("MUXAPI_MAX_BODY", 32<<20),
 	}
 }
 
@@ -64,6 +67,13 @@ func env(k, def string) string {
 
 func envInt(k string, def int) int {
 	if v, err := strconv.Atoi(os.Getenv(k)); err == nil {
+		return v
+	}
+	return def
+}
+
+func envInt64(k string, def int64) int64 {
+	if v, err := strconv.ParseInt(os.Getenv(k), 10, 64); err == nil {
 		return v
 	}
 	return def

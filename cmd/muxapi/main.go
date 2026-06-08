@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -113,18 +114,36 @@ func main() {
 	//（看板统计 + 路由熔断器）。探测间隔/路径已全下放到各监控项，
 	// 传 nil 让 prober 用内置默认（5m / /v1/chat/completions），监控项可逐项覆盖。
 	monProber := monitor.NewProber(mon, st, hm, nil, nil)
-	srv := server.New(fwd, cfg.AdminToken, st, hm, mon, monProber)
+	srv := server.New(fwd, cfg.AdminToken, st, hm, mon, monProber, cfg.MaxBody)
 
 	// 收到 SIGINT/SIGTERM 时取消：停探测并触发优雅关闭
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// 后台 goroutine 用 WaitGroup 跟踪：Shutdown 后等它们退出再 st.Close()，
+	// 消除退出期探测/清理仍在写库而 DB 已关的竞态。
+	var wg sync.WaitGroup
 	// 监控项级主动探测：记看板(成功率/延迟/趋势) + 驱动路由熔断器。
-	go monProber.Run(ctx)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		monProber.Run(ctx)
+	}()
 	// 日志清理：按条数保留最新 N 条，定时裁剪防止 logs 表无限增长（页面可配，缺省 1 万条）。
 	logRetention := settingInt("log_retention", 10000)
-	go runLogJanitor(ctx, st, logRetention)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runLogJanitor(ctx, st, logRetention)
+	}()
 
-	httpSrv := &http.Server{Addr: cfg.Addr, Handler: srv.Handler()}
+	// 防 slowloris：仅限制读 header 的时长，不设全局 ReadTimeout——
+	// 否则会误杀慢上传/流式上传。MaxHeaderBytes 限制 header 体积。
+	httpSrv := &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 15 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 	go func() {
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("server exited", "err", err)
@@ -140,6 +159,7 @@ func main() {
 	if err := httpSrv.Shutdown(shutCtx); err != nil {
 		slog.Error("shutdown failed", "err", err)
 	}
+	wg.Wait() // 等后台 goroutine 退出，再让 defer st.Close() 安全关库
 }
 
 // runLogJanitor 定时裁剪 logs 表 + 探测结果：启动先清一次，之后每 10 分钟一轮。
