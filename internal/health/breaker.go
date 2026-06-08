@@ -39,7 +39,8 @@ type breaker struct {
 	// 业务流量统计（仅转发层计入，探测不算；进程级、重启清零）
 	reqs       int64 // 总请求数
 	failReqs   int64 // 失败请求数
-	totLatency int64 // 累计延迟(ms)，仅成功请求
+	totLatency int64 // 累计延迟(ms)，仅 latencyMs>0 的成功请求
+	latSamples int64 // 计入 totLatency 的成功样本数：作平均延迟分母，与分子同口径(仅 latencyMs>0)，避免 0 延迟成功样本只进分母拉低均值
 	// 趋势采样：环形缓冲 + 上次采样时的累计值（用于算窗口增量）
 	trend     []TrendPoint
 	lastReqs  int64
@@ -220,7 +221,21 @@ func (m *Manager) Report(id int64, model string, ok bool, latencyMs int64) {
 		up.failReqs++
 	} else if latencyMs > 0 {
 		up.totLatency += latencyMs
+		up.latSamples++ // 与 totLatency 同口径计数，作平均延迟分母(L3：0 延迟成功样本不计，避免低估)
 		up.latencyMs = latencyMs
+	}
+	// model!="" 时状态机驱动模型级键，但上游级键的选路 EWMA 不会被 drive 更新；
+	// 此处对上游级键同步累计 succEWMA/latencyEWMA，使新模型冷启动回退上游级路由读到鲜活值，
+	// 不再被 Seed 冻结。仅动这两个 EWMA，绝不碰 up 的 state/fails/openUntil。
+	if model != "" {
+		up.succEWMA = mixEWMA(up.succEWMA, boolToF(ok))
+		if ok && latencyMs > 0 {
+			if up.latencyEWMA == 0 {
+				up.latencyEWMA = float64(latencyMs)
+			} else {
+				up.latencyEWMA = ewmaAlpha*float64(latencyMs) + (1-ewmaAlpha)*up.latencyEWMA
+			}
+		}
 	}
 	// 状态机驱动到对应粒度的键：model=="" → 上游级；否则 → 模型级
 	b := m.get(breakerKey{id, model})
@@ -233,10 +248,12 @@ func (m *Manager) Report(id int64, model string, ok bool, latencyMs int64) {
 }
 
 // reportProbe 主动探测反馈：只驱动熔断状态机，不计入业务统计。
+// 探测是【确定性健康信号】（明确探到失败=渠道当下不可用），故用阈值 1：失败一次即熔断，
+// 不与业务流量共用 failThreshold——否则 failThreshold>1 时探测红了、路由却迟迟不熔断。
 func (m *Manager) reportProbe(id int64, model string, ok bool, latencyMs int64) {
 	m.mu.Lock()
 	b := m.get(breakerKey{id, model})
-	from, to := m.drive(b, ok, latencyMs)
+	from, to := m.driveWith(b, ok, latencyMs, 1)
 	ev, flipped := transitionEvent(id, model, from, to, b.fails)
 	m.mu.Unlock()
 	if flipped {
@@ -281,10 +298,17 @@ func transitionEvent(id int64, model string, from, to State, fails int) (AlertEv
 	}, true
 }
 
-// drive 熔断状态机（调用方须持有 m.mu）。返回 (旧状态, 新状态) 供调用方判翻转。
-// 半开态(HalfOpen)只要失败一次即重新 Open——这是死渠道保护：半开期放行的并发
-// 业务流量若打到真死渠道，每个失败回执都会立即把它打回 Open，重新进入冷却。
+// drive 熔断状态机（调用方须持有 m.mu）：业务流量口径，用 m.failThreshold。
+// 偶发抖动须连续失败 failThreshold 次才熔断，避免单次毛刺误熔健康渠道。
 func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) (from, to State) {
+	return m.driveWith(b, ok, latencyMs, m.failThreshold)
+}
+
+// driveWith 熔断状态机核心（调用方须持有 m.mu），threshold 为「连续失败几次熔断」。
+// 返回 (旧状态, 新状态) 供调用方判翻转。半开态(HalfOpen)只要失败一次即重新 Open——
+// 这是死渠道保护：半开期放行的并发流量若打到真死渠道，每个失败回执都会立即把它打回 Open。
+// 探测口径传 threshold=1（探测是确定性健康信号，失败一次即熔断，见 reportProbe）。
+func (m *Manager) driveWith(b *breaker, ok bool, latencyMs int64, threshold int) (from, to State) {
 	from = b.state
 	b.succEWMA = mixEWMA(b.succEWMA, boolToF(ok)) // 成功率 EWMA：成功=1 失败=0，首样本直赋(见 mixEWMA)
 	if ok {
@@ -302,7 +326,7 @@ func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) (from, to State) {
 		return from, b.state
 	}
 	b.fails++
-	if b.fails >= m.failThreshold || b.state == HalfOpen {
+	if b.fails >= threshold || b.state == HalfOpen {
 		b.state = Open
 		b.openUntil = time.Now().Add(m.cooldown)
 	}
@@ -387,8 +411,8 @@ func (m *Manager) Snapshot(id int64) Snapshot {
 	if b.reqs > 0 {
 		sn.SuccRate = float64(b.reqs-b.failReqs) / float64(b.reqs)
 	}
-	if succ := b.reqs - b.failReqs; succ > 0 {
-		sn.AvgLatMs = b.totLatency / succ
+	if b.latSamples > 0 { // 分母与分子同口径：仅统计 latencyMs>0 的成功样本，0 延迟样本不参与均值(L3)
+		sn.AvgLatMs = b.totLatency / b.latSamples
 	}
 	return sn
 }
@@ -442,8 +466,15 @@ func (m *Manager) ModelStates(id int64) []ModelHealth {
 func (m *Manager) EffectiveState(id int64) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if up := m.breakers[breakerKey{id, ""}]; up != nil && up.state == Open {
-		return Open.String() // 上游级熔断：所有模型连坐
+	if up := m.breakers[breakerKey{id, ""}]; up != nil {
+		if up.state == Open {
+			return Open.String() // 上游级熔断：所有模型连坐
+		}
+		if up.state == HalfOpen {
+			// 上游级半开(凭证类熔断冷却到期、正自证)：与无模型键路径 snapshotState 口径一致，
+			// 不被下面的模型级聚合吞成 CLOSED。位置须在 Open 判定之后、模型聚合之前(L1)。
+			return HalfOpen.String()
+		}
 	}
 	// 模型级聚合：anyClosed 优先(正常) > anyHalf(半开) > 全 OPEN(熔断)。
 	// 注意 State 枚举值 Closed=0/Open=1/HalfOpen=2 并非按健康度排序，不能直接比大小。

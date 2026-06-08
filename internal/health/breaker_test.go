@@ -497,3 +497,97 @@ func TestEffectiveStateNeverProbed(t *testing.T) {
 		t.Fatalf("从未探测应回退 CLOSED，得到 %q", got)
 	}
 }
+
+// 探测与业务流量阈值解耦：failThreshold=3 时，
+// 业务流量(Report)失败一次仍 CLOSED（须连续3次才熔断，防偶发抖动误熔）；
+// 而主动探测(ObserveProbe)失败一次即 OPEN（确定性健康信号，立即熔断）。
+// 这是「看板/总览已红，分组/上游页却迟迟显示正常」bug 的回归用例。
+func TestProbeFailsFastVsTraffic(t *testing.T) {
+	m := New(3, time.Hour) // 生产默认阈值 3
+	const id = int64(60)
+
+	// 业务流量失败一次：未达阈值3，仍 CLOSED
+	m.Report(id, "gpt-5.5", false, 0)
+	if got := m.EffectiveState(id); got != "CLOSED" {
+		t.Fatalf("业务流量失败1次<阈值3，应仍 CLOSED，得到 %q", got)
+	}
+
+	// 主动探测失败一次：立即 OPEN（不等阈值）
+	m.ObserveProbe(id, "gpt-5.5", false, 0)
+	if got := m.EffectiveState(id); got != "OPEN" {
+		t.Fatalf("探测失败1次应立即 OPEN，得到 %q", got)
+	}
+
+	// 探测成功一次：立即恢复 CLOSED
+	m.ObserveProbe(id, "gpt-5.5", true, 80)
+	if got := m.EffectiveState(id); got != "CLOSED" {
+		t.Fatalf("探测成功应立即恢复 CLOSED，得到 %q", got)
+	}
+}
+
+// L1 回归：上游级键处于 HALF_OPEN 时，EffectiveState 不应被模型级聚合吞成 CLOSED，
+// 须返回 HALF_OPEN，与无模型键路径(snapshotState)口径一致。
+func TestEffectiveStateUpstreamHalfOpen(t *testing.T) {
+	m := New(1, 20*time.Millisecond) // 阈值1：一次失败即熔断；短冷却便于翻 HALF_OPEN
+	const id = int64(70)
+
+	// 上游级失败 → OPEN；同时给一个正常模型级键，制造「模型聚合会算出 CLOSED」的陷阱
+	m.Report(id, "", false, 0)
+	m.Report(id, "gpt-5.5", true, 100)
+	if got := m.EffectiveState(id); got != "OPEN" {
+		t.Fatalf("上游级熔断应 OPEN，得到 %q", got)
+	}
+
+	// 冷却到期后触发翻 HALF_OPEN（IsAvailable 对上游级键 canServe 会翻态）
+	time.Sleep(30 * time.Millisecond)
+	if !m.IsAvailable(id, "") {
+		t.Fatal("冷却到期上游级应可用(HALF_OPEN)")
+	}
+	// 此刻上游级=HALF_OPEN、模型级=CLOSED：必须返回 HALF_OPEN，不能被聚合成 CLOSED
+	if got := m.EffectiveState(id); got != "HALF_OPEN" {
+		t.Fatalf("上游级 HALF_OPEN 不应被模型聚合吞成 CLOSED，得到 %q", got)
+	}
+}
+
+// L2 回归：model!="" 的 Report 须同步更新上游级键的 succEWMA/latencyEWMA，
+// 使无模型键的回退路由(RouteStats/LatencyEWMA)读到鲜活值而非 Seed 冻结值。
+func TestReportUpdatesUpstreamEWMA(t *testing.T) {
+	m := New(100, time.Hour) // 高阈值避免熔断干扰
+	const id = int64(71)
+
+	// 仅按模型级上报成功流量
+	m.Report(id, "gpt-5.5", true, 200)
+	m.Report(id, "gpt-5.5", true, 200)
+
+	// 上游级回退查询应能读到非零延迟 EWMA（修复前恒为 0/Seed 冻结）
+	if lat := m.LatencyEWMA(id, ""); lat <= 0 {
+		t.Fatalf("上游级 latencyEWMA 应被模型级流量同步更新为正值，得到 %d", lat)
+	}
+	ewmaMs, succ := m.RouteStats(id, "")
+	if ewmaMs <= 0 {
+		t.Fatalf("上游级回退 RouteStats 延迟应>0，得到 %f", ewmaMs)
+	}
+	if succ <= 0.99 { // 两次全成功，succEWMA 应趋近 1
+		t.Fatalf("上游级回退成功率应≈1，得到 %f", succ)
+	}
+
+	// 反例：上游级键的状态/失败数绝不能被模型级流量带动
+	if s := m.Snapshot(id); s.State != "CLOSED" || s.Fails != 0 {
+		t.Fatalf("同步 EWMA 不应改动上游级 state/fails，得到 %+v", s)
+	}
+}
+
+// L3 回归：平均延迟分子分母同口径——latencyMs==0 的成功样本既不进分子也不进分母，
+// 不再系统性低估平均延迟。
+func TestAvgLatencySameDenominator(t *testing.T) {
+	m := New(100, time.Hour)
+	const id = int64(72)
+
+	m.Report(id, "", true, 100) // 计入：100ms
+	m.Report(id, "", true, 200) // 计入：200ms
+	m.Report(id, "", true, 0)   // 成功但无延迟数据：不进分子也不进分母
+
+	if avg := m.Snapshot(id).AvgLatMs; avg != 150 { // (100+200)/2，而非 /3=100
+		t.Fatalf("平均延迟应 150ms(仅计有延迟样本)，实际 %d", avg)
+	}
+}

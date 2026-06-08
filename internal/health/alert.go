@@ -31,8 +31,16 @@ type WebhookAlerter struct {
 	nameOf   func(int64) string   // id→上游名解析，解析不到回退 id 字符串
 	client   *http.Client
 
-	mu       sync.Mutex            // 仅护去抖表，独立于 Manager.mu，不与熔断锁纠缠
-	lastSent map[breakerKey]time.Time
+	mu       sync.Mutex // 仅护去抖表，独立于 Manager.mu，不与熔断锁纠缠
+	lastSent map[debounceKey]time.Time
+}
+
+// debounceKey 去抖槽键：在 (上游,模型) 基础上并入方向(recovered)，
+// 使「熔断(DOWN)」与「恢复(RECOVERED)」各自独立去抖——
+// 否则 debounce 调大时，恢复告警会复用熔断刚占的槽被吞掉(M1)。
+type debounceKey struct {
+	key       breakerKey
+	recovered bool // true=恢复(→CLOSED)，false=熔断(→OPEN)
 }
 
 // NewWebhookAlerter 构造告警器。webhook/debounce 为运行时 getter（页面可配）；
@@ -43,7 +51,7 @@ func NewWebhookAlerter(webhook func() string, debounce func() time.Duration, nam
 		debounce: debounce,
 		nameOf:   nameOf,
 		client:   &http.Client{Timeout: 5 * time.Second},
-		lastSent: make(map[breakerKey]time.Time),
+		lastSent: make(map[debounceKey]time.Time),
 	}
 }
 
@@ -56,7 +64,8 @@ func (a *WebhookAlerter) Notify(ev AlertEvent) {
 	if url == "" { // 未配置 webhook：告警整体关闭，零侵入
 		return
 	}
-	if !a.allow(breakerKey{ev.UpstreamID, ev.Model}) {
+	// 去抖键并入方向：恢复(→CLOSED)与熔断各占独立槽，互不吞没(M1)
+	if !a.allow(debounceKey{key: breakerKey{ev.UpstreamID, ev.Model}, recovered: ev.ToState == Closed.String()}) {
 		return // 去抖窗口内已发过，丢弃
 	}
 
@@ -90,7 +99,7 @@ func (a *WebhookAlerter) Notify(ev AlertEvent) {
 }
 
 // allow 去抖判定：同键在窗口内只放行一次。放行时记录本次时间。
-func (a *WebhookAlerter) allow(k breakerKey) bool {
+func (a *WebhookAlerter) allow(k debounceKey) bool {
 	win := 60 * time.Second
 	if a.debounce != nil {
 		if d := a.debounce(); d > 0 {

@@ -156,6 +156,47 @@ func TestWebhookPayloadAndAsync(t *testing.T) {
 	}
 }
 
+// M1 回归：大 debounce 窗口下，同键的「熔断(→OPEN)」与「恢复(→CLOSED)」
+// 必须各占独立去抖槽——恢复告警不能被先前的熔断告警吞掉。
+func TestWebhookDebounceByDirection(t *testing.T) {
+	var down, recovered int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p alertPayload
+		json.NewDecoder(r.Body).Decode(&p)
+		if p.ToState == "CLOSED" {
+			atomic.AddInt32(&recovered, 1)
+		} else {
+			atomic.AddInt32(&down, 1)
+		}
+	}))
+	defer srv.Close()
+
+	a := NewWebhookAlerter(
+		func() string { return srv.URL },
+		func() time.Duration { return time.Hour }, // 大窗口：方向不分槽时恢复会被吞
+		nil,
+	)
+	k := func(to string) AlertEvent {
+		from := "CLOSED"
+		if to == "CLOSED" {
+			from = "OPEN"
+		}
+		return AlertEvent{UpstreamID: 1, Model: "gpt-x", FromState: from, ToState: to, TS: time.Now().Unix()}
+	}
+	a.Notify(k("OPEN"))    // 熔断
+	a.Notify(k("CLOSED"))  // 恢复：方向不同 → 应放行(修复前被同槽吞)
+	a.Notify(k("OPEN"))    // 再熔断：同向同窗口 → 应被去抖
+	a.Notify(k("CLOSED"))  // 再恢复：同向同窗口 → 应被去抖
+
+	cond := func() bool {
+		return atomic.LoadInt32(&down) == 1 && atomic.LoadInt32(&recovered) == 1
+	}
+	if !waitFor(cond, 2*time.Second) {
+		t.Fatalf("熔断/恢复应各发 1 次，实际 down=%d recovered=%d",
+			atomic.LoadInt32(&down), atomic.LoadInt32(&recovered))
+	}
+}
+
 func itoa(n int64) string {
 	if n == 0 {
 		return "0"
