@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -307,6 +308,38 @@ func TestPreviewSharesColdStart(t *testing.T) {
 	sh := PreviewShares(tier, stats, 30000)
 	if sh[2].Share < 0.4 || sh[2].Share > 0.6 {
 		t.Fatalf("冷启动 New 应与 Old 公平竞争(约0.5)，实际 New=%.3f", sh[2].Share)
+	}
+}
+
+// L4 回归：toleranceMs<=0 且同层全冷启动时，占比不得产生 NaN/Inf。
+// 生产注入口恒正(不可达)，此为防御性兜底验证。
+func TestPreviewSharesZeroToleranceNoNaN(t *testing.T) {
+	tier := []*upstream.Upstream{
+		{ID: 1, Name: "A", Priority: 1, Weight: 1, Enabled: true},
+		{ID: 2, Name: "B", Priority: 1, Weight: 1, Enabled: true},
+	}
+	allCold := func(id int64) (float64, float64) { return 0, 1 } // EWMA=0 真冷启动
+	for _, tol := range []float64{0, -5} {
+		sh := PreviewShares(tier, allCold, tol)
+		sum := 0.0
+		for _, u := range tier {
+			s := sh[u.ID]
+			if math.IsNaN(s.Share) || math.IsInf(s.Share, 0) {
+				t.Fatalf("tol=%.0f 全冷启动占比应有限，实际 id=%d Share=%v", tol, u.ID, s.Share)
+			}
+			if math.IsNaN(s.EffLatencyMs) || math.IsInf(s.EffLatencyMs, 0) {
+				t.Fatalf("tol=%.0f 有效延迟应有限，实际 id=%d Eff=%v", tol, u.ID, s.EffLatencyMs)
+			}
+			sum += s.Share
+		}
+		if sum < 0.99 || sum > 1.01 { // 等权全冷应均分且加和=1
+			t.Fatalf("tol=%.0f 占比加和应≈1，实际 %.4f", tol, sum)
+		}
+	}
+
+	// EffLatency 直接传 0/负容忍线也不得除零爆 Inf
+	if e := EffLatency(100, 0.5, 0); math.IsNaN(e) || math.IsInf(e, 0) {
+		t.Fatalf("EffLatency tol=0 应有限，实际 %v", e)
 	}
 }
 

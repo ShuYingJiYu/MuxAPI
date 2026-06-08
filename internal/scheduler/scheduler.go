@@ -140,6 +140,11 @@ func PreviewShares(tier []*upstream.Upstream, stats func(id int64) (ewmaMs, succ
 	if len(tier) == 0 {
 		return out
 	}
+	if toleranceMs <= 0 {
+		// 容忍线兜底：生产注入口恒正(不可达)，防全冷启动时 base=toleranceMs=0
+		// → 权重 weight/0=+Inf → 归一化 Inf/Inf=NaN。取正最小值保结果有限。
+		toleranceMs = 1
+	}
 	// 一遍：算已知有效延迟 + 记同层最优(给冷启动代入)；存 sr 供二遍区分「全失败 vs 真冷启动」
 	effs := make([]float64, len(tier))
 	srs := make([]float64, len(tier))
@@ -196,6 +201,9 @@ func PreviewShares(tier []*upstream.Upstream, stats func(id int64) (ewmaMs, succ
 // EffLatency 有效延迟(ms)：成功延迟 + 失败的期望超时成本。succRate 夹到 (0,1] 防除零。
 // 导出供 server 预览流量占比，与选路用同一公式——口径单一来源，前端展示=实际选路。
 func EffLatency(ewmaMs, succRate, toleranceMs float64) float64 {
+	if toleranceMs <= 0 {
+		toleranceMs = 1 // 容忍线兜底：恒正不可达，防失败成本项归零失真（见 PreviewShares）
+	}
 	if succRate > 1 {
 		succRate = 1
 	}

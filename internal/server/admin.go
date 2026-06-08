@@ -1,9 +1,11 @@
 package server
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -293,11 +295,6 @@ func (s *Server) computeRoutePreviews(eff []*store.Member) map[int64][]routeShar
 	if len(eff) < 1 {
 		return out
 	}
-	// 候选层(只需 ID/Weight，PreviewShares 据此算权重)
-	tier := make([]*upstream.Upstream, 0, len(eff))
-	for _, m := range eff {
-		tier = append(tier, &upstream.Upstream{ID: m.UpstreamID, Weight: m.Weight})
-	}
 	// 生效层成员的模型并集（稳定排序），逐模型算占比
 	seen := map[string]bool{}
 	models := make([]string, 0)
@@ -312,11 +309,19 @@ func (s *Server) computeRoutePreviews(eff []*store.Member) map[int64][]routeShar
 	sort.Strings(models)
 	tol := s.routeTolerance()
 	for _, model := range models {
+		// 候选层按模型过滤：与真实选路 PickExcluding 一致，
+		// 该模型熔断(IsAvailable=false)的成员不进抽样集合，故份额为 0。
+		tier := make([]*upstream.Upstream, 0, len(eff))
+		for _, m := range eff {
+			if s.health.IsAvailable(m.UpstreamID, model) {
+				tier = append(tier, &upstream.Upstream{ID: m.UpstreamID, Weight: m.Weight})
+			}
+		}
 		shares := scheduler.PreviewShares(tier,
 			func(id int64) (float64, float64) { return s.health.RouteStats(id, model) }, tol)
 		for _, m := range eff {
 			ewma, sr := s.health.RouteStats(m.UpstreamID, model)
-			sh := shares[m.UpstreamID]
+			sh := shares[m.UpstreamID] // 被过滤掉的成员取零值，SharePct=0
 			out[m.UpstreamID] = append(out[m.UpstreamID], routeShareView{
 				Model: model, LatEWMAMs: ewma, SuccRate: sr,
 				EffLatencyMs: sh.EffLatencyMs, SharePct: sh.Share * 100,
@@ -469,6 +474,15 @@ func (s *Server) batchCreateMonitors(w http.ResponseWriter, r *http.Request, id 
 		http.Error(w, "no models selected", 400)
 		return
 	}
+	// 校验 upstream 存在：与单建监控同口径，杜绝孤儿监控行
+	if _, err := s.store.Get(id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "upstream not found", 404)
+			return
+		}
+		http.Error(w, err.Error(), 500)
+		return
+	}
 	tmpl := store.Monitor{
 		Enabled: in.Enabled, Stream: in.Stream, ProbeText: strings.TrimSpace(in.ProbeText),
 		MaxTokens: in.MaxTokens, IntervalSec: in.IntervalSec, Path: strings.TrimSpace(in.Path),
@@ -532,6 +546,15 @@ func (s *Server) adminMonitors(w http.ResponseWriter, r *http.Request) {
 		in, err := decodeMonitor(r)
 		if err != nil {
 			http.Error(w, err.Error(), 400)
+			return
+		}
+		// 校验 upstream 存在：避免建出孤儿监控行(被 INNER JOIN 过滤但 POST 误返回成功)
+		if _, err := s.store.Get(in.UpstreamID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				http.Error(w, "upstream not found", 404)
+				return
+			}
+			http.Error(w, err.Error(), 500)
 			return
 		}
 		id, err := s.store.CreateMonitor(in)
@@ -644,6 +667,16 @@ func decodeUpstream(r *http.Request) (*upstream.Upstream, error) {
 	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
 		return nil, err
 	}
+	d.Name = strings.TrimSpace(d.Name)
+	d.BaseURL = strings.TrimSpace(d.BaseURL)
+	if d.Name == "" {
+		return nil, errors.New("name is required")
+	}
+	// BaseURL 必须是 http/https 绝对 URL（系统边界严格校验）
+	u, err := url.Parse(d.BaseURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, errors.New("base_url must be a valid http(s) URL")
+	}
 	return &upstream.Upstream{
 		Name: d.Name, BaseURL: d.BaseURL, APIKey: d.APIKey, Proxy: d.Proxy, Enabled: d.Enabled,
 		ChannelProbe: d.ChannelProbe,
@@ -747,7 +780,10 @@ func (s *Server) adminGroupUpstreams(w http.ResponseWriter, r *http.Request, gid
 			var d struct {
 				Enabled bool `json:"enabled"`
 			}
-			json.NewDecoder(r.Body).Decode(&d)
+			if json.NewDecoder(r.Body).Decode(&d) != nil {
+				http.Error(w, "bad request body", 400)
+				return
+			}
 			if err := s.store.SetMemberEnabled(gid, uid, d.Enabled); err != nil {
 				http.Error(w, err.Error(), 500)
 				return
@@ -871,7 +907,10 @@ func (s *Server) adminKeyItem(w http.ResponseWriter, r *http.Request) {
 		var d struct {
 			Enabled bool `json:"enabled"`
 		}
-		json.NewDecoder(r.Body).Decode(&d)
+		if json.NewDecoder(r.Body).Decode(&d) != nil {
+			http.Error(w, "bad request body", 400)
+			return
+		}
 		if err := s.store.SetKeyEnabled(id, d.Enabled); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
