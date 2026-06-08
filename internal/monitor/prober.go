@@ -42,10 +42,18 @@ func NewProber(mgr *Manager, st *store.Store, breaker breakerReporter, interval 
 	return &Prober{mgr: mgr, store: st, breaker: breaker, interval: interval, path: path}
 }
 
-// effInterval 该监控项的有效探测周期：自带 interval_sec>0 则用它，否则用全局。
+// minIntervalSec 监控项自带探测周期的下限(秒)：太小会让单项探测尚未返回就被反复重叠派发，
+// 徒增上游压力。<此值的自定义 interval_sec 一律抬到此下限（0 仍表示「沿用全局默认」，不受限）。
+const minIntervalSec = 5
+
+// effInterval 该监控项的有效探测周期：自带 interval_sec>0 则用它(但不低于下限)，否则用全局。
 func (p *Prober) effInterval(m *store.Monitor) time.Duration {
 	if m.IntervalSec > 0 {
-		return time.Duration(m.IntervalSec) * time.Second
+		sec := m.IntervalSec
+		if sec < minIntervalSec {
+			sec = minIntervalSec // 下限：防过密探测重叠
+		}
+		return time.Duration(sec) * time.Second
 	}
 	return p.interval()
 }
@@ -53,9 +61,23 @@ func (p *Prober) effInterval(m *store.Monitor) time.Duration {
 // Run 自调度循环：每轮只探测「距上次探测已达自身周期」的监控项，
 // 然后睡到下一个最近到期的时刻（全局间隔作心跳上限，1s 作下限防忙转）。
 // 新项的 lastProbe 为零值，会在首轮立即探测。
+// 在飞标记：同项上轮探测未返回则本轮跳过，避免单次探测超周期时重叠派发压垮上游；
+// 探测协程完成后经 done 回传 ID 由本协程清标记（状态仅本协程读写，无需加锁）。
 func (p *Prober) Run(ctx context.Context) {
 	last := make(map[int64]time.Time) // 各监控项最后探测时刻；Run 单协程访问，无需加锁
+	inflight := make(map[int64]bool)  // 正在探测中的项；同上仅本协程读写
+	done := make(chan int64, 256)     // 探测协程完成回传其 ID；缓冲足够大，发送侧再带 ctx 兜底防阻塞
 	for {
+		// 先排空已完成回传，清在飞标记（非阻塞，本轮新到期项才能再次派发）
+		for {
+			select {
+			case id := <-done:
+				delete(inflight, id)
+				continue
+			default:
+			}
+			break
+		}
 		now := time.Now()
 		ms, _ := p.store.ListMonitors(true)
 		live := make(map[int64]bool, len(ms))
@@ -63,19 +85,34 @@ func (p *Prober) Run(ctx context.Context) {
 		for _, m := range ms {
 			live[m.ID] = true
 			iv := p.effInterval(m)
-			if due := now.Sub(last[m.ID]); due >= iv {
-				last[m.ID] = now
-				go p.Probe(ctx, m)
-				if iv < next {
-					next = iv
+			due := now.Sub(last[m.ID])
+			if due < iv { // 未到期：记下最近的剩余时间作为唤醒上限
+				if remain := iv - due; remain < next {
+					next = remain
 				}
-			} else if remain := iv - due; remain < next {
-				next = remain
+				continue
+			}
+			if inflight[m.ID] { // 上轮探测仍在飞：跳过，等其完成回传再重新派发
+				continue
+			}
+			last[m.ID] = now
+			inflight[m.ID] = true
+			m := m // 捕获本轮变量，供探测协程闭包安全引用
+			go func() {
+				p.Probe(ctx, m)
+				select {
+				case done <- m.ID:
+				case <-ctx.Done(): // 退出途中无人消费，丢弃回传防协程泄漏
+				}
+			}()
+			if iv < next {
+				next = iv
 			}
 		}
 		for id := range last { // 清理已删除项，避免 map 无限增长
 			if !live[id] {
 				delete(last, id)
+				delete(inflight, id)
 			}
 		}
 		if next < time.Second {
@@ -84,6 +121,8 @@ func (p *Prober) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case id := <-done: // 有探测提前完成则提前醒来，尽快重新评估其是否到期
+			delete(inflight, id)
 		case <-time.After(next):
 		}
 	}
@@ -146,6 +185,7 @@ func (p *Prober) Probe(ctx context.Context, m *store.Monitor) {
 // observe 把探测结果按【熔断器口径】喂路由熔断器（与看板 classify 口径分离）：
 // 失败判定用 upstream.IsFailureStatus（429 在此算失败，与看板的「降级」不同）；
 // 凭证类(401/402/403)按 upstream 级熔断(scope="")、其余仅熔该模型。
+// 探测【成功】时除复活对应键外，总额外复活上游级键(凭证维度)——见函数体说明。
 // hasResp=false 表示网络/构造错误，直接按模型级失败处理。
 func (p *Prober) observe(m *store.Monitor, hasResp bool, code int, lat int64) {
 	if p.breaker == nil {
@@ -164,6 +204,13 @@ func (p *Prober) observe(m *store.Monitor, hasResp bool, code int, lat int64) {
 		scope = "" // 渠道级探测开关：探测成功 → 复活整渠道（该上游所有未单独熔断的模型恢复）
 	}
 	p.breaker.ObserveProbe(m.UpstreamID, scope, ok, lat)
+	// 探测成功额外复活上游级键(scope="")：探测请求带了上游凭证，探到成功即证明凭证有效，
+	// 凭证维度(承载 401/402/403 整上游熔断)理应恢复。否则凭证类熔断只进不出——
+	// 非渠道级模式下探测成功只复活模型级键、上游级键卡在 Open/HalfOpen，看板长期失真且违背
+	// 「主动探测即时恢复」。scope 已为 "" 时上面那次已驱动，不重复。模型级键各自独立、不受影响。
+	if ok && scope != "" {
+		p.breaker.ObserveProbe(m.UpstreamID, "", true, lat)
+	}
 }
 
 // classify 把上游状态码映射到栅栏档位：2xx 正常 / 429 降级 / 其余故障。

@@ -3,20 +3,36 @@ package monitor
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
+	"github.com/mirainya/muxapi/internal/health"
 	"github.com/mirainya/muxapi/internal/store"
 )
 
-// fakeBreaker 捕获 observe 喂给熔断器的 (id, model, ok) 三元组。
+// probeCall 记一次喂给熔断器的调用（探测成功会驱动两次：模型级 + 上游级）。
+type probeCall struct {
+	id    int64
+	model string
+	ok    bool
+}
+
+// fakeBreaker 捕获 observe 喂给熔断器的【全部】调用，按顺序记录。
 type fakeBreaker struct {
-	gotID    int64
-	gotModel string
-	gotOK    bool
-	called   bool
+	calls []probeCall
 }
 
 func (f *fakeBreaker) ObserveProbe(id int64, model string, ok bool, latencyMs int64) {
-	f.gotID, f.gotModel, f.gotOK, f.called = id, model, ok, true
+	f.calls = append(f.calls, probeCall{id, model, ok})
+}
+
+// hasUpstreamRevive 是否含一次「复活上游级键(scope="", ok=true)」的调用。
+func (f *fakeBreaker) hasUpstreamRevive(id int64) bool {
+	for _, c := range f.calls {
+		if c.id == id && c.model == "" && c.ok {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBuildProbeBody(t *testing.T) {
@@ -83,21 +99,84 @@ func TestObserveBreakerScope(t *testing.T) {
 			fb := &fakeBreaker{}
 			p := &Prober{breaker: fb}
 			p.observe(m, c.hasResp, c.code, 100)
-			if !fb.called {
+			if len(fb.calls) == 0 {
 				t.Fatal("应调用 ObserveProbe")
 			}
-			if fb.gotID != 7 {
-				t.Fatalf("上游 ID 应透传 7，实际 %d", fb.gotID)
+			// 第一次调用＝主口径（模型级/渠道级/上游级失败）。
+			first := fb.calls[0]
+			if first.id != 7 {
+				t.Fatalf("上游 ID 应透传 7，实际 %d", first.id)
 			}
-			if fb.gotOK != c.wantOK {
-				t.Fatalf("ok 应为 %v，实际 %v", c.wantOK, fb.gotOK)
+			if first.ok != c.wantOK {
+				t.Fatalf("ok 应为 %v，实际 %v", c.wantOK, first.ok)
 			}
-			if fb.gotModel != c.wantModel {
-				t.Fatalf("scope 应为 %q，实际 %q", c.wantModel, fb.gotModel)
+			if first.model != c.wantModel {
+				t.Fatalf("scope 应为 %q，实际 %q", c.wantModel, first.model)
+			}
+			// 成功时总应额外复活上游级键(凭证维度)；失败时不应有上游级复活。
+			revived := fb.hasUpstreamRevive(7)
+			if c.wantOK && !revived {
+				t.Fatalf("探测成功应复活上游级键(scope=\"\",ok)，调用序列=%+v", fb.calls)
+			}
+			if !c.wantOK && revived {
+				t.Fatalf("探测失败不应复活上游级键，调用序列=%+v", fb.calls)
 			}
 		})
 	}
 
 	// breaker 为 nil 时 observe 不 panic（探测器可无熔断器纯看板模式）
 	(&Prober{}).observe(&store.Monitor{UpstreamID: 7, Model: "gpt-x"}, true, 200, 10)
+}
+
+// 端到端回归：ChannelProbe=false 时，凭证类(401)故障熔断上游级键后，
+// 后续探测成功必须能把上游级键复活到 CLOSED——否则上游级键只进不出、
+// 看板长期失真（修复前：探测成功只复活模型级键，上游级键卡 OPEN/HALF_OPEN）。
+func TestProbeRevivesUpstreamKeyOnSuccess(t *testing.T) {
+	const id = int64(88)
+	mgr := health.New(3, time.Minute) // 业务阈值3；探测口径阈值1，401一次即上游级 OPEN
+	p := &Prober{breaker: mgr}
+	m := &store.Monitor{UpstreamID: id, Model: "gpt-x", ChannelProbe: false}
+
+	// 1) 凭证类失败：探测 401 → 上游级键 OPEN，整上游不可用
+	p.observe(m, true, 401, 0)
+	if mgr.IsAvailable(id, "gpt-x") {
+		t.Fatal("401 探测后整上游应不可用")
+	}
+	if got := mgr.EffectiveState(id); got != "OPEN" {
+		t.Fatalf("凭证类熔断后对外状态应 OPEN，实际 %q", got)
+	}
+
+	// 2) 凭证修好：探测 200 → 应复活上游级键（缺陷修复点），整上游恢复可用
+	p.observe(m, true, 200, 50)
+	if !mgr.IsAvailable(id, "gpt-x") {
+		t.Fatal("探测成功后上游级键应被复活、整上游恢复可用（缺陷：修复前会卡 OPEN）")
+	}
+	if got := mgr.EffectiveState(id); got != "CLOSED" {
+		t.Fatalf("探测成功后对外状态应 CLOSED，实际 %q", got)
+	}
+}
+// 防单项探测尚未返回就被反复重叠派发；0 仍表示沿用全局默认，不受下限影响。
+func TestEffIntervalLowerBound(t *testing.T) {
+	const globalIV = 5 * time.Minute
+	p := NewProber(nil, nil, nil, func() time.Duration { return globalIV }, nil)
+
+	cases := []struct {
+		name string
+		sec  int
+		want time.Duration
+	}{
+		{"过小抬到下限", 1, minIntervalSec * time.Second},
+		{"恰好低于下限", minIntervalSec - 1, minIntervalSec * time.Second},
+		{"等于下限保持", minIntervalSec, minIntervalSec * time.Second},
+		{"高于下限照用", 120, 120 * time.Second},
+		{"0 沿用全局默认", 0, globalIV},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := p.effInterval(&store.Monitor{IntervalSec: c.sec})
+			if got != c.want {
+				t.Fatalf("interval_sec=%d 应得 %v，实际 %v", c.sec, c.want, got)
+			}
+		})
+	}
 }
