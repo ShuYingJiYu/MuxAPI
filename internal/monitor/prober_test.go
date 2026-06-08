@@ -56,23 +56,30 @@ func TestBuildProbeBody(t *testing.T) {
 //   - 401 → 凭证类，熔断器记上游级(scope="")，所有模型连坐
 //   - 网络错误 → 模型级失败
 func TestObserveBreakerScope(t *testing.T) {
-	m := &store.Monitor{UpstreamID: 7, Model: "gpt-x"}
 	cases := []struct {
 		name      string
+		channel   bool // 该上游是否开启渠道级探测
 		hasResp   bool
 		code      int
 		wantOK    bool
 		wantModel string
 	}{
-		{"2xx成功", true, 200, true, "gpt-x"},
-		{"429限流-熔断器算失败-模型级", true, 429, false, "gpt-x"},
-		{"401凭证类-上游级连坐", true, 401, false, ""},
-		{"403凭证类-上游级连坐", true, 403, false, ""},
-		{"500故障-模型级", true, 500, false, "gpt-x"},
-		{"网络错误-模型级失败", false, 0, false, "gpt-x"},
+		// 渠道级关：成功只复活该模型
+		{"关-2xx成功-模型级", false, true, 200, true, "gpt-x"},
+		{"关-429限流-熔断器算失败-模型级", false, true, 429, false, "gpt-x"},
+		{"关-401凭证类-上游级连坐", false, true, 401, false, ""},
+		{"关-403凭证类-上游级连坐", false, true, 403, false, ""},
+		{"关-500故障-模型级", false, true, 500, false, "gpt-x"},
+		{"关-网络错误-模型级失败", false, false, 0, false, "gpt-x"},
+		// 渠道级开：成功复活整渠道(scope="")；失败口径不变
+		{"开-2xx成功-渠道级复活", true, true, 200, true, ""},
+		{"开-401凭证类-上游级连坐", true, true, 401, false, ""},
+		{"开-500故障-仍模型级", true, true, 500, false, "gpt-x"},
+		{"开-网络错误-仍模型级失败", true, false, 0, false, "gpt-x"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			m := &store.Monitor{UpstreamID: 7, Model: "gpt-x", ChannelProbe: c.channel}
 			fb := &fakeBreaker{}
 			p := &Prober{breaker: fb}
 			p.observe(m, c.hasResp, c.code, 100)
@@ -92,5 +99,5 @@ func TestObserveBreakerScope(t *testing.T) {
 	}
 
 	// breaker 为 nil 时 observe 不 panic（探测器可无熔断器纯看板模式）
-	(&Prober{}).observe(m, true, 200, 10)
+	(&Prober{}).observe(&store.Monitor{UpstreamID: 7, Model: "gpt-x"}, true, 200, 10)
 }

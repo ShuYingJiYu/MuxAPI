@@ -65,25 +65,25 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 		routeTolerance, routeToleranceSource := intSettingValue(s.store.GetSetting("route_tolerance_ms", ""), 30000)
 		routeSmart := s.store.GetSetting("route_smart", "on") // 默认开
 		writeJSON(w, map[string]string{
-			"log_retention":            s.store.GetSetting("log_retention", ""),
-			"alert_webhook":            s.store.GetSetting("alert_webhook", ""),
-			"alert_debounce":           s.store.GetSetting("alert_debounce", ""),
-			"route_tolerance_ms":       s.store.GetSetting("route_tolerance_ms", ""),
-			"route_smart":              routeSmart,
-			"effective_log_retention":  logRetention,
-			"effective_alert_webhook":  alertWebhook,
-			"effective_alert_debounce": alertDebounce,
+			"log_retention":                s.store.GetSetting("log_retention", ""),
+			"alert_webhook":                s.store.GetSetting("alert_webhook", ""),
+			"alert_debounce":               s.store.GetSetting("alert_debounce", ""),
+			"route_tolerance_ms":           s.store.GetSetting("route_tolerance_ms", ""),
+			"route_smart":                  routeSmart,
+			"effective_log_retention":      logRetention,
+			"effective_alert_webhook":      alertWebhook,
+			"effective_alert_debounce":     alertDebounce,
 			"effective_route_tolerance_ms": routeTolerance,
-			"log_retention_source":     logRetentionSource,
-			"alert_webhook_source":     alertWebhookSource,
-			"alert_debounce_source":    alertDebounceSource,
-			"route_tolerance_ms_source": routeToleranceSource,
+			"log_retention_source":         logRetentionSource,
+			"alert_webhook_source":         alertWebhookSource,
+			"alert_debounce_source":        alertDebounceSource,
+			"route_tolerance_ms_source":    routeToleranceSource,
 		})
 	case http.MethodPut:
 		var d struct {
-			LogRetention  string `json:"log_retention"`
-			AlertWebhook  string `json:"alert_webhook"`
-			AlertDebounce string `json:"alert_debounce"`
+			LogRetention     string `json:"log_retention"`
+			AlertWebhook     string `json:"alert_webhook"`
+			AlertDebounce    string `json:"alert_debounce"`
 			RouteToleranceMs string `json:"route_tolerance_ms"`
 			RouteSmart       string `json:"route_smart"`
 		}
@@ -152,13 +152,16 @@ type healthView struct {
 	LastProbe int64   `json:"last_probe"` // 最后探测 unix 秒，0=从未探测
 }
 
-func toHealthView(sn health.Snapshot) healthView {
+// toHealthView 把上游级快照转精简视图。state 由调用方传入「聚合后的对外状态」
+// (health.EffectiveState)，而非上游级原始 State——这样「单模型上游唯一模型熔断」
+// 等情形能如实显示熔断，避免运行时列与真实选路口径(IsAvailable 看模型级)错位。
+func toHealthView(sn health.Snapshot, state string) healthView {
 	var lastProbe int64
 	if !sn.LastProbe.IsZero() {
 		lastProbe = sn.LastProbe.Unix()
 	}
 	return healthView{
-		State: sn.State, Fails: sn.Fails, Reqs: sn.Reqs,
+		State: state, Fails: sn.Fails, Reqs: sn.Reqs,
 		SuccRate: sn.SuccRate, AvgLatMs: sn.AvgLatMs, LastProbe: lastProbe,
 	}
 }
@@ -243,9 +246,10 @@ type groupOut struct {
 // computeGroupRuntime 算一个分组的运行时概览。
 func (s *Server) computeGroupRuntime(gid int64) groupRuntime {
 	ms, _ := s.store.ListGroupMembers(gid)
-	snaps := make(map[int64]health.Snapshot, len(ms))
+	// 缓存各成员「聚合后对外状态」（含模型级聚合），避免重复加锁查询
+	eff := make(map[int64]string, len(ms))
 	for _, m := range ms {
-		snaps[m.UpstreamID] = s.health.Snapshot(m.UpstreamID)
+		eff[m.UpstreamID] = s.health.EffectiveState(m.UpstreamID)
 	}
 	rt := groupRuntime{Effective: []string{}}
 	for _, m := range ms {
@@ -253,7 +257,7 @@ func (s *Server) computeGroupRuntime(gid int64) groupRuntime {
 			continue
 		}
 		rt.Total++
-		switch snaps[m.UpstreamID].State {
+		switch eff[m.UpstreamID] {
 		case "OPEN":
 			rt.Open++
 		case "HALF_OPEN":
@@ -262,10 +266,10 @@ func (s *Server) computeGroupRuntime(gid int64) groupRuntime {
 			rt.Normal++
 		}
 	}
-	best, hasEff := effectivePriority(ms, func(id int64) string { return snaps[id].State })
+	best, hasEff := effectivePriority(ms, func(id int64) string { return eff[id] })
 	if hasEff {
 		for _, m := range ms {
-			if m.Enabled && m.Priority == best && snaps[m.UpstreamID].State != "OPEN" {
+			if m.Enabled && m.Priority == best && eff[m.UpstreamID] != "OPEN" {
 				rt.Effective = append(rt.Effective, m.Name)
 			}
 		}
@@ -324,15 +328,16 @@ func (s *Server) computeRoutePreviews(eff []*store.Member) map[int64][]routeShar
 
 // upstreamDTO 对外视图：api_key 脱敏，不回显完整凭证。
 type upstreamDTO struct {
-	ID          int64             `json:"id"`
-	Name        string            `json:"name"`
-	BaseURL     string            `json:"base_url"`
-	Proxy       string            `json:"proxy"`
-	APIKey      string            `json:"api_key,omitempty"` // 输入用；输出时脱敏到 masked
-	Masked      string            `json:"masked,omitempty"`
-	Enabled     bool              `json:"enabled"`
-	Health      healthView        `json:"health"`                 // 运行时健康（仅 GET 列表填充）
-	ModelHealth []modelHealthView `json:"model_health,omitempty"` // 模型级健康（仅 GET 列表填充，无则省略）
+	ID           int64             `json:"id"`
+	Name         string            `json:"name"`
+	BaseURL      string            `json:"base_url"`
+	Proxy        string            `json:"proxy"`
+	APIKey       string            `json:"api_key,omitempty"` // 输入用；输出时脱敏到 masked
+	Masked       string            `json:"masked,omitempty"`
+	Enabled      bool              `json:"enabled"`
+	ChannelProbe bool              `json:"channel_probe"`          // 渠道级探测：探任一模型成功即视整渠道可用
+	Health       healthView        `json:"health"`                 // 运行时健康（仅 GET 列表填充）
+	ModelHealth  []modelHealthView `json:"model_health,omitempty"` // 模型级健康（仅 GET 列表填充，无则省略）
 }
 
 func mask(key string) string {
@@ -354,8 +359,8 @@ func (s *Server) adminUpstreams(w http.ResponseWriter, r *http.Request) {
 		for _, u := range list {
 			out = append(out, upstreamDTO{
 				ID: u.ID, Name: u.Name, BaseURL: u.BaseURL, Proxy: u.Proxy,
-				Masked: mask(u.APIKey), Enabled: u.Enabled,
-				Health:      toHealthView(s.health.Snapshot(u.ID)),
+				Masked: mask(u.APIKey), Enabled: u.Enabled, ChannelProbe: u.ChannelProbe,
+				Health:      toHealthView(s.health.Snapshot(u.ID), s.health.EffectiveState(u.ID)),
 				ModelHealth: toModelHealthViews(s.health.ModelStates(u.ID)),
 			})
 		}
@@ -475,6 +480,7 @@ func (s *Server) batchCreateMonitors(w http.ResponseWriter, r *http.Request, id 
 	}
 	writeJSON(w, map[string]int{"created": created, "skipped": skipped})
 }
+
 type monitorDTO struct {
 	ID           int64            `json:"id"`
 	UpstreamID   int64            `json:"upstream_id"`
@@ -640,6 +646,7 @@ func decodeUpstream(r *http.Request) (*upstream.Upstream, error) {
 	}
 	return &upstream.Upstream{
 		Name: d.Name, BaseURL: d.BaseURL, APIKey: d.APIKey, Proxy: d.Proxy, Enabled: d.Enabled,
+		ChannelProbe: d.ChannelProbe,
 	}, nil
 }
 
@@ -766,28 +773,29 @@ func (s *Server) adminGroupUpstreams(w http.ResponseWriter, r *http.Request, gid
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		// 先缓存各成员健康快照，避免重复加锁查询
+		// 缓存各成员快照(含 reqs/延迟)与「聚合后对外状态」，避免重复加锁查询
 		snaps := make(map[int64]health.Snapshot, len(ms))
+		effSt := make(map[int64]string, len(ms))
 		for _, m := range ms {
 			snaps[m.UpstreamID] = s.health.Snapshot(m.UpstreamID)
+			effSt[m.UpstreamID] = s.health.EffectiveState(m.UpstreamID)
 		}
-		state := func(id int64) string { return snaps[id].State }
+		state := func(id int64) string { return effSt[id] }
 		best, hasEff := effectivePriority(ms, state)
 		// 生效层成员集合 → 算智能路由流量占比预估
 		eff := make([]*store.Member, 0)
 		for _, m := range ms {
-			if hasEff && m.Enabled && m.GroupEnabled && m.Priority == best && snaps[m.UpstreamID].State != "OPEN" {
+			if hasEff && m.Enabled && m.GroupEnabled && m.Priority == best && effSt[m.UpstreamID] != "OPEN" {
 				eff = append(eff, m)
 			}
 		}
 		previews := s.computeRoutePreviews(eff)
 		out := make([]memberOut, 0, len(ms))
 		for _, m := range ms {
-			sn := snaps[m.UpstreamID]
-			isEff := hasEff && m.Enabled && m.GroupEnabled && m.Priority == best && sn.State != "OPEN"
+			isEff := hasEff && m.Enabled && m.GroupEnabled && m.Priority == best && effSt[m.UpstreamID] != "OPEN"
 			out = append(out, memberOut{
 				Member:       m,
-				Health:       toHealthView(sn),
+				Health:       toHealthView(snaps[m.UpstreamID], effSt[m.UpstreamID]),
 				ModelHealth:  toModelHealthViews(s.health.ModelStates(m.UpstreamID)),
 				Effective:    isEff,
 				RoutePreview: previews[m.UpstreamID],

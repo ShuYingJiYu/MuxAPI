@@ -21,6 +21,7 @@ type Upstream struct {
 	Priority int    // 组内视图：越小越优先
 	Weight   int    // 组内视图：同优先级层分流权重
 	Enabled  bool
+	ChannelProbe bool // 渠道级探测：探任一模型成功即视整渠道可用（探测复活连带 + 运行时列收起模型徽章）
 }
 
 // ProxyTransport 按代理 URL 构建 Transport：空则回退到环境变量(HTTPS_PROXY)，解析失败也回退。

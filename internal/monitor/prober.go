@@ -21,6 +21,7 @@ type breakerReporter interface {
 // 探测系统统一后，它是唯一的主动探测源，一次探测【双写】：
 //   - mgr.Record：记看板统计(成功率/延迟/趋势)，429 算「降级」
 //   - breaker.ObserveProbe：驱动路由熔断器，按熔断口径 429 算失败
+//
 // 每项可配自己的探测周期(interval_sec)、端点(path)、消息内容、max_tokens、是否流式；
 // 这些字段为空/0 时回退到内置默认(间隔 5m、路径 /v1/chat/completions)。
 type Prober struct {
@@ -156,8 +157,11 @@ func (p *Prober) observe(m *store.Monitor, hasResp bool, code int, lat int64) {
 	}
 	ok := !upstream.IsFailureStatus(code)
 	scope := m.Model
-	if !ok && upstream.FailIsUpstreamLevel(code) {
-		scope = ""
+	switch {
+	case !ok && upstream.FailIsUpstreamLevel(code):
+		scope = "" // 失败连带：凭证/余额类(401/402/403) → 熔整上游
+	case ok && m.ChannelProbe:
+		scope = "" // 渠道级探测开关：探测成功 → 复活整渠道（该上游所有未单独熔断的模型恢复）
 	}
 	p.breaker.ObserveProbe(m.UpstreamID, scope, ok, lat)
 }

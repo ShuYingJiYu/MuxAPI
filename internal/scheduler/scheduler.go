@@ -67,8 +67,9 @@ func (s *Scheduler) Pick(groupID int64, model string) (*upstream.Upstream, error
 // model 用于按 (上游,模型) 粒度判定健康：某上游的某模型熔断，不影响该上游的其他模型。
 func (s *Scheduler) PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, error) {
 	// 1. 过滤出该分组健康、且未被本次请求排除的上游
+	all := s.list(groupID)
 	var healthy []*upstream.Upstream
-	for _, u := range s.list(groupID) {
+	for _, u := range all {
 		if exclude[u.ID] {
 			continue
 		}

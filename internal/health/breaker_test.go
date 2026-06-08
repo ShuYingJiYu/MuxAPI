@@ -51,9 +51,9 @@ func TestTrafficStats(t *testing.T) {
 	m := New(100, time.Second) // 高阈值避免熔断干扰
 	const id = int64(7)
 
-	m.Report(id, "", true, 100)  // 成功 100ms
-	m.Report(id, "", true, 200)  // 成功 200ms
-	m.Report(id, "", false, 0)   // 失败
+	m.Report(id, "", true, 100)      // 成功 100ms
+	m.Report(id, "", true, 200)      // 成功 200ms
+	m.Report(id, "", false, 0)       // 失败
 	m.reportProbe(id, "", true, 999) // 探测：不应计入 reqs/延迟
 	m.reportProbe(id, "", false, 0)  // 探测失败：不应计入
 
@@ -183,7 +183,8 @@ func TestUpstreamLevelEquivalence(t *testing.T) {
 }
 
 // 模型级失败的流量统计仍累计到上游级 Snapshot（看板按上游聚合，不漏计）。
-func TestModelFailCountsToUpstreamSnapshot(t *testing.T) {	m := New(100, time.Minute) // 高阈值避免熔断干扰
+func TestModelFailCountsToUpstreamSnapshot(t *testing.T) {
+	m := New(100, time.Minute) // 高阈值避免熔断干扰
 	const id = int64(3)
 	m.Report(id, "modelA", true, 100)
 	m.Report(id, "modelA", false, 0)
@@ -390,5 +391,109 @@ func TestSeedRebuildsRouteStats(t *testing.T) {
 	}
 	if st := m.Snapshot(id); st.State != "CLOSED" {
 		t.Fatalf("Seed 后上游级应 CLOSED，实际 %s", st.State)
+	}
+}
+
+// 渠道级复活(breaker 契约)：探测以 scope=""(上游级)上报成功时，应复活整渠道——
+// 被上游级故障连坐熔断的模型随之恢复；但被【自身故障】熔断的模型仍 OPEN，不被连带复活。
+// prober 在「上游开了渠道级探测且本次成功」时就传 scope=""，故这里直接以 scope="" 验证 breaker 契约。
+func TestProbeSuccessRevivesChannelLevel(t *testing.T) {
+	m := New(1, time.Hour) // 冷却极长：排除"靠冷却自愈"，纯验探测复活
+	const id = int64(41)
+
+	// 1) 上游级故障(如 403)连坐：所有模型不可用
+	m.Report(id, "", false, 0) // scope="" → 上游级 OPEN
+	if m.IsAvailable(id, "gpt-5.4") || m.IsAvailable(id, "gpt-5.5") {
+		t.Fatal("上游级熔断应连坐所有模型不可用")
+	}
+	// 2) 渠道级探测成功上报 scope="" → 复活上游级闸门，全渠道恢复
+	m.ObserveProbe(id, "", true, 120)
+	if !m.IsAvailable(id, "gpt-5.4") || !m.IsAvailable(id, "gpt-5.5") {
+		t.Fatal("渠道级探测成功(scope=\"\")应复活整渠道，所有未单独熔断的模型恢复可用")
+	}
+
+	// 3) 边界：gpt-5.5 被【自身】5xx 熔断后，渠道级探测成功不应连带复活 gpt-5.5
+	m.Report(id, "gpt-5.5", false, 0) // 模型级 OPEN（gpt-5.5 自己的故障）
+	if m.IsAvailable(id, "gpt-5.5") {
+		t.Fatal("gpt-5.5 自身熔断后应不可用")
+	}
+	m.ObserveProbe(id, "", true, 120) // 再次渠道级探测成功
+	if m.IsAvailable(id, "gpt-5.5") {
+		t.Fatal("边界：gpt-5.5 被自身故障熔断，不应被渠道级探测成功连带复活（渠道通≠该模型自身没病）")
+	}
+}
+
+// 模型级探测：scope=model 上报成功只复活该模型，不连带其他模型（开关关时 prober 走此路径）。
+func TestProbeSuccessModelLevelOnly(t *testing.T) {
+	m := New(1, time.Hour)
+	const id = int64(43)
+	// 两个模型各自被自身故障熔断
+	m.Report(id, "gpt-5.4", false, 0)
+	m.Report(id, "gpt-5.5", false, 0)
+	// 只探 gpt-5.4 成功(scope=model) → 只复活 gpt-5.4
+	m.ObserveProbe(id, "gpt-5.4", true, 100)
+	if !m.IsAvailable(id, "gpt-5.4") {
+		t.Fatal("模型级探测成功应复活 gpt-5.4")
+	}
+	if m.IsAvailable(id, "gpt-5.5") {
+		t.Fatal("模型级探测(scope=gpt-5.4)不应连带复活 gpt-5.5")
+	}
+}
+
+// 探测【失败】不连带：探 gpt-5.4 失败(模型级)只熔 gpt-5.4，不连坐 gpt-5.5，
+// 也不影响上游级（失败的连坐范围由调用方 scope 精确表达，本次成功复活逻辑不反向作恶）。
+func TestProbeFailDoesNotCascade(t *testing.T) {
+	m := New(1, time.Hour)
+	const id = int64(42)
+	m.ObserveProbe(id, "gpt-5.4", false, 0) // 模型级失败
+	if m.IsAvailable(id, "gpt-5.4") {
+		t.Fatal("探测失败的 gpt-5.4 应熔断")
+	}
+	if !m.IsAvailable(id, "gpt-5.5") {
+		t.Fatal("探 gpt-5.4 失败(模型级)不应连坐 gpt-5.5")
+	}
+	if !m.IsAvailable(id, "") {
+		t.Fatal("模型级探测失败不应熔断上游级")
+	}
+}
+
+// EffectiveState 聚合：单模型上游唯一模型探测失败熔断 → 整体应 OPEN。
+// 这是「oojj 只配一个探测、探测报错却仍显正常」bug 的回归用例。
+func TestEffectiveStateSingleModelDown(t *testing.T) {
+	m := New(1, time.Hour)
+	const id = int64(50)
+	m.ObserveProbe(id, "gpt-5.5", false, 0) // 唯一模型探测失败 → 模型级 OPEN
+	if got := m.EffectiveState(id); got != "OPEN" {
+		t.Fatalf("唯一模型熔断，整体应 OPEN，得到 %q", got)
+	}
+}
+
+// EffectiveState 聚合：多模型上游只挂一个，其余正常 → 整体仍可用(CLOSED)。
+func TestEffectiveStateOneOfManyDown(t *testing.T) {
+	m := New(1, time.Hour)
+	const id = int64(51)
+	m.ObserveProbe(id, "gpt-5.4", false, 0)  // 一个挂
+	m.ObserveProbe(id, "gpt-5.5", true, 100) // 一个好
+	if got := m.EffectiveState(id); got != "CLOSED" {
+		t.Fatalf("尚有可用模型，整体应 CLOSED，得到 %q", got)
+	}
+}
+
+// EffectiveState 聚合：上游级(凭证类)熔断 → 整体 OPEN，连坐所有模型。
+func TestEffectiveStateUpstreamLevelOpen(t *testing.T) {
+	m := New(1, time.Hour)
+	const id = int64(52)
+	m.ObserveProbe(id, "gpt-5.5", true, 100) // 模型本身正常
+	m.ObserveProbe(id, "", false, 0)         // 上游级失败(如 401)
+	if got := m.EffectiveState(id); got != "OPEN" {
+		t.Fatalf("上游级熔断应连坐整体 OPEN，得到 %q", got)
+	}
+}
+
+// EffectiveState 聚合：从未按模型探过 → 回退上游级状态(默认 CLOSED，即「待探测」由前端再细分)。
+func TestEffectiveStateNeverProbed(t *testing.T) {
+	m := New(1, time.Hour)
+	if got := m.EffectiveState(99); got != "CLOSED" {
+		t.Fatalf("从未探测应回退 CLOSED，得到 %q", got)
 	}
 }

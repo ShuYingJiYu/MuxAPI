@@ -59,7 +59,7 @@ func (f *Forwarder) headerTimeout() time.Duration {
 // keyName 为命中的接入密钥名，仅用于请求记录展示来源客户端。
 func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte, groupID int64, keyName string) {
 	model := parseModel(body) // 解析请求模型用于 (上游,模型) 级健康判定；解析失败为 "" 回退上游级
-	endpoint := r.URL.Path     // 请求端点(如 /v1/messages)，落库供按协议区分
+	endpoint := r.URL.Path    // 请求端点(如 /v1/messages)，落库供按协议区分
 	var lastErr error
 	tried := map[int64]bool{}
 	for attempt := 0; attempt <= f.maxRetries; attempt++ {

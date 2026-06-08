@@ -15,16 +15,16 @@ type Store struct{ db *sql.DB }
 
 // Group 虚拟接入点：拥有自己的上游池(经中间表)和接入密钥。
 type Group struct {
-	ID                   int64  `json:"id"`
-	Name                 string `json:"name"`
-	Description          string `json:"description"`
-	UpstreamCount        int    `json:"upstream_count"`
-	EnabledUpstreamCount int    `json:"enabled_upstream_count"`
-	KeyCount             int    `json:"key_count"`
-	EnabledKeyCount      int    `json:"enabled_key_count"`
-	RecentTotal          int    `json:"recent_total"`
-	SuccessRate          int    `json:"success_rate"`
-	AvgLatencyMs         int64  `json:"avg_latency_ms"`
+	ID                   int64       `json:"id"`
+	Name                 string      `json:"name"`
+	Description          string      `json:"description"`
+	UpstreamCount        int         `json:"upstream_count"`
+	EnabledUpstreamCount int         `json:"enabled_upstream_count"`
+	KeyCount             int         `json:"key_count"`
+	EnabledKeyCount      int         `json:"enabled_key_count"`
+	RecentTotal          int         `json:"recent_total"`
+	SuccessRate          int         `json:"success_rate"`
+	AvgLatencyMs         int64       `json:"avg_latency_ms"`
 	Trend                []HourPoint `json:"trend"` // 近 24h 按小时分桶的成功率序列（喂给前端栅栏）
 }
 
@@ -66,6 +66,7 @@ type Monitor struct {
 	BaseURL      string `json:"-"`
 	APIKey       string `json:"-"`
 	Proxy        string `json:"-"`
+	ChannelProbe bool   `json:"-"` // 所属上游是否开启渠道级探测：开则探测成功复活整渠道（scope=""）
 }
 
 func Open(path string) (*Store, error) {
@@ -78,6 +79,9 @@ func Open(path string) (*Store, error) {
 	}
 	// 迁移：旧库 upstreams 补 proxy 列（已存在则忽略报错）
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN proxy TEXT NOT NULL DEFAULT ''`)
+	// 迁移：旧库 upstreams 补 channel_probe 列（渠道级探测：探任一模型成功即视整渠道可用）。
+	// 默认 1=开：存量上游一并启用渠道级语义，运行时列默认收起模型徽章（异常才显）。
+	db.Exec(`ALTER TABLE upstreams ADD COLUMN channel_probe INTEGER NOT NULL DEFAULT 1`)
 	// 迁移：旧库 group_upstreams 补 enabled 列（组内成员开关，默认启用）
 	db.Exec(`ALTER TABLE group_upstreams ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`)
 	// 迁移：旧库 monitors 补可配探测列（空/0 表示沿用全局默认）
@@ -108,7 +112,8 @@ CREATE TABLE IF NOT EXISTS upstreams (
 	base_url TEXT NOT NULL,
 	api_key  TEXT NOT NULL,
 	proxy    TEXT NOT NULL DEFAULT '',
-	enabled  INTEGER NOT NULL DEFAULT 1
+	enabled  INTEGER NOT NULL DEFAULT 1,
+	channel_probe INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS group_upstreams (
 	group_id    INTEGER NOT NULL,
@@ -171,7 +176,7 @@ func scanUps(rows *sql.Rows) ([]*upstream.Upstream, error) {
 	var list []*upstream.Upstream
 	for rows.Next() {
 		u := &upstream.Upstream{}
-		if err := rows.Scan(&u.ID, &u.Name, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Enabled, &u.Priority, &u.Weight); err != nil {
+		if err := rows.Scan(&u.ID, &u.Name, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Enabled, &u.Priority, &u.Weight, &u.ChannelProbe); err != nil {
 			return nil, err
 		}
 		list = append(list, u)
@@ -182,7 +187,7 @@ func scanUps(rows *sql.Rows) ([]*upstream.Upstream, error) {
 // ListEnabledByGroup 返回某分组下启用的上游，JOIN 中间表填充组内 priority/weight，
 // 按组内优先级升序（调度用）。
 func (s *Store) ListEnabledByGroup(groupID int64) ([]*upstream.Upstream, error) {
-	rows, err := s.db.Query(`SELECT u.id,u.name,u.base_url,u.api_key,u.proxy,u.enabled,gu.priority,gu.weight
+	rows, err := s.db.Query(`SELECT u.id,u.name,u.base_url,u.api_key,u.proxy,u.enabled,gu.priority,gu.weight,u.channel_probe
 		FROM upstreams u JOIN group_upstreams gu ON gu.upstream_id=u.id
 		WHERE gu.group_id=? AND u.enabled=1 AND gu.enabled=1 ORDER BY gu.priority ASC`, groupID)
 	if err != nil {
@@ -193,7 +198,7 @@ func (s *Store) ListEnabledByGroup(groupID int64) ([]*upstream.Upstream, error) 
 
 // List 返回全部上游(含停用)，priority/weight 置 0（全局池无组内语义），供探测与后台管理。
 func (s *Store) List() ([]*upstream.Upstream, error) {
-	rows, err := s.db.Query(`SELECT id,name,base_url,api_key,proxy,enabled,0,0 FROM upstreams ORDER BY id`)
+	rows, err := s.db.Query(`SELECT id,name,base_url,api_key,proxy,enabled,0,0,channel_probe FROM upstreams ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -203,25 +208,25 @@ func (s *Store) List() ([]*upstream.Upstream, error) {
 // Get 按 id 取单个上游（含完整 api_key，供连通测试用）。
 func (s *Store) Get(id int64) (*upstream.Upstream, error) {
 	u := &upstream.Upstream{}
-	err := s.db.QueryRow(`SELECT id,name,base_url,api_key,proxy,enabled FROM upstreams WHERE id=?`, id).
-		Scan(&u.ID, &u.Name, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Enabled)
+	err := s.db.QueryRow(`SELECT id,name,base_url,api_key,proxy,enabled,channel_probe FROM upstreams WHERE id=?`, id).
+		Scan(&u.ID, &u.Name, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Enabled, &u.ChannelProbe)
 	return u, err
 }
 
 func (s *Store) Create(u *upstream.Upstream) error {
-	_, err := s.db.Exec(`INSERT INTO upstreams(name,base_url,api_key,proxy,enabled) VALUES(?,?,?,?,?)`,
-		u.Name, u.BaseURL, u.APIKey, u.Proxy, u.Enabled)
+	_, err := s.db.Exec(`INSERT INTO upstreams(name,base_url,api_key,proxy,enabled,channel_probe) VALUES(?,?,?,?,?,?)`,
+		u.Name, u.BaseURL, u.APIKey, u.Proxy, u.Enabled, u.ChannelProbe)
 	return err
 }
 
 func (s *Store) Update(u *upstream.Upstream) error {
 	if u.APIKey == "" { // 留空则不改凭证（对齐后台「留空则不修改」语义）
-		_, err := s.db.Exec(`UPDATE upstreams SET name=?,base_url=?,proxy=?,enabled=? WHERE id=?`,
-			u.Name, u.BaseURL, u.Proxy, u.Enabled, u.ID)
+		_, err := s.db.Exec(`UPDATE upstreams SET name=?,base_url=?,proxy=?,enabled=?,channel_probe=? WHERE id=?`,
+			u.Name, u.BaseURL, u.Proxy, u.Enabled, u.ChannelProbe, u.ID)
 		return err
 	}
-	_, err := s.db.Exec(`UPDATE upstreams SET name=?,base_url=?,api_key=?,proxy=?,enabled=? WHERE id=?`,
-		u.Name, u.BaseURL, u.APIKey, u.Proxy, u.Enabled, u.ID)
+	_, err := s.db.Exec(`UPDATE upstreams SET name=?,base_url=?,api_key=?,proxy=?,enabled=?,channel_probe=? WHERE id=?`,
+		u.Name, u.BaseURL, u.APIKey, u.Proxy, u.Enabled, u.ChannelProbe, u.ID)
 	return err
 }
 
@@ -248,7 +253,7 @@ func scanMonitors(rows *sql.Rows) ([]*Monitor, error) {
 		m := &Monitor{}
 		if err := rows.Scan(&m.ID, &m.UpstreamID, &m.Model, &m.Name, &m.Enabled,
 			&m.Stream, &m.ProbeText, &m.MaxTokens, &m.IntervalSec, &m.Path,
-			&m.UpstreamName, &m.BaseURL, &m.APIKey, &m.Proxy); err != nil {
+			&m.UpstreamName, &m.BaseURL, &m.APIKey, &m.Proxy, &m.ChannelProbe); err != nil {
 			return nil, err
 		}
 		ms = append(ms, m)
@@ -256,7 +261,7 @@ func scanMonitors(rows *sql.Rows) ([]*Monitor, error) {
 	return ms, rows.Err()
 }
 
-const monitorJoin = `SELECT m.id,m.upstream_id,m.model,m.name,m.enabled,m.stream,m.probe_text,m.max_tokens,m.interval_sec,m.path,u.name,u.base_url,u.api_key,u.proxy
+const monitorJoin = `SELECT m.id,m.upstream_id,m.model,m.name,m.enabled,m.stream,m.probe_text,m.max_tokens,m.interval_sec,m.path,u.name,u.base_url,u.api_key,u.proxy,u.channel_probe
 	FROM monitors m JOIN upstreams u ON u.id=m.upstream_id`
 
 // ListMonitors 全部监控项；enabledOnly 时只返回启用且渠道也启用的（探测用）。
@@ -585,10 +590,11 @@ type Member struct {
 	GroupEnabled bool   `json:"group_enabled"` // 组内开关
 	Priority     int    `json:"priority"`
 	Weight       int    `json:"weight"`
+	ChannelProbe bool   `json:"channel_probe"` // 渠道级探测：前端据此决定运行时列模型徽章「异常才显」
 }
 
 func (s *Store) ListGroupMembers(groupID int64) ([]*Member, error) {
-	rows, err := s.db.Query(`SELECT u.id,u.name,u.base_url,u.enabled,gu.enabled,gu.priority,gu.weight
+	rows, err := s.db.Query(`SELECT u.id,u.name,u.base_url,u.enabled,gu.enabled,gu.priority,gu.weight,u.channel_probe
 		FROM upstreams u JOIN group_upstreams gu ON gu.upstream_id=u.id
 		WHERE gu.group_id=? ORDER BY gu.priority ASC`, groupID)
 	if err != nil {
@@ -598,7 +604,7 @@ func (s *Store) ListGroupMembers(groupID int64) ([]*Member, error) {
 	var ms []*Member
 	for rows.Next() {
 		m := &Member{}
-		if err := rows.Scan(&m.UpstreamID, &m.Name, &m.BaseURL, &m.Enabled, &m.GroupEnabled, &m.Priority, &m.Weight); err != nil {
+		if err := rows.Scan(&m.UpstreamID, &m.Name, &m.BaseURL, &m.Enabled, &m.GroupEnabled, &m.Priority, &m.Weight, &m.ChannelProbe); err != nil {
 			return nil, err
 		}
 		ms = append(ms, m)

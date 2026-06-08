@@ -243,7 +243,7 @@ function saveGroup() {
   })
 }
 
-function newUpstream() { dlg.type = 'upstream'; dlg.form = { name: '', base_url: '', api_key: '', proxy: '', enabled: true } }
+function newUpstream() { dlg.type = 'upstream'; dlg.form = { name: '', base_url: '', api_key: '', proxy: '', enabled: true, channel_probe: true } }
 function editUpstream(u) { dlg.type = 'upstream'; dlg.form = { ...u, api_key: '' } }
 function saveUpstream() {
   guard(async () => {
@@ -410,6 +410,14 @@ const rtRate = h => (h && h.reqs) ? (h.succ_rate * 100).toFixed(0) + '%' : '—'
 
 // 模型级徽章：复用 rtClass 的配色档（closed/half/open/nodata），未探测过显示灰点。
 const mhClass = mh => (!mh || (mh.state === 'CLOSED' && !mh.last_probe)) ? 'nodata' : ({ CLOSED: 'closed', HALF_OPEN: 'half', OPEN: 'open' }[mh.state] || 'nodata')
+
+// 运行时列要显示哪些模型徽章：渠道级探测的上游平时只看渠道状态，模型徽章「异常才显」
+// （仅 OPEN/HALF_OPEN 的模型单独亮出，便于看出某模型自身故障）；非渠道级则照旧全显。
+function visibleDots(item) {
+  const dots = item?.model_health || []
+  if (!item?.channel_probe) return dots
+  return dots.filter(mh => mh.state === 'OPEN' || mh.state === 'HALF_OPEN')
+}
 
 // 分组卡片：生效渠道文本 + 健康概览文本
 const effText = rt => (rt && rt.effective && rt.effective.length) ? rt.effective.join(' / ') : '无可用'
@@ -717,8 +725,8 @@ function logout() {
                   <td>{{ m.weight }}</td>
                   <td>
                     <span class="state-badge" :class="rtClass(m.health)">{{ m.enabled && m.group_enabled ? rtLabel(m.health) : '已停用' }}</span>
-                    <div v-if="m.model_health && m.model_health.length" class="model-dots">
-                      <span v-for="mh in m.model_health" :key="mh.model" class="model-dot" :class="mhClass(mh)" :title="mhTitle(mh)">{{ mh.model }}</span>
+                    <div v-if="visibleDots(m).length" class="model-dots">
+                      <span v-for="mh in visibleDots(m)" :key="mh.model" class="model-dot" :class="mhClass(mh)" :title="mhTitle(mh)">{{ mh.model }}</span>
                     </div>
                   </td>
                   <td>{{ rtRate(m.health) }}</td>
@@ -806,8 +814,8 @@ function logout() {
                   <td><code>{{ u.masked }}</code></td>
                   <td>
                     <span class="state-badge" :class="rtClass(u.health)">{{ u.enabled ? rtLabel(u.health) : '已停用' }}</span>
-                    <div v-if="u.model_health && u.model_health.length" class="model-dots">
-                      <span v-for="mh in u.model_health" :key="mh.model" class="model-dot" :class="mhClass(mh)" :title="mhTitle(mh)">{{ mh.model }}</span>
+                    <div v-if="visibleDots(u).length" class="model-dots">
+                      <span v-for="mh in visibleDots(u)" :key="mh.model" class="model-dot" :class="mhClass(mh)" :title="mhTitle(mh)">{{ mh.model }}</span>
                     </div>
                   </td>
                   <td>{{ rtRate(u.health) }}</td>
@@ -1102,6 +1110,7 @@ function logout() {
           <div class="field"><label>api_key</label><input v-model="dlg.form.api_key" :placeholder="dlg.form.id ? '留空则不修改' : 'sk-...'" /></div>
           <div class="field"><label>代理</label><input v-model="dlg.form.proxy" placeholder="留空=直连/环境变量；如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></div>
           <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>
+          <label class="check"><input type="checkbox" v-model="dlg.form.channel_probe" /> 渠道级探测<span class="check-hint">探任一模型成功即视整渠道可用，运行时列只显渠道状态（模型异常才单独亮出）</span></label>
           <div class="dialog-foot"><button class="btn btn-ghost" @click="closeDlg">取消</button><button class="btn" @click="saveUpstream">保存</button></div>
         </template>
 

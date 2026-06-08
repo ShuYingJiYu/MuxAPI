@@ -323,7 +323,8 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .batch-item .bm-name { flex: 1; font-size: 13px; word-break: break-all; }
 .key-reveal { background: var(--g50); border: 1px solid var(--g200); border-radius: 12px; padding: 14px; margin: 14px 0; word-break: break-all; }
 .key-reveal code { background: none; padding: 0; font-size: 13px; color: var(--g900); }
-.check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--g700); cursor: pointer; }
+.check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--g700); cursor: pointer; flex-wrap: wrap; }
+.check-hint { flex-basis: 100%; padding-left: 24px; margin-top: 2px; font-size: 12px; color: var(--g400); line-height: 1.4; }
 .field input:disabled { background: var(--g50); color: var(--g400); }
 .dialog-sm { width: 380px; }
 .confirm-msg { font-size: 14px; color: var(--g600); line-height: 1.6; }

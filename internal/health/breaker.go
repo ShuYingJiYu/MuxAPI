@@ -247,7 +247,12 @@ func (m *Manager) reportProbe(id int64, model string, ok bool, latencyMs int64) 
 // ObserveProbe 供外部探测器(monitor)反馈一次探测结果：标记探测时刻 + 驱动熔断状态机，
 // 不计入业务流量统计。是 markProbe+reportProbe 的导出合并版——探测系统统一后，
 // monitor 探测器是唯一主动探测源，一次探测既记看板(Record)又驱动熔断(本方法)。
-// scope 由调用方按熔断器口径决定：凭证类(401/402/403)传 model="" 熔整上游，其余传具体 model。
+// scope 完全由调用方(prober)按口径决定，本方法忠实驱动该 scope，不再额外连带：
+//   - 凭证类失败(401/402/403)→ scope="" 熔整上游；
+//   - 渠道级探测(上游开关开)成功 → scope="" 复活整渠道；
+//   - 其余 → scope=model 仅作用该模型。
+//
+// 连带策略集中在 prober.observe，本方法保持单一职责（见 [[probe-scope-by-channel-switch]]）。
 func (m *Manager) ObserveProbe(id int64, model string, ok bool, latencyMs int64) {
 	m.markProbe(id, model)
 	m.reportProbe(id, model, ok, latencyMs)
@@ -425,6 +430,55 @@ func (m *Manager) ModelStates(id int64) []ModelHealth {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Model < out[j].Model })
 	return out
+}
+
+// EffectiveState 返回该上游「对外真实运行状态」，供看板展示与「生效层」判定使用。
+// 纯只读：不调 canServe，不触发 OPEN→HalfOpen 翻转，仅快照当前状态。
+//
+// 规则（修复「单模型上游唯一探测失败却仍显正常」）：
+//   - 上游级(model="")OPEN → 整体 OPEN（凭证/余额类连坐所有模型）；
+//   - 否则看模型级键：任一可用(CLOSED/HALF_OPEN)则整体可用，全部 OPEN → 整体 OPEN；
+//   - 无任何模型级键（从未按模型探过）→ 回退上游级 State（保留「待探测/正常」原样）。
+func (m *Manager) EffectiveState(id int64) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if up := m.breakers[breakerKey{id, ""}]; up != nil && up.state == Open {
+		return Open.String() // 上游级熔断：所有模型连坐
+	}
+	// 模型级聚合：anyClosed 优先(正常) > anyHalf(半开) > 全 OPEN(熔断)。
+	// 注意 State 枚举值 Closed=0/Open=1/HalfOpen=2 并非按健康度排序，不能直接比大小。
+	hasModel, anyClosed, anyHalf := false, false, false
+	for k, b := range m.breakers {
+		if k.upstreamID != id || k.model == "" {
+			continue
+		}
+		hasModel = true
+		switch b.state {
+		case Closed:
+			anyClosed = true
+		case HalfOpen:
+			anyHalf = true
+		}
+	}
+	if !hasModel {
+		return m.snapshotState(id) // 从未按模型探过：照旧用上游级状态
+	}
+	switch {
+	case anyClosed:
+		return Closed.String()
+	case anyHalf:
+		return HalfOpen.String()
+	default:
+		return Open.String() // 所有模型都 OPEN → 整个上游熔断（oojj 单模型死掉即此情形）
+	}
+}
+
+// snapshotState 只读取上游级键的状态字符串（无键＝从未探测，按 Closed 处理）。
+func (m *Manager) snapshotState(id int64) string {
+	if up := m.breakers[breakerKey{id, ""}]; up != nil {
+		return up.state.String()
+	}
+	return Closed.String()
 }
 
 func (m *Manager) markProbe(id int64, model string) {
