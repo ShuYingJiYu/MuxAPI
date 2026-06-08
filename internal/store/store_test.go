@@ -338,3 +338,86 @@ func TestPruneProbes(t *testing.T) {
 		t.Fatalf("ForgetProbes 后应无记录，实际 %d", reqs)
 	}
 }
+
+// countRows 小工具：直读某表行数，校验级联删除是否干净。
+func countRows(t *testing.T, st *Store, table string) int {
+	t.Helper()
+	var n int
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&n); err != nil {
+		t.Fatalf("count %s: %v", table, err)
+	}
+	return n
+}
+
+// TestDeleteUpstreamCascade 验证 Delete 事务化后：删上游会一并清掉中间表与监控项，
+// 提交成功则三表均无残留（事务原子性回归——任一步失败整体回滚，不留半删）。
+func TestDeleteUpstreamCascade(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	g1, _ := st.CreateGroup("g1", "")
+	st.Create(&upstream.Upstream{Name: "A", BaseURL: "http://a", APIKey: "k", Enabled: true})
+	uid := func() int64 { ups, _ := st.List(); return ups[0].ID }()
+	st.AddMember(g1, uid, 1, 1)
+	st.CreateMonitor(&Monitor{UpstreamID: uid, Model: "m1", Enabled: true})
+	st.CreateMonitor(&Monitor{UpstreamID: uid, Model: "m2", Enabled: true})
+
+	// 删前：三表均有该上游相关行
+	if countRows(t, st, "upstreams") != 1 || countRows(t, st, "group_upstreams") != 1 || countRows(t, st, "monitors") != 2 {
+		t.Fatal("前置数据未就绪")
+	}
+
+	if err := st.Delete(uid); err != nil {
+		t.Fatal(err)
+	}
+	// 删后：父子表全干净，无半删
+	if n := countRows(t, st, "upstreams"); n != 0 {
+		t.Fatalf("upstreams 应清空，残留 %d", n)
+	}
+	if n := countRows(t, st, "group_upstreams"); n != 0 {
+		t.Fatalf("group_upstreams 应清空，残留 %d", n)
+	}
+	if n := countRows(t, st, "monitors"); n != 0 {
+		t.Fatalf("monitors 应清空，残留 %d", n)
+	}
+}
+
+// TestDeleteGroupCascade 验证 DeleteGroup 事务化后：删分组会一并清掉成员关系与接入密钥，
+// 提交成功则 groups/group_upstreams/access_keys 三表均无该组残留。
+func TestDeleteGroupCascade(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	g1, _ := st.CreateGroup("g1", "")
+	st.Create(&upstream.Upstream{Name: "A", BaseURL: "http://a", APIKey: "k", Enabled: true})
+	uid := func() int64 { ups, _ := st.List(); return ups[0].ID }()
+	st.AddMember(g1, uid, 1, 1)
+	st.CreateKey("k1", g1)
+
+	if countRows(t, st, "groups") != 1 || countRows(t, st, "group_upstreams") != 1 || countRows(t, st, "access_keys") != 1 {
+		t.Fatal("前置数据未就绪")
+	}
+
+	if err := st.DeleteGroup(g1); err != nil {
+		t.Fatal(err)
+	}
+	if n := countRows(t, st, "groups"); n != 0 {
+		t.Fatalf("groups 应清空，残留 %d", n)
+	}
+	if n := countRows(t, st, "group_upstreams"); n != 0 {
+		t.Fatalf("group_upstreams 应清空，残留 %d", n)
+	}
+	if n := countRows(t, st, "access_keys"); n != 0 {
+		t.Fatalf("access_keys 应清空，残留 %d", n)
+	}
+	// 上游全局池不受删组影响
+	if n := countRows(t, st, "upstreams"); n != 1 {
+		t.Fatalf("删组不应动全局上游，实际 %d", n)
+	}
+}

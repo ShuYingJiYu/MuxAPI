@@ -70,7 +70,16 @@ type Monitor struct {
 }
 
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	// 并发可靠性 PRAGMA（modernc.org/sqlite 经 DSN 的 _pragma 参数下发到每条连接）：
+	//   busy_timeout(5000) 写锁竞争时最多等 5s 再返回 SQLITE_BUSY，避免并发写静默丢日志/探测数据；
+	//   journal_mode(WAL)  读写不互斥，提升并发；foreign_keys(1) 启用外键约束。
+	// path 已带 query（如 :memory: 变体或自定义参数）时用 & 续接，否则用 ? 起始，避免覆盖。
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	dsn := path + sep + "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +175,8 @@ CREATE TABLE IF NOT EXISTS probe_results (
 	latency_ms INTEGER NOT NULL,
 	created_at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_probe_mon_time ON probe_results(monitor_id, created_at);`
+CREATE INDEX IF NOT EXISTS idx_probe_mon_time ON probe_results(monitor_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_logs_group_time ON logs(group_id, created_at);`
 
 // --- 上游全局池 ---
 
@@ -231,14 +241,21 @@ func (s *Store) Update(u *upstream.Upstream) error {
 }
 
 func (s *Store) Delete(id int64) error {
-	if _, err := s.db.Exec(`DELETE FROM group_upstreams WHERE upstream_id=?`, id); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(`DELETE FROM monitors WHERE upstream_id=?`, id); err != nil {
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM group_upstreams WHERE upstream_id=?`, id); err != nil {
 		return err
 	}
-	_, err := s.db.Exec(`DELETE FROM upstreams WHERE id=?`, id)
-	return err
+	if _, err := tx.Exec(`DELETE FROM monitors WHERE upstream_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM upstreams WHERE id=?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -565,16 +582,21 @@ func (s *Store) UpdateGroup(id int64, name, desc string) error {
 }
 
 func (s *Store) DeleteGroup(id int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	for _, q := range []string{
 		`DELETE FROM group_upstreams WHERE group_id=?`,
 		`DELETE FROM access_keys WHERE group_id=?`,
 		`DELETE FROM groups WHERE id=?`,
 	} {
-		if _, err := s.db.Exec(q, id); err != nil {
+		if _, err := tx.Exec(q, id); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // --- 组成员（M:N 中间表）---
