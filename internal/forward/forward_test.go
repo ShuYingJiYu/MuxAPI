@@ -2,6 +2,7 @@ package forward
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -268,7 +269,90 @@ func TestForward403Failover(t *testing.T) {
 	}
 }
 
-// flushRecorder 把写入接到 io.Pipe，并记录每次 Flush，用于验证增量透传。
+// countingHealth 记录 Report 调用次数，并兼当 Picker 返回固定上游(避开 exclude)，
+// 用于断言「客户端断连不污染健康」。
+type countingHealth struct {
+	reports int32
+	up      *upstream.Upstream
+}
+
+func (c *countingHealth) Report(id int64, model string, ok bool, latencyMs int64) {
+	atomic.AddInt32(&c.reports, 1)
+}
+func (c *countingHealth) PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, error) {
+	if exclude[c.up.ID] {
+		return nil, io.EOF // 没有更多可用上游
+	}
+	return c.up, nil
+}
+
+// H2 回归：客户端中途断连(ctx canceled)时，转发层不得 Report 失败——
+// 否则一次 abort 会让本次试过的多个健康上游各记一次失败、累积误熔断。
+func TestForwardClientCancelNoReport(t *testing.T) {
+	// 上游收到请求后阻塞不返回，制造「客户端先取消」的时序窗口。
+	gotReq := make(chan struct{})
+	block := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(gotReq)
+		<-block // 一直阻塞到测试结束
+	}))
+	defer srv.Close()
+	defer close(block)
+
+	ch := &countingHealth{up: &upstream.Upstream{ID: 1, Name: "A", BaseURL: srv.URL, APIKey: "k", Priority: 1, Enabled: true}}
+	fwd := New(ch, ch, noopLogger{}, 3)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`)).WithContext(ctx)
+
+	done := make(chan struct{})
+	go func() {
+		fwd.Forward(rec, req, []byte(`{"model":"m"}`), 0, "")
+		close(done)
+	}()
+	<-gotReq // 确保请求已发到上游、正阻塞在等响应头
+	cancel() // 客户端断连
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("客户端取消后 Forward 应尽快返回")
+	}
+	if n := atomic.LoadInt32(&ch.reports); n != 0 {
+		t.Fatalf("客户端断连不应 Report 任何健康反馈，实际 Report %d 次", n)
+	}
+}
+
+// H3 回归：单条 SSE data 行超 1MB(旧 Scanner 上限) 也应完整透传、不静默截断。
+func TestForwardSSELongLineNoTruncate(t *testing.T) {
+	huge := strings.Repeat("x", 3*1024*1024) // 3MB，远超旧 Scanner 1MB 上限
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fl := w.(http.Flusher)
+		io.WriteString(w, "data: "+huge+"\n")
+		fl.Flush()
+		io.WriteString(w, "data: [DONE]\n")
+		fl.Flush()
+	}))
+	defer srv.Close()
+
+	ups := []*upstream.Upstream{{ID: 1, Name: "A", BaseURL: srv.URL, APIKey: "k", Priority: 1, Enabled: true}}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, noopLogger{}, 3)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"stream":true}`))
+	fwd.Forward(rec, req, []byte(`{"stream":true}`), 0, "")
+
+	body, _ := io.ReadAll(rec.Result().Body)
+	if !strings.Contains(string(body), huge) {
+		t.Fatalf("超长单行应完整透传，实际长度 %d 不含完整 payload", len(body))
+	}
+	if !strings.Contains(string(body), "[DONE]") {
+		t.Fatal("超长行后续事件([DONE])也应到达，证明未静默截断")
+	}
+}
 type flushRecorder struct {
 	header  http.Header
 	w       *io.PipeWriter

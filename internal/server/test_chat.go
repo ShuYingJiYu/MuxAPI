@@ -88,39 +88,47 @@ func (s *Server) testUpstreamChat(w http.ResponseWriter, r *http.Request, id int
 
 // relayChatStream 解析上游 OpenAI SSE 流，逐块把 delta 文字转成 content 事件。
 func (s *Server) relayChatStream(body io.Reader, send func(testEvent), start time.Time) {
-	sc := bufio.NewScanner(body)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "[DONE]" {
-			break
-		}
-		var chunk struct {
-			Choices []struct {
-				Delta struct {
-					Content string `json:"content"`
-				} `json:"delta"`
-			} `json:"choices"`
-			Error *struct {
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			continue
-		}
-		if chunk.Error != nil {
-			send(testEvent{Type: "error", Error: chunk.Error.Message, LatencyMs: time.Since(start).Milliseconds()})
-			return
-		}
-		for _, ch := range chunk.Choices {
-			if ch.Delta.Content != "" {
-				send(testEvent{Type: "content", Text: ch.Delta.Content})
+	// 用 bufio.Reader 按行读，不受 Scanner 1MB token 上限约束（单条 data: 行再长也不截断）。
+	br := bufio.NewReaderSize(body, 64*1024)
+	for {
+		raw, readErr := br.ReadString('\n')
+		line := strings.TrimSpace(raw)
+		if line != "" && strings.HasPrefix(line, "data:") {
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if data == "[DONE]" {
+				send(testEvent{Type: "test_complete", Success: true, LatencyMs: time.Since(start).Milliseconds()})
+				return
+			}
+			var chunk struct {
+				Choices []struct {
+					Delta struct {
+						Content string `json:"content"`
+					} `json:"delta"`
+				} `json:"choices"`
+				Error *struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal([]byte(data), &chunk); err == nil {
+				if chunk.Error != nil {
+					send(testEvent{Type: "error", Error: chunk.Error.Message, LatencyMs: time.Since(start).Milliseconds()})
+					return
+				}
+				for _, ch := range chunk.Choices {
+					if ch.Delta.Content != "" {
+						send(testEvent{Type: "content", Text: ch.Delta.Content})
+					}
+				}
 			}
 		}
+		if readErr != nil {
+			// 正常结束(EOF)才算测试通过；读流中途出错不能伪报成功完成。
+			if readErr == io.EOF {
+				send(testEvent{Type: "test_complete", Success: true, LatencyMs: time.Since(start).Milliseconds()})
+			} else {
+				send(testEvent{Type: "error", Error: readErr.Error(), LatencyMs: time.Since(start).Milliseconds()})
+			}
+			return
+		}
 	}
-	send(testEvent{Type: "test_complete", Success: true, LatencyMs: time.Since(start).Milliseconds()})
 }

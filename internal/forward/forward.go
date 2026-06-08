@@ -3,6 +3,7 @@ package forward
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -74,14 +75,29 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			lastErr = err
 			continue
 		}
-		req = req.WithContext(r.Context())
-		// 每个上游用自己的代理出口；首响应头超时=容忍线，超时即换源(不影响已开始的流式)
+		// 子 context 仅用于「首响应头超时」(容忍线)：超时即 cancel 换源。
+		// 不在共享 Transport 上设 ResponseHeaderTimeout——那会按代理出口被所有请求共享、
+		// 且容忍线动态可变。改用定时器：拿到响应头后立刻 Stop，故不影响已开始的流式总时长。
+		// 父 ctx(r.Context()) 反映客户端是否断连，与本超时各自独立、便于区分二者。
+		ctx, cancel := context.WithCancel(r.Context())
+		timer := time.AfterFunc(f.headerTimeout(), cancel)
+		req = req.WithContext(ctx)
+		// 每个上游用自己的代理出口共享 Transport（含空闲回收，避免每请求新建泄漏连接）。
 		tr := u.NewTransport()
-		tr.ResponseHeaderTimeout = f.headerTimeout()
 		client := &http.Client{Timeout: 0, Transport: tr}
 		start := time.Now()
 		resp, err := client.Do(req)
-		if err != nil { // 网络错误：模型级失败（不连坐整上游）
+		timer.Stop() // 已收到响应头(或已失败)，解除超时定时器，后续流式不受限
+		if err != nil {
+			// 客户端断连(父 ctx 已取消)：直接结束，不上报健康、不记日志、不重试——
+			// 否则一次 abort 会让本次试过的多个健康上游各记一次失败、累积误熔断。
+			if r.Context().Err() != nil {
+				cancel()
+				return
+			}
+			// 首响应头超时(本地 cancel 触发、父 ctx 未取消) 或真实网络错误：
+			// 均视为该上游模型级失败，反馈并换下一个上游。
+			cancel()
 			f.health.Report(u.ID, model, false, 0)
 			f.logger.Log(groupID, u.ID, model, endpoint, keyName, attempt, 0, 0)
 			lastErr = err
@@ -92,7 +108,9 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			lat := time.Since(start).Milliseconds()
 			f.health.Report(u.ID, failScope(model, resp.StatusCode), false, lat)
 			f.logger.Log(groupID, u.ID, model, endpoint, keyName, attempt, resp.StatusCode, lat)
+			io.Copy(io.Discard, resp.Body) // 排空再 Close，助连接复用
 			resp.Body.Close()
+			cancel()
 			continue
 		}
 		// 成功：反馈 + 透传响应
@@ -100,6 +118,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		f.health.Report(u.ID, model, true, lat)
 		f.logger.Log(groupID, u.ID, model, endpoint, keyName, attempt, resp.StatusCode, lat)
 		relayResponse(w, resp)
+		cancel()
 		return
 	}
 	// 循环结束仍没成功：分两种情况
@@ -148,14 +167,18 @@ func relayResponse(w http.ResponseWriter, resp *http.Response) {
 	flusher, canFlush := w.(http.Flusher)
 	br := bufio.NewReaderSize(resp.Body, 64*1024)
 	if canFlush && isStream(ct, br) {
-		sc := bufio.NewScanner(br)
-		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for sc.Scan() {
-			w.Write(sc.Bytes())
-			w.Write([]byte("\n"))
-			flusher.Flush()
+		// 按行读 + 实时 flush：ReadBytes 不受 Scanner 的 token 上限约束，
+		// 单条 data: 行再长也完整透传，不会静默截断。读到 EOF 即结束。
+		for {
+			line, err := br.ReadBytes('\n')
+			if len(line) > 0 {
+				w.Write(line)
+				flusher.Flush()
+			}
+			if err != nil { // io.EOF 或读错误：流结束
+				return
+			}
 		}
-		return
 	}
 	io.Copy(w, br)
 }

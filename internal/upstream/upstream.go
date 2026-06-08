@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,6 +26,7 @@ type Upstream struct {
 }
 
 // ProxyTransport 按代理 URL 构建 Transport：空则回退到环境变量(HTTPS_PROXY)，解析失败也回退。
+// 每次新建一个独立 Transport，供探测/拉模型这类一次性短连接使用。
 func ProxyTransport(proxy string) *http.Transport {
 	t := &http.Transport{Proxy: http.ProxyFromEnvironment}
 	if proxy != "" {
@@ -35,8 +37,29 @@ func ProxyTransport(proxy string) *http.Transport {
 	return t
 }
 
-// NewTransport 该上游专属 Transport（含其代理出口）。
-func (u *Upstream) NewTransport() *http.Transport { return ProxyTransport(u.Proxy) }
+// sharedTransports 按代理出口缓存复用的 Transport（key=proxy 字符串）。
+// 转发热路径每请求新建 Transport 会泄漏连接/fd（旧实现），改为按出口共享一份、
+// 带空闲连接回收，long-run 不再耗尽资源。
+var sharedTransports sync.Map // proxy string -> *http.Transport
+
+// SharedTransport 取（或惰性建）该代理出口共享的 Transport，供转发热路径复用。
+// 设 IdleConnTimeout=90s、MaxIdleConnsPerHost=100 让空闲连接及时回收又能复用；
+// 注意：不在此设 ResponseHeaderTimeout（它随容忍线动态变化），由调用方在 context/client 层控制。
+func SharedTransport(proxy string) *http.Transport {
+	if v, ok := sharedTransports.Load(proxy); ok {
+		return v.(*http.Transport)
+	}
+	t := ProxyTransport(proxy)
+	t.IdleConnTimeout = 90 * time.Second
+	t.MaxIdleConns = 100
+	t.MaxIdleConnsPerHost = 100
+	// LoadOrStore 防并发重复建：多个 goroutine 同时 miss 时只留一份。
+	actual, _ := sharedTransports.LoadOrStore(proxy, t)
+	return actual.(*http.Transport)
+}
+
+// NewTransport 该上游专属共享 Transport（含其代理出口），转发热路径复用以免连接泄漏。
+func (u *Upstream) NewTransport() *http.Transport { return SharedTransport(u.Proxy) }
 
 // IsFailureStatus 判断上游响应码是否表示「该上游此刻不可用」，需触发故障切换/熔断摘除。
 // 涵盖：5xx 服务端错误、429 限流，以及 401/402/403/408 这类凭证/余额/超时问题。
