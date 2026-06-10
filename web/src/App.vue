@@ -2,6 +2,7 @@
 import { ref, reactive, onMounted, onUnmounted, computed } from 'vue'
 import Icon from './Icon.vue'
 import Fence from './Fence.vue'
+import FancySelect from './FancySelect.vue'
 import { api } from './api.js'
 
 const page = ref('overview')      // overview | groups | upstreams | monitors
@@ -275,6 +276,56 @@ function delUpstream(u) {
     guard(async () => { await api.deleteUpstream(u.id); await loadUpstreams() }))
 }
 
+const upstreamRunFilter = ref('')
+const upstreamEnabledFilter = ref('')
+const upstreamDragId = ref(null)
+const upstreamDragOverId = ref(null)
+const upstreamRunOptions = [
+  { value: '', label: '运行状态：全部' },
+  { value: 'CLOSED', label: '正常' },
+  { value: 'HALF_OPEN', label: '半开' },
+  { value: 'OPEN', label: '熔断' },
+  { value: 'UNPROBED', label: '待探测' },
+]
+const upstreamEnabledOptions = [
+  { value: '', label: '启停状态：全部' },
+  { value: 'enabled', label: '启用' },
+  { value: 'disabled', label: '停用' },
+]
+
+const upstreamRunValue = u => rtUnprobed(u.health) ? 'UNPROBED' : (u.health?.state || '')
+const upstreamsFiltered = computed(() => upstreams.value.filter(u => {
+  if (upstreamEnabledFilter.value === 'enabled' && !u.enabled) return false
+  if (upstreamEnabledFilter.value === 'disabled' && u.enabled) return false
+  if (upstreamRunFilter.value && upstreamRunValue(u) !== upstreamRunFilter.value) return false
+  return true
+}))
+
+function onUpstreamDragStart(u, e) {
+  upstreamDragId.value = u.id
+  e.dataTransfer.effectAllowed = 'move'
+}
+function onUpstreamDragOver(u, e) {
+  e.preventDefault()
+  if (u.id !== upstreamDragId.value) upstreamDragOverId.value = u.id
+}
+function onUpstreamDrop(target) {
+  const visible = upstreamsFiltered.value
+  const from = visible.findIndex(x => x.id === upstreamDragId.value)
+  const to = visible.findIndex(x => x.id === target.id)
+  if (from < 0 || to < 0 || from === to) { onUpstreamDragEnd(); return }
+  const reorderedVisible = visible.slice()
+  const [moved] = reorderedVisible.splice(from, 1)
+  reorderedVisible.splice(to, 0, moved)
+  const visibleIds = new Set(visible.map(x => x.id))
+  let vi = 0
+  const arr = upstreams.value.map(u => visibleIds.has(u.id) ? reorderedVisible[vi++] : u)
+  upstreams.value = arr
+  onUpstreamDragEnd()
+  guard(() => api.reorderUpstreams(arr.map(x => x.id)).catch(e => { loadUpstreams().catch(() => {}); throw e }))
+}
+function onUpstreamDragEnd() { upstreamDragId.value = upstreamDragOverId.value = null }
+
 // 连通测试 + 模型列表
 const testState = reactive({
   show: false, id: 0, name: '',
@@ -410,7 +461,7 @@ function gotoSection(id) {
 function saveSettings() {
   guard(async () => {
     await api.saveSettings({
-      log_retention: logRetention.value,
+      log_retention: String(logRetention.value),
       alert_webhook: alertWebhook.value,
       alert_debounce: alertDebounce.value,
       route_smart: routeSmart.value,
@@ -480,6 +531,13 @@ const logFModel = ref('')     // 筛选：模型（空=全部）
 const logFStatus = ref('')    // 筛选：'' 全部 | 'ok' | 'fail'
 const logModelOpts = ref([])  // 全量去重选项（服务端给）
 const logGroupOpts = ref([])
+const logGroupSelectOptions = computed(() => [{ value: '', label: '全部分组' }, ...logGroupOpts.value.map(g => ({ value: g, label: g }))])
+const logModelSelectOptions = computed(() => [{ value: '', label: '全部模型' }, ...logModelOpts.value.map(m => ({ value: m, label: m }))])
+const logStatusOptions = [
+  { value: '', label: '全部状态' },
+  { value: 'ok', label: '仅成功' },
+  { value: 'fail', label: '仅失败' },
+]
 // 首屏/筛选变化：重置后拉第一页；append=true 时翻下一页累积
 async function loadLogs(append = false) {
   if (logLoading.value) return
@@ -524,6 +582,18 @@ const fmtEndpoint = p => !p ? '—' : p.replace(/^\/v1\//, '')
 
 // 监控项 CRUD
 const monModels = ref([])  // 当前对话框选中渠道的可选模型（datalist）
+const routeSmartOptions = [
+  { value: 'on', label: '开启' },
+  { value: 'off', label: '关闭（经典 P2C）' },
+]
+const testModelOptions = computed(() => {
+  if (testState.modelsLoading) return [{ value: '', label: '加载模型中…', disabled: true }]
+  const opts = testState.models.map(m => ({ value: m, label: m }))
+  if (!opts.length && testState.model) opts.push({ value: testState.model, label: testState.model })
+  return opts
+})
+const upstreamSelectOptions = computed(() => upstreams.value.map(u => ({ value: u.id, label: `${u.name} — ${u.base_url}` })))
+const addableSelectOptions = computed(() => addable.value.map(u => ({ value: u.id, label: `${u.name} — ${u.base_url}` })))
 function loadMonModels(uid) {
   monModels.value = []
   if (!uid) return
@@ -825,15 +895,24 @@ function logout() {
 
         <!-- 上游池 -->
         <template v-else-if="page === 'upstreams'">
-          <div class="toolbar">
-            <div class="toolbar-left"><span class="count">{{ upstreams.length }} 个上游</span></div>
+          <div class="toolbar upstream-toolbar">
+            <div class="toolbar-left">
+              <span class="count">{{ upstreamsFiltered.length }} / {{ upstreams.length }} 个上游</span>
+              <FancySelect v-model="upstreamRunFilter" :options="upstreamRunOptions" />
+              <FancySelect v-model="upstreamEnabledFilter" :options="upstreamEnabledOptions" />
+            </div>
             <button class="btn" @click="newUpstream"><Icon name="plus" :size="16" />新增上游</button>
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>名称</th><th>地址</th><th>凭证</th><th>运行时</th><th>成功率</th><th>人工开关</th><th>操作</th></tr></thead>
+              <thead><tr><th></th><th>名称</th><th>地址</th><th>凭证</th><th>运行时</th><th>成功率</th><th>人工开关</th><th>操作</th></tr></thead>
               <tbody>
-                <tr v-for="u in upstreams" :key="u.id">
+                <tr v-for="u in upstreamsFiltered" :key="u.id"
+                  :class="{ disabled: !u.enabled, dragging: upstreamDragId === u.id, dragover: upstreamDragOverId === u.id }"
+                  draggable="true"
+                  @dragstart="onUpstreamDragStart(u, $event)" @dragover="onUpstreamDragOver(u, $event)"
+                  @drop="onUpstreamDrop(u)" @dragend="onUpstreamDragEnd">
+                  <td class="drag-cell"><span class="mon-grip" title="拖拽调整顺序"><Icon name="grip" :size="16" /></span></td>
                   <td class="cell-name">{{ u.name }}</td>
                   <td class="cell-url">{{ u.base_url }}</td>
                   <td><code>{{ u.masked }}</code></td>
@@ -852,7 +931,7 @@ function logout() {
                     <button class="icon-btn danger" @click="delUpstream(u)"><Icon name="trash" :size="16" /></button>
                   </td>
                 </tr>
-                <tr v-if="!upstreams.length"><td colspan="7" class="empty-cell">还没有上游，点右上角新增。</td></tr>
+                <tr v-if="!upstreamsFiltered.length"><td colspan="8" class="empty-cell">{{ upstreams.length ? '没有符合筛选的上游。' : '还没有上游，点右上角新增。' }}</td></tr>
               </tbody>
             </table>
           </div>
@@ -909,19 +988,9 @@ function logout() {
         <!-- 请求记录页：每次转发的真实去向，按模型/分组/状态筛选 -->
         <template v-else-if="page === 'logs'">
           <div class="log-toolbar">
-            <select class="filter-select" v-model="logFGroup" @change="onLogFilterChange">
-              <option value="">全部分组</option>
-              <option v-for="g in logGroupOpts" :key="g" :value="g">{{ g }}</option>
-            </select>
-            <select class="filter-select" v-model="logFModel" @change="onLogFilterChange">
-              <option value="">全部模型</option>
-              <option v-for="m in logModelOpts" :key="m" :value="m">{{ m }}</option>
-            </select>
-            <select class="filter-select" v-model="logFStatus" @change="onLogFilterChange">
-              <option value="">全部状态</option>
-              <option value="ok">仅成功</option>
-              <option value="fail">仅失败</option>
-            </select>
+            <FancySelect v-model="logFGroup" :options="logGroupSelectOptions" @change="onLogFilterChange" />
+            <FancySelect v-model="logFModel" :options="logModelSelectOptions" @change="onLogFilterChange" />
+            <FancySelect v-model="logFStatus" :options="logStatusOptions" @change="onLogFilterChange" />
             <span class="log-count">已加载 {{ logs.length }} 条{{ logHasMore ? '＋' : '' }}</span>
             <button class="btn btn-sm" :disabled="logLoading" @click="onLogFilterChange"><Icon name="refresh" :size="14" />刷新</button>
           </div>
@@ -938,7 +1007,7 @@ function logout() {
                   <td>{{ l.model || '—' }}</td>
                   <td>{{ l.upstream_name || '—' }}</td>
                   <td><span v-if="l.retries > 0" class="log-retry">第{{ l.retries + 1 }}次</span><span v-else class="log-dim">直连</span></td>
-                  <td><span class="log-status" :class="logOk(l.status) ? 'ok' : 'fail'">{{ statusText(l.status) }}</span></td>
+                  <td><span class="log-status" :class="logOk(l.status) ? 'ok' : 'fail'" :title="l.error || ''">{{ statusText(l.status) }}</span></td>
                   <td>{{ l.status === 0 ? '—' : (l.latency_ms >= 1000 ? (l.latency_ms / 1000).toFixed(1) + 's' : l.latency_ms + 'ms') }}</td>
                 </tr>
                 <tr v-if="!logs.length"><td colspan="10" class="empty-cell">{{ logLoading ? '加载中…' : '没有符合条件的请求记录。客户端发起请求后这里会出现。' }}</td></tr>
@@ -967,7 +1036,7 @@ function logout() {
               <section id="set-logs" class="card settings-card">
                 <div class="settings-title"><h3>日志清理</h3><p>按条数保留最新调用日志，超出自动裁剪。</p></div>
                 <div class="settings-fields">
-                  <div class="field"><label>日志保留条数</label><input v-model="logRetention" type="number" min="100" placeholder="10000" /></div>
+                  <div class="field"><label>日志保留条数</label><input v-model="logRetention" type="number" min="100" placeholder="300" /></div>
                 </div>
                 <div class="settings-info">
                   <div><span>日志</span><b>{{ effectiveLogRetention ? effectiveLogRetention + ' 条' : '—' }}</b><em>{{ sourceText(logRetentionSource) }}</em></div>
@@ -983,7 +1052,7 @@ function logout() {
                 <div class="settings-fields">
                   <div class="field">
                     <label>智能路由</label>
-                    <select v-model="routeSmart"><option value="on">开启</option><option value="off">关闭（经典 P2C）</option></select>
+                    <FancySelect v-model="routeSmart" :options="routeSmartOptions" />
                   </div>
                   <div class="field"><label>最多等多久（秒）</label><input v-model="routeToleranceSec" type="number" min="1" max="300" placeholder="30" /></div>
                 </div>
@@ -1070,11 +1139,7 @@ function logout() {
         <p class="hint" style="margin:0 0 10px">发一条真实对话请求，验证能否端到端跑通并查看回复。</p>
 
         <div class="test-row">
-          <select v-model="testState.model" :disabled="testState.modelsLoading || testState.running" class="select">
-            <option v-if="testState.modelsLoading" value="">加载模型中…</option>
-            <option v-for="m in testState.models" :key="m" :value="m">{{ m }}</option>
-            <option v-if="!testState.modelsLoading && !testState.models.length" :value="testState.model">{{ testState.model }}</option>
-          </select>
+          <FancySelect v-model="testState.model" :options="testModelOptions" :disabled="testState.modelsLoading || testState.running" />
           <button class="btn" :disabled="testState.running || !testState.model" @click="runTest">
             <Icon :name="testState.running ? 'loader' : 'play'" :size="16" />{{ testState.running ? '测试中…' : '开始测试' }}
           </button>
@@ -1143,9 +1208,7 @@ function logout() {
           <h3>{{ dlg.form.id ? '编辑监控项' : '新增监控项' }}</h3>
           <div class="field">
             <label>渠道</label>
-            <select v-model="dlg.form.upstream_id" class="filter-select" style="width:100%" @change="loadMonModels(Number(dlg.form.upstream_id))">
-              <option v-for="u in upstreams" :key="u.id" :value="u.id">{{ u.name }} — {{ u.base_url }}</option>
-            </select>
+            <FancySelect v-model="dlg.form.upstream_id" :options="upstreamSelectOptions" @change="loadMonModels(Number(dlg.form.upstream_id))" />
           </div>
           <div class="field">
             <label>模型</label>
@@ -1200,9 +1263,7 @@ function logout() {
           <h3>{{ dlg.form.locked ? '调整组内策略' : '添加上游到分组' }}</h3>
           <div class="field" v-if="!dlg.form.locked">
             <label>选择上游</label>
-            <select v-model="dlg.form.upstream_id" class="filter-select" style="width:100%">
-              <option v-for="u in addable" :key="u.id" :value="u.id">{{ u.name }} — {{ u.base_url }}</option>
-            </select>
+            <FancySelect v-model="dlg.form.upstream_id" :options="addableSelectOptions" />
           </div>
           <div class="field" v-else><label>上游</label><input :value="upName(dlg.form.upstream_id)" disabled /></div>
           <div class="field-row">

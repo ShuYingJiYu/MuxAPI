@@ -14,14 +14,14 @@ import (
 // 上游是全局凭证池成员；Priority/Weight 是「组内视图」字段——
 // 由 store 从 group_upstreams 中间表 JOIN 填充，表示该上游在某分组内的调度策略。
 type Upstream struct {
-	ID       int64
-	Name     string
-	BaseURL  string // 中转站地址
-	APIKey   string // 透传凭证
-	Proxy    string // 转发/探测走的代理出口(空=按环境变量或直连)
-	Priority int    // 组内视图：越小越优先
-	Weight   int    // 组内视图：同优先级层分流权重
-	Enabled  bool
+	ID           int64
+	Name         string
+	BaseURL      string // 中转站地址
+	APIKey       string // 透传凭证
+	Proxy        string // 转发/探测走的代理出口(空=按环境变量或直连)
+	Priority     int    // 组内视图：越小越优先
+	Weight       int    // 组内视图：同优先级层分流权重
+	Enabled      bool
 	ChannelProbe bool // 渠道级探测：探任一模型成功即视整渠道可用（探测复活连带 + 运行时列收起模型徽章）
 }
 
@@ -89,8 +89,11 @@ func IsFailureStatus(code int) bool {
 func FailIsUpstreamLevel(code int) bool {
 	switch code {
 	case http.StatusUnauthorized, // 401
-		http.StatusPaymentRequired, // 402
-		http.StatusForbidden:       // 403
+		http.StatusPaymentRequired,    // 402
+		http.StatusForbidden,          // 403
+		http.StatusBadGateway,         // 502
+		http.StatusServiceUnavailable, // 503
+		http.StatusGatewayTimeout:     // 504
 		return true
 	}
 	return false

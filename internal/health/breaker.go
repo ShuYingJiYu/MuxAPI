@@ -28,13 +28,14 @@ func (s State) String() string {
 
 // breaker 单个上游的熔断器（仅内存）
 type breaker struct {
-	state       State
-	fails       int       // 连续失败次数
-	openUntil   time.Time // Open 冷却到期时间：到期后 canServe 翻 HalfOpen 放行恢复流量
-	lastProbe   time.Time
-	latencyMs   int64
-	latencyEWMA float64 // 成功请求延迟的指数加权移动平均(ms)，供 P2C 选路；0=尚无数据
-	succEWMA    float64 // 成功率的指数加权移动平均(0..1)：成功样本=1、失败=0。供延迟加权选路算「有效延迟」；
+	state            State
+	fails            int       // 连续失败次数
+	openUntil        time.Time // Open 冷却到期时间：到期后 canServe 翻 HalfOpen 放行恢复流量
+	halfOpenInFlight bool      // HalfOpen allows only one business probe
+	lastProbe        time.Time
+	latencyMs        int64
+	latencyEWMA      float64 // 成功请求延迟的指数加权移动平均(ms)，供 P2C 选路；0=尚无数据
+	succEWMA         float64 // 成功率的指数加权移动平均(0..1)：成功样本=1、失败=0。供延迟加权选路算「有效延迟」；
 	// 用 EWMA 而非全历史比例——能快速反映「正在变差」，不被陈旧好成绩稀释。-1=尚无样本(新键乐观，视为 1)。
 	// 业务流量统计（仅转发层计入，探测不算；进程级、重启清零）
 	reqs       int64 // 总请求数
@@ -141,7 +142,28 @@ func (m *Manager) canServe(b *breaker) bool {
 		if !time.Now().After(b.openUntil) {
 			return false
 		}
-		b.state = HalfOpen // 冷却结束，进入恢复期，放行业务流量自证
+		b.state = HalfOpen
+		b.halfOpenInFlight = false
+	}
+	return b.state != HalfOpen || !b.halfOpenInFlight
+}
+
+func (m *Manager) Claim(id int64, model string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	bs := []*breaker{m.get(breakerKey{id, ""})}
+	if model != "" {
+		bs = append(bs, m.get(breakerKey{id, model}))
+	}
+	for _, b := range bs {
+		if !m.canServe(b) {
+			return false
+		}
+	}
+	for _, b := range bs {
+		if b.state == HalfOpen {
+			b.halfOpenInFlight = true
+		}
 	}
 	return true
 }
@@ -266,13 +288,34 @@ func (m *Manager) reportProbe(id int64, model string, ok bool, latencyMs int64) 
 // monitor 探测器是唯一主动探测源，一次探测既记看板(Record)又驱动熔断(本方法)。
 // scope 完全由调用方(prober)按口径决定，本方法忠实驱动该 scope，不再额外连带：
 //   - 凭证类失败(401/402/403)→ scope="" 熔整上游；
-//   - 渠道级探测(上游开关开)成功 → scope="" 复活整渠道；
+//   - 渠道级探测(上游开关开)成功/失败 → scope="" 复活/熔断整渠道；
 //   - 其余 → scope=model 仅作用该模型。
 //
 // 连带策略集中在 prober.observe，本方法保持单一职责（见 [[probe-scope-by-channel-switch]]）。
 func (m *Manager) ObserveProbe(id int64, model string, ok bool, latencyMs int64) {
 	m.markProbe(id, model)
 	m.reportProbe(id, model, ok, latencyMs)
+	if ok && model == "" {
+		m.recoverModelsForUpstream(id, latencyMs)
+	}
+}
+
+func (m *Manager) recoverModelsForUpstream(id int64, latencyMs int64) {
+	m.mu.Lock()
+	var events []AlertEvent
+	for k, b := range m.breakers {
+		if k.upstreamID != id || k.model == "" {
+			continue
+		}
+		from, to := m.driveWith(b, true, latencyMs, 1)
+		if ev, flipped := transitionEvent(id, k.model, from, to, b.fails); flipped {
+			events = append(events, ev)
+		}
+	}
+	m.mu.Unlock()
+	for _, ev := range events {
+		m.dispatch(ev)
+	}
 }
 
 // dispatch 异步派发告警：drive 持锁、此处已释放锁，仍 go 出去防 webhook 慢阻塞调用方。
@@ -314,6 +357,7 @@ func (m *Manager) driveWith(b *breaker, ok bool, latencyMs int64, threshold int)
 	if ok {
 		b.fails = 0
 		b.state = Closed
+		b.halfOpenInFlight = false
 		if latencyMs > 0 {
 			b.latencyMs = latencyMs
 			// 仅成功请求计入 EWMA（失败延迟无意义）。首次直接赋值，避免被 0 拖低。
@@ -328,6 +372,7 @@ func (m *Manager) driveWith(b *breaker, ok bool, latencyMs int64, threshold int)
 	b.fails++
 	if b.fails >= threshold || b.state == HalfOpen {
 		b.state = Open
+		b.halfOpenInFlight = false
 		b.openUntil = time.Now().Add(m.cooldown)
 	}
 	return from, b.state

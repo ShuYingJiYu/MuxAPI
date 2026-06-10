@@ -61,7 +61,7 @@ func (s *Server) adminLogOptions(w http.ResponseWriter, r *http.Request) {
 func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		logRetention, logRetentionSource := intSettingValue(s.store.GetSetting("log_retention", ""), 10000)
+		logRetention, logRetentionSource := intSettingValue(s.store.GetSetting("log_retention", ""), 300)
 		alertWebhook, alertWebhookSource := stringSettingValue(s.store.GetSetting("alert_webhook", ""), "")
 		alertDebounce, alertDebounceSource := settingValue(s.store.GetSetting("alert_debounce", ""), "60s")
 		routeTolerance, routeToleranceSource := intSettingValue(s.store.GetSetting("route_tolerance_ms", ""), 30000)
@@ -82,14 +82,30 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 			"route_tolerance_ms_source":    routeToleranceSource,
 		})
 	case http.MethodPut:
-		var d struct {
-			LogRetention     string `json:"log_retention"`
-			AlertWebhook     string `json:"alert_webhook"`
-			AlertDebounce    string `json:"alert_debounce"`
-			RouteToleranceMs string `json:"route_tolerance_ms"`
-			RouteSmart       string `json:"route_smart"`
+		var raw struct {
+			LogRetention     any `json:"log_retention"`
+			AlertWebhook     any `json:"alert_webhook"`
+			AlertDebounce    any `json:"alert_debounce"`
+			RouteToleranceMs any `json:"route_tolerance_ms"`
+			RouteSmart       any `json:"route_smart"`
 		}
-		json.NewDecoder(r.Body).Decode(&d)
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			http.Error(w, "设置参数格式无效", 400)
+			return
+		}
+		d := struct {
+			LogRetention     string
+			AlertWebhook     string
+			AlertDebounce    string
+			RouteToleranceMs string
+			RouteSmart       string
+		}{
+			LogRetention:     settingString(raw.LogRetention),
+			AlertWebhook:     settingString(raw.AlertWebhook),
+			AlertDebounce:    settingString(raw.AlertDebounce),
+			RouteToleranceMs: settingString(raw.RouteToleranceMs),
+			RouteSmart:       settingString(raw.RouteSmart),
+		}
 		if n, err := strconv.Atoi(d.LogRetention); err != nil || n < 100 {
 			http.Error(w, "日志保留条数须为 >=100 的整数", 400)
 			return
@@ -120,6 +136,17 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(204)
 	default:
 		http.Error(w, "method not allowed", 405)
+	}
+}
+
+func settingString(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case float64:
+		return strconv.FormatInt(int64(x), 10)
+	default:
+		return ""
 	}
 }
 
@@ -389,6 +416,10 @@ func (s *Server) adminUpstreams(w http.ResponseWriter, r *http.Request) {
 func (s *Server) adminUpstreamItem(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/admin/upstreams/")
 	parts := strings.Split(rest, "/")
+	if parts[0] == "reorder" && r.Method == http.MethodPost {
+		s.reorderUpstreams(w, r)
+		return
+	}
 	id, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
 		http.Error(w, "bad id", 400)
@@ -566,6 +597,22 @@ func (s *Server) adminMonitors(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", 405)
 	}
+}
+
+// reorderUpstreams 持久化拖拽后的上游顺序。body: {ids:[3,1,2,...]}
+func (s *Server) reorderUpstreams(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if err := s.store.ReorderUpstreams(in.IDs); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.WriteHeader(204)
 }
 
 func (s *Server) adminMonitorItem(w http.ResponseWriter, r *http.Request) {
@@ -889,6 +936,7 @@ func (s *Server) adminGroupKeys(w http.ResponseWriter, r *http.Request, gid int6
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(201)
 		writeJSON(w, map[string]string{"key": key})
 	default:

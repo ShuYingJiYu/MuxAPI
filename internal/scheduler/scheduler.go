@@ -22,6 +22,7 @@ const (
 // Health 调度层只依赖这个接口（解耦：不关心熔断如何实现）
 type Health interface {
 	IsAvailable(id int64, model string) bool
+	Claim(id int64, model string) bool
 	// LatencyEWMA 返回该 (上游,模型) 成功延迟的 EWMA(ms)，供同层 P2C 选路比较；0=未知。
 	LatencyEWMA(id int64, model string) int64
 	// RouteStats 返回该 (上游,模型) 的成功延迟 EWMA(ms) 与成功率(0..1)，供延迟加权选路算「有效延迟」。
@@ -66,36 +67,41 @@ func (s *Scheduler) Pick(groupID int64, model string) (*upstream.Upstream, error
 // 熔断负责跨请求的长期摘除，单请求重试只需避开本次已试过的。
 // model 用于按 (上游,模型) 粒度判定健康：某上游的某模型熔断，不影响该上游的其他模型。
 func (s *Scheduler) PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, error) {
-	// 1. 过滤出该分组健康、且未被本次请求排除的上游
-	all := s.list(groupID)
-	var healthy []*upstream.Upstream
-	for _, u := range all {
-		if exclude[u.ID] {
-			continue
+	if exclude == nil {
+		exclude = map[int64]bool{}
+	}
+	for {
+		all := s.list(groupID)
+		var healthy []*upstream.Upstream
+		for _, u := range all {
+			if exclude[u.ID] {
+				continue
+			}
+			if s.health.IsAvailable(u.ID, model) {
+				healthy = append(healthy, u)
+			}
 		}
-		if s.health.IsAvailable(u.ID, model) {
-			healthy = append(healthy, u)
+		if len(healthy) == 0 {
+			return nil, ErrNoUpstream
 		}
-	}
-	if len(healthy) == 0 {
-		return nil, ErrNoUpstream
-	}
-	// 2. 取最高优先级层（priority 最小值），严格优先级——绝不掺低优先级
-	top := healthy[0].Priority
-	var tier []*upstream.Upstream
-	for _, u := range healthy {
-		if u.Priority == top {
-			tier = append(tier, u)
+		top := healthy[0].Priority
+		var tier []*upstream.Upstream
+		for _, u := range healthy {
+			if u.Priority == top {
+				tier = append(tier, u)
+			}
 		}
+		var chosen *upstream.Upstream
+		if s.routingOn() {
+			chosen = s.pickWeightedByEffLatency(tier, model)
+		} else {
+			chosen = s.pickP2C(tier, model)
+		}
+		if s.health.Claim(chosen.ID, model) {
+			return chosen, nil
+		}
+		exclude[chosen.ID] = true
 	}
-	// 3. 同层内选路：智能路由开 → 有效延迟加权抽样；否则经典 P2C（延迟感知的 2 选 1）
-	var chosen *upstream.Upstream
-	if s.routingOn() {
-		chosen = s.pickWeightedByEffLatency(tier, model)
-	} else {
-		chosen = s.pickP2C(tier, model)
-	}
-	return chosen, nil
 }
 
 // pickWeightedByEffLatency 智能路由：按「有效延迟」加权抽样（值越小被选概率越大）。

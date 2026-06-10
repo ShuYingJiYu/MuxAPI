@@ -154,6 +154,55 @@ func TestMaxBodyLimit(t *testing.T) {
 	}
 }
 
+func TestIngressFailuresAreLogged(t *testing.T) {
+	st, _ := store.Open(":memory:")
+	defer st.Close()
+	hm := health.New(1, time.Hour)
+	sched := scheduler.New(func(int64) []*upstream.Upstream { return nil }, hm)
+	fwd := forward.New(sched, hm, st, 3)
+	gid, _ := st.CreateGroup("g", "")
+	key, _ := st.CreateKey("k", gid)
+	srv := New(fwd, "", st, hm, monitor.New(st), nil, 32<<20)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	bad, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/messages", strings.NewReader(`{"model":"x"}`))
+	bad.Header.Set("Authorization", "Bearer bad-key")
+	resp, err := http.DefaultClient.Do(bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unknown access key should return 401, got %d", resp.StatusCode)
+	}
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/messages", strings.NewReader(`{"model":"x"}`))
+	req.Header.Set("Authorization", "Bearer "+key)
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("no upstream should return 503, got %d", resp2.StatusCode)
+	}
+
+	logs, err := st.ListLogs(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 2 {
+		t.Fatalf("expected 2 ingress failure logs, got %d", len(logs))
+	}
+	if logs[0].Status != http.StatusServiceUnavailable || logs[0].Model != "x" {
+		t.Fatalf("latest log should be 503 with model x, got status=%d model=%q", logs[0].Status, logs[0].Model)
+	}
+	if logs[1].Status != http.StatusUnauthorized {
+		t.Fatalf("older log should be 401, got status=%d", logs[1].Status)
+	}
+}
+
 // L16 回归：管理鉴权用常量时间比较，错误 token 必须被拒（401），正确 token 放行。
 func TestAdminAuthRejectsWrongToken(t *testing.T) {
 	st, _ := store.Open(":memory:")

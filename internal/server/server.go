@@ -93,6 +93,7 @@ func clientKey(r *http.Request) string {
 func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	groupID, keyName, ok := s.store.GroupAndKeyByKey(clientKey(r))
 	if !ok {
+		s.store.Log(0, 0, "", r.URL.Path, "unknown", 0, http.StatusUnauthorized, 0, "unauthorized: unknown access key")
 		http.Error(w, "unauthorized: unknown access key", http.StatusUnauthorized)
 		return
 	}
@@ -104,13 +105,23 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var mbErr *http.MaxBytesError
 		if errors.As(err, &mbErr) {
+			s.store.Log(groupID, 0, parseBodyModel(body), r.URL.Path, keyName, 0, http.StatusRequestEntityTooLarge, 0, "request body too large")
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
+		s.store.Log(groupID, 0, parseBodyModel(body), r.URL.Path, keyName, 0, http.StatusBadRequest, 0, "read body failed")
 		http.Error(w, "read body failed", http.StatusBadRequest)
 		return
 	}
 	s.fwd.Forward(w, r, body, groupID, keyName)
+}
+
+func parseBodyModel(body []byte) string {
+	var payload struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &payload)
+	return payload.Model
 }
 
 // listModels 下游模型清单：按接入 key 找到分组，实时汇总分组内各启用上游的

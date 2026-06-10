@@ -68,30 +68,29 @@ func TestBuildProbeBody(t *testing.T) {
 
 // 验证 observe 用【熔断器口径】喂熔断器，且与看板 classify 口径分离：
 //   - 2xx → ok=true，模型级
-//   - 429 → 看板算降级，但熔断器算【失败】，模型级（不连累整上游）
+//   - 429 → 看板算降级，但熔断器算【失败】；渠道级探测开时熔整渠道，否则只熔模型
 //   - 401 → 凭证类，熔断器记上游级(scope="")，所有模型连坐
-//   - 网络错误 → 模型级失败
+//   - 网络错误 → 渠道级探测开时熔整渠道，否则只熔模型
+
 func TestObserveBreakerScope(t *testing.T) {
 	cases := []struct {
 		name      string
-		channel   bool // 该上游是否开启渠道级探测
+		channel   bool
 		hasResp   bool
 		code      int
 		wantOK    bool
 		wantModel string
 	}{
-		// 渠道级关：成功只复活该模型
-		{"关-2xx成功-模型级", false, true, 200, true, "gpt-x"},
-		{"关-429限流-熔断器算失败-模型级", false, true, 429, false, "gpt-x"},
-		{"关-401凭证类-上游级连坐", false, true, 401, false, ""},
-		{"关-403凭证类-上游级连坐", false, true, 403, false, ""},
-		{"关-500故障-模型级", false, true, 500, false, "gpt-x"},
-		{"关-网络错误-模型级失败", false, false, 0, false, "gpt-x"},
-		// 渠道级开：成功复活整渠道(scope="")；失败口径不变
-		{"开-2xx成功-渠道级复活", true, true, 200, true, ""},
-		{"开-401凭证类-上游级连坐", true, true, 401, false, ""},
-		{"开-500故障-仍模型级", true, true, 500, false, "gpt-x"},
-		{"开-网络错误-仍模型级失败", true, false, 0, false, "gpt-x"},
+		{"off-2xx-model-success", false, true, 200, true, "gpt-x"},
+		{"off-429-model-fail", false, true, 429, false, "gpt-x"},
+		{"off-401-upstream-fail", false, true, 401, false, ""},
+		{"off-403-upstream-fail", false, true, 403, false, ""},
+		{"off-500-model-fail", false, true, 500, false, "gpt-x"},
+		{"off-network-model-fail", false, false, 0, false, "gpt-x"},
+		{"on-2xx-channel-success", true, true, 200, true, ""},
+		{"on-401-upstream-fail", true, true, 401, false, ""},
+		{"on-500-channel-fail", true, true, 500, false, ""},
+		{"on-network-channel-fail", true, false, 0, false, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -99,63 +98,42 @@ func TestObserveBreakerScope(t *testing.T) {
 			fb := &fakeBreaker{}
 			p := &Prober{breaker: fb}
 			p.observe(m, c.hasResp, c.code, 100)
-			if len(fb.calls) == 0 {
-				t.Fatal("应调用 ObserveProbe")
+			if len(fb.calls) != 1 {
+				t.Fatalf("expected exactly one breaker call, got %+v", fb.calls)
 			}
-			// 第一次调用＝主口径（模型级/渠道级/上游级失败）。
-			first := fb.calls[0]
-			if first.id != 7 {
-				t.Fatalf("上游 ID 应透传 7，实际 %d", first.id)
-			}
-			if first.ok != c.wantOK {
-				t.Fatalf("ok 应为 %v，实际 %v", c.wantOK, first.ok)
-			}
-			if first.model != c.wantModel {
-				t.Fatalf("scope 应为 %q，实际 %q", c.wantModel, first.model)
-			}
-			// 成功时总应额外复活上游级键(凭证维度)；失败时不应有上游级复活。
-			revived := fb.hasUpstreamRevive(7)
-			if c.wantOK && !revived {
-				t.Fatalf("探测成功应复活上游级键(scope=\"\",ok)，调用序列=%+v", fb.calls)
-			}
-			if !c.wantOK && revived {
-				t.Fatalf("探测失败不应复活上游级键，调用序列=%+v", fb.calls)
+			got := fb.calls[0]
+			if got.id != 7 || got.ok != c.wantOK || got.model != c.wantModel {
+				t.Fatalf("unexpected call: got=%+v want id=7 ok=%v model=%q", got, c.wantOK, c.wantModel)
 			}
 		})
 	}
 
-	// breaker 为 nil 时 observe 不 panic（探测器可无熔断器纯看板模式）
 	(&Prober{}).observe(&store.Monitor{UpstreamID: 7, Model: "gpt-x"}, true, 200, 10)
 }
 
-// 端到端回归：ChannelProbe=false 时，凭证类(401)故障熔断上游级键后，
-// 后续探测成功必须能把上游级键复活到 CLOSED——否则上游级键只进不出、
-// 看板长期失真（修复前：探测成功只复活模型级键，上游级键卡 OPEN/HALF_OPEN）。
-func TestProbeRevivesUpstreamKeyOnSuccess(t *testing.T) {
+func TestChannelProbeRevivesUpstreamKeyOnSuccess(t *testing.T) {
 	const id = int64(88)
-	mgr := health.New(3, time.Minute) // 业务阈值3；探测口径阈值1，401一次即上游级 OPEN
+	mgr := health.New(3, time.Minute)
 	p := &Prober{breaker: mgr}
-	m := &store.Monitor{UpstreamID: id, Model: "gpt-x", ChannelProbe: false}
+	m := &store.Monitor{UpstreamID: id, Model: "gpt-x", ChannelProbe: true}
 
-	// 1) 凭证类失败：探测 401 → 上游级键 OPEN，整上游不可用
 	p.observe(m, true, 401, 0)
 	if mgr.IsAvailable(id, "gpt-x") {
-		t.Fatal("401 探测后整上游应不可用")
+		t.Fatal("401 probe should block the upstream")
 	}
 	if got := mgr.EffectiveState(id); got != "OPEN" {
-		t.Fatalf("凭证类熔断后对外状态应 OPEN，实际 %q", got)
+		t.Fatalf("state should be OPEN after upstream failure, got %q", got)
 	}
 
-	// 2) 凭证修好：探测 200 → 应复活上游级键（缺陷修复点），整上游恢复可用
 	p.observe(m, true, 200, 50)
 	if !mgr.IsAvailable(id, "gpt-x") {
-		t.Fatal("探测成功后上游级键应被复活、整上游恢复可用（缺陷：修复前会卡 OPEN）")
+		t.Fatal("channel probe success should revive the upstream")
 	}
 	if got := mgr.EffectiveState(id); got != "CLOSED" {
-		t.Fatalf("探测成功后对外状态应 CLOSED，实际 %q", got)
+		t.Fatalf("state should be CLOSED after channel probe success, got %q", got)
 	}
 }
-// 防单项探测尚未返回就被反复重叠派发；0 仍表示沿用全局默认，不受下限影响。
+
 func TestEffIntervalLowerBound(t *testing.T) {
 	const globalIV = 5 * time.Minute
 	p := NewProber(nil, nil, nil, func() time.Duration { return globalIV }, nil)

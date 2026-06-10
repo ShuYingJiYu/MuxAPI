@@ -91,6 +91,8 @@ func Open(path string) (*Store, error) {
 	// 迁移：旧库 upstreams 补 channel_probe 列（渠道级探测：探任一模型成功即视整渠道可用）。
 	// 默认 1=开：存量上游一并启用渠道级语义，运行时列默认收起模型徽章（异常才显）。
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN channel_probe INTEGER NOT NULL DEFAULT 1`)
+	// 迁移：旧库 upstreams 补 sort_order 列（拖拽排序权重，0=未排过按 id）
+	db.Exec(`ALTER TABLE upstreams ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`)
 	// 迁移：旧库 group_upstreams 补 enabled 列（组内成员开关，默认启用）
 	db.Exec(`ALTER TABLE group_upstreams ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`)
 	// 迁移：旧库 monitors 补可配探测列（空/0 表示沿用全局默认）
@@ -106,6 +108,7 @@ func Open(path string) (*Store, error) {
 	db.Exec(`ALTER TABLE logs ADD COLUMN endpoint TEXT NOT NULL DEFAULT ''`)
 	db.Exec(`ALTER TABLE logs ADD COLUMN key_name TEXT NOT NULL DEFAULT ''`)
 	db.Exec(`ALTER TABLE logs ADD COLUMN retries INTEGER NOT NULL DEFAULT 0`)
+	db.Exec(`ALTER TABLE logs ADD COLUMN error_text TEXT NOT NULL DEFAULT ''`)
 	return &Store{db: db}, nil
 }
 
@@ -122,7 +125,8 @@ CREATE TABLE IF NOT EXISTS upstreams (
 	api_key  TEXT NOT NULL,
 	proxy    TEXT NOT NULL DEFAULT '',
 	enabled  INTEGER NOT NULL DEFAULT 1,
-	channel_probe INTEGER NOT NULL DEFAULT 1
+	channel_probe INTEGER NOT NULL DEFAULT 1,
+	sort_order INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS group_upstreams (
 	group_id    INTEGER NOT NULL,
@@ -162,7 +166,8 @@ CREATE TABLE IF NOT EXISTS logs (
 	model       TEXT NOT NULL DEFAULT '',
 	endpoint    TEXT NOT NULL DEFAULT '',
 	key_name    TEXT NOT NULL DEFAULT '',
-	retries     INTEGER NOT NULL DEFAULT 0
+	retries     INTEGER NOT NULL DEFAULT 0,
+	error_text  TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS settings (
 	key   TEXT PRIMARY KEY,
@@ -208,7 +213,7 @@ func (s *Store) ListEnabledByGroup(groupID int64) ([]*upstream.Upstream, error) 
 
 // List 返回全部上游(含停用)，priority/weight 置 0（全局池无组内语义），供探测与后台管理。
 func (s *Store) List() ([]*upstream.Upstream, error) {
-	rows, err := s.db.Query(`SELECT id,name,base_url,api_key,proxy,enabled,0,0,channel_probe FROM upstreams ORDER BY id`)
+	rows, err := s.db.Query(`SELECT id,name,base_url,api_key,proxy,enabled,0,0,channel_probe FROM upstreams ORDER BY sort_order, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -224,9 +229,25 @@ func (s *Store) Get(id int64) (*upstream.Upstream, error) {
 }
 
 func (s *Store) Create(u *upstream.Upstream) error {
-	_, err := s.db.Exec(`INSERT INTO upstreams(name,base_url,api_key,proxy,enabled,channel_probe) VALUES(?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT INTO upstreams(name,base_url,api_key,proxy,enabled,channel_probe,sort_order)
+		VALUES(?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM upstreams))`,
 		u.Name, u.BaseURL, u.APIKey, u.Proxy, u.Enabled, u.ChannelProbe)
 	return err
+}
+
+// ReorderUpstreams 按给定 id 顺序写入 sort_order 权重（从 1 起）。
+func (s *Store) ReorderUpstreams(ids []int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for i, id := range ids {
+		if _, err := tx.Exec(`UPDATE upstreams SET sort_order=? WHERE id=?`, i+1, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Update(u *upstream.Upstream) error {
@@ -734,12 +755,13 @@ type LogEntry struct {
 	Endpoint     string `json:"endpoint"` // 请求端点路径，如 /v1/messages；旧数据为空
 	KeyName      string `json:"key_name"` // 命中的接入密钥名；旧数据为空
 	Retries      int    `json:"retries"`  // 本次落库时已重试次数(0=首次命中)
+	Error        string `json:"error"`    // 错误摘要；成功或旧数据为空
 }
 
 // Log 记一条转发调用日志（异步友好：忽略写入错误，不阻塞转发）。
-func (s *Store) Log(groupID, upstreamID int64, model, endpoint, keyName string, retries, status int, latencyMs int64) {
-	s.db.Exec(`INSERT INTO logs(group_id,upstream_id,model,endpoint,key_name,retries,status,latency_ms,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
-		groupID, upstreamID, model, endpoint, keyName, retries, status, latencyMs, time.Now().Unix())
+func (s *Store) Log(groupID, upstreamID int64, model, endpoint, keyName string, retries, status int, latencyMs int64, errorText string) {
+	s.db.Exec(`INSERT INTO logs(group_id,upstream_id,model,endpoint,key_name,retries,status,latency_ms,created_at,error_text) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		groupID, upstreamID, model, endpoint, keyName, retries, status, latencyMs, time.Now().Unix(), errorText)
 }
 
 // LogPage 一页日志 + 游标分页元信息。
@@ -757,7 +779,7 @@ func (s *Store) ListLogsPage(beforeID int64, limit int, model, group, statusClas
 	if limit <= 0 || limit > 500 {
 		limit = 50
 	}
-	q := `SELECT l.id,l.group_id,COALESCE(g.name,''),l.upstream_id,COALESCE(u.name,''),l.model,l.status,l.latency_ms,l.created_at,l.endpoint,l.key_name,l.retries
+	q := `SELECT l.id,l.group_id,COALESCE(g.name,''),l.upstream_id,COALESCE(u.name,''),l.model,l.status,l.latency_ms,l.created_at,l.endpoint,l.key_name,l.retries,l.error_text
 		FROM logs l LEFT JOIN upstreams u ON u.id=l.upstream_id LEFT JOIN groups g ON g.id=l.group_id WHERE 1=1`
 	var args []any
 	if beforeID > 0 {
@@ -788,7 +810,7 @@ func (s *Store) ListLogsPage(beforeID int64, limit int, model, group, statusClas
 	page := &LogPage{Entries: []*LogEntry{}}
 	for rows.Next() {
 		e := &LogEntry{}
-		if err := rows.Scan(&e.ID, &e.GroupID, &e.GroupName, &e.UpstreamID, &e.UpstreamName, &e.Model, &e.Status, &e.LatencyMs, &e.CreatedAt, &e.Endpoint, &e.KeyName, &e.Retries); err != nil {
+		if err := rows.Scan(&e.ID, &e.GroupID, &e.GroupName, &e.UpstreamID, &e.UpstreamName, &e.Model, &e.Status, &e.LatencyMs, &e.CreatedAt, &e.Endpoint, &e.KeyName, &e.Retries, &e.Error); err != nil {
 			return nil, err
 		}
 		page.Entries = append(page.Entries, e)
@@ -887,7 +909,7 @@ func (s *Store) ListLogs(limit int) ([]*LogEntry, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.db.Query(`SELECT l.id,l.group_id,COALESCE(g.name,''),l.upstream_id,COALESCE(u.name,''),l.model,l.status,l.latency_ms,l.created_at
+	rows, err := s.db.Query(`SELECT l.id,l.group_id,COALESCE(g.name,''),l.upstream_id,COALESCE(u.name,''),l.model,l.status,l.latency_ms,l.created_at,l.endpoint,l.key_name,l.retries,l.error_text
 		FROM logs l LEFT JOIN upstreams u ON u.id=l.upstream_id LEFT JOIN groups g ON g.id=l.group_id ORDER BY l.id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -896,7 +918,7 @@ func (s *Store) ListLogs(limit int) ([]*LogEntry, error) {
 	var out []*LogEntry
 	for rows.Next() {
 		e := &LogEntry{}
-		if err := rows.Scan(&e.ID, &e.GroupID, &e.GroupName, &e.UpstreamID, &e.UpstreamName, &e.Model, &e.Status, &e.LatencyMs, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.GroupID, &e.GroupName, &e.UpstreamID, &e.UpstreamName, &e.Model, &e.Status, &e.LatencyMs, &e.CreatedAt, &e.Endpoint, &e.KeyName, &e.Retries, &e.Error); err != nil {
 			return nil, err
 		}
 		out = append(out, e)

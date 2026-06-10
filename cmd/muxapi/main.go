@@ -129,7 +129,7 @@ func main() {
 		monProber.Run(ctx)
 	}()
 	// 日志清理：按条数保留最新 N 条，定时裁剪防止 logs 表无限增长（页面可配，缺省 1 万条）。
-	logRetention := settingInt("log_retention", 10000)
+	logRetention := settingInt("log_retention", 300)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()

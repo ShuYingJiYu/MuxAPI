@@ -40,32 +40,34 @@ func TestStrictPriorityFailback(t *testing.T) {
 
 	// 4. A 冷却到期 + 探测成功恢复 → 应自动回切到 A（核心 failback）
 	time.Sleep(60 * time.Millisecond)
-	hm.IsAvailable(1, "")   // 触发 Open→HalfOpen
+	hm.IsAvailable(1, "")       // 触发 Open→HalfOpen
 	hm.Report(1, "", true, 100) // 探测成功 → Closed
 	if u, _ := s.Pick(0, ""); u.Name != "A" {
 		t.Fatalf("A 恢复后应回切到 A，实际 %s ← 这是核心痛点", u.Name)
 	}
 }
 
-// 回归：半开放行后，多个同层上游同时半开时，连续 Pick 都应选出上游（不再有单闸门占满问题）。
-func TestHalfOpenGateNotExhaustedAcrossUpstreams(t *testing.T) {
+// HalfOpen only allows one probe per upstream. With three same-tier half-open upstreams,
+// the first three picks can occupy A/B/C; further picks fail until a probe reports back.
+func TestHalfOpenGateAllowsOnePerUpstream(t *testing.T) {
 	ups := []*upstream.Upstream{
 		{ID: 1, Name: "A", Priority: 1, Weight: 1, Enabled: true},
 		{ID: 2, Name: "B", Priority: 1, Weight: 1, Enabled: true},
 		{ID: 3, Name: "C", Priority: 1, Weight: 1, Enabled: true},
 	}
-	hm := health.New(1, 20*time.Millisecond) // 一次失败即熔断，冷却 20ms
+	hm := health.New(1, 20*time.Millisecond)
 	s := New(func(int64) []*upstream.Upstream { return ups }, hm)
-	// 三个全部熔断 → 冷却到期后都进半开
 	for _, id := range []int64{1, 2, 3} {
 		hm.Report(id, "", false, 0)
 	}
 	time.Sleep(30 * time.Millisecond)
-	// 连续 Pick：半开放行后每次都能选出上游（旧单闸门设计下第2次起会 ErrNoUpstream）
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 3; i++ {
 		if _, err := s.Pick(0, ""); err != nil {
-			t.Fatalf("第 %d 次 Pick 不应失败（半开放行），实际 %v", i+1, err)
+			t.Fatalf("pick %d should claim one half-open upstream, got %v", i+1, err)
 		}
+	}
+	if _, err := s.Pick(0, ""); err == nil {
+		t.Fatal("fourth pick should fail because all half-open probes are in flight")
 	}
 }
 
@@ -366,4 +368,3 @@ func TestP2CColdStart(t *testing.T) {
 		t.Fatalf("冷启动新上游应优先探数据，New 应多于 Old，实际 New=%d Old=%d", cnt["New"], cnt["Old"])
 	}
 }
-

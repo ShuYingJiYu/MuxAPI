@@ -20,7 +20,7 @@ import (
 // noopLogger 测试用空日志器
 type noopLogger struct{}
 
-func (noopLogger) Log(groupID, upstreamID int64, model, endpoint, keyName string, retries, status int, latencyMs int64) {
+func (noopLogger) Log(groupID, upstreamID int64, model, endpoint, keyName string, retries, status int, latencyMs int64, errorText string) {
 }
 
 // 验证 SSE 流式逐行透传不丢事件、不破坏格式。
@@ -35,6 +35,9 @@ func TestForwardSSEStreaming(t *testing.T) {
 			"",
 			"event: content_block_delta",
 			`data: {"text":"hi"}`,
+			"",
+			"event: message_stop",
+			`data: {"type":"message_stop"}`,
 			"",
 		} {
 			io.WriteString(w, ev+"\n")
@@ -79,6 +82,7 @@ func TestForwardSSEFailover(t *testing.T) {
 		w.WriteHeader(200)
 		fl := w.(http.Flusher)
 		io.WriteString(w, `data: {"text":"from-B"}`+"\n")
+		io.WriteString(w, `data: {"type":"message_stop"}`+"\n")
 		fl.Flush()
 	}))
 	defer srvB.Close()
@@ -112,7 +116,6 @@ func TestForwardSSEFailover(t *testing.T) {
 
 // 验证按失败原因区分熔断范围：5xx 仅熔断 (上游,模型)，401 熔断整上游。
 func TestForwardFailScope(t *testing.T) {
-	// 503 上游：触发模型级熔断
 	srv503 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
 	defer srv503.Close()
 	ups := []*upstream.Upstream{{ID: 1, Name: "A", BaseURL: srv503.URL, APIKey: "k", Priority: 1, Enabled: true}}
@@ -121,17 +124,10 @@ func TestForwardFailScope(t *testing.T) {
 
 	body := []byte(`{"model":"gpt-x","stream":false}`)
 	fwd.Forward(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body))), body, 0, "")
-	if hm.IsAvailable(1, "gpt-x") {
-		t.Fatal("503 应熔断 (A, gpt-x)")
-	}
-	if !hm.IsAvailable(1, "gpt-y") {
-		t.Fatal("503 只熔断 gpt-x，gpt-y 不应受影响 ← 模型级隔离")
-	}
-	if !hm.IsAvailable(1, "") {
-		t.Fatal("503 是模型级，上游级不应熔断")
+	if hm.IsAvailable(1, "gpt-x") || hm.IsAvailable(1, "gpt-y") || hm.IsAvailable(1, "") {
+		t.Fatal("503 should open the whole upstream breaker")
 	}
 
-	// 401 上游：触发上游级熔断（所有模型连坐）
 	srv401 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(401) }))
 	defer srv401.Close()
 	ups2 := []*upstream.Upstream{{ID: 2, Name: "C", BaseURL: srv401.URL, APIKey: "k", Priority: 1, Enabled: true}}
@@ -140,11 +136,10 @@ func TestForwardFailScope(t *testing.T) {
 	body2 := []byte(`{"model":"gpt-x"}`)
 	fwd2.Forward(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body2))), body2, 0, "")
 	if hm2.IsAvailable(2, "anything") {
-		t.Fatal("401 应熔断整个上游，所有模型连坐")
+		t.Fatal("401 should open the whole upstream breaker")
 	}
 }
 
-// 验证 SSE 是逐块 flush 透传，而非全缓冲后一次性返回。
 func TestForwardSSEIncrementalFlush(t *testing.T) {
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -353,6 +348,7 @@ func TestForwardSSELongLineNoTruncate(t *testing.T) {
 		t.Fatal("超长行后续事件([DONE])也应到达，证明未静默截断")
 	}
 }
+
 type flushRecorder struct {
 	header  http.Header
 	w       *io.PipeWriter
@@ -371,11 +367,7 @@ func (f *flushRecorder) Flush() {
 	}
 }
 
-// 端到端回归(核心 503 修复)：主力上游恢复到半开后，codex 式并发突发请求
-// 应全部 200、零 503。复现并验证「半开放行」修复——旧单闸门设计下并发只 1 个能进、
-// 其余在选路阶段拿不到上游而 503(no upstream available)。
-func TestForwardHalfOpenConcurrentNo503(t *testing.T) {
-	// 健康主力上游：始终 200，带真实时延拉长并发重叠窗口
+func TestForwardHalfOpenConcurrentSingleProbe(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(15 * time.Millisecond)
 		w.WriteHeader(200)
@@ -383,17 +375,16 @@ func TestForwardHalfOpenConcurrentNo503(t *testing.T) {
 	}))
 	defer srv.Close()
 	ups := []*upstream.Upstream{{ID: 1, Name: "primary", BaseURL: srv.URL, APIKey: "k", Priority: 1, Enabled: true}}
-	hm := health.New(1, 20*time.Millisecond) // 短冷却便于进入半开恢复窗口
+	hm := health.New(1, 20*time.Millisecond)
 	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, noopLogger{}, 0)
 
-	// 主力先熔断（模拟一次抖动开了熔断器），等冷却到期 → 下次判定翻半开恢复期
-	hm.Report(1, "gpt-5.5", false, 0) // 模型级 OPEN
-	time.Sleep(30 * time.Millisecond) // 冷却到期
+	hm.Report(1, "gpt-5.5", false, 0)
+	time.Sleep(30 * time.Millisecond)
 
 	body := []byte(`{"model":"gpt-5.5","stream":false}`)
 	var ok200, got503 int64
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ { // codex 式并发突发
+	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -408,10 +399,7 @@ func TestForwardHalfOpenConcurrentNo503(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if got503 != 0 {
-		t.Fatalf("半开恢复期 8 并发不应有 503，实际 200=%d 503=%d", ok200, got503)
-	}
-	if ok200 != 8 {
-		t.Fatalf("半开恢复期 8 并发应全部 200(主力健康)，实际仅 %d", ok200)
+	if ok200 != 1 || got503 != 7 {
+		t.Fatalf("half-open single upstream should allow 1 probe and reject 7, got 200=%d 503=%d", ok200, got503)
 	}
 }

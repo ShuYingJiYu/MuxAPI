@@ -29,6 +29,7 @@ export const api = {
   createUpstream: u => req('POST', '/upstreams', u),
   updateUpstream: (id, u) => req('PUT', '/upstreams/' + id, u),
   deleteUpstream: id => req('DELETE', '/upstreams/' + id),
+  reorderUpstreams: ids => req('POST', '/upstreams/reorder', { ids }),
   testUpstream: id => req('GET', `/upstreams/${id}/models`),
   createMonitorsBatch: (id, payload) => req('POST', `/upstreams/${id}/monitors`, payload),
   // 真实对话测试：发 hi 请求，SSE 逐块回调 onEvent({type,text,...})。EventSource 不能带鉴权头，故用 fetch 流式解析。

@@ -204,7 +204,7 @@ func TestPruneLogs(t *testing.T) {
 	defer st.Close()
 
 	for i := 0; i < 50; i++ {
-		st.Log(1, 1, "gpt-test", "/v1/messages", "k1", 0, 200, 10)
+		st.Log(1, 1, "gpt-test", "/v1/messages", "k1", 0, 200, 10, "")
 	}
 
 	// keep<=0：关闭清理，不删任何行

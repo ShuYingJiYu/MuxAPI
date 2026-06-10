@@ -94,7 +94,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o muxapi-linux-amd64 ./cmd/muxap
 
 | 设置 | 默认 | 说明 |
 |------|------|------|
-| `log_retention` | `10000` | 调用日志按条数保留最新 N 条，定时裁剪 |
+| `log_retention` | `300` | 调用日志按条数保留最新 N 条，定时裁剪 |
 | `alert_webhook` | （空） | 熔断翻转告警 Webhook URL，留空关闭 |
 | `alert_debounce` | `60s` | 告警去抖窗口，同键窗口内最多发一次 |
 

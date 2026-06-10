@@ -1,6 +1,6 @@
-:root {
+﻿:root {
   /* 糖果色设计系统：马卡龙主色 + 柔和圆角 + 弥散阴影。
-     沿用原 token 名(--p*/--g*/语义色)，仅重映射取值，全站换皮零类名改动。 */
+     沿用原 token 名（p/g/语义色），仅重映射取值，全站换皮零类名改动。 */
   /* 主色：薄荷绿（teal→mint 柔化） */
   --p50: #f0fffb; --p100: #d6fff4; --p400: #7de2d1;
   --p500: #5fd3c0; --p600: #38bfae; --p700: #2aa295;
@@ -95,6 +95,27 @@ svg { display: block; flex-shrink: 0; }
 /* Toolbar */
 .toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; gap: 12px; }
 .toolbar-left { display: flex; align-items: center; gap: 10px; }
+.upstream-toolbar {
+  min-height: 58px;
+  margin-bottom: 12px;
+  padding: 10px 12px 10px 16px;
+  border: 1px solid var(--g100);
+  border-radius: 18px;
+  background: linear-gradient(120deg, rgba(255,245,250,.72), rgba(236,253,250,.72));
+  box-shadow: var(--sh-card);
+}
+.upstream-toolbar .toolbar-left {
+  flex-wrap: wrap;
+  gap: 10px 12px;
+}
+.upstream-toolbar .count {
+  min-width: 82px;
+  font-weight: 800;
+  color: var(--g600);
+}
+.upstream-toolbar .fancy-select {
+  min-width: 180px;
+}
 .search-box { position: relative; }
 .search-box .ic { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); color: var(--g400); }
 .search-input, .filter-select {
@@ -104,6 +125,123 @@ svg { display: block; flex-shrink: 0; }
 .search-input { width: 230px; padding: 0 12px 0 34px; }
 .filter-select { padding: 0 12px; cursor: pointer; }
 .search-input:focus, .filter-select:focus { outline: none; border-color: var(--p500); box-shadow: 0 0 0 3px rgba(95,211,192,.25); }
+
+/* 全局糖果风下拉 */
+.fancy-select {
+  position: relative;
+  min-width: 190px;
+}
+.field .fancy-select,
+.test-row .fancy-select {
+  width: 100%;
+}
+.fancy-select-btn {
+  width: 100%;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 13px 0 16px;
+  border: 1px solid var(--g200);
+  border-radius: 16px;
+  background: rgba(255,255,255,.86);
+  color: var(--g700);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: var(--sh-card);
+  transition: all .18s ease;
+}
+.fancy-select-btn span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fancy-select:not(.disabled) .fancy-select-btn:hover {
+  border-color: var(--p400);
+  box-shadow: 0 8px 22px rgba(95,211,192,.18);
+  transform: translateY(-1px);
+}
+.fancy-select.open .fancy-select-btn {
+  border-color: var(--p500);
+  box-shadow: 0 0 0 4px rgba(95,211,192,.22), var(--sh-card);
+}
+.fancy-select.disabled .fancy-select-btn {
+  cursor: not-allowed;
+  opacity: .6;
+}
+.fancy-select-arrow {
+  color: var(--g400);
+  transform: rotate(90deg);
+  transition: transform .18s ease;
+}
+.fancy-select.open .fancy-select-arrow {
+  transform: rotate(-90deg);
+  color: var(--p600);
+}
+.fancy-select-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: 80;
+  max-height: 280px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--p100);
+  border-radius: 18px;
+  background: rgba(255,255,255,.96);
+  backdrop-filter: blur(18px);
+  box-shadow: 0 18px 46px rgba(168,120,160,.22);
+}
+.fancy-select-item {
+  width: 100%;
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 11px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--g600);
+  font: inherit;
+  font-weight: 650;
+  text-align: left;
+  cursor: pointer;
+  transition: all .14s ease;
+}
+.fancy-select-item span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fancy-select-item:hover {
+  background: linear-gradient(90deg, rgba(255,179,198,.18), rgba(125,226,209,.16));
+  color: var(--g900);
+}
+.fancy-select-item.active {
+  background: linear-gradient(120deg, #ff9ec0, #9bd9f0);
+  color: #fff;
+  box-shadow: 0 6px 16px rgba(255,158,192,.28);
+}
+.fancy-select-item.disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+.fancy-pop-enter-active,
+.fancy-pop-leave-active {
+  transition: opacity .14s ease, transform .14s ease;
+}
+.fancy-pop-enter-from,
+.fancy-pop-leave-to {
+  opacity: 0;
+  transform: translateY(-6px) scale(.98);
+}
 
 /* Buttons (rounded-xl, gradient primary, active scale) */
 .btn {
@@ -376,6 +514,13 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .metric-value.sm { font-size: 13px; }
 .mon-foot { display: flex; align-items: center; gap: 4px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--g100); }
 .mon-foot .hspacer { flex: 1; }
+
+/* ===== 上游池表格拖拽 ===== */
+.drag-cell { width: 42px; color: var(--g300); }
+tr.disabled { opacity: .65; }
+tr.dragging td { opacity: .45; }
+tr.dragover td { box-shadow: inset 0 2px 0 var(--p400); }
+tbody tr:hover .mon-grip { color: var(--g500); }
 
 /* ===== 总览：糖果汇总卡 ===== */
 .ov-stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; margin-bottom: 14px; }
