@@ -31,7 +31,8 @@ type breaker struct {
 	state            State
 	fails            int       // 连续失败次数
 	openUntil        time.Time // Open 冷却到期时间：到期后 canServe 翻 HalfOpen 放行恢复流量
-	halfOpenInFlight bool      // HalfOpen allows only one business probe
+	halfOpenInFlight bool      // 半开单试探闸门：Claim 占名额时置真，释放方(Report/探测)清零
+	halfOpenClaimAt  time.Time // 占名额的时刻：超过一个冷却周期仍未回报视为陈旧泄漏(客户端断连)，canServe 放行接管
 	lastProbe        time.Time
 	latencyMs        int64
 	latencyEWMA      float64 // 成功请求延迟的指数加权移动平均(ms)，供 P2C 选路；0=尚无数据
@@ -72,9 +73,9 @@ const trendCap = 60 // 环形缓冲容量
 const ewmaAlpha = 0.3
 
 // breakerKey 熔断键：(上游, 模型)。model=="" 表示「上游级」键——
-// 承载凭证/余额类(401/402/403)的整上游熔断，以及看板的上游级流量统计聚合。
-// model!="" 表示「模型级」键——承载 429/5xx 这类某上游某模型的局部故障，
-// 使「gpt-5.5 挂了」不再连累同上游的 claude。
+// 承载凭证/余额/网关类(401/402/403、502/503/504)的整上游熔断，以及看板的上游级流量统计聚合。
+// model!="" 表示「模型级」键——承载 429/408/网络错误这类某上游某模型的局部故障，
+// 使「gpt-5.5 挂了」不再连累同上游的 claude。连坐范围由 upstream.FailIsUpstreamLevel 划定。
 type breakerKey struct {
 	upstreamID int64
 	model      string
@@ -125,18 +126,17 @@ func (m *Manager) get(k breakerKey) *breaker {
 	return b
 }
 
-// canServe 只读判定：该键现在能否承接业务请求（调用方须持有 m.mu）。
+// canServe 只读判定该键现在能否承接业务请求（调用方须持有 m.mu）：
 //
 //   - Closed：可服务。
 //   - Open 未到冷却：不可服务（死渠道不吃业务流量）。
-//   - Open 冷却到期：翻 HalfOpen → 可服务（恢复期放行业务流量自证）。
-//   - HalfOpen：可服务（不限并发）。半开期放行所有请求去试这个上游——
-//     健康渠道刚恢复时并发能立即满血；真死渠道则被一波请求各打一次、
-//     drive 对半开态失败立即重新 Open，死渠道保护仍在。
+//   - Open 冷却到期：翻 HalfOpen + 清闸门 → 可服务（恢复期放行一个请求自证）。
+//   - HalfOpen：半开单试探闸门——仅放行一个 Claim 名额，其余请求跳过本上游(下沉备份)。
+//     单闸门避免「主力刚恢复，一波并发全打过去，真死渠道时每个都各熔一次」的雪崩；
+//     而 Claim 的名额由 Report/探测在请求收尾时确定释放，使主力健康后立刻满血。
 //
-// 不再用「半开单请求闸门」：在严格优先级(主备)拓扑下，单闸门会把主力上游
-// 恢复期的并发请求拦成不可用→选路 no upstream available→503，且备份失败转移
-// 也被选路阶段短路。放行让恢复瞬间不丢流量、失败也能正常下沉备份。
+// P1 陈旧兜底：名额被占且已超一个冷却周期仍未释放（多半是客户端断连后 forward 直接 return、
+// 未回报，见 forward.go 断连分支），视为已释放并清零——避免一次 abort 把半开键永久焊死。
 func (m *Manager) canServe(b *breaker) bool {
 	if b.state == Open {
 		if !time.Now().After(b.openUntil) {
@@ -144,6 +144,10 @@ func (m *Manager) canServe(b *breaker) bool {
 		}
 		b.state = HalfOpen
 		b.halfOpenInFlight = false
+	}
+	if b.state == HalfOpen && b.halfOpenInFlight &&
+		time.Since(b.halfOpenClaimAt) > m.cooldown {
+		b.halfOpenInFlight = false // 陈旧名额：占用方久未回报，放行接管
 	}
 	return b.state != HalfOpen || !b.halfOpenInFlight
 }
@@ -163,9 +167,25 @@ func (m *Manager) Claim(id int64, model string) bool {
 	for _, b := range bs {
 		if b.state == HalfOpen {
 			b.halfOpenInFlight = true
+			b.halfOpenClaimAt = time.Now() // 记占用时刻，供 canServe 陈旧兜底（见 P1）
 		}
 	}
 	return true
+}
+
+// ReleaseClaim 与 Claim 严格配对：请求收尾时确定释放本次 Claim 占用的半开名额。
+// Claim(id,model) 会同时占【上游级+模型级】两个键的名额，但转发层的 Report 走的是
+// failScope 塌缩后的单一 scope（如 502→""），无法对称释放另一粒度的名额——
+// 故名额释放独立于熔断驱动，由本方法按【原始 model】对两个键都清零，避免泄漏。
+// 仅清在途名额、不碰 state/fails/EWMA；幂等：键已非半开(inFlight 本就 false)时清零无副作用。
+// 客户端断连分支(forward 不 Report)也调本方法显式释放，使 canServe 的陈旧兜底退化为最后防线。
+func (m *Manager) ReleaseClaim(id int64, model string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.get(breakerKey{id, ""}).halfOpenInFlight = false
+	if model != "" {
+		m.get(breakerKey{id, model}).halfOpenInFlight = false
+	}
 }
 
 // IsAvailable 调度层询问：该上游的该模型现在能用吗？
@@ -246,9 +266,16 @@ func (m *Manager) Report(id int64, model string, ok bool, latencyMs int64) {
 		up.latSamples++ // 与 totLatency 同口径计数，作平均延迟分母(L3：0 延迟成功样本不计，避免低估)
 		up.latencyMs = latencyMs
 	}
-	// model!="" 时状态机驱动模型级键，但上游级键的选路 EWMA 不会被 drive 更新；
-	// 此处对上游级键同步累计 succEWMA/latencyEWMA，使新模型冷启动回退上游级路由读到鲜活值，
-	// 不再被 Seed 冻结。仅动这两个 EWMA，绝不碰 up 的 state/fails/openUntil。
+	// model!="" 时状态机只驱动模型级键，上游级键在此对称收尾两件事：
+	// (1) 选路 EWMA 保鲜——使新模型冷启动回退上游级路由读到鲜活值，不被 Seed 冻结；
+	// (2) 半开名额释放(P0 死锁修复)——上游级键若处于 HalfOpen(被 Claim 占了名额)，
+	//     须在请求收尾时确定释放，否则永卡 inFlight → canServe 恒 false → 该上游所有
+	//     模型连坐黑洞。成功则顺带复活到 Closed(带凭证业务成功自证凭证有效，同探测复活逻辑)；
+	//     失败仅释放名额、不重开(连坐范围由 failScope 精确表达)。
+	// 上游级 Open 冷却中不受模型级结果干扰：生产中 IsAvailable 已门控冷却期不会有此 Report，
+	// 即便直接调用/竞态进来，也绝不让单个模型成功绕过 401 的冷却把整上游复活。
+	var upEvent AlertEvent
+	var upFlipped bool
 	if model != "" {
 		up.succEWMA = mixEWMA(up.succEWMA, boolToF(ok))
 		if ok && latencyMs > 0 {
@@ -258,12 +285,25 @@ func (m *Manager) Report(id int64, model string, ok bool, latencyMs int64) {
 				up.latencyEWMA = ewmaAlpha*float64(latencyMs) + (1-ewmaAlpha)*up.latencyEWMA
 			}
 		}
+		if up.state == HalfOpen {
+			if ok {
+				up.fails = 0
+				up.state = Closed
+				if ev, f := transitionEvent(id, "", HalfOpen, Closed, up.fails); f {
+					upEvent, upFlipped = ev, f
+				}
+			}
+			up.halfOpenInFlight = false // 成败都释放半开名额，确定收尾防泄漏
+		}
 	}
 	// 状态机驱动到对应粒度的键：model=="" → 上游级；否则 → 模型级
 	b := m.get(breakerKey{id, model})
 	from, to := m.drive(b, ok, latencyMs)
 	ev, flipped := transitionEvent(id, model, from, to, b.fails)
 	m.mu.Unlock()
+	if upFlipped {
+		m.dispatch(upEvent)
+	}
 	if flipped {
 		m.dispatch(ev)
 	}
@@ -287,11 +327,12 @@ func (m *Manager) reportProbe(id int64, model string, ok bool, latencyMs int64) 
 // 不计入业务流量统计。是 markProbe+reportProbe 的导出合并版——探测系统统一后，
 // monitor 探测器是唯一主动探测源，一次探测既记看板(Record)又驱动熔断(本方法)。
 // scope 完全由调用方(prober)按口径决定，本方法忠实驱动该 scope，不再额外连带：
-//   - 凭证类失败(401/402/403)→ scope="" 熔整上游；
+//   - 凭证/网关类失败(401/402/403、502/503/504)→ scope="" 熔整上游；
 //   - 渠道级探测(上游开关开)成功/失败 → scope="" 复活/熔断整渠道；
 //   - 其余 → scope=model 仅作用该模型。
 //
 // 连带策略集中在 prober.observe，本方法保持单一职责（见 [[probe-scope-by-channel-switch]]）。
+// 注：scope=""(上游级)成功时连带复活该上游全部模型键(recoverModelsForUpstream)。
 func (m *Manager) ObserveProbe(id int64, model string, ok bool, latencyMs int64) {
 	m.markProbe(id, model)
 	m.reportProbe(id, model, ok, latencyMs)

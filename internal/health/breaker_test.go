@@ -587,3 +587,117 @@ func TestAvgLatencySameDenominator(t *testing.T) {
 		t.Fatalf("平均延迟应 150ms(仅计有延迟样本)，实际 %d", avg)
 	}
 }
+
+// P0 回归：上游级键半开死锁。上游级熔断(如 401)冷却到期后，
+// 第一个带 model 的业务请求 Claim 会占用上游级键的半开名额；该请求【成功】时，
+// 旧实现只复活模型级键、上游级键永卡 HALF_OPEN+inFlight → canServe 恒 false →
+// 该上游所有模型连坐黑洞。修复后：业务成功须对称复活上游级键(凭证有效自证)。
+func TestUpstreamHalfOpenRecoversOnModelSuccess(t *testing.T) {
+	m := New(1, 20*time.Millisecond) // 阈值1一次失败即熔；短冷却便于翻 HALF_OPEN
+	const id, model = int64(80), "claude"
+
+	m.Report(id, "", false, 0) // 上游级熔断(模拟 401)
+	if m.IsAvailable(id, model) {
+		t.Fatal("上游级熔断应连坐所有模型")
+	}
+	time.Sleep(30 * time.Millisecond) // 冷却到期
+
+	// 模拟 scheduler：先 Claim(占上游级+模型级半开名额) 再业务成功回报
+	if !m.Claim(id, model) {
+		t.Fatal("冷却到期应能 Claim 到半开名额")
+	}
+	m.Report(id, model, true, 100) // 业务成功
+
+	// 关键断言：上游级键必须随业务成功复活，不能卡死
+	if !m.IsAvailable(id, model) {
+		t.Fatal("业务成功后上游级键应复活，修复前此处死锁(永久不可用)")
+	}
+	if !m.IsAvailable(id, "anyOtherModel") {
+		t.Fatal("上游级复活应让该上游所有模型恢复，而非仅 claude")
+	}
+	if s := m.Snapshot(id); s.State != "CLOSED" {
+		t.Fatalf("业务成功后上游级应 CLOSED，实际 %s", s.State)
+	}
+}
+
+// P0 配套：model!="" 业务【失败】不得重开上游级键(连坐范围由 failScope 表达)，
+// 但须释放被 Claim 占用的上游级半开名额，否则同样卡死。
+func TestUpstreamHalfOpenReleasedOnModelFail(t *testing.T) {
+	m := New(1, 20*time.Millisecond)
+	const id, model = int64(81), "claude"
+
+	m.Report(id, "", false, 0) // 上游级熔断
+	time.Sleep(30 * time.Millisecond)
+	if !m.Claim(id, model) {
+		t.Fatal("应能 Claim 到半开名额")
+	}
+	m.Report(id, model, false, 0) // 模型级失败(如 429，failScope 仍传 model)
+
+	// 上游级名额已释放：下一个请求能再次 Claim(不被陈旧 inFlight 焊死)
+	if !m.Claim(id, "otherModel") {
+		t.Fatal("模型级失败应释放上游级半开名额，使后续请求可再试探")
+	}
+	// 但模型级失败不应把上游级重新打到 OPEN(连坐范围由调用方 scope 精确表达)
+	m.Report(id, "otherModel", true, 50)
+	if !m.IsAvailable(id, "") {
+		t.Fatal("模型级失败不应重开上游级键")
+	}
+}
+
+// P0 镜像缺陷回归：Claim(id,model) 占【上游级+模型级】两个半开名额，但请求拿回上游级
+// 失败码(如 502)时 forward 经 failScope 把 Report scope 塌缩成 ""，只驱动上游级键 →
+// 模型级名额无人释放、卡 inFlight。ReleaseClaim 须按原始 model 确定释放该名额。
+// 本例隔离验证 ReleaseClaim 对模型级名额的释放：保持上游键 Closed(不被 Report 打 OPEN)，
+// 并在冷却窗口内紧凑操作，排除 canServe 陈旧兜底的干扰，确保通过的是 ReleaseClaim 而非兜底。
+func TestReleaseClaimFreesModelSlotOnScopeCollapse(t *testing.T) {
+	const id, model = int64(83), "claude"
+	m := New(1, 50*time.Millisecond) // 冷却 50ms：下面释放→重 Claim 在数 µs 内完成，远未触发陈旧兜底
+
+	m.Report(id, model, false, 0) // 模型级 OPEN（上游级保持 Closed）
+	time.Sleep(60 * time.Millisecond)
+	if !m.Claim(id, model) { // 模型级翻 HalfOpen 并占名额；上游级 Closed 不占
+		t.Fatal("冷却到期应能 Claim 模型级半开名额")
+	}
+	if m.Claim(id, model) {
+		t.Fatal("模型级名额已占，紧接 Claim 应被拒")
+	}
+	m.ReleaseClaim(id, model) // 模拟 forward 在 Report 塌缩后按原始 model 补释放
+	if !m.Claim(id, model) {
+		t.Fatal("ReleaseClaim 应已释放模型级名额，后续请求可即刻再 Claim（修复前卡 inFlight）")
+	}
+}
+
+// ReleaseClaim 幂等性：对非半开键(Closed/已释放)调用应无副作用，不改 state/fails。
+func TestReleaseClaimIdempotent(t *testing.T) {
+	m := New(3, time.Hour)
+	const id, model = int64(84), "claude"
+	m.Report(id, model, true, 100) // 正常态 Closed
+	m.ReleaseClaim(id, model)
+	m.ReleaseClaim(id, model) // 重复调用
+	if !m.IsAvailable(id, model) || !m.IsAvailable(id, "") {
+		t.Fatal("ReleaseClaim 不应影响正常态可用性")
+	}
+	if s := m.Snapshot(id); s.State != "CLOSED" || s.Fails != 0 {
+		t.Fatalf("ReleaseClaim 不应改 state/fails，实际 %+v", s)
+	}
+}
+// P1 回归：客户端断连等导致 Claim 占名额后久未回报，canServe 须在超过一个冷却周期后
+// 视为陈旧并放行接管，避免半开键被一次 abort 永久焊死（ReleaseClaim 是主路径，此为最后防线）。
+func TestStaleHalfOpenClaimReleased(t *testing.T) {
+	m := New(1, 20*time.Millisecond)
+	const id = int64(82)
+
+	m.Report(id, "", false, 0) // OPEN
+	time.Sleep(30 * time.Millisecond)
+	if !m.Claim(id, "") { // 占名额，模拟随后客户端断连、永不回报
+		t.Fatal("冷却到期应能 Claim")
+	}
+	if m.Claim(id, "") {
+		t.Fatal("名额已占，紧接着的 Claim 应被拒")
+	}
+	// 等过一个冷却周期：陈旧名额应被 canServe 放行接管
+	time.Sleep(30 * time.Millisecond)
+	if !m.Claim(id, "") {
+		t.Fatal("陈旧 inFlight(超冷却周期未回报)应被释放，允许新请求接管")
+	}
+}

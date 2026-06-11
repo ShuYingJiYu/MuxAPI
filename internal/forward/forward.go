@@ -14,9 +14,12 @@ import (
 	"github.com/mirainya/muxapi/internal/upstream"
 )
 
-// Health 转发层反馈结果给健康层（model 为空时按上游级处理）
+// Health 转发层反馈结果给健康层（model 为空时按上游级处理）。
+// ReleaseClaim 与调度层 Claim 配对：请求收尾时按【原始 model】释放占用的半开名额，
+// 独立于 Report 的失败 scope，避免 failScope 塌缩(如 502→"")时模型级名额泄漏。
 type Health interface {
 	Report(id int64, model string, ok bool, latencyMs int64)
+	ReleaseClaim(id int64, model string)
 }
 
 // Logger 转发层记调用日志（status=HTTP码，网络失败为 0；model 为请求模型，解析失败为空）
@@ -94,8 +97,11 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		if err != nil {
 			// 客户端断连(父 ctx 已取消)：直接结束，不上报健康、不记日志、不重试——
 			// 否则一次 abort 会让本次试过的多个健康上游各记一次失败、累积误熔断。
+			// 但 Claim 占的半开名额必须显式释放(本次不 Report)，否则上游级+模型级名额
+			// 双泄漏、卡到 canServe 陈旧兜底才回收（见 P1）。
 			if r.Context().Err() != nil {
 				cancel()
+				f.health.ReleaseClaim(u.ID, model)
 				return
 			}
 			// 首响应头超时(本地 cancel 触发、父 ctx 未取消) 或真实网络错误：
@@ -106,10 +112,14 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			lastErr = err
 			continue
 		}
-		// 上游级失败(5xx/429/401/402/403/408)：反馈并切换下一个上游
+		// 上游返回需切换的失败码(5xx/429/401/402/403/408)：反馈并切换下一个上游。
+		// 熔断范围由 failScope 区分上游级(凭证/网关)还是模型级(429/408)。
 		if upstream.IsFailureStatus(resp.StatusCode) {
 			lat := time.Since(start).Milliseconds()
 			f.health.Report(u.ID, failScope(model, resp.StatusCode), false, lat)
+			// failScope 可能把上游级失败码塌缩成 ""，Report 只驱动了上游级键；
+			// 须按原始 model 显式释放模型级半开名额，否则它卡 inFlight 直到陈旧兜底。
+			f.health.ReleaseClaim(u.ID, model)
 			errText := clipErr(readBodyText(resp.Body))
 			f.logger.Log(groupID, u.ID, model, endpoint, keyName, attempt, resp.StatusCode, lat, errText)
 			io.Copy(io.Discard, resp.Body) // 排空再 Close，助连接复用
@@ -166,8 +176,8 @@ func parseModel(body []byte) string {
 	return m.Model
 }
 
-// failScope 按失败原因决定熔断范围：凭证/余额类(401/402/403)熔断整上游(返回"")，
-// 其余(5xx/429/408)仅熔断当前模型(返回 model)。见 upstream.FailIsUpstreamLevel。
+// failScope 按失败原因决定熔断范围：凭证/网关类(401/402/403、502/503/504)熔断整上游(返回"")，
+// 其余(429/408)仅熔断当前模型(返回 model)。判定口径见 upstream.FailIsUpstreamLevel。
 func failScope(model string, code int) string {
 	if upstream.FailIsUpstreamLevel(code) {
 		return ""

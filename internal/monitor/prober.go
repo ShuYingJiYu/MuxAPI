@@ -183,11 +183,14 @@ func (p *Prober) Probe(ctx context.Context, m *store.Monitor) {
 }
 
 // observe 把探测结果按【熔断器口径】喂路由熔断器（与看板 classify 口径分离）：
-// 失败判定用 upstream.IsFailureStatus（429 在此算失败，与看板的「降级」不同）；
-// 渠道级探测开启时，成功/失败都作用到 upstream 级(scope="")；
-// 未开启时，凭证类(401/402/403)按 upstream 级熔断，其余仅熔该模型。
-// 探测【成功】时除复活对应键外，总额外复活上游级键(凭证维度)——见函数体说明。
-// hasResp=false 表示网络/构造错误，直接按模型级失败处理。
+// 失败判定用 upstream.IsFailureStatus（429 在此算失败，与看板的「降级」不同）。
+// scope 由本函数按口径决定，ObserveProbe 忠实驱动该 scope、不再额外连带：
+//   - 渠道级探测(上游开关开)：成功/失败都作用 upstream 级(scope="")，探一个模型即代表整渠道；
+//   - 未开渠道级、且失败属凭证/网关类(401/402/403、502/503/504)：按 upstream 级熔断；
+//   - 其余：仅作用该模型(scope=model)。
+//
+// scope=""(上游级)成功时，ObserveProbe 会连带复活该上游全部模型键(见 recoverModelsForUpstream)。
+// hasResp=false 表示网络/构造错误，按上述失败口径处理。
 func (p *Prober) observe(m *store.Monitor, hasResp bool, code int, lat int64) {
 	if p.breaker == nil {
 		return
@@ -206,9 +209,9 @@ func (p *Prober) observe(m *store.Monitor, hasResp bool, code int, lat int64) {
 	case !ok && m.ChannelProbe:
 		scope = "" // 渠道级探测：失败熔整渠道，成功也复活整渠道
 	case !ok && upstream.FailIsUpstreamLevel(code):
-		scope = "" // 失败连带：凭证/余额类(401/402/403) → 熔整上游
+		scope = "" // 失败连带：凭证/网关类(401/402/403、502/503/504) → 熔整上游
 	case ok && m.ChannelProbe:
-		scope = "" // 渠道级探测开关：探测成功 → 复活整渠道（该上游所有未单独熔断的模型恢复）
+		scope = "" // 渠道级探测成功 → 复活整渠道（recoverModelsForUpstream 连带复活该上游全部模型键，含被自身故障熔断的）
 	}
 	p.breaker.ObserveProbe(m.UpstreamID, scope, ok, lat)
 }
