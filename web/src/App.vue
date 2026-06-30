@@ -397,6 +397,7 @@ function toggleMember(m) {
 // 密钥
 const newKey = ref('')   // 生成后明文展示一次
 const copied = ref(0)    // 刚点击复制的密钥 id（短暂提示用）
+const errorTipId = ref(0) // 当前显示错误提示的日志 id
 const logRetention = ref('')           // 日志保留条数(页面可配)
 const effectiveLogRetention = ref('')
 const logRetentionSource = ref('')
@@ -434,6 +435,11 @@ function copyText(t, id) {
   navigator.clipboard?.writeText(t)
   copied.value = id
   setTimeout(() => { if (copied.value === id) copied.value = 0 }, 1200)
+}
+function copyError(text, id) {
+  navigator.clipboard?.writeText(text)
+  errorTipId.value = id
+  setTimeout(() => { if (errorTipId.value === id) errorTipId.value = 0 }, 1200)
 }
 async function loadSettings() {
   const s = await api.getSettings()
@@ -1007,7 +1013,15 @@ function logout() {
                   <td>{{ l.model || '—' }}</td>
                   <td>{{ l.upstream_name || '—' }}</td>
                   <td><span v-if="l.retries > 0" class="log-retry">第{{ l.retries + 1 }}次</span><span v-else class="log-dim">直连</span></td>
-                  <td><span class="log-status" :class="logOk(l.status) ? 'ok' : 'fail'" :title="l.error || ''">{{ statusText(l.status) }}</span></td>
+                  <td>
+                    <div class="log-status-wrap" @mouseenter="l.error && (errorTipId = l.id)" @mouseleave="errorTipId = 0">
+                      <span class="log-status" :class="logOk(l.status) ? 'ok' : 'fail'">{{ statusText(l.status) }}</span>
+                      <div v-if="l.error && errorTipId === l.id" class="error-tooltip" @click="copyError(l.error, l.id)">
+                        <div class="error-tooltip-text">{{ l.error }}</div>
+                        <div class="error-tooltip-hint">{{ copied === 0 ? '点击复制' : '已复制 ✓' }}</div>
+                      </div>
+                    </div>
+                  </td>
                   <td>{{ l.status === 0 ? '—' : (l.latency_ms >= 1000 ? (l.latency_ms / 1000).toFixed(1) + 's' : l.latency_ms + 'ms') }}</td>
                 </tr>
                 <tr v-if="!logs.length"><td colspan="10" class="empty-cell">{{ logLoading ? '加载中…' : '没有符合条件的请求记录。客户端发起请求后这里会出现。' }}</td></tr>
