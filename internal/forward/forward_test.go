@@ -2,7 +2,9 @@ package forward
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,12 +18,6 @@ import (
 	"github.com/mirainya/muxapi/internal/scheduler"
 	"github.com/mirainya/muxapi/internal/upstream"
 )
-
-// noopLogger 测试用空日志器
-type noopLogger struct{}
-
-func (noopLogger) Log(groupID, upstreamID int64, model, endpoint, keyName string, retries, status int, latencyMs int64, errorText string) {
-}
 
 // 验证 SSE 流式逐行透传不丢事件、不破坏格式。
 func TestForwardSSEStreaming(t *testing.T) {
@@ -48,7 +44,7 @@ func TestForwardSSEStreaming(t *testing.T) {
 
 	ups := []*upstream.Upstream{{ID: 1, Name: "A", BaseURL: upSrv.URL, APIKey: "k", Priority: 1, Enabled: true}}
 	hm := health.New(3, time.Hour)
-	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, noopLogger{}, 3)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 3)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"stream":true}`))
@@ -92,7 +88,7 @@ func TestForwardSSEFailover(t *testing.T) {
 		{ID: 2, Name: "B", BaseURL: srvB.URL, APIKey: "k", Priority: 20, Enabled: true},
 	}
 	hm := health.New(1, time.Hour) // 阈值1：A一失败立即熔断，下次Pick避开
-	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, noopLogger{}, 3)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 3)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"stream":true}`))
@@ -114,13 +110,79 @@ func TestForwardSSEFailover(t *testing.T) {
 	}
 }
 
+func TestForwardSSECleanEOFAfterFirstByteIsTransparent(t *testing.T) {
+	var backupHits int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "event: response.output_text.delta\n")
+		io.WriteString(w, "data: {\"delta\":\"ok\"}\n\n")
+	}))
+	defer primary.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&backupHits, 1)
+		io.WriteString(w, `{"backup":true}`)
+	}))
+	defer backup.Close()
+
+	upstreams := []*upstream.Upstream{
+		{ID: 1, BaseURL: primary.URL, APIKey: "k", Priority: 1, Weight: 1},
+		{ID: 2, BaseURL: backup.URL, APIKey: "k", Priority: 2, Weight: 1},
+	}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 2)
+	body := []byte(`{"model":"gpt","stream":true}`)
+	recorder := httptest.NewRecorder()
+	result := fwd.Forward(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body)), body, 1, "")
+
+	if result.Outcome != OutcomeSuccess || len(result.Attempts) != 1 {
+		t.Fatalf("clean EOF after streamed bytes must be transparent, got %+v", result)
+	}
+	if atomic.LoadInt32(&backupHits) != 0 {
+		t.Fatal("backup must not run after response bytes were committed")
+	}
+	if got := recorder.Body.String(); !strings.Contains(got, `"delta":"ok"`) {
+		t.Fatalf("stream bytes were not relayed: %s", got)
+	}
+}
+
+func TestForwardSSEEmptyBodyFailsOverBeforeCommit(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer primary.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"text\":\"backup\"}\n\n")
+	}))
+	defer backup.Close()
+
+	upstreams := []*upstream.Upstream{
+		{ID: 1, BaseURL: primary.URL, APIKey: "k", Priority: 1, Weight: 1},
+		{ID: 2, BaseURL: backup.URL, APIKey: "k", Priority: 2, Weight: 1},
+	}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 2)
+	body := []byte(`{"model":"gpt","stream":true}`)
+	recorder := httptest.NewRecorder()
+	result := fwd.Forward(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body)), body, 1, "")
+
+	if result.Outcome != OutcomeSuccess || len(result.Attempts) != 2 || result.Attempts[0].Outcome != OutcomeFailed {
+		t.Fatalf("empty stream must fail over before commit, got %+v", result)
+	}
+	if got := recorder.Body.String(); !strings.Contains(got, `"text":"backup"`) {
+		t.Fatalf("backup stream was not relayed: %s", got)
+	}
+}
+
 // 验证按失败原因区分熔断范围：5xx 仅熔断 (上游,模型)，401 熔断整上游。
 func TestForwardFailScope(t *testing.T) {
 	srv503 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
 	defer srv503.Close()
 	ups := []*upstream.Upstream{{ID: 1, Name: "A", BaseURL: srv503.URL, APIKey: "k", Priority: 1, Enabled: true}}
 	hm := health.New(1, time.Hour)
-	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, noopLogger{}, 0)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 0)
 
 	body := []byte(`{"model":"gpt-x","stream":false}`)
 	fwd.Forward(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body))), body, 0, "")
@@ -132,7 +194,7 @@ func TestForwardFailScope(t *testing.T) {
 	defer srv401.Close()
 	ups2 := []*upstream.Upstream{{ID: 2, Name: "C", BaseURL: srv401.URL, APIKey: "k", Priority: 1, Enabled: true}}
 	hm2 := health.New(1, time.Hour)
-	fwd2 := New(scheduler.New(func(int64) []*upstream.Upstream { return ups2 }, hm2), hm2, noopLogger{}, 0)
+	fwd2 := New(scheduler.New(func(int64) []*upstream.Upstream { return ups2 }, hm2), hm2, 0)
 	body2 := []byte(`{"model":"gpt-x"}`)
 	fwd2.Forward(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body2))), body2, 0, "")
 	if hm2.IsAvailable(2, "anything") {
@@ -156,7 +218,7 @@ func TestForwardSSEIncrementalFlush(t *testing.T) {
 
 	ups := []*upstream.Upstream{{ID: 1, Name: "A", BaseURL: srv.URL, APIKey: "k", Priority: 1, Enabled: true}}
 	hm := health.New(3, time.Hour)
-	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, noopLogger{}, 3)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 3)
 
 	pr, pw := io.Pipe()
 	rec := &flushRecorder{header: http.Header{}, w: pw, flushed: make(chan struct{}, 8)}
@@ -202,7 +264,7 @@ func TestForwardFailoverWithHighThreshold(t *testing.T) {
 		{ID: 2, Name: "B", BaseURL: srvB.URL, APIKey: "k", Priority: 20, Enabled: true},
 	}
 	hm := health.New(3, time.Hour) // 默认阈值3：A 一次失败不熔断，仍须切到 B
-	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, noopLogger{}, 3)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 3)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
@@ -245,7 +307,7 @@ func TestForward403Failover(t *testing.T) {
 		{ID: 2, Name: "B", BaseURL: srvB.URL, APIKey: "k", Priority: 20, Enabled: true},
 	}
 	hm := health.New(3, time.Hour)
-	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, noopLogger{}, 3)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 3)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
@@ -274,7 +336,9 @@ type countingHealth struct {
 func (c *countingHealth) Report(id int64, model string, ok bool, latencyMs int64) {
 	atomic.AddInt32(&c.reports, 1)
 }
-func (c *countingHealth) ReleaseClaim(id int64, model string) {}
+func (c *countingHealth) ReleaseClaim(id int64, model string)         {}
+func (c *countingHealth) MarkModelUnsupported(id int64, model string) {}
+func (c *countingHealth) MarkModelSupported(id int64, model string)   {}
 func (c *countingHealth) PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, error) {
 	if exclude[c.up.ID] {
 		return nil, io.EOF // 没有更多可用上游
@@ -296,26 +360,58 @@ func TestForwardClientCancelNoReport(t *testing.T) {
 	defer close(block)
 
 	ch := &countingHealth{up: &upstream.Upstream{ID: 1, Name: "A", BaseURL: srv.URL, APIKey: "k", Priority: 1, Enabled: true}}
-	fwd := New(ch, ch, noopLogger{}, 3)
+	fwd := New(ch, ch, 3)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`)).WithContext(ctx)
 
-	done := make(chan struct{})
+	done := make(chan Result, 1)
 	go func() {
-		fwd.Forward(rec, req, []byte(`{"model":"m"}`), 0, "")
-		close(done)
+		done <- fwd.Forward(rec, req, []byte(`{"model":"m"}`), 0, "")
 	}()
 	<-gotReq // 确保请求已发到上游、正阻塞在等响应头
 	cancel() // 客户端断连
 	select {
-	case <-done:
+	case result := <-done:
+		if result.Outcome != OutcomeCanceled || result.Status != StatusClientClosedRequest || len(result.Attempts) != 1 {
+			t.Fatalf("取消请求应返回 499 和一条取消尝试，实际 %+v", result)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("客户端取消后 Forward 应尽快返回")
 	}
 	if n := atomic.LoadInt32(&ch.reports); n != 0 {
 		t.Fatalf("客户端断连不应 Report 任何健康反馈，实际 Report %d 次", n)
+	}
+}
+
+func TestForwardRetriesSuccessfulStatusErrorPayload(t *testing.T) {
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"error":{"message":"upstream failed"}}`)
+	}))
+	defer bad.Close()
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	defer good.Close()
+
+	ups := []*upstream.Upstream{
+		{ID: 1, BaseURL: bad.URL, APIKey: "a", Priority: 1, Enabled: true},
+		{ID: 2, BaseURL: good.URL, APIKey: "b", Priority: 2, Enabled: true},
+	}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 2)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	result := fwd.Forward(rec, req, []byte(`{"model":"m"}`), 1, "k")
+
+	if result.Outcome != OutcomeSuccess || len(result.Attempts) != 2 || result.Attempts[0].Outcome != OutcomeFailed {
+		t.Fatalf("200 错误对象应触发换源，实际 %+v", result)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `"ok":true`) {
+		t.Fatalf("应返回第二个渠道响应，实际 %s", body)
 	}
 }
 
@@ -335,7 +431,7 @@ func TestForwardSSELongLineNoTruncate(t *testing.T) {
 
 	ups := []*upstream.Upstream{{ID: 1, Name: "A", BaseURL: srv.URL, APIKey: "k", Priority: 1, Enabled: true}}
 	hm := health.New(3, time.Hour)
-	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, noopLogger{}, 3)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 3)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"stream":true}`))
@@ -377,7 +473,7 @@ func TestForwardHalfOpenConcurrentSingleProbe(t *testing.T) {
 	defer srv.Close()
 	ups := []*upstream.Upstream{{ID: 1, Name: "primary", BaseURL: srv.URL, APIKey: "k", Priority: 1, Enabled: true}}
 	hm := health.New(1, 20*time.Millisecond)
-	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, noopLogger{}, 0)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 0)
 
 	hm.Report(1, "gpt-5.5", false, 0)
 	time.Sleep(30 * time.Millisecond)
@@ -402,5 +498,143 @@ func TestForwardHalfOpenConcurrentSingleProbe(t *testing.T) {
 	wg.Wait()
 	if ok200 != 1 || got503 != 7 {
 		t.Fatalf("half-open single upstream should allow 1 probe and reject 7, got 200=%d 503=%d", ok200, got503)
+	}
+}
+
+func TestForwardModelUnsupportedFailover(t *testing.T) {
+	var aHits, bHits int32
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&aHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `{"error":{"code":"model_not_found"}}`)
+	}))
+	defer a.Close()
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&bHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	defer b.Close()
+
+	upstreams := []*upstream.Upstream{
+		{ID: 1, BaseURL: a.URL, APIKey: "k", Priority: 1, Weight: 1},
+		{ID: 2, BaseURL: b.URL, APIKey: "k", Priority: 2, Weight: 1},
+	}
+	hm := health.New(1, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 3)
+	body := []byte(`{"model":"gpt-5.6"}`)
+	recorder := httptest.NewRecorder()
+	fwd.Forward(recorder, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)), body, 1, "")
+
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"ok":true`) {
+		t.Fatalf("expected failover success, status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if aHits != 1 || bHits != 1 {
+		t.Fatalf("expected one attempt per upstream, A=%d B=%d", aHits, bHits)
+	}
+	if !hm.IsModelUnsupported(1, "gpt-5.6") {
+		t.Fatal("model capability should be cached for A")
+	}
+	if hm.EffectiveState(1) != "CLOSED" {
+		t.Fatal("model capability mismatch must not open A")
+	}
+}
+
+func TestForwardPreservesQuery(t *testing.T) {
+	queries := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries <- r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	defer server.Close()
+
+	upstreams := []*upstream.Upstream{{ID: 1, BaseURL: server.URL, APIKey: "k", Priority: 1, Weight: 1}}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 1)
+	body := []byte(`{"model":"gpt"}`)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses?beta=true&trace=1", bytes.NewReader(body))
+	fwd.Forward(httptest.NewRecorder(), request, body, 1, "")
+	if got := <-queries; got != "beta=true&trace=1" {
+		t.Fatalf("query was not preserved: %q", got)
+	}
+}
+
+type failingWriter struct{ header http.Header }
+
+func (w *failingWriter) Header() http.Header { return w.header }
+func (w *failingWriter) WriteHeader(int)     {}
+func (w *failingWriter) Write([]byte) (int, error) {
+	return 0, errors.New("client connection closed")
+}
+func (w *failingWriter) Flush() {}
+
+func TestDownstreamWriteFailureDoesNotReportChannelFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {}\ndata: [DONE]\n")
+	}))
+	defer server.Close()
+	counting := &countingHealth{up: &upstream.Upstream{ID: 1, BaseURL: server.URL, APIKey: "k", Priority: 1}}
+	fwd := New(counting, counting, 1)
+	body := []byte(`{"model":"gpt","stream":true}`)
+	fwd.Forward(&failingWriter{header: http.Header{}}, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)), body, 1, "")
+	if got := atomic.LoadInt32(&counting.reports); got != 0 {
+		t.Fatalf("downstream write error must be neutral, got %d health reports", got)
+	}
+}
+
+func TestFirstByteTimeoutFailsOver(t *testing.T) {
+	stalled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer stalled.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	defer backup.Close()
+	upstreams := []*upstream.Upstream{
+		{ID: 1, BaseURL: stalled.URL, APIKey: "k", Priority: 1, Weight: 1},
+		{ID: 2, BaseURL: backup.URL, APIKey: "k", Priority: 2, Weight: 1},
+	}
+	hm := health.New(1, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 2)
+	fwd.SetFirstResponseTimeout(func() time.Duration { return 20 * time.Millisecond })
+	body := []byte(`{"model":"gpt","stream":true}`)
+	recorder := httptest.NewRecorder()
+	fwd.Forward(recorder, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)), body, 1, "")
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"ok":true`) {
+		t.Fatalf("expected backup response after first-event timeout, status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestStreamingLatencyUsesTTFT(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		io.WriteString(w, "data: {\"chunk\":1}\n")
+		flusher.Flush()
+		time.Sleep(150 * time.Millisecond)
+		io.WriteString(w, "data: [DONE]\n")
+		flusher.Flush()
+	}))
+	defer server.Close()
+	upstreams := []*upstream.Upstream{{ID: 1, BaseURL: server.URL, APIKey: "k", Priority: 1, Weight: 1}}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 1)
+	body := []byte(`{"model":"gpt","stream":true}`)
+	started := time.Now()
+	fwd.Forward(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)), body, 1, "")
+	elapsed := time.Since(started)
+	if elapsed < 140*time.Millisecond {
+		t.Fatalf("test did not exercise a long stream: %v", elapsed)
+	}
+	if got := hm.Snapshot(1).LatencyMs; got >= 100 {
+		t.Fatalf("routing latency should be TTFT, not total stream duration: %dms", got)
 	}
 }

@@ -500,6 +500,18 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .log-endpoint { font-family: var(--mono, ui-monospace, monospace); font-size: 11px; color: var(--g600, #555); }
 .log-retry { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; color: #b45309; background: #fef3c7; }
 .log-dim { color: var(--g400, #b0b0b0); font-size: 11px; }
+.log-expand-col { width: 34px; padding-right: 0 !important; }
+.log-expand { width: 26px; height: 26px; padding: 0; color: var(--g500); transition: transform .15s ease, color .15s ease; }
+.log-expand.open { transform: rotate(90deg); color: var(--p600); }
+.attempt-detail-row > td { padding: 0 14px 14px 48px; background: var(--g50); }
+.attempt-table { width: 100%; background: transparent; table-layout: fixed; }
+.attempt-table th { padding: 8px 10px; font-size: 11px; }
+.attempt-table td { padding: 8px 10px; font-size: 12px; background: transparent; }
+.attempt-table th:nth-child(1) { width: 58px; }
+.attempt-table th:nth-child(2) { width: 160px; }
+.attempt-table th:nth-child(3) { width: 150px; }
+.attempt-table th:nth-child(4), .attempt-table th:nth-child(5) { width: 80px; }
+.attempt-error { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--g500); font-family: var(--mono, ui-monospace, monospace); }
 .btn-link { background: none; border: none; color: var(--p600); cursor: pointer; font-size: 13px; font-weight: 500; padding: 4px 0; margin-bottom: 16px; }
 .btn-link.sm { font-size: 12px; margin: 0 4px 0 0; padding: 4px 6px; }
 .btn-link:hover { color: var(--p700); text-decoration: underline; }

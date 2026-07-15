@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -196,45 +198,56 @@ func modelOrder(ms []*Monitor) []string {
 	return out
 }
 
-func TestPruneLogs(t *testing.T) {
+func TestRequestAuditAndPrune(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
 
+	now := time.Now()
 	for i := 0; i < 50; i++ {
-		st.Log(1, 1, "gpt-test", "/v1/messages", "k1", 0, 200, 10, "")
+		st.EnqueueRequest(RequestRecord{
+			RequestID: fmt.Sprintf("00000000-0000-0000-0000-%012d", i+1),
+			GroupID:   1, FinalUpstreamID: 1, Model: "gpt-test", Endpoint: "/v1/messages",
+			KeyName: "k1", Status: 200, Outcome: "success", TTFTMs: 10, DurationMs: 20,
+			CreatedAt: now, CompletedAt: now,
+			Attempts: []RequestAttemptRecord{{AttemptNo: 1, UpstreamID: 1, Status: 200,
+				Outcome: "success", TTFTMs: 10, DurationMs: 20, CreatedAt: now, CompletedAt: now}},
+		})
 	}
-
-	// keep<=0：关闭清理，不删任何行
-	if n, _ := st.PruneLogs(0); n != 0 {
-		t.Fatalf("keep=0 应不删，实际删 %d", n)
+	old := now.Add(-8 * 24 * time.Hour)
+	for i := 0; i < 2; i++ {
+		st.EnqueueRequest(RequestRecord{
+			RequestID: fmt.Sprintf("10000000-0000-0000-0000-%012d", i+1),
+			Status:    502, Outcome: "failed", CreatedAt: old, CompletedAt: old,
+			Attempts: []RequestAttemptRecord{{AttemptNo: 1, UpstreamID: 1, Outcome: "failed", CreatedAt: old, CompletedAt: old}},
+		})
 	}
-	if got, _ := st.ListLogs(1000); len(got) != 50 {
-		t.Fatalf("应仍有 50 条，实际 %d", len(got))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := st.FlushRequests(ctx); err != nil {
+		t.Fatal(err)
 	}
-
-	// keep>总数：不删
-	if n, _ := st.PruneLogs(100); n != 0 {
-		t.Fatalf("keep>总数应不删，实际删 %d", n)
+	if got, _ := st.ListRequests(100); len(got) != 52 {
+		t.Fatalf("应有 52 个请求，实际 %d", len(got))
 	}
-
-	// 保留最新 20 条：删 30
-	n, err := st.PruneLogs(20)
+	if countRows(t, st, "request_attempts") != 52 {
+		t.Fatal("每个请求应有一条尝试记录")
+	}
+	n, err := st.PruneRequests(7, 5000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 30 {
-		t.Fatalf("应删 30 条，实际 %d", n)
+	if n != 2 {
+		t.Fatalf("应删 2 个过期请求，实际 %d", n)
 	}
-	got, _ := st.ListLogs(1000)
-	if len(got) != 20 {
-		t.Fatalf("应剩 20 条，实际 %d", len(got))
+	got, _ := st.ListRequests(100)
+	if len(got) != 50 {
+		t.Fatalf("应剩 50 个请求，实际 %d", len(got))
 	}
-	// 保留的应是最新的（id 最大那批），ListLogs 倒序，首条 id 应为 50
-	if got[0].ID != 50 {
-		t.Fatalf("保留的应是最新批次(首条 id=50)，实际 id=%d", got[0].ID)
+	if countRows(t, st, "request_attempts") != 50 {
+		t.Fatal("过期请求的尝试记录应级联删除")
 	}
 }
 
@@ -242,7 +255,7 @@ func TestPruneLogs(t *testing.T) {
 func insertProbeAt(t *testing.T, st *Store, monitorID int64, status int, latMs, ts int64) {
 	t.Helper()
 	if _, err := st.db.Exec(`INSERT INTO probe_results(monitor_id,status,latency_ms,created_at) VALUES(?,?,?,?)`,
-		monitorID, status, latMs, ts); err != nil {
+		monitorID, status, latMs, st.timeValue(time.Unix(ts, 0))); err != nil {
 		t.Fatalf("插探测行失败: %v", err)
 	}
 }

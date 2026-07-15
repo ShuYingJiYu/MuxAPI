@@ -37,3 +37,34 @@ func TestIsFailureStatus(t *testing.T) {
 		}
 	}
 }
+
+func TestIsModelUnsupported(t *testing.T) {
+	if IsModelUnsupported(http.StatusNotFound, "gpt-5.6", `{"error":"not found"}`) {
+		t.Fatal("generic 404 must not create a model capability exclusion")
+	}
+	if !IsModelUnsupported(http.StatusNotFound, "gpt-5.6", `{"error":"model not found"}`) {
+		t.Fatal("explicit model 404 should be treated as unsupported capability")
+	}
+	if !IsModelUnsupported(http.StatusBadRequest, "gpt-5.6", `{"code":"model_not_found"}`) {
+		t.Fatal("explicit model_not_found should be treated as unsupported capability")
+	}
+	if IsModelUnsupported(http.StatusBadRequest, "gpt-5.6", `{"error":"invalid temperature"}`) {
+		t.Fatal("ordinary request validation errors must not change model capability")
+	}
+	if IsModelUnsupported(http.StatusNotFound, "", `{"error":"not found"}`) {
+		t.Fatal("missing model must not create a capability exclusion")
+	}
+}
+
+func TestIsErrorPayload(t *testing.T) {
+	for _, body := range []string{`{"error":{"message":"failed"}}`, `{"type":"error"}`} {
+		if !IsErrorPayload([]byte(body)) {
+			t.Fatalf("应识别错误响应: %s", body)
+		}
+	}
+	for _, body := range []string{`{"ok":true}`, `{"error":null}`, `{"error":false}`} {
+		if IsErrorPayload([]byte(body)) {
+			t.Fatalf("不应误判正常响应: %s", body)
+		}
+	}
+}

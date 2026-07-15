@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -42,7 +43,7 @@ func TestEndToEndForward(t *testing.T) {
 	// 真实 SQLite 内存库，建分组 + 系统生成 access_key 让请求通过分组路由
 	st, _ := store.Open(":memory:")
 	defer st.Close()
-	fwd := forward.New(sched, hm, st, 3)
+	fwd := forward.New(sched, hm, 3)
 	gid, _ := st.CreateGroup("test", "")
 	key, _ := st.CreateKey("test-key", gid)
 	srv := New(fwd, "", st, hm, monitor.New(st), nil, 32<<20)
@@ -66,6 +67,22 @@ func TestEndToEndForward(t *testing.T) {
 	// 验证双 header 注入了 B 的 key
 	if gotAuth != "Bearer keyB" || gotKey != "keyB" {
 		t.Fatalf("双 header 注入错误: Authorization=%q x-api-key=%q", gotAuth, gotKey)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := st.FlushRequests(ctx); err != nil {
+		t.Fatal(err)
+	}
+	requests, err := st.ListRequests(10)
+	if err != nil || len(requests) != 1 {
+		t.Fatalf("应记录一个客户端请求，得到 %d，错误 %v", len(requests), err)
+	}
+	if requests[0].Outcome != forward.OutcomeSuccess || requests[0].AttemptCount != 2 || len(requests[0].Attempts) != 2 {
+		t.Fatalf("请求应为换源后成功且包含两次尝试，实际 %+v", requests[0])
+	}
+	groups, err := st.ListGroups()
+	if err != nil || len(groups) != 1 || groups[0].RecentTotal != 1 || groups[0].SuccessRate != 100 {
+		t.Fatalf("分组统计应按客户端请求计为 1 次且成功率 100%%，实际 %+v，错误 %v", groups, err)
 	}
 }
 
@@ -94,7 +111,7 @@ func TestListModels(t *testing.T) {
 
 	hm := health.New(1, time.Hour)
 	sched := scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm)
-	fwd := forward.New(sched, hm, st, 3)
+	fwd := forward.New(sched, hm, 3)
 	srv := New(fwd, "", st, hm, monitor.New(st), nil, 32<<20)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -132,7 +149,7 @@ func TestMaxBodyLimit(t *testing.T) {
 	defer st.Close()
 	hm := health.New(1, time.Hour)
 	sched := scheduler.New(func(int64) []*upstream.Upstream { return nil }, hm)
-	fwd := forward.New(sched, hm, st, 3)
+	fwd := forward.New(sched, hm, 3)
 	gid, _ := st.CreateGroup("g", "")
 	key, _ := st.CreateKey("k", gid)
 
@@ -159,7 +176,7 @@ func TestIngressFailuresAreLogged(t *testing.T) {
 	defer st.Close()
 	hm := health.New(1, time.Hour)
 	sched := scheduler.New(func(int64) []*upstream.Upstream { return nil }, hm)
-	fwd := forward.New(sched, hm, st, 3)
+	fwd := forward.New(sched, hm, 3)
 	gid, _ := st.CreateGroup("g", "")
 	key, _ := st.CreateKey("k", gid)
 	srv := New(fwd, "", st, hm, monitor.New(st), nil, 32<<20)
@@ -188,7 +205,12 @@ func TestIngressFailuresAreLogged(t *testing.T) {
 		t.Fatalf("no upstream should return 503, got %d", resp2.StatusCode)
 	}
 
-	logs, err := st.ListLogs(10)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := st.FlushRequests(ctx); err != nil {
+		t.Fatal(err)
+	}
+	logs, err := st.ListRequests(10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +231,7 @@ func TestAdminAuthRejectsWrongToken(t *testing.T) {
 	defer st.Close()
 	hm := health.New(1, time.Hour)
 	sched := scheduler.New(func(int64) []*upstream.Upstream { return nil }, hm)
-	fwd := forward.New(sched, hm, st, 3)
+	fwd := forward.New(sched, hm, 3)
 
 	const adminTok = "s3cret-admin-token"
 	srv := New(fwd, adminTok, st, hm, monitor.New(st), nil, 32<<20)

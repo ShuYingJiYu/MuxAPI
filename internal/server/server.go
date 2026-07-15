@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/mirainya/muxapi/internal/forward"
 	"github.com/mirainya/muxapi/internal/health"
 	"github.com/mirainya/muxapi/internal/monitor"
@@ -91,10 +92,15 @@ func clientKey(r *http.Request) string {
 
 // messages 转发入口：按接入 key 找到分组，在组内调度转发。
 func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	requestID := uuid.NewString()
+	w.Header().Set("X-Request-ID", requestID)
+	endpoint := r.URL.RequestURI()
 	groupID, keyName, ok := s.store.GroupAndKeyByKey(clientKey(r))
 	if !ok {
-		s.store.Log(0, 0, "", r.URL.Path, "unknown", 0, http.StatusUnauthorized, 0, "unauthorized: unknown access key")
 		http.Error(w, "unauthorized: unknown access key", http.StatusUnauthorized)
+		s.recordRequest(requestID, started, 0, "unknown", "", endpoint,
+			forward.Result{Status: http.StatusUnauthorized, Outcome: forward.OutcomeClientError, Error: "unauthorized: unknown access key"})
 		return
 	}
 	// 限制请求体大小，防无上限 io.ReadAll 被超大 body 打爆内存(DoS)。
@@ -105,15 +111,37 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var mbErr *http.MaxBytesError
 		if errors.As(err, &mbErr) {
-			s.store.Log(groupID, 0, parseBodyModel(body), r.URL.Path, keyName, 0, http.StatusRequestEntityTooLarge, 0, "request body too large")
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			s.recordRequest(requestID, started, groupID, keyName, parseBodyModel(body), endpoint,
+				forward.Result{Status: http.StatusRequestEntityTooLarge, Outcome: forward.OutcomeClientError, Error: "request body too large"})
 			return
 		}
-		s.store.Log(groupID, 0, parseBodyModel(body), r.URL.Path, keyName, 0, http.StatusBadRequest, 0, "read body failed")
 		http.Error(w, "read body failed", http.StatusBadRequest)
+		s.recordRequest(requestID, started, groupID, keyName, parseBodyModel(body), endpoint,
+			forward.Result{Status: http.StatusBadRequest, Outcome: forward.OutcomeClientError, Error: "read body failed"})
 		return
 	}
-	s.fwd.Forward(w, r, body, groupID, keyName)
+	model := parseBodyModel(body)
+	result := s.fwd.Forward(w, r, body, groupID, keyName)
+	s.recordRequest(requestID, started, groupID, keyName, model, endpoint, result)
+}
+
+func (s *Server) recordRequest(requestID string, started time.Time, groupID int64, keyName, model, endpoint string, result forward.Result) {
+	completed := time.Now()
+	attempts := make([]store.RequestAttemptRecord, len(result.Attempts))
+	for i, attempt := range result.Attempts {
+		attempts[i] = store.RequestAttemptRecord{
+			AttemptNo: attempt.AttemptNo, UpstreamID: attempt.UpstreamID, Status: attempt.Status,
+			Outcome: attempt.Outcome, TTFTMs: attempt.TTFTMs, DurationMs: attempt.DurationMs,
+			CreatedAt: attempt.CreatedAt, CompletedAt: attempt.CompletedAt, Error: attempt.Error,
+		}
+	}
+	s.store.EnqueueRequest(store.RequestRecord{
+		RequestID: requestID, GroupID: groupID, FinalUpstreamID: result.FinalUpstreamID,
+		Model: model, Endpoint: endpoint, KeyName: keyName, Status: result.Status,
+		Outcome: result.Outcome, TTFTMs: result.TTFTMs, DurationMs: completed.Sub(started).Milliseconds(),
+		CreatedAt: started, CompletedAt: completed, Error: result.Error, Attempts: attempts,
+	})
 }
 
 func parseBodyModel(body []byte) string {
@@ -177,6 +205,7 @@ func (s *Server) upstreamModels(u *upstream.Upstream) []string {
 	if err != nil {
 		return ent.models // 失败回退到旧缓存（无则 nil）
 	}
+	s.health.MarkModelsSupported(u.ID, models)
 	s.modelMu.Lock()
 	s.modelCache[u.ID] = modelCacheEntry{models: models, ts: time.Now()}
 	s.modelMu.Unlock()

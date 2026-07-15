@@ -155,13 +155,7 @@ const routeDist = computed(() => {
     .map(([model, rows]) => ({ model, rows: rows.sort((a, b) => b.share_pct - a.share_pct) }))
     .sort((a, b) => a.model.localeCompare(b.model))
 })
-// 模型徽章 hover 提示：状态 + 选路 EWMA 指标（数据来自后端 model_health）
-const mhTitle = mh => {
-  let t = mh.model + ' · ' + rtLabel(mh)
-  if (mh.lat_ewma) t += ' · 选路延迟 ' + Math.round(mh.lat_ewma) + 'ms'
-  if (mh.succ_ewma != null) t += ' · 成功率 ' + (mh.succ_ewma * 100).toFixed(0) + '%'
-  return t
-}
+const mhTitle = mh => mh.model + ' · 当前渠道暂不支持，5 分钟后重新尝试'
 async function loadDetail(gid) {
   const ep = loadEpoch
   await loadMembers(gid)
@@ -261,7 +255,7 @@ function saveGroup() {
   })
 }
 
-function newUpstream() { dlg.type = 'upstream'; dlg.form = { name: '', base_url: '', api_key: '', proxy: '', enabled: true, channel_probe: true } }
+function newUpstream() { dlg.type = 'upstream'; dlg.form = { name: '', base_url: '', api_key: '', proxy: '', enabled: true, channel_probe: false } }
 function editUpstream(u) { dlg.type = 'upstream'; dlg.form = { ...u, api_key: '' } }
 function saveUpstream() {
   guard(async () => {
@@ -398,7 +392,7 @@ function toggleMember(m) {
 const newKey = ref('')   // 生成后明文展示一次
 const copied = ref(0)    // 刚点击复制的密钥 id（短暂提示用）
 const errorTipId = ref(0) // 当前显示错误提示的日志 id
-const logRetention = ref('')           // 日志保留条数(页面可配)
+const logRetention = ref('')           // 请求记录保留天数
 const effectiveLogRetention = ref('')
 const logRetentionSource = ref('')
 const alertWebhook = ref('')           // 告警 Webhook URL(空=关闭)
@@ -407,10 +401,10 @@ const effectiveAlertWebhook = ref('')
 const effectiveAlertDebounce = ref('')
 const alertWebhookSource = ref('')
 const alertDebounceSource = ref('')
-const routeSmart = ref('on')               // 智能路由总开关 on/off
-const routeToleranceSec = ref('')          // 容忍线(秒，UI 友好；后端存毫秒)：超时换源上限 + 算有效延迟的失败成本
-const effectiveRouteToleranceMs = ref('')
-const routeToleranceSource = ref('')
+const routeSmart = ref('on')               // 兼容旧设置字段；调度固定使用标准 P2C
+const firstResponseTimeoutSec = ref('')    // 首字节超时(秒，后端存毫秒)
+const effectiveFirstResponseTimeoutMs = ref('')
+const firstResponseTimeoutSource = ref('')
 const apiBase = location.origin    // 当前访问地址，用于展示客户端接入端点
 const settingsSaved = ref(false)
 const settingsSection = ref('logs')  // 设置页左锚点：logs | alert | endpoint
@@ -453,10 +447,10 @@ async function loadSettings() {
   alertWebhookSource.value = s.alert_webhook_source || ''
   alertDebounceSource.value = s.alert_debounce_source || ''
   routeSmart.value = s.route_smart || 'on'
-  effectiveRouteToleranceMs.value = s.effective_route_tolerance_ms || ''
+  effectiveFirstResponseTimeoutMs.value = s.effective_first_response_timeout_ms || ''
   // 后端存毫秒，UI 展示秒：优先取页面设置值，否则用 effective
-  routeToleranceSec.value = String(Math.round((Number(s.route_tolerance_ms || s.effective_route_tolerance_ms) || 30000) / 1000))
-  routeToleranceSource.value = s.route_tolerance_ms_source || ''
+  firstResponseTimeoutSec.value = String(Math.round((Number(s.first_response_timeout_ms || s.effective_first_response_timeout_ms) || 120000) / 1000))
+  firstResponseTimeoutSource.value = s.first_response_timeout_ms_source || ''
 }
 const sourceText = s => s === 'settings' ? '页面设置' : '默认值'
 // 设置页左锚点点击：滚动到对应 section 并高亮
@@ -471,7 +465,7 @@ function saveSettings() {
       alert_webhook: alertWebhook.value,
       alert_debounce: alertDebounce.value,
       route_smart: routeSmart.value,
-      route_tolerance_ms: String((Number(routeToleranceSec.value) || 30) * 1000),
+      first_response_timeout_ms: String((Number(firstResponseTimeoutSec.value) || 120) * 1000),
     })
     await loadSettings()
     settingsSaved.value = true
@@ -489,16 +483,9 @@ const rtLabel = h => rtUnprobed(h) ? '待探测' : ({ CLOSED: '正常', HALF_OPE
 const rtClass = h => rtUnprobed(h) ? 'nodata' : ({ CLOSED: 'closed', HALF_OPEN: 'half', OPEN: 'open' }[h?.state] || 'nodata')
 const rtRate = h => (h && h.reqs) ? (h.succ_rate * 100).toFixed(0) + '%' : '—'
 
-// 模型级徽章：复用 rtClass 的配色档（closed/half/open/nodata），未探测过显示灰点。
-const mhClass = mh => (!mh || (mh.state === 'CLOSED' && !mh.last_probe)) ? 'nodata' : ({ CLOSED: 'closed', HALF_OPEN: 'half', OPEN: 'open' }[mh.state] || 'nodata')
-
-// 运行时列要显示哪些模型徽章：渠道级探测的上游平时只看渠道状态，模型徽章「异常才显」
-// （仅 OPEN/HALF_OPEN 的模型单独亮出，便于看出某模型自身故障）；非渠道级则照旧全显。
-function visibleDots(item) {
-  const dots = item?.model_health || []
-  if (!item?.channel_probe) return dots
-  return dots.filter(mh => mh.state === 'OPEN' || mh.state === 'HALF_OPEN')
-}
+// 模型徽章只表示短期能力排除，不再表示独立熔断状态。
+const mhClass = mh => mh?.state === 'UNSUPPORTED' ? 'open' : 'nodata'
+const visibleDots = item => item?.model_health || []
 
 // 分组卡片：生效渠道文本 + 健康概览文本
 const effText = rt => (rt && rt.effective && rt.effective.length) ? rt.effective.join(' / ') : '无可用'
@@ -532,6 +519,7 @@ const logPageSize = 50
 const logCursor = ref(0)      // 下一页游标（id<此值）；0=从最新开始
 const logHasMore = ref(false)
 const logLoading = ref(false)
+const expandedRequestId = ref(0)
 const logFGroup = ref('')     // 筛选：分组名（空=全部）
 const logFModel = ref('')     // 筛选：模型（空=全部）
 const logFStatus = ref('')    // 筛选：'' 全部 | 'ok' | 'fail'
@@ -568,7 +556,18 @@ async function loadLogOptions() {
 }
 // 筛选变化即重新从第一页拉（服务端筛选，保证跨页正确）
 function onLogFilterChange() { guard(() => loadLogs(false)) }
-const logOk = s => s >= 200 && s < 400
+const logOk = l => l?.outcome === 'success'
+const toggleRequest = id => { expandedRequestId.value = expandedRequestId.value === id ? 0 : id }
+const requestShort = id => id ? id.slice(0, 8) : '—'
+const fmtMs = ms => {
+  const value = Number(ms) || 0
+  if (!value) return '—'
+  return value >= 1000 ? (value / 1000).toFixed(1) + 's' : value + 'ms'
+}
+const outcomeText = outcome => ({
+  success: '成功', failed: '失败', canceled: '已取消', partial: '流中断',
+  client_error: '请求错误', unsupported: '不支持', unavailable: '无可用渠道',
+}[outcome] || outcome || '未知')
 // 绝对时间 MM-DD HH:MM:SS（请求记录看具体时刻，不用相对）
 const fmtTime = ts => {
   if (!ts) return '—'
@@ -582,16 +581,12 @@ const fmtTimeFull = ts => {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 // 状态展示文案：0=网络失败，否则状态码
-const statusText = s => s === 0 ? '网络失败' : String(s)
+const statusText = s => s === 0 ? '网络失败' : s === 499 ? '客户端取消' : String(s)
 // 端点路径简化展示：去掉 /v1/ 前缀，空则 —
 const fmtEndpoint = p => !p ? '—' : p.replace(/^\/v1\//, '')
 
 // 监控项 CRUD
 const monModels = ref([])  // 当前对话框选中渠道的可选模型（datalist）
-const routeSmartOptions = [
-  { value: 'on', label: '开启' },
-  { value: 'off', label: '关闭（经典 P2C）' },
-]
 const testModelOptions = computed(() => {
   if (testState.modelsLoading) return [{ value: '', label: '加载模型中…', disabled: true }]
   const opts = testState.models.map(m => ({ value: m, label: m }))
@@ -849,15 +844,12 @@ function logout() {
 
           <div class="section-head" style="margin-top:28px">
             <h3 class="section-title">流量分配预估</h3>
-            <span class="route-flag" :class="routeSmart === 'off' ? 'off' : 'on'">{{ routeSmart === 'off' ? '智能路由 关闭' : '智能路由 开启' }}</span>
+            <span class="route-flag on">标准 P2C</span>
           </div>
           <div class="card route-card">
-            <p v-if="routeSmart === 'off'" class="hint" style="margin:0">
-              当前为<b>经典 P2C</b>：同层随机抽 2 个、选延迟低者。到「设置 → 智能路由」可开启延迟加权分配。
-            </p>
-            <template v-else>
-              <p class="route-cap">同优先级生效层内，按「又快又稳」的有效延迟加权分配流量；占比即预估实际分流。容忍线 {{ effectiveRouteToleranceMs ? Math.round(effectiveRouteToleranceMs / 1000) + 's' : '—' }}。</p>
-              <div v-if="!routeDist.length" class="empty">生效层暂无模型级数据，发起请求或探测后这里会亮起 ✨</div>
+            <template>
+              <p class="route-cap">同优先级层内独立抽取两个渠道，按 TTFT 与当前并发选择更优者。</p>
+              <div v-if="!routeDist.length" class="empty">生效层暂无路由数据</div>
               <div v-for="md in routeDist" :key="md.model" class="route-model">
                 <div class="route-model-name">{{ md.model }}<span class="route-model-cnt">{{ md.rows.length }} 个渠道</span></div>
                 <div v-for="r in md.rows" :key="r.name" class="route-row">
@@ -867,8 +859,8 @@ function logout() {
                   </div>
                   <span class="route-bar"><i :style="{ width: Math.max(r.share_pct, 2) + '%' }"></i></span>
                   <span class="route-metrics">
-                    <template v-if="r.lat_ewma_ms > 0">延迟 {{ Math.round(r.lat_ewma_ms) }}ms · 成功 {{ (r.succ_rate * 100).toFixed(0) }}% · 有效 {{ Math.round(r.eff_latency_ms) }}ms</template>
-                    <template v-else>待数据 · 成功 {{ (r.succ_rate * 100).toFixed(0) }}%</template>
+                    <template v-if="r.lat_ewma_ms > 0">TTFT {{ Math.round(r.lat_ewma_ms) }}ms</template>
+                    <template v-else>待数据</template>
                   </span>
                 </div>
               </div>
@@ -991,7 +983,7 @@ function logout() {
           </div>
         </template>
 
-        <!-- 请求记录页：每次转发的真实去向，按模型/分组/状态筛选 -->
+        <!-- 请求记录页：每行一个客户端请求，展开查看渠道尝试链 -->
         <template v-else-if="page === 'logs'">
           <div class="log-toolbar">
             <FancySelect v-model="logFGroup" :options="logGroupSelectOptions" @change="onLogFilterChange" />
@@ -1002,29 +994,51 @@ function logout() {
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>#</th><th>时间</th><th>密钥</th><th>端点</th><th>分组</th><th>模型</th><th>渠道</th><th>重试</th><th>状态</th><th>延迟</th></tr></thead>
+              <thead><tr><th class="log-expand-col"></th><th>时间</th><th>请求</th><th>密钥</th><th>端点</th><th>分组</th><th>模型</th><th>最终渠道</th><th>结果</th><th>TTFT</th><th>总耗时</th></tr></thead>
               <tbody>
-                <tr v-for="l in logs" :key="l.id">
-                  <td class="log-id">{{ l.id }}</td>
-                  <td class="log-time" :title="fmtTimeFull(l.created_at)">{{ fmtTime(l.created_at) }}</td>
-                  <td>{{ l.key_name || '—' }}</td>
-                  <td class="log-endpoint" :title="l.endpoint || ''">{{ fmtEndpoint(l.endpoint) }}</td>
-                  <td>{{ l.group_name || '—' }}</td>
-                  <td>{{ l.model || '—' }}</td>
-                  <td>{{ l.upstream_name || '—' }}</td>
-                  <td><span v-if="l.retries > 0" class="log-retry">第{{ l.retries + 1 }}次</span><span v-else class="log-dim">直连</span></td>
-                  <td>
-                    <div class="log-status-wrap" @mouseenter="l.error && (errorTipId = l.id)" @mouseleave="errorTipId = 0">
-                      <span class="log-status" :class="logOk(l.status) ? 'ok' : 'fail'">{{ statusText(l.status) }}</span>
-                      <div v-if="l.error && errorTipId === l.id" class="error-tooltip" @click="copyError(l.error, l.id)">
-                        <div class="error-tooltip-text">{{ l.error }}</div>
-                        <div class="error-tooltip-hint">{{ copied === 0 ? '点击复制' : '已复制 ✓' }}</div>
+                <template v-for="l in logs" :key="l.id">
+                  <tr>
+                    <td class="log-expand-col">
+                      <button v-if="l.attempts?.length" class="icon-btn log-expand" :class="{ open: expandedRequestId === l.id }" title="查看尝试链" @click="toggleRequest(l.id)">
+                        <Icon name="chevron-right" :size="14" />
+                      </button>
+                    </td>
+                    <td class="log-time" :title="fmtTimeFull(l.created_at)">{{ fmtTime(l.created_at) }}</td>
+                    <td class="log-id" :title="l.request_id">{{ requestShort(l.request_id) }}</td>
+                    <td>{{ l.key_name || '—' }}</td>
+                    <td class="log-endpoint" :title="l.endpoint || ''">{{ fmtEndpoint(l.endpoint) }}</td>
+                    <td>{{ l.group_name || '—' }}</td>
+                    <td>{{ l.model || '—' }}</td>
+                    <td>{{ l.final_upstream_name || '—' }}<span v-if="l.attempt_count > 1" class="log-retry">{{ l.attempt_count }} 次</span></td>
+                    <td>
+                      <div class="log-status-wrap" @mouseenter="l.error && (errorTipId = 'r-' + l.id)" @mouseleave="errorTipId = 0">
+                        <span class="log-status" :class="logOk(l) ? 'ok' : 'fail'">{{ outcomeText(l.outcome) }} · {{ statusText(l.status) }}</span>
+                        <div v-if="l.error && errorTipId === 'r-' + l.id" class="error-tooltip" @click="copyError(l.error, l.id)">
+                          <div class="error-tooltip-text">{{ l.error }}</div>
+                          <div class="error-tooltip-hint">{{ copied === l.id ? '已复制 ✓' : '点击复制' }}</div>
+                        </div>
                       </div>
-                    </div>
-                  </td>
-                  <td>{{ l.status === 0 ? '—' : (l.latency_ms >= 1000 ? (l.latency_ms / 1000).toFixed(1) + 's' : l.latency_ms + 'ms') }}</td>
-                </tr>
-                <tr v-if="!logs.length"><td colspan="10" class="empty-cell">{{ logLoading ? '加载中…' : '没有符合条件的请求记录。客户端发起请求后这里会出现。' }}</td></tr>
+                    </td>
+                    <td>{{ fmtMs(l.ttft_ms) }}</td>
+                    <td>{{ fmtMs(l.duration_ms) }}</td>
+                  </tr>
+                  <tr v-if="expandedRequestId === l.id" class="attempt-detail-row">
+                    <td colspan="11">
+                      <table class="attempt-table">
+                        <thead><tr><th>尝试</th><th>渠道</th><th>结果</th><th>TTFT</th><th>耗时</th><th>错误</th></tr></thead>
+                        <tbody>
+                          <tr v-for="a in l.attempts" :key="a.id">
+                            <td>#{{ a.attempt_no }}</td><td>{{ a.upstream_name || ('#' + a.upstream_id) }}</td>
+                            <td><span class="log-status" :class="a.outcome === 'success' ? 'ok' : 'fail'">{{ outcomeText(a.outcome) }} · {{ statusText(a.status) }}</span></td>
+                            <td>{{ fmtMs(a.ttft_ms) }}</td><td>{{ fmtMs(a.duration_ms) }}</td>
+                            <td class="attempt-error" :title="a.error || ''">{{ a.error || '—' }}</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </td>
+                  </tr>
+                </template>
+                <tr v-if="!logs.length"><td colspan="11" class="empty-cell">{{ logLoading ? '加载中…' : '没有符合条件的请求记录。客户端发起请求后这里会出现。' }}</td></tr>
               </tbody>
             </table>
           </div>
@@ -1040,7 +1054,7 @@ function logout() {
           <div class="settings-layout">
             <aside class="settings-nav">
               <div class="set-navitem" :class="{ active: settingsSection === 'logs' }" @click="gotoSection('logs')"><Icon name="refresh" :size="16" />日志清理</div>
-              <div class="set-navitem" :class="{ active: settingsSection === 'route' }" @click="gotoSection('route')"><Icon name="link" :size="16" />智能路由</div>
+              <div class="set-navitem" :class="{ active: settingsSection === 'route' }" @click="gotoSection('route')"><Icon name="link" :size="16" />渠道路由</div>
               <div class="set-navitem" :class="{ active: settingsSection === 'alert' }" @click="gotoSection('alert')"><Icon name="alert" :size="16" />健康告警</div>
               <div class="set-navitem" :class="{ active: settingsSection === 'endpoint' }" @click="gotoSection('endpoint')"><Icon name="link" :size="16" />接入地址</div>
               <p class="set-navhint">探测间隔 / 路径已下放到各监控项，在「监控看板」逐项配置。</p>
@@ -1048,12 +1062,12 @@ function logout() {
 
             <div class="settings-body">
               <section id="set-logs" class="card settings-card">
-                <div class="settings-title"><h3>日志清理</h3><p>按条数保留最新调用日志，超出自动裁剪。</p></div>
+                <div class="settings-title"><h3>日志清理</h3><p>按完成时间保留请求记录，过期记录与尝试链自动删除。</p></div>
                 <div class="settings-fields">
-                  <div class="field"><label>日志保留条数</label><input v-model="logRetention" type="number" min="100" placeholder="300" /></div>
+                  <div class="field"><label>保留天数</label><input v-model="logRetention" type="number" min="1" max="365" placeholder="7" /></div>
                 </div>
                 <div class="settings-info">
-                  <div><span>日志</span><b>{{ effectiveLogRetention ? effectiveLogRetention + ' 条' : '—' }}</b><em>{{ sourceText(logRetentionSource) }}</em></div>
+                  <div><span>请求记录</span><b>{{ effectiveLogRetention ? effectiveLogRetention + ' 天' : '—' }}</b><em>{{ sourceText(logRetentionSource) }}</em></div>
                 </div>
                 <div class="settings-actions">
                   <span class="save-status" :class="{ show: settingsSaved }">已保存 ✓</span>
@@ -1062,19 +1076,15 @@ function logout() {
               </section>
 
               <section id="set-route" class="card settings-card">
-                <div class="settings-title"><h3>智能路由</h3><p>同优先级层内按「又快又稳」综合分配流量；慢渠道自动少给、变快自动回升。</p></div>
+                <div class="settings-title"><h3>渠道路由</h3><p>首字节前允许故障切换，流开始后保持透明传输。</p></div>
                 <div class="settings-fields">
-                  <div class="field">
-                    <label>智能路由</label>
-                    <FancySelect v-model="routeSmart" :options="routeSmartOptions" />
-                  </div>
-                  <div class="field"><label>最多等多久（秒）</label><input v-model="routeToleranceSec" type="number" min="1" max="300" placeholder="30" /></div>
+                  <div class="field"><label>首字节超时（秒）</label><input v-model="firstResponseTimeoutSec" type="number" min="1" max="600" placeholder="120" /></div>
                 </div>
                 <div class="settings-info">
-                  <div><span>状态</span><b>{{ routeSmart === 'off' ? '已关闭' : '已开启' }}</b><em>{{ routeSmart === 'off' ? '退回经典 P2C' : '延迟加权' }}</em></div>
-                  <div><span>容忍线</span><b>{{ effectiveRouteToleranceMs ? Math.round(effectiveRouteToleranceMs / 1000) + ' 秒' : '—' }}</b><em>{{ sourceText(routeToleranceSource) }}</em></div>
+                  <div><span>算法</span><b>标准 P2C</b><em>渠道级</em></div>
+                  <div><span>首字节超时</span><b>{{ effectiveFirstResponseTimeoutMs ? Math.round(effectiveFirstResponseTimeoutMs / 1000) + ' 秒' : '—' }}</b><em>{{ sourceText(firstResponseTimeoutSource) }}</em></div>
                 </div>
-                <p class="hint">某请求超过容忍线还没首字节 → 立刻换下一家；该值同时作为渠道偶发失败的等待成本估算。</p>
+                <p class="hint">收到任何响应字节前可切换渠道；开始传输后不再解析或强制等待结束事件。</p>
                 <div class="settings-actions">
                   <span class="save-status" :class="{ show: settingsSaved }">已保存 ✓</span>
                   <button class="btn" @click="saveSettings"><Icon name="check" :size="16" />保存</button>
@@ -1082,7 +1092,7 @@ function logout() {
               </section>
 
               <section id="set-alert" class="card settings-card">
-                <div class="settings-title"><h3>健康告警</h3><p>上游/模型熔断翻转时推送 Webhook，URL 留空则关闭。</p></div>
+                <div class="settings-title"><h3>健康告警</h3><p>上游渠道熔断翻转时推送 Webhook，URL 留空则关闭。</p></div>
                 <div class="settings-fields">
                   <div class="field"><label>告警 Webhook</label><input v-model="alertWebhook" placeholder="https://... 留空关闭" /></div>
                   <div class="field"><label>去抖间隔</label><input v-model="alertDebounce" placeholder="60s / 5m" /></div>
@@ -1214,7 +1224,6 @@ function logout() {
           <div class="field"><label>api_key</label><input v-model="dlg.form.api_key" :placeholder="dlg.form.id ? '留空则不修改' : 'sk-...'" /></div>
           <div class="field"><label>代理</label><input v-model="dlg.form.proxy" placeholder="留空=直连/环境变量；如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></div>
           <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>
-          <label class="check"><input type="checkbox" v-model="dlg.form.channel_probe" /> 渠道级探测<span class="check-hint">探任一模型成功即视整渠道可用，运行时列只显渠道状态（模型异常才单独亮出）</span></label>
           <div class="dialog-foot"><button class="btn btn-ghost" @click="closeDlg">取消</button><button class="btn" @click="saveUpstream">保存</button></div>
         </template>
 

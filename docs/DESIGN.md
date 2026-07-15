@@ -158,7 +158,7 @@ upstream_models                    # 上游支持的模型(模型路由用)
 参考 sub2api `internal/pkg/apicompat/` 思路：
 - 入口路径：`/v1/messages`(Claude)、`/v1/chat/completions`(OpenAI)、`/v1/responses`(Codex)、`/v1beta/models/*`(Gemini)。
 - **MVP 阶段优先做「同格式透传」**（同格式进同格式出，不转换），稳定且覆盖绝大多数场景。
-- 流式 SSE 用 `bufio.Scanner` 逐事件透传。
+- 流式 SSE 在首个响应字节前保留换源能力，收到字节后不解析事件并透明转发。
 - 跨格式协议转换（如 OpenAI 入 → Claude 上游）作为后续迭代，复用 apicompat 的链式转换思路。
 
 ## 8. 安全须知
@@ -256,7 +256,6 @@ App.vue
 
 > 🟢CLOSED=正常 ｜ 🟡HALF_OPEN=半开探测中 ｜ 🔴OPEN=熔断冷却中。
 > 「当前生效」一行直接展示严格优先级的选择结果，回切发生时这里实时变化。
-
 
 
 

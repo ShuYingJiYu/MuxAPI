@@ -41,24 +41,21 @@ func TestAlertOnlyOnFlip(t *testing.T) {
 	m.Report(id, "", false, 0)
 	// 第三次失败 → Closed→Open，发「熔断」
 	m.Report(id, "", false, 0)
-	// 冷却后转 HalfOpen 再失败 → HalfOpen→Open，不单独发
-	time.Sleep(40 * time.Millisecond)
-	m.IsAvailable(id, "") // 触发 → HalfOpen
-	m.Report(id, "", false, 0)
-	// 冷却后 HalfOpen + 成功 → 恢复，发「恢复」
-	time.Sleep(40 * time.Millisecond)
-	m.IsAvailable(id, "") // → HalfOpen
-	m.Report(id, "", true, 50)
+	// 首次探测成功只进入 HalfOpen；第二次成功才恢复并发告警。
+	m.ObserveProbe(id, "gpt", true, 50)
+	m.ObserveProbe(id, "gpt", true, 45)
 
 	if !waitFor(func() bool { return len(rec.snapshot()) == 2 }, 2*time.Second) {
 		t.Fatalf("应收到 2 条翻转告警，实际 %d", len(rec.snapshot()))
 	}
 	evs := rec.snapshot()
-	if evs[0].FromState != "CLOSED" || evs[0].ToState != "OPEN" {
-		t.Fatalf("第一条应 CLOSED→OPEN，实际 %+v", evs[0])
+	var opened, recovered bool
+	for _, event := range evs {
+		opened = opened || (event.FromState == "CLOSED" && event.ToState == "OPEN")
+		recovered = recovered || event.ToState == "CLOSED"
 	}
-	if evs[1].ToState != "CLOSED" {
-		t.Fatalf("第二条应恢复→CLOSED，实际 %+v", evs[1])
+	if !opened || !recovered {
+		t.Fatalf("应各收到一条熔断和恢复告警，实际 %+v", evs)
 	}
 }
 
@@ -93,7 +90,7 @@ func TestWebhookDebounce(t *testing.T) {
 	)
 	ev := AlertEvent{UpstreamID: 1, Model: "", FromState: "CLOSED", ToState: "OPEN", TS: time.Now().Unix()}
 	a.Notify(ev)
-	a.Notify(ev) // 同键，窗口内 → 被丢弃
+	a.Notify(ev)                                                                         // 同键，窗口内 → 被丢弃
 	a.Notify(AlertEvent{UpstreamID: 2, Model: "", FromState: "CLOSED", ToState: "OPEN"}) // 不同键 → 放行
 
 	if got := atomic.LoadInt32(&hits); got != 2 {
@@ -183,10 +180,10 @@ func TestWebhookDebounceByDirection(t *testing.T) {
 		}
 		return AlertEvent{UpstreamID: 1, Model: "gpt-x", FromState: from, ToState: to, TS: time.Now().Unix()}
 	}
-	a.Notify(k("OPEN"))    // 熔断
-	a.Notify(k("CLOSED"))  // 恢复：方向不同 → 应放行(修复前被同槽吞)
-	a.Notify(k("OPEN"))    // 再熔断：同向同窗口 → 应被去抖
-	a.Notify(k("CLOSED"))  // 再恢复：同向同窗口 → 应被去抖
+	a.Notify(k("OPEN"))   // 熔断
+	a.Notify(k("CLOSED")) // 恢复：方向不同 → 应放行(修复前被同槽吞)
+	a.Notify(k("OPEN"))   // 再熔断：同向同窗口 → 应被去抖
+	a.Notify(k("CLOSED")) // 再恢复：同向同窗口 → 应被去抖
 
 	cond := func() bool {
 		return atomic.LoadInt32(&down) == 1 && atomic.LoadInt32(&recovered) == 1

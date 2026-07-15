@@ -1,7 +1,6 @@
 package forward
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -14,234 +13,410 @@ import (
 	"github.com/mirainya/muxapi/internal/upstream"
 )
 
-// Health 转发层反馈结果给健康层（model 为空时按上游级处理）。
-// ReleaseClaim 与调度层 Claim 配对：请求收尾时按【原始 model】释放占用的半开名额，
-// 独立于 Report 的失败 scope，避免 failScope 塌缩(如 502→"")时模型级名额泄漏。
+const defaultFirstResponseTimeout = 120 * time.Second
+
 type Health interface {
 	Report(id int64, model string, ok bool, latencyMs int64)
 	ReleaseClaim(id int64, model string)
+	MarkModelUnsupported(id int64, model string)
+	MarkModelSupported(id int64, model string)
 }
 
-// Logger 转发层记调用日志（status=HTTP码，网络失败为 0；model 为请求模型，解析失败为空）
-type Logger interface {
-	Log(groupID, upstreamID int64, model, endpoint, keyName string, retries, status int, latencyMs int64, errorText string)
-}
-
-// Picker 调度层在指定分组内按模型选上游（exclude 为本次请求已试过、需跳过的上游）
 type Picker interface {
 	PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, error)
 }
 
 type Forwarder struct {
-	picker     Picker
-	health     Health
-	logger     Logger
-	maxRetries int // kept for config compatibility; forwarding tries until no candidate remains
-	// 首响应头超时(容忍线)：超过即视为该上游失败、cancel 换源。
-	// 用首响应头而非总时长——流式长输出总时长几十秒正常，砍总时长会误杀；
-	// 首字节(TTFT)能切掉「上游号池轮询卡住」这类慢。nil 时回退默认 60s。
-	tolerance func() time.Duration
+	picker               Picker
+	health               Health
+	maxAttempts          int
+	firstResponseTimeout func() time.Duration
 }
 
-func New(p Picker, h Health, l Logger, maxRetries int) *Forwarder {
-	return &Forwarder{picker: p, health: h, logger: l, maxRetries: maxRetries}
+func New(p Picker, h Health, maxRetries int) *Forwarder {
+	maxAttempts := maxRetries
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	return &Forwarder{picker: p, health: h, maxAttempts: maxAttempts}
 }
 
-// SetTolerance 注入首响应头超时(容忍线)，读 settings 即时生效。
-func (f *Forwarder) SetTolerance(d func() time.Duration) { f.tolerance = d }
+func (f *Forwarder) SetFirstResponseTimeout(timeout func() time.Duration) {
+	f.firstResponseTimeout = timeout
+}
 
-// headerTimeout 当前容忍线；未注入或非正值时回退默认 60s。
-func (f *Forwarder) headerTimeout() time.Duration {
-	if f.tolerance != nil {
-		if d := f.tolerance(); d > 0 {
-			return d
+func (f *Forwarder) firstByteTimeout() time.Duration {
+	if f.firstResponseTimeout != nil {
+		if timeout := f.firstResponseTimeout(); timeout > 0 {
+			return timeout
 		}
 	}
-	return 60 * time.Second
+	return defaultFirstResponseTimeout
 }
 
-// Forward 在指定分组内转发请求：失败则换上游重试（每次跳过本次已试过的，立即切换到下一优先级层）。
-// keyName 为命中的接入密钥名，仅用于请求记录展示来源客户端。
-func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte, groupID int64, keyName string) {
-	model := parseModel(body) // 解析请求模型用于 (上游,模型) 级健康判定；解析失败为 "" 回退上游级
-	endpoint := r.URL.Path    // 请求端点(如 /v1/messages)，落库供按协议区分
-	var lastErr error
-	tried := map[int64]bool{}
-	for attempt := 0; ; attempt++ {
-		u, err := f.picker.PickExcluding(groupID, model, tried)
-		if err != nil {
-			break // 没有更多可用上游了
-		}
-		tried[u.ID] = true
+const StatusClientClosedRequest = 499
 
-		req, err := u.BuildRequest(r.Method, r.URL.Path, bytes.NewReader(body), r.Header)
+const (
+	OutcomeSuccess     = "success"
+	OutcomeFailed      = "failed"
+	OutcomeCanceled    = "canceled"
+	OutcomePartial     = "partial"
+	OutcomeClientError = "client_error"
+	OutcomeUnsupported = "unsupported"
+	OutcomeUnavailable = "unavailable"
+)
+
+type AttemptResult struct {
+	AttemptNo   int
+	UpstreamID  int64
+	Status      int
+	Outcome     string
+	TTFTMs      int64
+	DurationMs  int64
+	CreatedAt   time.Time
+	CompletedAt time.Time
+	Error       string
+}
+
+type Result struct {
+	Status          int
+	Outcome         string
+	FinalUpstreamID int64
+	TTFTMs          int64
+	Error           string
+	Attempts        []AttemptResult
+}
+
+func attemptResult(number int, upstreamID int64, status int, outcome string, ttft int64, started time.Time, errText string) AttemptResult {
+	completed := time.Now()
+	return AttemptResult{
+		AttemptNo: number, UpstreamID: upstreamID, Status: status, Outcome: outcome,
+		TTFTMs: ttft, DurationMs: completed.Sub(started).Milliseconds(),
+		CreatedAt: started, CompletedAt: completed, Error: clipErr(errText),
+	}
+}
+
+func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte, groupID int64, keyName string) Result {
+	model := parseModel(body)
+	tried := map[int64]bool{}
+	var lastErr error
+	attempts := make([]AttemptResult, 0, f.maxAttempts)
+
+	for attempt := 0; attempt < f.maxAttempts; attempt++ {
+		candidate, err := f.picker.PickExcluding(groupID, model, tried)
 		if err != nil {
-			f.health.Report(u.ID, model, false, 0)
-			f.logger.Log(groupID, u.ID, model, endpoint, keyName, attempt, 0, 0, clipErr(err.Error()))
+			break
+		}
+		tried[candidate.ID] = true
+		release := func() { f.health.ReleaseClaim(candidate.ID, model) }
+		attemptStarted := time.Now()
+		attemptNo := attempt + 1
+
+		req, err := candidate.BuildRequest(r.Method, r.URL.RequestURI(), bytes.NewReader(body), r.Header)
+		if err != nil {
+			f.health.Report(candidate.ID, model, false, 0)
+			release()
+			attempts = append(attempts, attemptResult(attemptNo, candidate.ID, 0, OutcomeFailed, 0, attemptStarted, err.Error()))
 			lastErr = err
 			continue
 		}
-		// 子 context 仅用于「首响应头超时」(容忍线)：超时即 cancel 换源。
-		// 不在共享 Transport 上设 ResponseHeaderTimeout——那会按代理出口被所有请求共享、
-		// 且容忍线动态可变。改用定时器：拿到响应头后立刻 Stop，故不影响已开始的流式总时长。
-		// 父 ctx(r.Context()) 反映客户端是否断连，与本超时各自独立、便于区分二者。
+
 		ctx, cancel := context.WithCancel(r.Context())
-		timer := time.AfterFunc(f.headerTimeout(), cancel)
+		firstByteTimer := time.AfterFunc(f.firstByteTimeout(), cancel)
 		req = req.WithContext(ctx)
-		// 每个上游用自己的代理出口共享 Transport（含空闲回收，避免每请求新建泄漏连接）。
-		tr := u.NewTransport()
-		client := &http.Client{Timeout: 0, Transport: tr}
+		client := &http.Client{Timeout: 0, Transport: candidate.NewTransport()}
 		start := time.Now()
 		resp, err := client.Do(req)
-		timer.Stop() // 已收到响应头(或已失败)，解除超时定时器，后续流式不受限
 		if err != nil {
-			// 客户端断连(父 ctx 已取消)：直接结束，不上报健康、不记日志、不重试——
-			// 否则一次 abort 会让本次试过的多个健康上游各记一次失败、累积误熔断。
-			// 但 Claim 占的半开名额必须显式释放(本次不 Report)，否则上游级+模型级名额
-			// 双泄漏、卡到 canServe 陈旧兜底才回收（见 P1）。
-			if r.Context().Err() != nil {
-				cancel()
-				f.health.ReleaseClaim(u.ID, model)
-				return
-			}
-			// 首响应头超时(本地 cancel 触发、父 ctx 未取消) 或真实网络错误：
-			// 均视为该上游模型级失败，反馈并换下一个上游。
+			firstByteTimer.Stop()
 			cancel()
-			f.health.Report(u.ID, model, false, 0)
-			f.logger.Log(groupID, u.ID, model, endpoint, keyName, attempt, 0, 0, clipErr(err.Error()))
+			release()
+			if r.Context().Err() != nil {
+				attempts = append(attempts, attemptResult(attemptNo, candidate.ID, StatusClientClosedRequest, OutcomeCanceled, 0, attemptStarted, r.Context().Err().Error()))
+				return Result{Status: StatusClientClosedRequest, Outcome: OutcomeCanceled, FinalUpstreamID: candidate.ID, Error: clipErr(r.Context().Err().Error()), Attempts: attempts}
+			}
+			f.health.Report(candidate.ID, model, false, 0)
+			attempts = append(attempts, attemptResult(attemptNo, candidate.ID, 0, OutcomeFailed, 0, attemptStarted, err.Error()))
 			lastErr = err
 			continue
 		}
-		// 上游返回需切换的失败码(5xx/429/401/402/403/408)：反馈并切换下一个上游。
-		// 熔断范围由 failScope 区分上游级(凭证/网关)还是模型级(429/408)。
+
+		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound {
+			payload, readErr := readLimitedBody(resp.Body, 2<<20)
+			firstByteTimer.Stop()
+			cancel()
+			resp.Body.Close()
+			if readErr != nil {
+				release()
+				if r.Context().Err() != nil {
+					attempts = append(attempts, attemptResult(attemptNo, candidate.ID, StatusClientClosedRequest, OutcomeCanceled, 0, attemptStarted, r.Context().Err().Error()))
+					return Result{Status: StatusClientClosedRequest, Outcome: OutcomeCanceled, FinalUpstreamID: candidate.ID, Error: clipErr(r.Context().Err().Error()), Attempts: attempts}
+				}
+				f.health.Report(candidate.ID, model, false, 0)
+				attempts = append(attempts, attemptResult(attemptNo, candidate.ID, 0, OutcomeFailed, 0, attemptStarted, readErr.Error()))
+				lastErr = readErr
+				continue
+			}
+			if upstream.IsModelUnsupported(resp.StatusCode, model, string(payload)) {
+				f.health.MarkModelUnsupported(candidate.ID, model)
+				release()
+				attempts = append(attempts, attemptResult(attemptNo, candidate.ID, resp.StatusCode, OutcomeUnsupported,
+					time.Since(start).Milliseconds(), attemptStarted, string(payload)))
+				continue
+			}
+
+			// Other 4xx responses describe the client request. Relay them without
+			// changing channel health.
+			resp.Body = io.NopCloser(bytes.NewReader(payload))
+			result := relayResponse(w, resp, start, nil)
+			release()
+			if result.err != nil {
+				attempts = append(attempts, attemptResult(attemptNo, candidate.ID, StatusClientClosedRequest, OutcomeCanceled,
+					result.ttftMs, attemptStarted, result.err.Error()))
+				return Result{Status: StatusClientClosedRequest, Outcome: OutcomeCanceled, FinalUpstreamID: candidate.ID,
+					TTFTMs: result.ttftMs, Error: clipErr(result.err.Error()), Attempts: attempts}
+			}
+			attempts = append(attempts, attemptResult(attemptNo, candidate.ID, resp.StatusCode, OutcomeClientError,
+				result.ttftMs, attemptStarted, string(payload)))
+			return Result{Status: resp.StatusCode, Outcome: OutcomeClientError, FinalUpstreamID: candidate.ID,
+				TTFTMs: result.ttftMs, Error: clipErr(string(payload)), Attempts: attempts}
+		}
+
 		if upstream.IsFailureStatus(resp.StatusCode) {
-			lat := time.Since(start).Milliseconds()
-			f.health.Report(u.ID, failScope(model, resp.StatusCode), false, lat)
-			// failScope 可能把上游级失败码塌缩成 ""，Report 只驱动了上游级键；
-			// 须按原始 model 显式释放模型级半开名额，否则它卡 inFlight 直到陈旧兜底。
-			f.health.ReleaseClaim(u.ID, model)
-			errText := clipErr(readBodyText(resp.Body))
-			f.logger.Log(groupID, u.ID, model, endpoint, keyName, attempt, resp.StatusCode, lat, errText)
-			io.Copy(io.Discard, resp.Body) // 排空再 Close，助连接复用
+			payload, _ := readLimitedBody(resp.Body, 64<<10)
+			firstByteTimer.Stop()
 			resp.Body.Close()
 			cancel()
+			latency := time.Since(start).Milliseconds()
+			f.health.Report(candidate.ID, model, false, latency)
+			release()
+			attempts = append(attempts, attemptResult(attemptNo, candidate.ID, resp.StatusCode, OutcomeFailed, latency, attemptStarted, string(payload)))
+			lastErr = errors.New(http.StatusText(resp.StatusCode))
 			continue
 		}
-		// 成功：反馈 + 透传响应
-		relayErr := relayResponse(w, resp)
+
+		result := relayResponse(w, resp, start, func() { firstByteTimer.Stop() })
+		firstByteTimer.Stop()
 		cancel()
-		lat := time.Since(start).Milliseconds()
-		if relayErr != nil {
-			f.health.Report(u.ID, model, false, lat)
-			f.logger.Log(groupID, u.ID, model, endpoint, keyName, attempt, 0, lat, clipErr(relayErr.Error()))
-			return
+		release()
+
+		if result.err != nil {
+			if result.source == relayDownstream || r.Context().Err() != nil {
+				errText := result.err.Error()
+				if r.Context().Err() != nil {
+					errText = r.Context().Err().Error()
+				}
+				attempts = append(attempts, attemptResult(attemptNo, candidate.ID, StatusClientClosedRequest, OutcomeCanceled,
+					result.ttftMs, attemptStarted, errText))
+				return Result{Status: StatusClientClosedRequest, Outcome: OutcomeCanceled, FinalUpstreamID: candidate.ID,
+					TTFTMs: result.ttftMs, Error: clipErr(errText), Attempts: attempts}
+			}
+			f.health.Report(candidate.ID, model, false, result.ttftMs)
+			outcome := OutcomeFailed
+			status := 0
+			if result.committed {
+				outcome = OutcomePartial
+				status = resp.StatusCode
+			}
+			attempts = append(attempts, attemptResult(attemptNo, candidate.ID, status, outcome,
+				result.ttftMs, attemptStarted, result.err.Error()))
+			lastErr = result.err
+			if !result.committed {
+				continue
+			}
+			return Result{Status: resp.StatusCode, Outcome: OutcomePartial, FinalUpstreamID: candidate.ID,
+				TTFTMs: result.ttftMs, Error: clipErr(result.err.Error()), Attempts: attempts}
 		}
-		f.health.Report(u.ID, model, true, lat)
-		f.logger.Log(groupID, u.ID, model, endpoint, keyName, attempt, resp.StatusCode, lat, "")
-		return
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			f.health.MarkModelSupported(candidate.ID, model)
+			f.health.Report(candidate.ID, model, true, result.ttftMs)
+		}
+		outcome := OutcomeSuccess
+		if resp.StatusCode >= 400 {
+			outcome = OutcomeClientError
+		}
+		attempts = append(attempts, attemptResult(attemptNo, candidate.ID, resp.StatusCode, outcome,
+			result.ttftMs, attemptStarted, ""))
+		return Result{Status: resp.StatusCode, Outcome: outcome, FinalUpstreamID: candidate.ID,
+			TTFTMs: result.ttftMs, Attempts: attempts}
 	}
-	// 循环结束仍没成功：分两种情况
+
 	if len(tried) == 0 {
-		f.logger.Log(groupID, 0, model, endpoint, keyName, 0, http.StatusServiceUnavailable, 0, "no upstream available")
 		http.Error(w, "no upstream available", http.StatusServiceUnavailable)
-		return
+		return Result{Status: http.StatusServiceUnavailable, Outcome: OutcomeUnavailable, Error: "no upstream available", Attempts: attempts}
 	}
 	if lastErr != nil {
 		http.Error(w, "upstream error: "+lastErr.Error(), http.StatusBadGateway)
-		return
+		return Result{Status: http.StatusBadGateway, Outcome: OutcomeFailed, Error: clipErr(lastErr.Error()), Attempts: attempts}
 	}
 	http.Error(w, "all upstreams failed", http.StatusBadGateway)
+	return Result{Status: http.StatusBadGateway, Outcome: OutcomeFailed, Error: "all upstreams failed", Attempts: attempts}
 }
 
-func clipErr(s string) string {
-	s = strings.TrimSpace(s)
-	if len(s) > 500 {
-		return s[:500]
+func clipErr(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > 500 {
+		return value[:500]
 	}
-	return s
+	return value
 }
 
-func readBodyText(r io.Reader) string {
-	b, _ := io.ReadAll(io.LimitReader(r, 2048))
-	return string(b)
+func readLimitedBody(reader io.Reader, limit int64) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(reader, limit))
 }
 
-// parseModel 从请求体浅解析 model 字段，用于 (上游,模型) 级健康判定。
-// 解析失败/缺失返回 ""，调用方据此回退到上游级（行为等价于改造前）。
 func parseModel(body []byte) string {
-	var m struct {
+	var payload struct {
 		Model string `json:"model"`
 	}
-	_ = json.Unmarshal(body, &m)
-	return m.Model
+	_ = json.Unmarshal(body, &payload)
+	return payload.Model
 }
 
-// failScope 按失败原因决定熔断范围：凭证/网关类(401/402/403、502/503/504)熔断整上游(返回"")，
-// 其余(429/408)仅熔断当前模型(返回 model)。判定口径见 upstream.FailIsUpstreamLevel。
-func failScope(model string, code int) string {
-	if upstream.FailIsUpstreamLevel(code) {
-		return ""
-	}
-	return model
+var errEmptyResponse = errors.New("upstream returned an empty response")
+var errErrorPayload = errors.New("upstream returned an error payload with a successful status")
+
+type relaySource int
+
+const (
+	relayUpstream relaySource = iota
+	relayDownstream
+)
+
+type relayResult struct {
+	err       error
+	source    relaySource
+	ttftMs    int64
+	committed bool
 }
 
-var errStreamIncomplete = errors.New("stream disconnected before completion")
-
-// relayResponse relays upstream response; SSE is flushed line by line.
-func relayResponse(w http.ResponseWriter, resp *http.Response) error {
+func relayResponse(w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func()) relayResult {
 	defer resp.Body.Close()
-	for k, vs := range resp.Header {
-		for _, v := range vs {
-			w.Header().Add(k, v)
-		}
+	contentType := resp.Header.Get("Content-Type")
+	if strings.HasPrefix(contentType, "text/event-stream") {
+		return relaySSE(w, resp, start, onFirstByte)
 	}
-	ct := resp.Header.Get("Content-Type")
-	w.WriteHeader(resp.StatusCode)
-
-	flusher, canFlush := w.(http.Flusher)
-	br := bufio.NewReaderSize(resp.Body, 64*1024)
-	if canFlush && isStream(ct, br) {
-		completed := false
-		for {
-			line, err := br.ReadBytes('\n')
-			if len(line) > 0 {
-				if _, writeErr := w.Write(line); writeErr != nil {
-					return writeErr
-				}
-				flusher.Flush()
-				if isStreamDone(line) {
-					completed = true
-				}
-			}
-			if err != nil {
-				if err == io.EOF {
-					if completed {
-						return nil
-					}
-					return errStreamIncomplete
-				}
-				return err
-			}
-		}
-	}
-	_, err := io.Copy(w, br)
-	return err
+	return relayBody(w, resp, start, onFirstByte)
 }
 
-// isStream 真实流式判定：Content-Type 标了 SSE 且响应体确以 data:/event: 开头。
-func isStream(ct string, br *bufio.Reader) bool {
-	if !strings.HasPrefix(ct, "text/event-stream") {
+func relaySSE(w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func()) relayResult {
+	flusher, canFlush := w.(http.Flusher)
+	buffer := make([]byte, 32*1024)
+	committed := false
+	ttft := int64(0)
+
+	for {
+		n, readErr := resp.Body.Read(buffer)
+		if n > 0 {
+			if !committed {
+				ttft = time.Since(start).Milliseconds()
+				if onFirstByte != nil {
+					onFirstByte()
+				}
+				copyResponseHeaders(w.Header(), resp.Header)
+				w.WriteHeader(resp.StatusCode)
+				committed = true
+			}
+			if _, err := w.Write(buffer[:n]); err != nil {
+				return relayResult{err: err, source: relayDownstream, ttftMs: ttft, committed: true}
+			}
+			if canFlush {
+				flusher.Flush()
+			}
+		}
+
+		if readErr != nil {
+			if readErr == io.EOF && committed {
+				return relayResult{ttftMs: ttft, committed: true}
+			}
+			if readErr == io.EOF {
+				readErr = errEmptyResponse
+			}
+			return relayResult{err: readErr, source: relayUpstream, ttftMs: ttft, committed: committed}
+		}
+	}
+}
+
+func relayBody(w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func()) relayResult {
+	const inspectLimit = 64 << 10
+	buffer := make([]byte, 32*1024)
+	ttft := int64(0)
+	firstByteSeen := false
+	var pending bytes.Buffer
+	for pending.Len() <= inspectLimit {
+		n, readErr := resp.Body.Read(buffer)
+		if n > 0 {
+			if !firstByteSeen {
+				firstByteSeen = true
+				ttft = time.Since(start).Milliseconds()
+				if onFirstByte != nil {
+					onFirstByte()
+				}
+			}
+			pending.Write(buffer[:n])
+		}
+		if readErr != nil {
+			if readErr != io.EOF {
+				return relayResult{err: readErr, source: relayUpstream, ttftMs: ttft}
+			}
+			if pending.Len() == 0 {
+				if resp.StatusCode == http.StatusNoContent {
+					copyResponseHeaders(w.Header(), resp.Header)
+					w.WriteHeader(resp.StatusCode)
+					return relayResult{ttftMs: time.Since(start).Milliseconds(), committed: true}
+				}
+				return relayResult{err: errEmptyResponse, source: relayUpstream}
+			}
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 && upstream.IsErrorPayload(pending.Bytes()) {
+				return relayResult{err: errErrorPayload, source: relayUpstream, ttftMs: ttft}
+			}
+			copyResponseHeaders(w.Header(), resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			if _, err := w.Write(pending.Bytes()); err != nil {
+				return relayResult{err: err, source: relayDownstream, ttftMs: ttft, committed: true}
+			}
+			return relayResult{ttftMs: ttft, committed: true}
+		}
+	}
+
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	if _, err := w.Write(pending.Bytes()); err != nil {
+		return relayResult{err: err, source: relayDownstream, ttftMs: ttft, committed: true}
+	}
+	for {
+		n, readErr := resp.Body.Read(buffer)
+		if n > 0 {
+			if _, err := w.Write(buffer[:n]); err != nil {
+				return relayResult{err: err, source: relayDownstream, ttftMs: ttft, committed: true}
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return relayResult{ttftMs: ttft, committed: true}
+			}
+			return relayResult{err: readErr, source: relayUpstream, ttftMs: ttft, committed: true}
+		}
+	}
+}
+
+func copyResponseHeaders(dst, src http.Header) {
+	for key, values := range src {
+		if isHopByHopHeader(key) {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func isHopByHopHeader(key string) bool {
+	switch http.CanonicalHeaderKey(key) {
+	case "Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade":
+		return true
+	default:
 		return false
 	}
-	head, _ := br.Peek(6)
-	return bytes.HasPrefix(head, []byte("data:")) || bytes.HasPrefix(head, []byte("event:"))
-}
-
-func isStreamDone(line []byte) bool {
-	s := strings.TrimSpace(string(line))
-	return s == "data: [DONE]" ||
-		s == "event: message_stop" ||
-		s == "event: response.completed" ||
-		strings.Contains(s, `"type":"message_stop"`) ||
-		strings.Contains(s, `"type":"response.completed"`)
 }

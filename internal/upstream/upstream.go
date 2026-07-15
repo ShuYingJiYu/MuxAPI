@@ -22,7 +22,7 @@ type Upstream struct {
 	Priority     int    // 组内视图：越小越优先
 	Weight       int    // 组内视图：同优先级层分流权重
 	Enabled      bool
-	ChannelProbe bool // 渠道级探测：探任一模型成功即视整渠道可用（探测复活连带 + 运行时列收起模型徽章）
+	ChannelProbe bool // 兼容旧数据；熔断固定为渠道级
 }
 
 // ProxyTransport 按代理 URL 构建 Transport：空则回退到环境变量(HTTPS_PROXY)，解析失败也回退。
@@ -61,12 +61,8 @@ func SharedTransport(proxy string) *http.Transport {
 // NewTransport 该上游专属共享 Transport（含其代理出口），转发热路径复用以免连接泄漏。
 func (u *Upstream) NewTransport() *http.Transport { return SharedTransport(u.Proxy) }
 
-// IsFailureStatus 判断上游响应码是否表示「该上游此刻不可用」，需触发故障切换/熔断摘除。
-// 涵盖：5xx 服务端错误、429 限流，以及 401/402/403/408 这类凭证/余额/超时问题。
-// MuxAPI 用自存 api_key 转发（客户端只提供接入 key），故 401/402/403 必为上游侧
-// 凭证或账户余额问题，切换到下一上游是安全且正确的。
-// 400/404 视为请求内容本身的问题（畸形参数/模型不存在），透传给客户端，
-// 不触发切换——避免无意义重试，也避免把客户端错误误判成上游故障而熔断健康上游。
+// IsFailureStatus reports channel-level failures that should trigger failover
+// and contribute to the single upstream breaker.
 func IsFailureStatus(code int) bool {
 	if code >= 500 {
 		return true
@@ -82,23 +78,57 @@ func IsFailureStatus(code int) bool {
 	return false
 }
 
-// FailIsUpstreamLevel 判断「失败」是否属于上游级（应熔断整个上游、所有模型连坐），
-// 而非仅当前模型。两类如此：
-//   - 凭证/余额类 401/402/403：与具体模型无关，是渠道凭证本身坏了；
-//   - 网关类 502/503/504：中转站整体回源故障/过载，并非单模型问题，连坐避免请求
-//     在同一坏渠道上逐模型空转。
-//
-// 其余失败（429 限流、408 超时、网络错误）一律视为模型级局部故障，只熔断 (上游,模型)，
-// 避免单个模型抖动误伤整个上游的其他模型。
+// FailIsUpstreamLevel remains for compatibility. All breaker failures are now
+// channel-level; model capability mismatches are handled separately.
 func FailIsUpstreamLevel(code int) bool {
-	switch code {
-	case http.StatusUnauthorized, // 401
-		http.StatusPaymentRequired,    // 402
-		http.StatusForbidden,          // 403
-		http.StatusBadGateway,         // 502
-		http.StatusServiceUnavailable, // 503
-		http.StatusGatewayTimeout:     // 504
-		return true
+	return IsFailureStatus(code)
+}
+
+// IsModelUnsupported identifies deterministic model/channel mismatches. They
+// exclude only this model for a short TTL and never affect channel health.
+func IsModelUnsupported(code int, model, body string) bool {
+	if model == "" {
+		return false
+	}
+	if code != http.StatusBadRequest && code != http.StatusNotFound {
+		return false
+	}
+	lower := strings.ToLower(body)
+	for _, marker := range []string{
+		"model_not_found",
+		"model not found",
+		"model does not exist",
+		"unknown model",
+		"unsupported model",
+		"模型不存在",
+		"不支持该模型",
+		"不支持模型",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsErrorPayload detects successful-status JSON envelopes that still contain
+// an upstream error. Null or empty error fields are not treated as failures.
+func IsErrorPayload(body []byte) bool {
+	var object map[string]json.RawMessage
+	if json.Unmarshal(body, &object) != nil {
+		return false
+	}
+	if raw, ok := object["error"]; ok {
+		value := strings.TrimSpace(string(raw))
+		switch value {
+		case "", "null", "false", `""`, "{}", "[]":
+		default:
+			return true
+		}
+	}
+	var responseType string
+	if raw, ok := object["type"]; ok && json.Unmarshal(raw, &responseType) == nil {
+		return strings.EqualFold(responseType, "error")
 	}
 	return false
 }
@@ -112,6 +142,9 @@ func (u *Upstream) BuildRequest(method, path string, body io.Reader, clientHeade
 		return nil, err
 	}
 	for k, vs := range clientHeader { // 全量透传客户端请求头
+		if isHopByHopHeader(k) {
+			continue
+		}
 		req.Header[k] = vs
 	}
 	req.Header.Del("Content-Length") // 由 body 重新计算，避免与原始长度冲突
@@ -122,6 +155,15 @@ func (u *Upstream) BuildRequest(method, path string, body io.Reader, clientHeade
 	req.Header.Set("Authorization", "Bearer "+u.APIKey)
 	req.Header.Set("x-api-key", u.APIKey)
 	return req, nil
+}
+
+func isHopByHopHeader(key string) bool {
+	switch http.CanonicalHeaderKey(key) {
+	case "Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade":
+		return true
+	default:
+		return false
+	}
 }
 
 // FetchModels 实时拉该上游的 /v1/models，解析 OpenAI 风格 {"data":[{"id":...}]}

@@ -27,7 +27,7 @@ func main() {
 		slog.Warn("MUXAPI_TOKEN 未设置：管理后台无鉴权，切勿对外暴露")
 	}
 
-	st, err := store.Open(cfg.DBPath)
+	st, err := store.Open(cfg.DatabaseURL)
 	if err != nil {
 		slog.Error("open store failed", "err", err)
 		return
@@ -58,7 +58,7 @@ func main() {
 		slog.Info("seeded route stats from logs", "samples", len(hs))
 	}
 	sched := scheduler.New(listByGroup, hm)
-	fwd := forward.New(sched, hm, st, cfg.MaxRetries)
+	fwd := forward.New(sched, hm, cfg.MaxRetries)
 	mon := monitor.New(st)
 	settingDuration := func(key string, def time.Duration) func() time.Duration {
 		return func() time.Duration {
@@ -84,15 +84,11 @@ func main() {
 			return def
 		}
 	}
-	// 智能路由(延迟加权选路)：容忍线 route_tolerance_ms 一个参数两处用——
-	// ① 调度层算「有效延迟」时的失败成本；② 转发层首响应头超时(超时即换源)。
-	// route_smart 总开关默认开，置 "off" 即一键退回经典 P2C(灰度/回滚)。
-	toleranceMs := settingInt("route_tolerance_ms", 30000)
-	sched.SetRouting(
-		func() float64 { return float64(toleranceMs()) },
-		func() bool { return st.GetSetting("route_smart", "on") != "off" },
-	)
-	fwd.SetTolerance(func() time.Duration { return time.Duration(toleranceMs()) * time.Millisecond })
+	// 仅在收到首个响应字节前允许超时换源；流开始后保持透明转发，由客户端取消请求。
+	firstResponseTimeoutMs := settingInt("first_response_timeout_ms", 120000)
+	fwd.SetFirstResponseTimeout(func() time.Duration {
+		return time.Duration(firstResponseTimeoutMs()) * time.Millisecond
+	})
 
 	// 健康事件主动告警：熔断翻转时推送 Webhook（URL 空则关闭）。
 	// id→name 解析用现成 List()，解析不到回退 id 字符串。
@@ -128,12 +124,12 @@ func main() {
 		defer wg.Done()
 		monProber.Run(ctx)
 	}()
-	// 日志清理：按条数保留最新 N 条，定时裁剪防止 logs 表无限增长（页面可配，缺省 1 万条）。
-	logRetention := settingInt("log_retention", 300)
+	// 请求审计按天保留，默认 7 天；每 10 分钟分批删除过期请求及其尝试链。
+	requestRetentionDays := settingInt("request_retention_days", 7)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runLogJanitor(ctx, st, logRetention)
+		runLogJanitor(ctx, st, requestRetentionDays)
 	}()
 
 	// 防 slowloris：仅限制读 header 的时长，不设全局 ReadTimeout——
@@ -162,18 +158,30 @@ func main() {
 	wg.Wait() // 等后台 goroutine 退出，再让 defer st.Close() 安全关库
 }
 
-// runLogJanitor 定时裁剪 logs 表 + 探测结果：启动先清一次，之后每 10 分钟一轮。
-// keep() 每轮取最新值，页面改保留条数下一轮生效；返回 0 表示关闭日志清理。
+// runLogJanitor 定时清理请求审计与探测结果：启动先清一次，之后每 10 分钟一轮。
+// keepDays() 每轮读取最新保留天数；每批最多 5000 个请求，避免长事务影响业务查询。
 // 探测结果固定保留 48h（覆盖看板 24h 展示窗口有余），防 probe_results 表无限增长。
-func runLogJanitor(ctx context.Context, st *store.Store, keep func() int) {
-	const probeKeepHours = 48
+func runLogJanitor(ctx context.Context, st *store.Store, keepDays func() int) {
+	const (
+		probeKeepHours = 48
+		requestBatch   = 5000
+		maxBatches     = 10
+	)
 	prune := func() {
-		n := keep()
-		if n > 0 {
-			if deleted, err := st.PruneLogs(n); err != nil {
-				slog.Error("log janitor prune failed", "err", err)
-			} else if deleted > 0 {
-				slog.Info("log janitor pruned", "deleted", deleted, "keep", n)
+		days := keepDays()
+		if days > 0 {
+			for batch := 0; batch < maxBatches; batch++ {
+				deleted, err := st.PruneRequests(days, requestBatch)
+				if err != nil {
+					slog.Error("request janitor prune failed", "err", err)
+					break
+				}
+				if deleted > 0 {
+					slog.Info("request janitor pruned", "deleted", deleted, "keepDays", days)
+				}
+				if deleted < requestBatch {
+					break
+				}
 			}
 		}
 		if deleted, err := st.PruneProbes(probeKeepHours); err != nil {

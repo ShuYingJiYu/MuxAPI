@@ -1,10 +1,14 @@
 package monitor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mirainya/muxapi/internal/store"
@@ -15,6 +19,11 @@ import (
 // 定义在 monitor 侧避免 import 环：health 不依赖 monitor，反向注入即可。
 type breakerReporter interface {
 	ObserveProbe(id int64, model string, ok bool, latencyMs int64)
+}
+
+type capabilityReporter interface {
+	MarkModelUnsupported(id int64, model string)
+	MarkModelSupported(id int64, model string)
 }
 
 // Prober 监控探测器：按各监控项自带的渠道+模型+探测参数发最小请求。
@@ -67,6 +76,7 @@ func (p *Prober) Run(ctx context.Context) {
 	last := make(map[int64]time.Time) // 各监控项最后探测时刻；Run 单协程访问，无需加锁
 	inflight := make(map[int64]bool)  // 正在探测中的项；同上仅本协程读写
 	done := make(chan int64, 256)     // 探测协程完成回传其 ID；缓冲足够大，发送侧再带 ctx 兜底防阻塞
+	var probes sync.WaitGroup
 	for {
 		// 先排空已完成回传，清在飞标记（非阻塞，本轮新到期项才能再次派发）
 		for {
@@ -79,7 +89,17 @@ func (p *Prober) Run(ctx context.Context) {
 			break
 		}
 		now := time.Now()
-		ms, _ := p.store.ListMonitors(true)
+		ms, err := p.store.ListMonitors(true)
+		if err != nil {
+			slog.Warn("list monitors failed", "err", err)
+			select {
+			case <-ctx.Done():
+				probes.Wait()
+				return
+			case <-time.After(5 * time.Second):
+				continue
+			}
+		}
 		live := make(map[int64]bool, len(ms))
 		next := p.interval() // 下次唤醒最长不超过全局间隔
 		for _, m := range ms {
@@ -98,7 +118,9 @@ func (p *Prober) Run(ctx context.Context) {
 			last[m.ID] = now
 			inflight[m.ID] = true
 			m := m // 捕获本轮变量，供探测协程闭包安全引用
+			probes.Add(1)
 			go func() {
+				defer probes.Done()
 				p.Probe(ctx, m)
 				select {
 				case done <- m.ID:
@@ -120,6 +142,7 @@ func (p *Prober) Run(ctx context.Context) {
 		}
 		select {
 		case <-ctx.Done():
+			probes.Wait()
 			return
 		case id := <-done: // 有探测提前完成则提前醒来，尽快重新评估其是否到期
 			delete(inflight, id)
@@ -128,9 +151,8 @@ func (p *Prober) Run(ctx context.Context) {
 	}
 }
 
-// buildProbeBody 按监控项配置生成最小探测请求体。
-// 空 ProbeText→"hi"，0 MaxTokens→1，Stream 为真时加 stream:true。
-// 用 json.Marshal 编码，自定义文本含引号也不会破坏 JSON。
+// buildProbeBody builds a protocol-correct minimal request for each supported
+// endpoint instead of sending chat-completions JSON to every protocol.
 func buildProbeBody(m *store.Monitor) []byte {
 	text := m.ProbeText
 	if strings.TrimSpace(text) == "" {
@@ -140,10 +162,21 @@ func buildProbeBody(m *store.Monitor) []byte {
 	if maxTok <= 0 {
 		maxTok = 1
 	}
-	body := map[string]any{
-		"model":      m.Model,
-		"max_tokens": maxTok,
-		"messages":   []map[string]string{{"role": "user", "content": text}},
+	path := strings.TrimSpace(m.Path)
+	var body map[string]any
+	switch {
+	case strings.HasSuffix(path, "/v1/responses"):
+		body = map[string]any{
+			"model":             m.Model,
+			"input":             text,
+			"max_output_tokens": maxTok,
+		}
+	default:
+		body = map[string]any{
+			"model":      m.Model,
+			"max_tokens": maxTok,
+			"messages":   []map[string]string{{"role": "user", "content": text}},
+		}
 	}
 	if m.Stream {
 		body["stream"] = true
@@ -162,58 +195,94 @@ func (p *Prober) Probe(ctx context.Context, m *store.Monitor) {
 		strings.TrimSuffix(m.BaseURL, "/")+path, strings.NewReader(string(buildProbeBody(m))))
 	if err != nil {
 		p.mgr.Record(m.ID, statDown, 0)
-		p.observe(m, false, 0, 0) // 构造失败＝该模型不可用
+		p.observe(m, false, 0, 0)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+m.APIKey)
 	req.Header.Set("x-api-key", m.APIKey)
+	if strings.HasSuffix(path, "/v1/messages") {
+		req.Header.Set("anthropic-version", "2023-06-01")
+	}
 	client := &http.Client{Timeout: 30 * time.Second, Transport: upstream.ProxyTransport(m.Proxy)}
 	start := time.Now()
 	resp, err := client.Do(req)
-	lat := time.Since(start).Milliseconds()
+	ttft := time.Since(start).Milliseconds()
 	if err != nil { // 网络错误：看板记故障 + 熔断器记模型级失败
 		p.mgr.Record(m.ID, statDown, 0)
 		p.observe(m, false, 0, 0)
 		return
 	}
 	defer resp.Body.Close()
-	p.mgr.Record(m.ID, classify(resp.StatusCode), lat)
-	p.observe(m, true, resp.StatusCode, lat) // 熔断器口径单独判定(见 observe)
+	payload, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if readErr != nil {
+		p.mgr.Record(m.ID, statDown, 0)
+		p.observe(m, false, 0, 0)
+		return
+	}
+	if upstream.IsModelUnsupported(resp.StatusCode, m.Model, string(payload)) {
+		p.mgr.Record(m.ID, statDown, ttft)
+		if reporter, ok := p.breaker.(capabilityReporter); ok {
+			reporter.MarkModelUnsupported(m.UpstreamID, m.Model)
+		}
+		return
+	}
+	if upstream.IsFailureStatus(resp.StatusCode) {
+		p.mgr.Record(m.ID, classify(resp.StatusCode), ttft)
+		p.observe(m, true, resp.StatusCode, ttft)
+		return
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if validProbePayload(resp.Header.Get("Content-Type"), payload, m.Stream) {
+			p.mgr.Record(m.ID, statOK, ttft)
+			if reporter, ok := p.breaker.(capabilityReporter); ok {
+				reporter.MarkModelSupported(m.UpstreamID, m.Model)
+			}
+			p.observe(m, true, resp.StatusCode, ttft)
+			return
+		}
+		p.mgr.Record(m.ID, statDown, ttft)
+		p.observe(m, false, 0, 0)
+		return
+	}
+	// Other 4xx responses are request/configuration errors. They remain visible
+	// on the monitor but do not poison channel health.
+	p.mgr.Record(m.ID, classify(resp.StatusCode), ttft)
 }
 
-// observe 把探测结果按【熔断器口径】喂路由熔断器（与看板 classify 口径分离）：
-// 失败判定用 upstream.IsFailureStatus（429 在此算失败，与看板的「降级」不同）。
-// scope 由本函数按口径决定，ObserveProbe 忠实驱动该 scope、不再额外连带：
-//   - 渠道级探测(上游开关开)：成功/失败都作用 upstream 级(scope="")，探一个模型即代表整渠道；
-//   - 未开渠道级、且失败属凭证/网关类(401/402/403、502/503/504)：按 upstream 级熔断；
-//   - 其余：仅作用该模型(scope=model)。
-//
-// scope=""(上游级)成功时，ObserveProbe 会连带复活该上游全部模型键(见 recoverModelsForUpstream)。
-// hasResp=false 表示网络/构造错误，按上述失败口径处理。
+// observe sends only channel-level failures/successes to the breaker.
 func (p *Prober) observe(m *store.Monitor, hasResp bool, code int, lat int64) {
 	if p.breaker == nil {
 		return
 	}
 	if !hasResp {
-		scope := m.Model
-		if m.ChannelProbe {
-			scope = "" // 渠道级探测：网络失败也表示整渠道当前不可用
-		}
-		p.breaker.ObserveProbe(m.UpstreamID, scope, false, 0)
+		p.breaker.ObserveProbe(m.UpstreamID, m.Model, false, 0)
 		return
 	}
-	ok := !upstream.IsFailureStatus(code)
-	scope := m.Model
 	switch {
-	case !ok && m.ChannelProbe:
-		scope = "" // 渠道级探测：失败熔整渠道，成功也复活整渠道
-	case !ok && upstream.FailIsUpstreamLevel(code):
-		scope = "" // 失败连带：凭证/网关类(401/402/403、502/503/504) → 熔整上游
-	case ok && m.ChannelProbe:
-		scope = "" // 渠道级探测成功 → 复活整渠道（recoverModelsForUpstream 连带复活该上游全部模型键，含被自身故障熔断的）
+	case code >= 200 && code < 300:
+		p.breaker.ObserveProbe(m.UpstreamID, m.Model, true, lat)
+	case upstream.IsFailureStatus(code):
+		p.breaker.ObserveProbe(m.UpstreamID, m.Model, false, lat)
 	}
-	p.breaker.ObserveProbe(m.UpstreamID, scope, ok, lat)
+}
+
+func validProbePayload(contentType string, payload []byte, stream bool) bool {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		return false
+	}
+	if stream || strings.HasPrefix(contentType, "text/event-stream") {
+		text := string(trimmed)
+		return strings.Contains(text, "data: [DONE]") ||
+			strings.Contains(text, "event: message_stop") ||
+			strings.Contains(text, "event: response.completed") ||
+			strings.Contains(text, `"type":"message_stop"`) ||
+			strings.Contains(text, `"type": "message_stop"`) ||
+			strings.Contains(text, `"type":"response.completed"`) ||
+			strings.Contains(text, `"type": "response.completed"`)
+	}
+	return json.Valid(trimmed) && !upstream.IsErrorPayload(trimmed)
 }
 
 // classify 把上游状态码映射到栅栏档位：2xx 正常 / 429 降级 / 其余故障。

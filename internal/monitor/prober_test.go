@@ -1,7 +1,12 @@
 package monitor
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -9,152 +14,162 @@ import (
 	"github.com/mirainya/muxapi/internal/store"
 )
 
-// probeCall 记一次喂给熔断器的调用（探测成功会驱动两次：模型级 + 上游级）。
-type probeCall struct {
+type breakerCall struct {
 	id    int64
 	model string
 	ok    bool
+	lat   int64
 }
 
-// fakeBreaker 捕获 observe 喂给熔断器的【全部】调用，按顺序记录。
 type fakeBreaker struct {
-	calls []probeCall
+	calls       []breakerCall
+	unsupported []string
+	supported   []string
 }
 
 func (f *fakeBreaker) ObserveProbe(id int64, model string, ok bool, latencyMs int64) {
-	f.calls = append(f.calls, probeCall{id, model, ok})
+	f.calls = append(f.calls, breakerCall{id: id, model: model, ok: ok, lat: latencyMs})
+}
+func (f *fakeBreaker) MarkModelUnsupported(id int64, model string) {
+	f.unsupported = append(f.unsupported, model)
+}
+func (f *fakeBreaker) MarkModelSupported(id int64, model string) {
+	f.supported = append(f.supported, model)
 }
 
-// hasUpstreamRevive 是否含一次「复活上游级键(scope="", ok=true)」的调用。
-func (f *fakeBreaker) hasUpstreamRevive(id int64) bool {
-	for _, c := range f.calls {
-		if c.id == id && c.model == "" && c.ok {
-			return true
-		}
+func TestBuildProbeBodyChat(t *testing.T) {
+	m := &store.Monitor{Model: "gpt-x", ProbeText: `say "ok"`, MaxTokens: 5, Stream: true}
+	var payload map[string]any
+	if err := json.Unmarshal(buildProbeBody(m), &payload); err != nil {
+		t.Fatal(err)
 	}
-	return false
-}
-
-func TestBuildProbeBody(t *testing.T) {
-	// 默认：空文本→"hi"，0 tokens→1，非流式不带 stream
-	b := buildProbeBody(&store.Monitor{Model: "gpt-4o"})
-	var d map[string]any
-	if err := json.Unmarshal(b, &d); err != nil {
-		t.Fatalf("默认体应为合法 JSON: %v", err)
+	if payload["model"] != "gpt-x" || payload["max_tokens"].(float64) != 5 || payload["stream"] != true {
+		t.Fatalf("unexpected chat payload: %+v", payload)
 	}
-	if d["model"] != "gpt-4o" || d["max_tokens"].(float64) != 1 {
-		t.Fatalf("默认 model/max_tokens 错: %+v", d)
-	}
-	if _, ok := d["stream"]; ok {
-		t.Fatal("非流式不应带 stream 字段")
-	}
-	msgs := d["messages"].([]any)
-	if msgs[0].(map[string]any)["content"] != "hi" {
-		t.Fatalf("空文本应默认 hi: %+v", msgs)
-	}
-
-	// 自定义：文本含引号(验证 json 编码不破坏)、自定义 tokens、流式
-	b = buildProbeBody(&store.Monitor{Model: "m", ProbeText: `say "ok"`, MaxTokens: 5, Stream: true})
-	if err := json.Unmarshal(b, &d); err != nil {
-		t.Fatalf("含引号文本应仍是合法 JSON: %v", err)
-	}
-	if d["max_tokens"].(float64) != 5 || d["stream"] != true {
-		t.Fatalf("自定义 tokens/stream 未生效: %+v", d)
-	}
-	if d["messages"].([]any)[0].(map[string]any)["content"] != `say "ok"` {
-		t.Fatalf("自定义文本未保留: %+v", d)
+	if payload["messages"].([]any)[0].(map[string]any)["content"] != `say "ok"` {
+		t.Fatalf("probe text was not preserved: %+v", payload)
 	}
 }
 
-// 验证 observe 用【熔断器口径】喂熔断器，且与看板 classify 口径分离：
-//   - 2xx → ok=true，模型级
-//   - 429 → 看板算降级，但熔断器算【失败】；渠道级探测开时熔整渠道，否则只熔模型
-//   - 401 → 凭证类，熔断器记上游级(scope="")，所有模型连坐
-//   - 网络错误 → 渠道级探测开时熔整渠道，否则只熔模型
+func TestBuildProbeBodyResponses(t *testing.T) {
+	m := &store.Monitor{Model: "gpt-x", Path: "/v1/responses", ProbeText: "hi", MaxTokens: 2}
+	var payload map[string]any
+	if err := json.Unmarshal(buildProbeBody(m), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["input"] != "hi" || payload["max_output_tokens"].(float64) != 2 {
+		t.Fatalf("unexpected responses payload: %+v", payload)
+	}
+	if _, exists := payload["messages"]; exists {
+		t.Fatalf("responses payload must not contain chat messages: %+v", payload)
+	}
+}
 
-func TestObserveBreakerScope(t *testing.T) {
+func TestValidProbePayload(t *testing.T) {
 	cases := []struct {
-		name      string
-		channel   bool
-		hasResp   bool
-		code      int
-		wantOK    bool
-		wantModel string
+		name   string
+		ct     string
+		body   string
+		stream bool
+		want   bool
 	}{
-		{"off-2xx-model-success", false, true, 200, true, "gpt-x"},
-		{"off-429-model-fail", false, true, 429, false, "gpt-x"},
-		{"off-401-upstream-fail", false, true, 401, false, ""},
-		{"off-403-upstream-fail", false, true, 403, false, ""},
-		{"off-500-model-fail", false, true, 500, false, "gpt-x"},
-		{"off-network-model-fail", false, false, 0, false, "gpt-x"},
-		{"on-2xx-channel-success", true, true, 200, true, ""},
-		{"on-401-upstream-fail", true, true, 401, false, ""},
-		{"on-500-channel-fail", true, true, 500, false, ""},
-		{"on-network-channel-fail", true, false, 0, false, ""},
+		{"json", "application/json", `{"ok":true}`, false, true},
+		{"empty", "application/json", ``, false, false},
+		{"invalid-json", "application/json", `ok`, false, false},
+		{"json-error", "application/json", `{"error":{"message":"failed"}}`, false, false},
+		{"sse-complete", "text/event-stream", "data: {}\ndata: [DONE]\n", true, true},
+		{"sse-incomplete", "text/event-stream", "data: {}\n", true, false},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			m := &store.Monitor{UpstreamID: 7, Model: "gpt-x", ChannelProbe: c.channel}
-			fb := &fakeBreaker{}
-			p := &Prober{breaker: fb}
-			p.observe(m, c.hasResp, c.code, 100)
-			if len(fb.calls) != 1 {
-				t.Fatalf("expected exactly one breaker call, got %+v", fb.calls)
-			}
-			got := fb.calls[0]
-			if got.id != 7 || got.ok != c.wantOK || got.model != c.wantModel {
-				t.Fatalf("unexpected call: got=%+v want id=7 ok=%v model=%q", got, c.wantOK, c.wantModel)
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validProbePayload(test.ct, []byte(test.body), test.stream); got != test.want {
+				t.Fatalf("got %v want %v", got, test.want)
 			}
 		})
 	}
-
-	(&Prober{}).observe(&store.Monitor{UpstreamID: 7, Model: "gpt-x"}, true, 200, 10)
 }
 
-func TestChannelProbeRevivesUpstreamKeyOnSuccess(t *testing.T) {
-	const id = int64(88)
-	mgr := health.New(3, time.Minute)
-	p := &Prober{breaker: mgr}
-	m := &store.Monitor{UpstreamID: id, Model: "gpt-x", ChannelProbe: true}
+func TestObserveAlwaysUsesChannelBreaker(t *testing.T) {
+	fake := &fakeBreaker{}
+	prober := &Prober{breaker: fake}
+	monitor := &store.Monitor{UpstreamID: 7, Model: "gpt-x", ChannelProbe: false}
+	prober.observe(monitor, false, 0, 0)
+	prober.observe(monitor, true, 429, 50)
+	prober.observe(monitor, true, 200, 40)
+	if len(fake.calls) != 3 {
+		t.Fatalf("expected three breaker calls, got %+v", fake.calls)
+	}
+	for _, call := range fake.calls {
+		if call.id != 7 || call.model != "gpt-x" {
+			t.Fatalf("unexpected channel call: %+v", call)
+		}
+	}
+	if fake.calls[0].ok || fake.calls[1].ok || !fake.calls[2].ok {
+		t.Fatalf("unexpected outcomes: %+v", fake.calls)
+	}
+}
 
-	p.observe(m, true, 401, 0)
-	if mgr.IsAvailable(id, "gpt-x") {
-		t.Fatal("401 probe should block the upstream")
+func TestProbeRecoveryNeedsTwoSuccesses(t *testing.T) {
+	mgr := health.New(1, time.Hour)
+	prober := &Prober{breaker: mgr}
+	monitor := &store.Monitor{UpstreamID: 9, Model: "gpt-x"}
+	prober.observe(monitor, false, 0, 0)
+	if got := mgr.EffectiveState(9); got != "OPEN" {
+		t.Fatalf("expected OPEN, got %s", got)
 	}
-	if got := mgr.EffectiveState(id); got != "OPEN" {
-		t.Fatalf("state should be OPEN after upstream failure, got %q", got)
+	prober.observe(monitor, true, 200, 30)
+	if got := mgr.EffectiveState(9); got != "HALF_OPEN" {
+		t.Fatalf("first success should enter HALF_OPEN, got %s", got)
 	}
+	prober.observe(monitor, true, 200, 25)
+	if got := mgr.EffectiveState(9); got != "CLOSED" {
+		t.Fatalf("second success should close channel, got %s", got)
+	}
+}
 
-	p.observe(m, true, 200, 50)
-	if !mgr.IsAvailable(id, "gpt-x") {
-		t.Fatal("channel probe success should revive the upstream")
+func TestProbeRejectsIncompleteStream(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"chunk\":1}\n")
+	}))
+	defer server.Close()
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "probe.db"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := mgr.EffectiveState(id); got != "CLOSED" {
-		t.Fatalf("state should be CLOSED after channel probe success, got %q", got)
+	defer st.Close()
+	hm := health.New(1, time.Hour)
+	prober := NewProber(New(st), st, hm, nil, nil)
+	item := &store.Monitor{
+		ID: 1, UpstreamID: 7, Model: "gpt", BaseURL: server.URL,
+		APIKey: "k", Path: "/v1/chat/completions", Stream: true,
+	}
+	prober.Probe(context.Background(), item)
+	if got := hm.EffectiveState(7); got != "OPEN" {
+		t.Fatalf("incomplete 200 stream should count as channel failure, got %s", got)
+	}
+	if got := prober.mgr.Snapshot(1).State; got != "DOWN" {
+		t.Fatalf("monitor should show DOWN, got %s", got)
 	}
 }
 
 func TestEffIntervalLowerBound(t *testing.T) {
-	const globalIV = 5 * time.Minute
-	p := NewProber(nil, nil, nil, func() time.Duration { return globalIV }, nil)
-
+	const globalInterval = 5 * time.Minute
+	prober := NewProber(nil, nil, nil, func() time.Duration { return globalInterval }, nil)
 	cases := []struct {
-		name string
-		sec  int
-		want time.Duration
+		seconds int
+		want    time.Duration
 	}{
-		{"过小抬到下限", 1, minIntervalSec * time.Second},
-		{"恰好低于下限", minIntervalSec - 1, minIntervalSec * time.Second},
-		{"等于下限保持", minIntervalSec, minIntervalSec * time.Second},
-		{"高于下限照用", 120, 120 * time.Second},
-		{"0 沿用全局默认", 0, globalIV},
+		{1, minIntervalSec * time.Second},
+		{minIntervalSec, minIntervalSec * time.Second},
+		{120, 120 * time.Second},
+		{0, globalInterval},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got := p.effInterval(&store.Monitor{IntervalSec: c.sec})
-			if got != c.want {
-				t.Fatalf("interval_sec=%d 应得 %v，实际 %v", c.sec, c.want, got)
-			}
-		})
+	for _, test := range cases {
+		monitor := &store.Monitor{IntervalSec: test.seconds}
+		if got := prober.effInterval(monitor); got != test.want {
+			t.Fatalf("seconds=%d got=%v want=%v", test.seconds, got, test.want)
+		}
 	}
 }

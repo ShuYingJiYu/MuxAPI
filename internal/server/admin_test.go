@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,7 +23,7 @@ func newAdminTestServer(t *testing.T) (*httptest.Server, *store.Store, string) {
 	t.Cleanup(func() { st.Close() })
 	hm := health.New(1, time.Hour)
 	sched := scheduler.New(func(int64) []*upstream.Upstream { return nil }, hm)
-	fwd := forward.New(sched, hm, st, 3)
+	fwd := forward.New(sched, hm, 3)
 	const tok = "admin-tok"
 	srv := New(fwd, tok, st, hm, monitor.New(st), nil, 32<<20)
 	ts := httptest.NewServer(srv.Handler())
@@ -40,6 +41,36 @@ func adminReq(t *testing.T, method, url, tok, body string) *http.Response {
 		t.Fatal(err)
 	}
 	return resp
+}
+
+func TestSettingsFirstResponseTimeout(t *testing.T) {
+	ts, st, tok := newAdminTestServer(t)
+	url := ts.URL + "/admin/settings"
+
+	get := adminReq(t, http.MethodGet, url, tok, "")
+	defer get.Body.Close()
+	var defaults map[string]string
+	if err := json.NewDecoder(get.Body).Decode(&defaults); err != nil {
+		t.Fatal(err)
+	}
+	if defaults["effective_first_response_timeout_ms"] != "120000" || defaults["first_response_timeout_ms_source"] != "default" {
+		t.Fatalf("unexpected first-response defaults: %+v", defaults)
+	}
+
+	put := adminReq(t, http.MethodPut, url, tok, `{
+		"log_retention":"7",
+		"alert_webhook":"",
+		"alert_debounce":"60s",
+		"first_response_timeout_ms":"180000",
+		"route_smart":"on"
+	}`)
+	put.Body.Close()
+	if put.StatusCode != http.StatusNoContent {
+		t.Fatalf("save settings returned %d", put.StatusCode)
+	}
+	if got := st.GetSetting("first_response_timeout_ms", ""); got != "180000" {
+		t.Fatalf("first response timeout was not persisted: %q", got)
+	}
 }
 
 // L13 回归：布尔启停 PUT 收到空/畸形 body 必须 400，绝不静默写 enabled=false。

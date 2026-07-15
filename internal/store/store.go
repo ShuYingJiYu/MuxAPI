@@ -1,17 +1,141 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/mirainya/muxapi/database/migrations"
 	"github.com/mirainya/muxapi/internal/upstream"
 	_ "modernc.org/sqlite"
 )
 
-type Store struct{ db *sql.DB }
+type dbAdapter struct {
+	*sql.DB
+	postgres bool
+}
+
+type txAdapter struct {
+	*sql.Tx
+	postgres bool
+}
+
+func bindPostgres(query string) string {
+	var b strings.Builder
+	b.Grow(len(query) + 16)
+	arg := 1
+	inString := false
+	for i := 0; i < len(query); i++ {
+		ch := query[i]
+		if ch == '\'' {
+			b.WriteByte(ch)
+			if inString && i+1 < len(query) && query[i+1] == '\'' {
+				b.WriteByte(query[i+1])
+				i++
+				continue
+			}
+			inString = !inString
+			continue
+		}
+		if ch == '?' && !inString {
+			fmt.Fprintf(&b, "$%d", arg)
+			arg++
+			continue
+		}
+		b.WriteByte(ch)
+	}
+	return b.String()
+}
+
+func (d *dbAdapter) bind(query string) string {
+	if d.postgres {
+		return bindPostgres(query)
+	}
+	return query
+}
+
+func (d *dbAdapter) Exec(query string, args ...any) (sql.Result, error) {
+	return d.DB.Exec(d.bind(query), args...)
+}
+
+func (d *dbAdapter) Query(query string, args ...any) (*sql.Rows, error) {
+	return d.DB.Query(d.bind(query), args...)
+}
+
+func (d *dbAdapter) QueryRow(query string, args ...any) *sql.Row {
+	return d.DB.QueryRow(d.bind(query), args...)
+}
+
+func (d *dbAdapter) Begin() (*txAdapter, error) {
+	tx, err := d.DB.Begin()
+	if err != nil {
+		return nil, err
+	}
+	return &txAdapter{Tx: tx, postgres: d.postgres}, nil
+}
+
+func (t *txAdapter) Exec(query string, args ...any) (sql.Result, error) {
+	if t.postgres {
+		query = bindPostgres(query)
+	}
+	return t.Tx.Exec(query, args...)
+}
+
+const requestQueueSize = 4096
+
+type requestWrite struct {
+	record  *RequestRecord
+	barrier chan struct{}
+}
+
+type Store struct {
+	db           *dbAdapter
+	requestQueue chan requestWrite
+	requestDone  chan struct{}
+	requestDrops atomic.Uint64
+	closeOnce    sync.Once
+}
+
+func newStore(db *dbAdapter) *Store {
+	s := &Store{
+		db:           db,
+		requestQueue: make(chan requestWrite, requestQueueSize),
+		requestDone:  make(chan struct{}),
+	}
+	go s.runRequestWriter()
+	return s
+}
+
+func (s *Store) timeValue(value time.Time) any {
+	if s.db.postgres {
+		return value
+	}
+	return value.Unix()
+}
+
+func (s *Store) unixExpr(column string) string {
+	if s.db.postgres {
+		return "CAST(EXTRACT(EPOCH FROM " + column + ") AS BIGINT)"
+	}
+	return column
+}
+
+func (s *Store) hourExpr(column string) string {
+	if s.db.postgres {
+		return "CAST(EXTRACT(EPOCH FROM date_trunc('hour', " + column + ")) AS BIGINT)"
+	}
+	return "(" + column + "/3600)*3600"
+}
 
 // Group 虚拟接入点：拥有自己的上游池(经中间表)和接入密钥。
 type Group struct {
@@ -66,10 +190,85 @@ type Monitor struct {
 	BaseURL      string `json:"-"`
 	APIKey       string `json:"-"`
 	Proxy        string `json:"-"`
-	ChannelProbe bool   `json:"-"` // 所属上游是否开启渠道级探测：开则探测成功复活整渠道（scope=""）
+	ChannelProbe bool   `json:"-"` // 兼容旧数据；运行时不再改变熔断粒度
 }
 
-func Open(path string) (*Store, error) {
+func Open(databaseURL string) (*Store, error) {
+	if strings.HasPrefix(databaseURL, "postgres://") || strings.HasPrefix(databaseURL, "postgresql://") {
+		db, err := sql.Open("pgx", databaseURL)
+		if err != nil {
+			return nil, err
+		}
+		db.SetMaxOpenConns(20)
+		db.SetMaxIdleConns(10)
+		db.SetConnMaxIdleTime(5 * time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := db.PingContext(ctx); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("connect PostgreSQL: %w", err)
+		}
+		if err := runPostgresMigrations(ctx, db); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("migrate PostgreSQL: %w", err)
+		}
+		return newStore(&dbAdapter{DB: db, postgres: true}), nil
+	}
+	if databaseURL == "" {
+		return nil, errors.New("MUXAPI_DATABASE_URL is required")
+	}
+	return openSQLite(databaseURL)
+}
+
+func runPostgresMigrations(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+		version TEXT PRIMARY KEY,
+		applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		return err
+	}
+	entries, err := migrations.Files.ReadDir(".")
+	if err != nil {
+		return err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+		version := strings.TrimSuffix(entry.Name(), ".sql")
+		var applied bool
+		if err := db.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)`, version).Scan(&applied); err != nil {
+			return err
+		}
+		if applied {
+			continue
+		}
+		body, err := migrations.Files.ReadFile(entry.Name())
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, string(body)); err == nil {
+			_, err = tx.ExecContext(ctx,
+				`INSERT INTO schema_migrations(version) VALUES($1)`, version)
+		}
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("%s: %w", entry.Name(), err)
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func openSQLite(path string) (*Store, error) {
 	// 并发可靠性 PRAGMA（modernc.org/sqlite 经 DSN 的 _pragma 参数下发到每条连接）：
 	//   busy_timeout(5000) 写锁竞争时最多等 5s 再返回 SQLITE_BUSY，避免并发写静默丢日志/探测数据；
 	//   journal_mode(WAL)  读写不互斥，提升并发；foreign_keys(1) 启用外键约束。
@@ -83,13 +282,16 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// SQLite 仅保留给单元测试和离线迁移；:memory: 每条连接是独立数据库，
+	// 固定单连接可避免异步审计写入拿到没有 schema 的新连接。
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	if _, err = db.Exec(schema); err != nil {
 		return nil, err
 	}
 	// 迁移：旧库 upstreams 补 proxy 列（已存在则忽略报错）
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN proxy TEXT NOT NULL DEFAULT ''`)
-	// 迁移：旧库 upstreams 补 channel_probe 列（渠道级探测：探任一模型成功即视整渠道可用）。
-	// 默认 1=开：存量上游一并启用渠道级语义，运行时列默认收起模型徽章（异常才显）。
+	// 迁移：保留旧 channel_probe 列，运行时已固定使用渠道级熔断。
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN channel_probe INTEGER NOT NULL DEFAULT 1`)
 	// 迁移：旧库 upstreams 补 sort_order 列（拖拽排序权重，0=未排过按 id）
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`)
@@ -109,7 +311,7 @@ func Open(path string) (*Store, error) {
 	db.Exec(`ALTER TABLE logs ADD COLUMN key_name TEXT NOT NULL DEFAULT ''`)
 	db.Exec(`ALTER TABLE logs ADD COLUMN retries INTEGER NOT NULL DEFAULT 0`)
 	db.Exec(`ALTER TABLE logs ADD COLUMN error_text TEXT NOT NULL DEFAULT ''`)
-	return &Store{db: db}, nil
+	return newStore(&dbAdapter{DB: db}), nil
 }
 
 const schema = `
@@ -180,8 +382,46 @@ CREATE TABLE IF NOT EXISTS probe_results (
 	latency_ms INTEGER NOT NULL,
 	created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS requests (
+	id                INTEGER PRIMARY KEY AUTOINCREMENT,
+	request_id        TEXT NOT NULL UNIQUE,
+	group_id          INTEGER NOT NULL DEFAULT 0,
+	final_upstream_id INTEGER NOT NULL DEFAULT 0,
+	model             TEXT NOT NULL DEFAULT '',
+	endpoint          TEXT NOT NULL DEFAULT '',
+	key_name          TEXT NOT NULL DEFAULT '',
+	status            INTEGER NOT NULL DEFAULT 0,
+	outcome           TEXT NOT NULL,
+	ttft_ms           INTEGER NOT NULL DEFAULT 0,
+	duration_ms       INTEGER NOT NULL DEFAULT 0,
+	attempt_count     INTEGER NOT NULL DEFAULT 0,
+	created_at        INTEGER NOT NULL,
+	completed_at      INTEGER NOT NULL,
+	error_text        TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS request_attempts (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	request_id   TEXT NOT NULL,
+	attempt_no   INTEGER NOT NULL,
+	upstream_id  INTEGER NOT NULL DEFAULT 0,
+	status       INTEGER NOT NULL DEFAULT 0,
+	outcome      TEXT NOT NULL,
+	ttft_ms      INTEGER NOT NULL DEFAULT 0,
+	duration_ms  INTEGER NOT NULL DEFAULT 0,
+	created_at   INTEGER NOT NULL,
+	completed_at INTEGER NOT NULL,
+	error_text   TEXT NOT NULL DEFAULT '',
+	FOREIGN KEY (request_id) REFERENCES requests(request_id) ON DELETE CASCADE,
+	UNIQUE (request_id, attempt_no)
+);
 CREATE INDEX IF NOT EXISTS idx_probe_mon_time ON probe_results(monitor_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_logs_group_time ON logs(group_id, created_at);`
+CREATE INDEX IF NOT EXISTS idx_logs_group_time ON logs(group_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests(created_at);
+CREATE INDEX IF NOT EXISTS idx_requests_group_time ON requests(group_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_requests_model_time ON requests(model, created_at);
+CREATE INDEX IF NOT EXISTS idx_requests_outcome_time ON requests(outcome, created_at);
+CREATE INDEX IF NOT EXISTS idx_attempts_request ON request_attempts(request_id, attempt_no);
+CREATE INDEX IF NOT EXISTS idx_attempts_upstream_time ON request_attempts(upstream_id, created_at);`
 
 // --- 上游全局池 ---
 
@@ -204,7 +444,7 @@ func scanUps(rows *sql.Rows) ([]*upstream.Upstream, error) {
 func (s *Store) ListEnabledByGroup(groupID int64) ([]*upstream.Upstream, error) {
 	rows, err := s.db.Query(`SELECT u.id,u.name,u.base_url,u.api_key,u.proxy,u.enabled,gu.priority,gu.weight,u.channel_probe
 		FROM upstreams u JOIN group_upstreams gu ON gu.upstream_id=u.id
-		WHERE gu.group_id=? AND u.enabled=1 AND gu.enabled=1 ORDER BY gu.priority ASC`, groupID)
+		WHERE gu.group_id=? AND u.enabled=TRUE AND gu.enabled=TRUE ORDER BY gu.priority ASC`, groupID)
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +519,11 @@ func (s *Store) Delete(id int64) error {
 	return tx.Commit()
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	s.closeOnce.Do(func() { close(s.requestQueue) })
+	<-s.requestDone
+	return s.db.Close()
+}
 
 // --- 监控项 ---
 
@@ -306,7 +550,7 @@ const monitorJoin = `SELECT m.id,m.upstream_id,m.model,m.name,m.enabled,m.stream
 func (s *Store) ListMonitors(enabledOnly bool) ([]*Monitor, error) {
 	q := monitorJoin
 	if enabledOnly {
-		q += ` WHERE m.enabled=1 AND u.enabled=1`
+		q += ` WHERE m.enabled=TRUE AND u.enabled=TRUE`
 	}
 	rows, err := s.db.Query(q + ` ORDER BY m.sort, m.id`)
 	if err != nil {
@@ -328,13 +572,11 @@ func (s *Store) GetMonitor(id int64) (*Monitor, error) {
 }
 
 func (s *Store) CreateMonitor(m *Monitor) (int64, error) {
-	res, err := s.db.Exec(`INSERT INTO monitors(upstream_id,model,name,enabled,stream,probe_text,max_tokens,interval_sec,path)
-		VALUES(?,?,?,?,?,?,?,?,?)`,
-		m.UpstreamID, m.Model, m.Name, m.Enabled, m.Stream, m.ProbeText, m.MaxTokens, m.IntervalSec, m.Path)
-	if err != nil {
-		return 0, err
-	}
-	return res.LastInsertId()
+	var id int64
+	err := s.db.QueryRow(`INSERT INTO monitors(upstream_id,model,name,enabled,stream,probe_text,max_tokens,interval_sec,path)
+		VALUES(?,?,?,?,?,?,?,?,?) RETURNING id`,
+		m.UpstreamID, m.Model, m.Name, m.Enabled, m.Stream, m.ProbeText, m.MaxTokens, m.IntervalSec, m.Path).Scan(&id)
+	return id, err
 }
 
 // ReorderMonitors 按给定 id 顺序写入 sort 权重（从 1 起，下标即权重）。
@@ -407,16 +649,16 @@ func (s *Store) DeleteMonitor(id int64) error {
 
 // --- 分组 ---
 func (s *Store) ListGroups() ([]*Group, error) {
-	since := time.Now().Add(-24 * time.Hour).Unix()
+	since := s.timeValue(time.Now().Add(-24 * time.Hour))
 	rows, err := s.db.Query(`SELECT
 		g.id,g.name,g.description,
 		COUNT(DISTINCT gu.upstream_id),
-		COUNT(DISTINCT CASE WHEN u.enabled=1 AND gu.enabled=1 THEN u.id END),
+		COUNT(DISTINCT CASE WHEN u.enabled=TRUE AND gu.enabled=TRUE THEN u.id END),
 		COUNT(DISTINCT ak.id),
-		COUNT(DISTINCT CASE WHEN ak.enabled=1 THEN ak.id END),
-		COALESCE((SELECT COUNT(*) FROM logs l WHERE l.group_id=g.id AND l.created_at>=?),0),
-		COALESCE((SELECT ROUND(100.0 * SUM(CASE WHEN l.status BETWEEN 200 AND 399 THEN 1 ELSE 0 END) / COUNT(*)) FROM logs l WHERE l.group_id=g.id AND l.created_at>=?),0),
-		COALESCE((SELECT ROUND(AVG(l.latency_ms)) FROM logs l WHERE l.group_id=g.id AND l.created_at>=?),0)
+		COUNT(DISTINCT CASE WHEN ak.enabled=TRUE THEN ak.id END),
+		COALESCE((SELECT COUNT(*) FROM requests r WHERE r.group_id=g.id AND r.created_at>=?),0),
+		COALESCE((SELECT CAST(ROUND(100.0 * SUM(CASE WHEN r.outcome='success' THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0)) AS BIGINT) FROM requests r WHERE r.group_id=g.id AND r.created_at>=?),0),
+		COALESCE((SELECT CAST(ROUND(AVG(r.ttft_ms)) AS BIGINT) FROM requests r WHERE r.group_id=g.id AND r.created_at>=? AND r.outcome='success' AND r.ttft_ms>0),0)
 		FROM groups g
 		LEFT JOIN group_upstreams gu ON gu.group_id=g.id
 		LEFT JOIN upstreams u ON u.id=gu.upstream_id
@@ -460,11 +702,12 @@ func (s *Store) groupHourlyTrend(groupID int64) []HourPoint {
 	// 按小时桶聚合：总数 + 成功数
 	type agg struct{ total, succ int }
 	buckets := make(map[int64]*agg, hours)
-	rows, err := s.db.Query(`SELECT
-		(created_at/3600)*3600 AS hour, COUNT(*),
-		SUM(CASE WHEN status BETWEEN 200 AND 399 THEN 1 ELSE 0 END)
-		FROM logs WHERE group_id=? AND created_at>=?
-		GROUP BY hour`, groupID, start.Unix())
+	query := fmt.Sprintf(`SELECT
+		%s AS hour, COUNT(*),
+		SUM(CASE WHEN outcome='success' THEN 1 ELSE 0 END)
+		FROM requests WHERE group_id=? AND created_at>=?
+		GROUP BY hour`, s.hourExpr("created_at"))
+	rows, err := s.db.Query(query, groupID, s.timeValue(start))
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
@@ -502,7 +745,7 @@ func (s *Store) groupHourlyTrend(groupID int64) []HourPoint {
 // InsertProbe 记录一次探测结果。status 为栅栏档位：1正常 2降级 3故障。
 func (s *Store) InsertProbe(monitorID int64, status int, latMs int64) error {
 	_, err := s.db.Exec(`INSERT INTO probe_results(monitor_id,status,latency_ms,created_at) VALUES(?,?,?,?)`,
-		monitorID, status, latMs, time.Now().Unix())
+		monitorID, status, latMs, s.timeValue(time.Now()))
 	return err
 }
 
@@ -514,11 +757,12 @@ func (s *Store) MonitorHourlyTrend(monitorID int64) []HourPoint {
 	start := curHour.Add(-time.Duration(hours-1) * time.Hour)
 	type agg struct{ total, succ int }
 	buckets := make(map[int64]*agg, hours)
-	rows, err := s.db.Query(`SELECT
-		(created_at/3600)*3600 AS hour, COUNT(*),
+	query := fmt.Sprintf(`SELECT
+		%s AS hour, COUNT(*),
 		SUM(CASE WHEN status=1 THEN 1 ELSE 0 END)
 		FROM probe_results WHERE monitor_id=? AND created_at>=?
-		GROUP BY hour`, monitorID, start.Unix())
+		GROUP BY hour`, s.hourExpr("created_at"))
+	rows, err := s.db.Query(query, monitorID, s.timeValue(start))
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
@@ -555,17 +799,17 @@ func (s *Store) MonitorHourlyTrend(monitorID int64) []HourPoint {
 // reqs/succ：总数与成功(status=1)数；avgMs：成功探测的平均延迟。
 // lastStatus/lastMs/lastTS：最近一次探测（决定当前 State）；无探测时 reqs=0。
 func (s *Store) MonitorRecent(monitorID int64) (reqs, succ int, avgMs, lastMs, lastTS int64, lastStatus int) {
-	since := time.Now().Add(-24 * time.Hour).Unix()
+	since := s.timeValue(time.Now().Add(-24 * time.Hour))
 	s.db.QueryRow(`SELECT
 		COUNT(*),
 		COALESCE(SUM(CASE WHEN status=1 THEN 1 ELSE 0 END),0),
-		COALESCE(CAST(ROUND(AVG(CASE WHEN status=1 THEN latency_ms END)) AS INTEGER),0)
+		COALESCE(CAST(ROUND(AVG(CASE WHEN status=1 THEN latency_ms END)) AS BIGINT),0)
 		FROM probe_results WHERE monitor_id=? AND created_at>=?`, monitorID, since).
 		Scan(&reqs, &succ, &avgMs)
 	// 最近一行不受 24h 窗口限制，保证刚重启也能显示上次状态
-	s.db.QueryRow(`SELECT status, latency_ms, created_at FROM probe_results
-		WHERE monitor_id=? ORDER BY id DESC LIMIT 1`, monitorID).
-		Scan(&lastStatus, &lastMs, &lastTS)
+	lastQuery := fmt.Sprintf(`SELECT status, latency_ms, %s FROM probe_results
+		WHERE monitor_id=? ORDER BY id DESC LIMIT 1`, s.unixExpr("created_at"))
+	s.db.QueryRow(lastQuery, monitorID).Scan(&lastStatus, &lastMs, &lastTS)
 	return
 }
 
@@ -574,7 +818,7 @@ func (s *Store) PruneProbes(keepHours int) (int64, error) {
 	if keepHours <= 0 {
 		return 0, nil
 	}
-	cutoff := time.Now().Add(-time.Duration(keepHours) * time.Hour).Unix()
+	cutoff := s.timeValue(time.Now().Add(-time.Duration(keepHours) * time.Hour))
 	res, err := s.db.Exec(`DELETE FROM probe_results WHERE created_at < ?`, cutoff)
 	if err != nil {
 		return 0, err
@@ -590,11 +834,9 @@ func (s *Store) ForgetProbes(monitorID int64) error {
 }
 
 func (s *Store) CreateGroup(name, desc string) (int64, error) {
-	res, err := s.db.Exec(`INSERT INTO groups(name,description) VALUES(?,?)`, name, desc)
-	if err != nil {
-		return 0, err
-	}
-	return res.LastInsertId()
+	var id int64
+	err := s.db.QueryRow(`INSERT INTO groups(name,description) VALUES(?,?) RETURNING id`, name, desc).Scan(&id)
+	return id, err
 }
 
 func (s *Store) UpdateGroup(id int64, name, desc string) error {
@@ -633,7 +875,7 @@ type Member struct {
 	GroupEnabled bool   `json:"group_enabled"` // 组内开关
 	Priority     int    `json:"priority"`
 	Weight       int    `json:"weight"`
-	ChannelProbe bool   `json:"channel_probe"` // 渠道级探测：前端据此决定运行时列模型徽章「异常才显」
+	ChannelProbe bool   `json:"channel_probe"` // 兼容旧数据
 }
 
 func (s *Store) ListGroupMembers(groupID int64) ([]*Member, error) {
@@ -682,13 +924,13 @@ func (s *Store) SetMemberEnabled(groupID, upstreamID int64, enabled bool) error 
 // GroupByKey 根据接入 key 找到其绑定的分组 id（路由核心），仅匹配启用的 key。
 func (s *Store) GroupByKey(key string) (int64, bool) {
 	var gid int64
-	err := s.db.QueryRow(`SELECT group_id FROM access_keys WHERE key=? AND enabled=1`, key).Scan(&gid)
+	err := s.db.QueryRow(`SELECT group_id FROM access_keys WHERE key=? AND enabled=TRUE`, key).Scan(&gid)
 	return gid, err == nil
 }
 
 // GroupAndKeyByKey 同 GroupByKey，但一并返回密钥名(供请求记录展示来源客户端)。
 func (s *Store) GroupAndKeyByKey(key string) (gid int64, name string, ok bool) {
-	err := s.db.QueryRow(`SELECT group_id,COALESCE(name,'') FROM access_keys WHERE key=? AND enabled=1`, key).Scan(&gid, &name)
+	err := s.db.QueryRow(`SELECT group_id,COALESCE(name,'') FROM access_keys WHERE key=? AND enabled=TRUE`, key).Scan(&gid, &name)
 	return gid, name, err == nil
 }
 
@@ -699,7 +941,7 @@ func (s *Store) CreateKey(name string, groupID int64) (string, error) {
 		return "", err
 	}
 	key := "sk-mux-" + hex.EncodeToString(b)
-	if _, err := s.db.Exec(`INSERT INTO access_keys(name,key,group_id,enabled) VALUES(?,?,?,1)`,
+	if _, err := s.db.Exec(`INSERT INTO access_keys(name,key,group_id,enabled) VALUES(?,?,?,TRUE)`,
 		name, key, groupID); err != nil {
 		return "", err
 	}
@@ -739,55 +981,170 @@ func (s *Store) DeleteKey(id int64) error {
 	return err
 }
 
-// --- 调用日志 ---
+// --- 请求审计 ---
 
-// LogEntry 一条转发日志（JOIN 出上游名、分组名供展示）。
-type LogEntry struct {
+type RequestAttemptRecord struct {
+	AttemptNo   int
+	UpstreamID  int64
+	Status      int
+	Outcome     string
+	TTFTMs      int64
+	DurationMs  int64
+	CreatedAt   time.Time
+	CompletedAt time.Time
+	Error       string
+}
+
+type RequestRecord struct {
+	RequestID       string
+	GroupID         int64
+	FinalUpstreamID int64
+	Model           string
+	Endpoint        string
+	KeyName         string
+	Status          int
+	Outcome         string
+	TTFTMs          int64
+	DurationMs      int64
+	CreatedAt       time.Time
+	CompletedAt     time.Time
+	Error           string
+	Attempts        []RequestAttemptRecord
+}
+
+type RequestAttemptEntry struct {
 	ID           int64  `json:"id"`
-	GroupID      int64  `json:"group_id"`
-	GroupName    string `json:"group_name"`
+	AttemptNo    int    `json:"attempt_no"`
 	UpstreamID   int64  `json:"upstream_id"`
 	UpstreamName string `json:"upstream_name"`
-	Model        string `json:"model"`  // 请求模型；旧数据/解析失败为空
-	Status       int    `json:"status"` // HTTP 状态码；网络失败为 0
-	LatencyMs    int64  `json:"latency_ms"`
+	Status       int    `json:"status"`
+	Outcome      string `json:"outcome"`
+	TTFTMs       int64  `json:"ttft_ms"`
+	DurationMs   int64  `json:"duration_ms"`
 	CreatedAt    int64  `json:"created_at"`
-	Endpoint     string `json:"endpoint"` // 请求端点路径，如 /v1/messages；旧数据为空
-	KeyName      string `json:"key_name"` // 命中的接入密钥名；旧数据为空
-	Retries      int    `json:"retries"`  // 本次落库时已重试次数(0=首次命中)
-	Error        string `json:"error"`    // 错误摘要；成功或旧数据为空
+	CompletedAt  int64  `json:"completed_at"`
+	Error        string `json:"error"`
 }
 
-// Log 记一条转发调用日志（异步友好：忽略写入错误，不阻塞转发）。
-func (s *Store) Log(groupID, upstreamID int64, model, endpoint, keyName string, retries, status int, latencyMs int64, errorText string) {
-	s.db.Exec(`INSERT INTO logs(group_id,upstream_id,model,endpoint,key_name,retries,status,latency_ms,created_at,error_text) VALUES(?,?,?,?,?,?,?,?,?,?)`,
-		groupID, upstreamID, model, endpoint, keyName, retries, status, latencyMs, time.Now().Unix(), errorText)
+type RequestEntry struct {
+	ID                int64                  `json:"id"`
+	RequestID         string                 `json:"request_id"`
+	GroupID           int64                  `json:"group_id"`
+	GroupName         string                 `json:"group_name"`
+	FinalUpstreamID   int64                  `json:"final_upstream_id"`
+	FinalUpstreamName string                 `json:"final_upstream_name"`
+	Model             string                 `json:"model"`
+	Endpoint          string                 `json:"endpoint"`
+	KeyName           string                 `json:"key_name"`
+	Status            int                    `json:"status"`
+	Outcome           string                 `json:"outcome"`
+	TTFTMs            int64                  `json:"ttft_ms"`
+	DurationMs        int64                  `json:"duration_ms"`
+	AttemptCount      int                    `json:"attempt_count"`
+	CreatedAt         int64                  `json:"created_at"`
+	CompletedAt       int64                  `json:"completed_at"`
+	Error             string                 `json:"error"`
+	Attempts          []*RequestAttemptEntry `json:"attempts"`
 }
 
-// LogPage 一页日志 + 游标分页元信息。
-type LogPage struct {
-	Entries    []*LogEntry `json:"entries"`
-	HasMore    bool        `json:"has_more"`
-	NextCursor int64       `json:"next_cursor"` // 下一页传 before=此值；0=没有更多
+type RequestPage struct {
+	Entries    []*RequestEntry `json:"entries"`
+	HasMore    bool            `json:"has_more"`
+	NextCursor int64           `json:"next_cursor"`
 }
 
-// ListLogsPage 游标分页 + 服务端筛选。
-// beforeID<=0 从最新开始；否则取 id<beforeID 的更旧一页（倒序）。
-// model/group 非空按精确匹配；statusClass: "ok"=2xx/3xx, "fail"=其余(含网络失败0)，空=不限。
-// 多取一条判断 hasMore，并以本页最后一条 id 作为下一页游标。
-func (s *Store) ListLogsPage(beforeID int64, limit int, model, group, statusClass string) (*LogPage, error) {
+func (s *Store) EnqueueRequest(record RequestRecord) bool {
+	select {
+	case s.requestQueue <- requestWrite{record: &record}:
+		return true
+	default:
+		dropped := s.requestDrops.Add(1)
+		if dropped == 1 || dropped%100 == 0 {
+			slog.Error("request audit queue full", "dropped", dropped)
+		}
+		return false
+	}
+}
+
+func (s *Store) FlushRequests(ctx context.Context) error {
+	done := make(chan struct{})
+	select {
+	case s.requestQueue <- requestWrite{barrier: done}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Store) RequestDrops() uint64 { return s.requestDrops.Load() }
+
+func (s *Store) runRequestWriter() {
+	defer close(s.requestDone)
+	for item := range s.requestQueue {
+		if item.barrier != nil {
+			close(item.barrier)
+			continue
+		}
+		if err := s.writeRequest(*item.record); err != nil {
+			s.requestDrops.Add(1)
+			slog.Error("write request audit failed", "request_id", item.record.RequestID, "err", err)
+		}
+	}
+}
+
+func (s *Store) writeRequest(record RequestRecord) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`INSERT INTO requests(
+		request_id,group_id,final_upstream_id,model,endpoint,key_name,status,outcome,
+		ttft_ms,duration_ms,attempt_count,created_at,completed_at,error_text)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		record.RequestID, record.GroupID, record.FinalUpstreamID, record.Model, record.Endpoint,
+		record.KeyName, record.Status, record.Outcome, record.TTFTMs, record.DurationMs,
+		len(record.Attempts), s.timeValue(record.CreatedAt), s.timeValue(record.CompletedAt), record.Error)
+	if err != nil {
+		return err
+	}
+	for _, attempt := range record.Attempts {
+		_, err = tx.Exec(`INSERT INTO request_attempts(
+			request_id,attempt_no,upstream_id,status,outcome,ttft_ms,duration_ms,created_at,completed_at,error_text)
+			VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			record.RequestID, attempt.AttemptNo, attempt.UpstreamID, attempt.Status, attempt.Outcome,
+			attempt.TTFTMs, attempt.DurationMs, s.timeValue(attempt.CreatedAt),
+			s.timeValue(attempt.CompletedAt), attempt.Error)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ListRequestsPage(beforeID int64, limit int, model, group, statusClass string) (*RequestPage, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 50
 	}
-	q := `SELECT l.id,l.group_id,COALESCE(g.name,''),l.upstream_id,COALESCE(u.name,''),l.model,l.status,l.latency_ms,l.created_at,l.endpoint,l.key_name,l.retries,l.error_text
-		FROM logs l LEFT JOIN upstreams u ON u.id=l.upstream_id LEFT JOIN groups g ON g.id=l.group_id WHERE 1=1`
+	q := fmt.Sprintf(`SELECT r.id,r.request_id,r.group_id,COALESCE(g.name,''),
+		r.final_upstream_id,COALESCE(u.name,''),r.model,r.endpoint,r.key_name,r.status,r.outcome,
+		r.ttft_ms,r.duration_ms,r.attempt_count,%s,%s,r.error_text
+		FROM requests r
+		LEFT JOIN upstreams u ON u.id=r.final_upstream_id
+		LEFT JOIN groups g ON g.id=r.group_id WHERE 1=1`,
+		s.unixExpr("r.created_at"), s.unixExpr("r.completed_at"))
 	var args []any
 	if beforeID > 0 {
-		q += " AND l.id < ?"
+		q += " AND r.id < ?"
 		args = append(args, beforeID)
 	}
 	if model != "" {
-		q += " AND l.model = ?"
+		q += " AND r.model = ?"
 		args = append(args, model)
 	}
 	if group != "" {
@@ -796,21 +1153,25 @@ func (s *Store) ListLogsPage(beforeID int64, limit int, model, group, statusClas
 	}
 	switch statusClass {
 	case "ok":
-		q += " AND l.status >= 200 AND l.status < 400"
+		q += " AND r.outcome = 'success'"
 	case "fail":
-		q += " AND (l.status < 200 OR l.status >= 400)"
+		q += " AND r.outcome <> 'success'"
 	}
-	q += " ORDER BY l.id DESC LIMIT ?"
-	args = append(args, limit+1) // 多取一条探测 hasMore
+	q += " ORDER BY r.id DESC LIMIT ?"
+	args = append(args, limit+1)
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	page := &LogPage{Entries: []*LogEntry{}}
+	page := &RequestPage{Entries: []*RequestEntry{}}
 	for rows.Next() {
-		e := &LogEntry{}
-		if err := rows.Scan(&e.ID, &e.GroupID, &e.GroupName, &e.UpstreamID, &e.UpstreamName, &e.Model, &e.Status, &e.LatencyMs, &e.CreatedAt, &e.Endpoint, &e.KeyName, &e.Retries, &e.Error); err != nil {
+		e := &RequestEntry{}
+		if err := rows.Scan(
+			&e.ID, &e.RequestID, &e.GroupID, &e.GroupName, &e.FinalUpstreamID,
+			&e.FinalUpstreamName, &e.Model, &e.Endpoint, &e.KeyName, &e.Status, &e.Outcome,
+			&e.TTFTMs, &e.DurationMs, &e.AttemptCount, &e.CreatedAt, &e.CompletedAt, &e.Error,
+		); err != nil {
 			return nil, err
 		}
 		page.Entries = append(page.Entries, e)
@@ -818,9 +1179,15 @@ func (s *Store) ListLogsPage(beforeID int64, limit int, model, group, statusClas
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if len(page.Entries) > limit { // 取到了探测行 → 还有更多
+	if len(page.Entries) > limit {
 		page.Entries = page.Entries[:limit]
 		page.HasMore = true
+	}
+	for _, entry := range page.Entries {
+		entry.Attempts, err = s.listRequestAttempts(entry.RequestID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if n := len(page.Entries); n > 0 {
 		page.NextCursor = page.Entries[n-1].ID
@@ -828,7 +1195,29 @@ func (s *Store) ListLogsPage(beforeID int64, limit int, model, group, statusClas
 	return page, nil
 }
 
-// LogFilterOptions 日志里出现过的模型/分组名（去重排序），供前端筛选下拉用全量值。
+func (s *Store) listRequestAttempts(requestID string) ([]*RequestAttemptEntry, error) {
+	q := fmt.Sprintf(`SELECT a.id,a.attempt_no,a.upstream_id,COALESCE(u.name,''),a.status,a.outcome,
+		a.ttft_ms,a.duration_ms,%s,%s,a.error_text
+		FROM request_attempts a LEFT JOIN upstreams u ON u.id=a.upstream_id
+		WHERE a.request_id=? ORDER BY a.attempt_no`,
+		s.unixExpr("a.created_at"), s.unixExpr("a.completed_at"))
+	rows, err := s.db.Query(q, requestID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*RequestAttemptEntry{}
+	for rows.Next() {
+		e := &RequestAttemptEntry{}
+		if err := rows.Scan(&e.ID, &e.AttemptNo, &e.UpstreamID, &e.UpstreamName, &e.Status,
+			&e.Outcome, &e.TTFTMs, &e.DurationMs, &e.CreatedAt, &e.CompletedAt, &e.Error); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 type LogFilterOptions struct {
 	Models []string `json:"models"`
 	Groups []string `json:"groups"`
@@ -844,28 +1233,22 @@ func (s *Store) LogFilterOptions() (*LogFilterOptions, error) {
 		defer rows.Close()
 		var out []string
 		for rows.Next() {
-			var v string
-			if err := rows.Scan(&v); err != nil {
+			var value string
+			if err := rows.Scan(&value); err != nil {
 				return nil, err
 			}
-			if v != "" {
-				out = append(out, v)
+			if value != "" {
+				out = append(out, value)
 			}
 		}
 		return out, rows.Err()
 	}
 	var err error
-	if opt.Models, err = collect(`SELECT DISTINCT model FROM logs WHERE model<>'' ORDER BY model`); err != nil {
+	if opt.Models, err = collect(`SELECT DISTINCT model FROM requests WHERE model<>'' ORDER BY model`); err != nil {
 		return nil, err
 	}
-	if opt.Groups, err = collect(`SELECT DISTINCT g.name FROM logs l JOIN groups g ON g.id=l.group_id ORDER BY g.name`); err != nil {
+	if opt.Groups, err = collect(`SELECT DISTINCT g.name FROM requests r JOIN groups g ON g.id=r.group_id ORDER BY g.name`); err != nil {
 		return nil, err
-	}
-	if opt.Models == nil {
-		opt.Models = []string{}
-	}
-	if opt.Groups == nil {
-		opt.Groups = []string{}
 	}
 	return opt, nil
 }
@@ -878,15 +1261,15 @@ type RouteSample struct {
 	LatencyMs  int64
 }
 
-// RecentSamples 取最近 limit 条日志、按时间【正序】(旧→新)返回，供 EWMA 顺序回放。
-// 只取真实转发记录用于重建选路预估；网络失败(status=0)也算样本(OK=false、延迟不计)。
+// RecentSamples 只回放会影响路由健康的成功或失败尝试。
 func (s *Store) RecentSamples(limit int) ([]RouteSample, error) {
 	if limit <= 0 {
 		limit = 2000
 	}
-	// 先按 id 倒序取最近 limit 条，再正序回放（子查询取最近、外层翻正序）
-	rows, err := s.db.Query(`SELECT upstream_id,model,status,latency_ms FROM
-		(SELECT id,upstream_id,model,status,latency_ms FROM logs ORDER BY id DESC LIMIT ?) ORDER BY id ASC`, limit)
+	rows, err := s.db.Query(`SELECT a.upstream_id,r.model,a.outcome,a.ttft_ms FROM
+		(SELECT id,request_id,upstream_id,outcome,ttft_ms FROM request_attempts
+		 WHERE upstream_id>0 AND outcome IN ('success','failed') ORDER BY id DESC LIMIT ?) a
+		JOIN requests r ON r.request_id=a.request_id ORDER BY a.id ASC`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -894,48 +1277,33 @@ func (s *Store) RecentSamples(limit int) ([]RouteSample, error) {
 	var out []RouteSample
 	for rows.Next() {
 		var s RouteSample
-		var status int
-		if err := rows.Scan(&s.UpstreamID, &s.Model, &status, &s.LatencyMs); err != nil {
+		var outcome string
+		if err := rows.Scan(&s.UpstreamID, &s.Model, &outcome, &s.LatencyMs); err != nil {
 			return nil, err
 		}
-		s.OK = status >= 200 && status < 400
+		s.OK = outcome == "success"
 		out = append(out, s)
 	}
 	return out, rows.Err()
 }
 
-// ListLogs 倒序返回最近 limit 条日志（limit<=0 时默认 100）。
-func (s *Store) ListLogs(limit int) ([]*LogEntry, error) {
-	if limit <= 0 {
-		limit = 100
-	}
-	rows, err := s.db.Query(`SELECT l.id,l.group_id,COALESCE(g.name,''),l.upstream_id,COALESCE(u.name,''),l.model,l.status,l.latency_ms,l.created_at,l.endpoint,l.key_name,l.retries,l.error_text
-		FROM logs l LEFT JOIN upstreams u ON u.id=l.upstream_id LEFT JOIN groups g ON g.id=l.group_id ORDER BY l.id DESC LIMIT ?`, limit)
+func (s *Store) ListRequests(limit int) ([]*RequestEntry, error) {
+	page, err := s.ListRequestsPage(0, limit, "", "", "")
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []*LogEntry
-	for rows.Next() {
-		e := &LogEntry{}
-		if err := rows.Scan(&e.ID, &e.GroupID, &e.GroupName, &e.UpstreamID, &e.UpstreamName, &e.Model, &e.Status, &e.LatencyMs, &e.CreatedAt, &e.Endpoint, &e.KeyName, &e.Retries, &e.Error); err != nil {
-			return nil, err
-		}
-		out = append(out, e)
-	}
-	return out, rows.Err()
+	return page.Entries, nil
 }
 
-// PruneLogs 只保留最新 keep 条调用日志，删除更旧的，返回删除行数。
-// keep<=0 视为关闭清理。利用主键自增有序：取第 keep 新的 id 当阈值，删比它更小的。
-// 日志数 <= keep 时子查询取到的最小 id 即全表最小，id < 它删不到任何行。
-func (s *Store) PruneLogs(keep int) (int64, error) {
-	if keep <= 0 {
+// PruneRequests 每轮分批删除超过 keepDays 天的请求，尝试记录由外键级联删除。
+func (s *Store) PruneRequests(keepDays, batch int) (int64, error) {
+	if keepDays <= 0 || batch <= 0 {
 		return 0, nil
 	}
-	res, err := s.db.Exec(
-		`DELETE FROM logs WHERE id < (SELECT MIN(id) FROM (SELECT id FROM logs ORDER BY id DESC LIMIT ?))`,
-		keep)
+	cutoff := s.timeValue(time.Now().Add(-time.Duration(keepDays) * 24 * time.Hour))
+	res, err := s.db.Exec(`DELETE FROM requests WHERE id IN (
+		SELECT id FROM requests WHERE created_at < ? ORDER BY created_at LIMIT ?
+	)`, cutoff, batch)
 	if err != nil {
 		return 0, err
 	}

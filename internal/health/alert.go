@@ -15,7 +15,7 @@ import (
 type alertPayload struct {
 	UpstreamID   int64  `json:"upstream_id"`
 	UpstreamName string `json:"upstream_name"`
-	Model        string `json:"model"` // ""=上游级
+	Model        string `json:"model"` // 触发渠道状态变化的请求/探测模型
 	FromState    string `json:"from_state"`
 	ToState      string `json:"to_state"`
 	Fails        int    `json:"fails"`
@@ -35,12 +35,11 @@ type WebhookAlerter struct {
 	lastSent map[debounceKey]time.Time
 }
 
-// debounceKey 去抖槽键：在 (上游,模型) 基础上并入方向(recovered)，
-// 使「熔断(DOWN)」与「恢复(RECOVERED)」各自独立去抖——
-// 否则 debounce 调大时，恢复告警会复用熔断刚占的槽被吞掉(M1)。
+// debounceKey is channel-level. The triggering model remains in the payload,
+// but must not create independent debounce slots for one upstream breaker.
 type debounceKey struct {
-	key       breakerKey
-	recovered bool // true=恢复(→CLOSED)，false=熔断(→OPEN)
+	upstreamID int64
+	recovered  bool // true=恢复(→CLOSED)，false=熔断(→OPEN)
 }
 
 // NewWebhookAlerter 构造告警器。webhook/debounce 为运行时 getter（页面可配）；
@@ -65,7 +64,7 @@ func (a *WebhookAlerter) Notify(ev AlertEvent) {
 		return
 	}
 	// 去抖键并入方向：恢复(→CLOSED)与熔断各占独立槽，互不吞没(M1)
-	if !a.allow(debounceKey{key: breakerKey{ev.UpstreamID, ev.Model}, recovered: ev.ToState == Closed.String()}) {
+	if !a.allow(debounceKey{upstreamID: ev.UpstreamID, recovered: ev.ToState == Closed.String()}) {
 		return // 去抖窗口内已发过，丢弃
 	}
 
