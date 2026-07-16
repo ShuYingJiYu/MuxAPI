@@ -18,10 +18,10 @@ type groupRow struct {
 }
 
 type upstreamRow struct {
-	id                           int64
-	name, baseURL, apiKey, proxy string
-	enabled, channelProbe        bool
-	sortOrder                    int
+	id                                     int64
+	name, baseURL, apiKey, proxy, protocol string
+	enabled, channelProbe                  bool
+	sortOrder                              int
 }
 
 type memberRow struct {
@@ -89,12 +89,12 @@ func main() {
 			row.id, row.name, row.description)
 	}
 	for _, row := range upstreams {
-		mustExec(tx, `INSERT INTO upstreams(id,name,base_url,api_key,proxy,enabled,channel_probe,sort_order)
-			VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(id) DO UPDATE SET
+		mustExec(tx, `INSERT INTO upstreams(id,name,base_url,api_key,proxy,protocol,enabled,channel_probe,sort_order)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(id) DO UPDATE SET
 			name=EXCLUDED.name,base_url=EXCLUDED.base_url,api_key=EXCLUDED.api_key,
-			proxy=EXCLUDED.proxy,enabled=EXCLUDED.enabled,channel_probe=EXCLUDED.channel_probe,
+			proxy=EXCLUDED.proxy,protocol=EXCLUDED.protocol,enabled=EXCLUDED.enabled,channel_probe=EXCLUDED.channel_probe,
 			sort_order=EXCLUDED.sort_order`, row.id, row.name, row.baseURL, row.apiKey, row.proxy,
-			row.enabled, row.channelProbe, row.sortOrder)
+			row.protocol, row.enabled, row.channelProbe, row.sortOrder)
 	}
 	for _, row := range members {
 		mustExec(tx, `INSERT INTO group_upstreams(group_id,upstream_id,priority,weight,enabled)
@@ -155,16 +155,37 @@ func loadGroups(db *sql.DB) []groupRow {
 }
 
 func loadUpstreams(db *sql.DB) []upstreamRow {
-	rows := mustQuery(db, `SELECT id,name,base_url,api_key,proxy,enabled,channel_probe,sort_order FROM upstreams ORDER BY id`)
+	protocolColumn := `'passthrough'`
+	if sqliteColumnExists(db, "upstreams", "protocol") {
+		protocolColumn = `COALESCE(protocol,'passthrough')`
+	}
+	rows := mustQuery(db, fmt.Sprintf(`SELECT id,name,base_url,api_key,proxy,%s,enabled,channel_probe,sort_order FROM upstreams ORDER BY id`, protocolColumn))
 	defer rows.Close()
 	var out []upstreamRow
 	for rows.Next() {
 		var row upstreamRow
-		mustScan(rows, &row.id, &row.name, &row.baseURL, &row.apiKey, &row.proxy, &row.enabled, &row.channelProbe, &row.sortOrder)
+		mustScan(rows, &row.id, &row.name, &row.baseURL, &row.apiKey, &row.proxy, &row.protocol, &row.enabled, &row.channelProbe, &row.sortOrder)
 		out = append(out, row)
 	}
 	mustRows(rows)
 	return out
+}
+
+func sqliteColumnExists(db *sql.DB, table, column string) bool {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey) == nil && name == column {
+			return true
+		}
+	}
+	return false
 }
 
 func loadMembers(db *sql.DB) []memberRow {

@@ -2,15 +2,18 @@ package server
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/mirainya/muxapi/internal/translate"
 )
 
-// testEvent 推给前端的测试事件（仿 sub2api TestEvent）。
 type testEvent struct {
 	Type      string `json:"type"` // test_start | content | test_complete | error
 	Model     string `json:"model,omitempty"`
@@ -21,58 +24,81 @@ type testEvent struct {
 	Error     string `json:"error,omitempty"`
 }
 
-// testUpstreamChat 发一条真实 chat 请求走完整转发链路，SSE 逐块回显上游真实回复。
-// 这是端到端验证（能否真对话），区别于 /models 的「凭证能列模型」轻量探测。
+// testUpstreamChat sends a canonical Responses request through the configured
+// protocol translator, then converts the result back before reporting it.
 func (s *Server) testUpstreamChat(w http.ResponseWriter, r *http.Request, id int64) {
-	u, err := s.store.Get(id)
-	if err != nil {
-		http.Error(w, "upstream not found", 404)
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	model := r.URL.Query().Get("model")
+	u, err := s.store.Get(id)
+	if err != nil {
+		http.Error(w, "upstream not found", http.StatusNotFound)
+		return
+	}
+	model := strings.TrimSpace(r.URL.Query().Get("model"))
 	if model == "" {
 		model = "gpt-5.5"
 	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "streaming unsupported", 500)
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(200)
+	w.WriteHeader(http.StatusOK)
 
 	send := func(e testEvent) {
-		b, _ := json.Marshal(e)
-		fmt.Fprintf(w, "data: %s\n\n", b)
+		payload, _ := json.Marshal(e)
+		fmt.Fprintf(w, "data: %s\n\n", payload)
 		flusher.Flush()
 	}
-
 	send(testEvent{Type: "test_start", Model: model})
 
-	payload := fmt.Sprintf(
-		`{"model":%q,"messages":[{"role":"user","content":"hi"}],"max_tokens":64,"stream":true}`,
-		model)
-	req, err := u.BuildRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(payload), http.Header{})
+	target, valid := translate.NormalizeFormat(u.Protocol)
+	if !valid {
+		send(testEvent{Type: "error", Error: "unsupported upstream protocol: " + u.Protocol})
+		return
+	}
+	original, _ := json.Marshal(map[string]any{
+		"model":             model,
+		"input":             "Reply with OK.",
+		"max_output_tokens": 64,
+		"stream":            true,
+	})
+	exchange, err := translate.NewExchange(translate.OpenAIResponses, target, model, true, original)
 	if err != nil {
 		send(testEvent{Type: "error", Error: err.Error()})
 		return
 	}
+	path, err := translate.TargetPath(target, "/v1/responses")
+	if err != nil {
+		send(testEvent{Type: "error", Error: err.Error()})
+		return
+	}
+	req, err := u.BuildRequest(http.MethodPost, path, bytes.NewReader(exchange.UpstreamRequest), http.Header{
+		"Accept": []string{"text/event-stream"},
+	})
+	if err != nil {
+		send(testEvent{Type: "error", Error: err.Error()})
+		return
+	}
+	translate.ConfigureRequestHeaders(req.Header, target, exchange.Translated())
 	req = req.WithContext(r.Context())
 
 	start := time.Now()
-	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
+	resp, err := (&http.Client{Timeout: 60 * time.Second, Transport: u.NewTransport()}).Do(req)
 	if err != nil {
 		send(testEvent{Type: "error", Error: err.Error(), LatencyMs: time.Since(start).Milliseconds()})
 		return
 	}
 	defer resp.Body.Close()
 
-	// 非 2xx：透传上游真实状态码与错误体（402 余额 / 403 封禁 / 429 限流等）。
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode >= http.StatusBadRequest {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		send(testEvent{
 			Type:      "error",
@@ -83,52 +109,159 @@ func (s *Server) testUpstreamChat(w http.ResponseWriter, r *http.Request, id int
 		return
 	}
 
-	s.relayChatStream(resp.Body, send, start)
-}
-
-// relayChatStream 解析上游 OpenAI SSE 流，逐块把 delta 文字转成 content 事件。
-func (s *Server) relayChatStream(body io.Reader, send func(testEvent), start time.Time) {
-	// 用 bufio.Reader 按行读，不受 Scanner 1MB token 上限约束（单条 data: 行再长也不截断）。
-	br := bufio.NewReaderSize(body, 64*1024)
-	for {
-		raw, readErr := br.ReadString('\n')
-		line := strings.TrimSpace(raw)
-		if line != "" && strings.HasPrefix(line, "data:") {
-			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if data == "[DONE]" {
-				send(testEvent{Type: "test_complete", Success: true, LatencyMs: time.Since(start).Milliseconds()})
-				return
-			}
-			var chunk struct {
-				Choices []struct {
-					Delta struct {
-						Content string `json:"content"`
-					} `json:"delta"`
-				} `json:"choices"`
-				Error *struct {
-					Message string `json:"message"`
-				} `json:"error"`
-			}
-			if err := json.Unmarshal([]byte(data), &chunk); err == nil {
-				if chunk.Error != nil {
-					send(testEvent{Type: "error", Error: chunk.Error.Message, LatencyMs: time.Since(start).Milliseconds()})
-					return
-				}
-				for _, ch := range chunk.Choices {
-					if ch.Delta.Content != "" {
-						send(testEvent{Type: "content", Text: ch.Delta.Content})
-					}
-				}
-			}
-		}
-		if readErr != nil {
-			// 正常结束(EOF)才算测试通过；读流中途出错不能伪报成功完成。
-			if readErr == io.EOF {
-				send(testEvent{Type: "test_complete", Success: true, LatencyMs: time.Since(start).Milliseconds()})
-			} else {
-				send(testEvent{Type: "error", Error: readErr.Error(), LatencyMs: time.Since(start).Milliseconds()})
-			}
+	if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		s.relayTranslatedTestStream(r.Context(), resp.Body, exchange, send, start)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		send(testEvent{Type: "error", Error: err.Error(), LatencyMs: time.Since(start).Milliseconds()})
+		return
+	}
+	if exchange.Translated() {
+		body, err = exchange.TranslateNonStream(r.Context(), body)
+		if err != nil {
+			send(testEvent{Type: "error", Error: err.Error(), LatencyMs: time.Since(start).Milliseconds()})
 			return
 		}
 	}
+	s.relayTestResponseBody(body, send, start)
+}
+
+func (s *Server) relayTranslatedTestStream(ctx context.Context, body io.Reader, exchange *translate.Exchange, send func(testEvent), start time.Time) {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 64*1024), 52_428_800)
+	for scanner.Scan() {
+		line := bytes.Clone(scanner.Bytes())
+		upstreamDone := bytes.Equal(bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:"))), []byte("[DONE]"))
+		chunks, err := exchange.TranslateStream(ctx, line)
+		if err != nil {
+			send(testEvent{Type: "error", Error: err.Error(), LatencyMs: time.Since(start).Milliseconds()})
+			return
+		}
+		for _, chunk := range chunks {
+			terminal, failed := emitTestResponseEvents(chunk, send, start)
+			if terminal || failed {
+				return
+			}
+		}
+		if upstreamDone {
+			send(testEvent{Type: "test_complete", Success: true, LatencyMs: time.Since(start).Milliseconds()})
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		send(testEvent{Type: "error", Error: err.Error(), LatencyMs: time.Since(start).Milliseconds()})
+		return
+	}
+	send(testEvent{Type: "error", Error: "stream ended before response.completed", LatencyMs: time.Since(start).Milliseconds()})
+}
+
+func (s *Server) relayTestResponseBody(body []byte, send func(testEvent), start time.Time) {
+	var response struct {
+		Error  json.RawMessage `json:"error"`
+		Output []struct {
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		send(testEvent{Type: "error", Error: "invalid translated response: " + err.Error(), LatencyMs: time.Since(start).Milliseconds()})
+		return
+	}
+	if message := responseErrorMessage(response.Error); message != "" {
+		send(testEvent{Type: "error", Error: message, LatencyMs: time.Since(start).Milliseconds()})
+		return
+	}
+	for _, item := range response.Output {
+		for _, content := range item.Content {
+			if content.Text != "" {
+				send(testEvent{Type: "content", Text: content.Text})
+			}
+		}
+	}
+	send(testEvent{Type: "test_complete", Success: true, LatencyMs: time.Since(start).Milliseconds()})
+}
+
+func emitTestResponseEvents(chunk []byte, send func(testEvent), start time.Time) (terminal, failed bool) {
+	lines := strings.Split(strings.ReplaceAll(string(chunk), "\r\n", "\n"), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "event:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			send(testEvent{Type: "test_complete", Success: true, LatencyMs: time.Since(start).Milliseconds()})
+			return true, false
+		}
+		if !json.Valid([]byte(data)) {
+			continue
+		}
+		var event struct {
+			Type     string          `json:"type"`
+			Delta    string          `json:"delta"`
+			Message  string          `json:"message"`
+			Error    json.RawMessage `json:"error"`
+			Response struct {
+				Error json.RawMessage `json:"error"`
+			} `json:"response"`
+		}
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			continue
+		}
+		switch event.Type {
+		case "response.output_text.delta":
+			if event.Delta != "" {
+				send(testEvent{Type: "content", Text: event.Delta})
+			}
+		case "response.completed":
+			send(testEvent{Type: "test_complete", Success: true, LatencyMs: time.Since(start).Milliseconds()})
+			return true, false
+		case "response.failed", "response.incomplete", "error":
+			message := responseErrorMessage(event.Error)
+			if message == "" {
+				message = responseErrorMessage(event.Response.Error)
+			}
+			if message == "" {
+				message = event.Message
+			}
+			if message == "" {
+				message = event.Type
+			}
+			send(testEvent{Type: "error", Error: message, LatencyMs: time.Since(start).Milliseconds()})
+			return false, true
+		}
+	}
+	return false, false
+}
+
+func responseErrorMessage(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return ""
+	}
+	var message string
+	if json.Unmarshal(raw, &message) == nil {
+		return message
+	}
+	var object struct {
+		Message string `json:"message"`
+		Code    string `json:"code"`
+		Type    string `json:"type"`
+	}
+	if json.Unmarshal(raw, &object) == nil {
+		if object.Message != "" {
+			return object.Message
+		}
+		if object.Code != "" {
+			return object.Code
+		}
+		if object.Type != "" {
+			return object.Type
+		}
+	}
+	return string(raw)
 }

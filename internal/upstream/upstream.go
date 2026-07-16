@@ -19,6 +19,7 @@ type Upstream struct {
 	BaseURL      string // 中转站地址
 	APIKey       string // 透传凭证
 	Proxy        string // 转发/探测走的代理出口(空=按环境变量或直连)
+	Protocol     string // 上游协议；passthrough 保持客户端请求格式
 	Priority     int    // 组内视图：越小越优先
 	Weight       int    // 组内视图：同优先级层分流权重
 	Enabled      bool

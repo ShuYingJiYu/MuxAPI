@@ -291,6 +291,7 @@ func openSQLite(path string) (*Store, error) {
 	}
 	// 迁移：旧库 upstreams 补 proxy 列（已存在则忽略报错）
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN proxy TEXT NOT NULL DEFAULT ''`)
+	db.Exec(`ALTER TABLE upstreams ADD COLUMN protocol TEXT NOT NULL DEFAULT 'passthrough'`)
 	// 迁移：保留旧 channel_probe 列，运行时已固定使用渠道级熔断。
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN channel_probe INTEGER NOT NULL DEFAULT 1`)
 	// 迁移：旧库 upstreams 补 sort_order 列（拖拽排序权重，0=未排过按 id）
@@ -311,6 +312,36 @@ func openSQLite(path string) (*Store, error) {
 	db.Exec(`ALTER TABLE logs ADD COLUMN key_name TEXT NOT NULL DEFAULT ''`)
 	db.Exec(`ALTER TABLE logs ADD COLUMN retries INTEGER NOT NULL DEFAULT 0`)
 	db.Exec(`ALTER TABLE logs ADD COLUMN error_text TEXT NOT NULL DEFAULT ''`)
+	// Request audit detail columns. Errors are ignored because fresh schemas already contain them.
+	for _, statement := range []string{
+		`ALTER TABLE requests ADD COLUMN stream INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE requests ADD COLUMN request_bytes INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE requests ADD COLUMN response_bytes INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE requests ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE requests ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE requests ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE requests ADD COLUMN stream_completed INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE requests ADD COLUMN last_event TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE requests ADD COLUMN upstream_request_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE requests ADD COLUMN error_kind TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE requests ADD COLUMN error_source TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE request_attempts ADD COLUMN priority INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_attempts ADD COLUMN selection_reason TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE request_attempts ADD COLUMN health_before TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE request_attempts ADD COLUMN health_after TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE request_attempts ADD COLUMN response_bytes INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_attempts ADD COLUMN stream INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_attempts ADD COLUMN stream_completed INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_attempts ADD COLUMN last_event TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE request_attempts ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_attempts ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_attempts ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_attempts ADD COLUMN upstream_request_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE request_attempts ADD COLUMN error_kind TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE request_attempts ADD COLUMN error_source TEXT NOT NULL DEFAULT ''`,
+	} {
+		db.Exec(statement)
+	}
 	return newStore(&dbAdapter{DB: db}), nil
 }
 
@@ -326,6 +357,7 @@ CREATE TABLE IF NOT EXISTS upstreams (
 	base_url TEXT NOT NULL,
 	api_key  TEXT NOT NULL,
 	proxy    TEXT NOT NULL DEFAULT '',
+	protocol TEXT NOT NULL DEFAULT 'passthrough',
 	enabled  INTEGER NOT NULL DEFAULT 1,
 	channel_probe INTEGER NOT NULL DEFAULT 1,
 	sort_order INTEGER NOT NULL DEFAULT 0
@@ -397,7 +429,18 @@ CREATE TABLE IF NOT EXISTS requests (
 	attempt_count     INTEGER NOT NULL DEFAULT 0,
 	created_at        INTEGER NOT NULL,
 	completed_at      INTEGER NOT NULL,
-	error_text        TEXT NOT NULL DEFAULT ''
+	error_text        TEXT NOT NULL DEFAULT '',
+	stream            INTEGER NOT NULL DEFAULT 0,
+	request_bytes     INTEGER NOT NULL DEFAULT 0,
+	response_bytes    INTEGER NOT NULL DEFAULT 0,
+	input_tokens      INTEGER NOT NULL DEFAULT 0,
+	output_tokens     INTEGER NOT NULL DEFAULT 0,
+	cached_tokens     INTEGER NOT NULL DEFAULT 0,
+	stream_completed  INTEGER NOT NULL DEFAULT 0,
+	last_event        TEXT NOT NULL DEFAULT '',
+	upstream_request_id TEXT NOT NULL DEFAULT '',
+	error_kind        TEXT NOT NULL DEFAULT '',
+	error_source      TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS request_attempts (
 	id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -411,6 +454,20 @@ CREATE TABLE IF NOT EXISTS request_attempts (
 	created_at   INTEGER NOT NULL,
 	completed_at INTEGER NOT NULL,
 	error_text   TEXT NOT NULL DEFAULT '',
+	priority     INTEGER NOT NULL DEFAULT 0,
+	selection_reason TEXT NOT NULL DEFAULT '',
+	health_before TEXT NOT NULL DEFAULT '',
+	health_after TEXT NOT NULL DEFAULT '',
+	response_bytes INTEGER NOT NULL DEFAULT 0,
+	stream       INTEGER NOT NULL DEFAULT 0,
+	stream_completed INTEGER NOT NULL DEFAULT 0,
+	last_event   TEXT NOT NULL DEFAULT '',
+	input_tokens INTEGER NOT NULL DEFAULT 0,
+	output_tokens INTEGER NOT NULL DEFAULT 0,
+	cached_tokens INTEGER NOT NULL DEFAULT 0,
+	upstream_request_id TEXT NOT NULL DEFAULT '',
+	error_kind   TEXT NOT NULL DEFAULT '',
+	error_source TEXT NOT NULL DEFAULT '',
 	FOREIGN KEY (request_id) REFERENCES requests(request_id) ON DELETE CASCADE,
 	UNIQUE (request_id, attempt_no)
 );
@@ -420,6 +477,8 @@ CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests(created_at);
 CREATE INDEX IF NOT EXISTS idx_requests_group_time ON requests(group_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_requests_model_time ON requests(model, created_at);
 CREATE INDEX IF NOT EXISTS idx_requests_outcome_time ON requests(outcome, created_at);
+CREATE INDEX IF NOT EXISTS idx_requests_key_time ON requests(key_name, created_at);
+CREATE INDEX IF NOT EXISTS idx_requests_error_time ON requests(error_kind, created_at);
 CREATE INDEX IF NOT EXISTS idx_attempts_request ON request_attempts(request_id, attempt_no);
 CREATE INDEX IF NOT EXISTS idx_attempts_upstream_time ON request_attempts(upstream_id, created_at);`
 
@@ -431,7 +490,7 @@ func scanUps(rows *sql.Rows) ([]*upstream.Upstream, error) {
 	var list []*upstream.Upstream
 	for rows.Next() {
 		u := &upstream.Upstream{}
-		if err := rows.Scan(&u.ID, &u.Name, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Enabled, &u.Priority, &u.Weight, &u.ChannelProbe); err != nil {
+		if err := rows.Scan(&u.ID, &u.Name, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Protocol, &u.Enabled, &u.Priority, &u.Weight, &u.ChannelProbe); err != nil {
 			return nil, err
 		}
 		list = append(list, u)
@@ -442,7 +501,7 @@ func scanUps(rows *sql.Rows) ([]*upstream.Upstream, error) {
 // ListEnabledByGroup 返回某分组下启用的上游，JOIN 中间表填充组内 priority/weight，
 // 按组内优先级升序（调度用）。
 func (s *Store) ListEnabledByGroup(groupID int64) ([]*upstream.Upstream, error) {
-	rows, err := s.db.Query(`SELECT u.id,u.name,u.base_url,u.api_key,u.proxy,u.enabled,gu.priority,gu.weight,u.channel_probe
+	rows, err := s.db.Query(`SELECT u.id,u.name,u.base_url,u.api_key,u.proxy,u.protocol,u.enabled,gu.priority,gu.weight,u.channel_probe
 		FROM upstreams u JOIN group_upstreams gu ON gu.upstream_id=u.id
 		WHERE gu.group_id=? AND u.enabled=TRUE AND gu.enabled=TRUE ORDER BY gu.priority ASC`, groupID)
 	if err != nil {
@@ -453,7 +512,7 @@ func (s *Store) ListEnabledByGroup(groupID int64) ([]*upstream.Upstream, error) 
 
 // List 返回全部上游(含停用)，priority/weight 置 0（全局池无组内语义），供探测与后台管理。
 func (s *Store) List() ([]*upstream.Upstream, error) {
-	rows, err := s.db.Query(`SELECT id,name,base_url,api_key,proxy,enabled,0,0,channel_probe FROM upstreams ORDER BY sort_order, id`)
+	rows, err := s.db.Query(`SELECT id,name,base_url,api_key,proxy,protocol,enabled,0,0,channel_probe FROM upstreams ORDER BY sort_order, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -463,15 +522,15 @@ func (s *Store) List() ([]*upstream.Upstream, error) {
 // Get 按 id 取单个上游（含完整 api_key，供连通测试用）。
 func (s *Store) Get(id int64) (*upstream.Upstream, error) {
 	u := &upstream.Upstream{}
-	err := s.db.QueryRow(`SELECT id,name,base_url,api_key,proxy,enabled,channel_probe FROM upstreams WHERE id=?`, id).
-		Scan(&u.ID, &u.Name, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Enabled, &u.ChannelProbe)
+	err := s.db.QueryRow(`SELECT id,name,base_url,api_key,proxy,protocol,enabled,channel_probe FROM upstreams WHERE id=?`, id).
+		Scan(&u.ID, &u.Name, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Protocol, &u.Enabled, &u.ChannelProbe)
 	return u, err
 }
 
 func (s *Store) Create(u *upstream.Upstream) error {
-	_, err := s.db.Exec(`INSERT INTO upstreams(name,base_url,api_key,proxy,enabled,channel_probe,sort_order)
-		VALUES(?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM upstreams))`,
-		u.Name, u.BaseURL, u.APIKey, u.Proxy, u.Enabled, u.ChannelProbe)
+	_, err := s.db.Exec(`INSERT INTO upstreams(name,base_url,api_key,proxy,protocol,enabled,channel_probe,sort_order)
+		VALUES(?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM upstreams))`,
+		u.Name, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe)
 	return err
 }
 
@@ -492,12 +551,12 @@ func (s *Store) ReorderUpstreams(ids []int64) error {
 
 func (s *Store) Update(u *upstream.Upstream) error {
 	if u.APIKey == "" { // 留空则不改凭证（对齐后台「留空则不修改」语义）
-		_, err := s.db.Exec(`UPDATE upstreams SET name=?,base_url=?,proxy=?,enabled=?,channel_probe=? WHERE id=?`,
-			u.Name, u.BaseURL, u.Proxy, u.Enabled, u.ChannelProbe, u.ID)
+		_, err := s.db.Exec(`UPDATE upstreams SET name=?,base_url=?,proxy=?,protocol=?,enabled=?,channel_probe=? WHERE id=?`,
+			u.Name, u.BaseURL, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe, u.ID)
 		return err
 	}
-	_, err := s.db.Exec(`UPDATE upstreams SET name=?,base_url=?,api_key=?,proxy=?,enabled=?,channel_probe=? WHERE id=?`,
-		u.Name, u.BaseURL, u.APIKey, u.Proxy, u.Enabled, u.ChannelProbe, u.ID)
+	_, err := s.db.Exec(`UPDATE upstreams SET name=?,base_url=?,api_key=?,proxy=?,protocol=?,enabled=?,channel_probe=? WHERE id=?`,
+		u.Name, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe, u.ID)
 	return err
 }
 
@@ -871,6 +930,7 @@ type Member struct {
 	UpstreamID   int64  `json:"upstream_id"`
 	Name         string `json:"name"`
 	BaseURL      string `json:"base_url"`
+	Protocol     string `json:"protocol"`
 	Enabled      bool   `json:"enabled"`       // 全局开关
 	GroupEnabled bool   `json:"group_enabled"` // 组内开关
 	Priority     int    `json:"priority"`
@@ -879,7 +939,7 @@ type Member struct {
 }
 
 func (s *Store) ListGroupMembers(groupID int64) ([]*Member, error) {
-	rows, err := s.db.Query(`SELECT u.id,u.name,u.base_url,u.enabled,gu.enabled,gu.priority,gu.weight,u.channel_probe
+	rows, err := s.db.Query(`SELECT u.id,u.name,u.base_url,u.protocol,u.enabled,gu.enabled,gu.priority,gu.weight,u.channel_probe
 		FROM upstreams u JOIN group_upstreams gu ON gu.upstream_id=u.id
 		WHERE gu.group_id=? ORDER BY gu.priority ASC`, groupID)
 	if err != nil {
@@ -889,7 +949,7 @@ func (s *Store) ListGroupMembers(groupID int64) ([]*Member, error) {
 	var ms []*Member
 	for rows.Next() {
 		m := &Member{}
-		if err := rows.Scan(&m.UpstreamID, &m.Name, &m.BaseURL, &m.Enabled, &m.GroupEnabled, &m.Priority, &m.Weight, &m.ChannelProbe); err != nil {
+		if err := rows.Scan(&m.UpstreamID, &m.Name, &m.BaseURL, &m.Protocol, &m.Enabled, &m.GroupEnabled, &m.Priority, &m.Weight, &m.ChannelProbe); err != nil {
 			return nil, err
 		}
 		ms = append(ms, m)
@@ -984,46 +1044,94 @@ func (s *Store) DeleteKey(id int64) error {
 // --- 请求审计 ---
 
 type RequestAttemptRecord struct {
-	AttemptNo   int
-	UpstreamID  int64
-	Status      int
-	Outcome     string
-	TTFTMs      int64
-	DurationMs  int64
-	CreatedAt   time.Time
-	CompletedAt time.Time
-	Error       string
+	AttemptNo         int
+	UpstreamID        int64
+	Priority          int
+	SelectionReason   string
+	HealthBefore      string
+	HealthAfter       string
+	Status            int
+	Outcome           string
+	TTFTMs            int64
+	DurationMs        int64
+	ResponseBytes     int64
+	Stream            bool
+	StreamCompleted   bool
+	LastEvent         string
+	InputTokens       int64
+	OutputTokens      int64
+	CachedTokens      int64
+	UpstreamRequestID string
+	ErrorKind         string
+	ErrorSource       string
+	CreatedAt         time.Time
+	CompletedAt       time.Time
+	Error             string
 }
 
 type RequestRecord struct {
-	RequestID       string
-	GroupID         int64
-	FinalUpstreamID int64
-	Model           string
-	Endpoint        string
-	KeyName         string
-	Status          int
-	Outcome         string
-	TTFTMs          int64
-	DurationMs      int64
-	CreatedAt       time.Time
-	CompletedAt     time.Time
-	Error           string
-	Attempts        []RequestAttemptRecord
+	RequestID         string
+	GroupID           int64
+	FinalUpstreamID   int64
+	Model             string
+	Endpoint          string
+	KeyName           string
+	Stream            bool
+	RequestBytes      int64
+	ResponseBytes     int64
+	InputTokens       int64
+	OutputTokens      int64
+	CachedTokens      int64
+	StreamCompleted   bool
+	LastEvent         string
+	UpstreamRequestID string
+	ErrorKind         string
+	ErrorSource       string
+	Status            int
+	Outcome           string
+	TTFTMs            int64
+	DurationMs        int64
+	CreatedAt         time.Time
+	CompletedAt       time.Time
+	Error             string
+	Attempts          []RequestAttemptRecord
 }
 
 type RequestAttemptEntry struct {
-	ID           int64  `json:"id"`
+	ID                int64  `json:"id"`
+	AttemptNo         int    `json:"attempt_no"`
+	UpstreamID        int64  `json:"upstream_id"`
+	UpstreamName      string `json:"upstream_name"`
+	Priority          int    `json:"priority"`
+	SelectionReason   string `json:"selection_reason"`
+	HealthBefore      string `json:"health_before"`
+	HealthAfter       string `json:"health_after"`
+	Status            int    `json:"status"`
+	Outcome           string `json:"outcome"`
+	TTFTMs            int64  `json:"ttft_ms"`
+	DurationMs        int64  `json:"duration_ms"`
+	ResponseBytes     int64  `json:"response_bytes"`
+	Stream            bool   `json:"stream"`
+	StreamCompleted   bool   `json:"stream_completed"`
+	LastEvent         string `json:"last_event"`
+	InputTokens       int64  `json:"input_tokens"`
+	OutputTokens      int64  `json:"output_tokens"`
+	CachedTokens      int64  `json:"cached_tokens"`
+	UpstreamRequestID string `json:"upstream_request_id"`
+	ErrorKind         string `json:"error_kind"`
+	ErrorSource       string `json:"error_source"`
+	CreatedAt         int64  `json:"created_at"`
+	CompletedAt       int64  `json:"completed_at"`
+	Error             string `json:"error"`
+}
+
+type RequestRouteStep struct {
 	AttemptNo    int    `json:"attempt_no"`
 	UpstreamID   int64  `json:"upstream_id"`
 	UpstreamName string `json:"upstream_name"`
 	Status       int    `json:"status"`
 	Outcome      string `json:"outcome"`
-	TTFTMs       int64  `json:"ttft_ms"`
-	DurationMs   int64  `json:"duration_ms"`
-	CreatedAt    int64  `json:"created_at"`
-	CompletedAt  int64  `json:"completed_at"`
-	Error        string `json:"error"`
+	ErrorKind    string `json:"error_kind"`
 }
 
 type RequestEntry struct {
@@ -1036,6 +1144,17 @@ type RequestEntry struct {
 	Model             string                 `json:"model"`
 	Endpoint          string                 `json:"endpoint"`
 	KeyName           string                 `json:"key_name"`
+	Stream            bool                   `json:"stream"`
+	RequestBytes      int64                  `json:"request_bytes"`
+	ResponseBytes     int64                  `json:"response_bytes"`
+	InputTokens       int64                  `json:"input_tokens"`
+	OutputTokens      int64                  `json:"output_tokens"`
+	CachedTokens      int64                  `json:"cached_tokens"`
+	StreamCompleted   bool                   `json:"stream_completed"`
+	LastEvent         string                 `json:"last_event"`
+	UpstreamRequestID string                 `json:"upstream_request_id"`
+	ErrorKind         string                 `json:"error_kind"`
+	ErrorSource       string                 `json:"error_source"`
 	Status            int                    `json:"status"`
 	Outcome           string                 `json:"outcome"`
 	TTFTMs            int64                  `json:"ttft_ms"`
@@ -1044,7 +1163,8 @@ type RequestEntry struct {
 	CreatedAt         int64                  `json:"created_at"`
 	CompletedAt       int64                  `json:"completed_at"`
 	Error             string                 `json:"error"`
-	Attempts          []*RequestAttemptEntry `json:"attempts"`
+	Route             []RequestRouteStep     `json:"route,omitempty"`
+	Attempts          []*RequestAttemptEntry `json:"attempts,omitempty"`
 }
 
 type RequestPage struct {
@@ -1105,21 +1225,31 @@ func (s *Store) writeRequest(record RequestRecord) error {
 	defer tx.Rollback()
 	_, err = tx.Exec(`INSERT INTO requests(
 		request_id,group_id,final_upstream_id,model,endpoint,key_name,status,outcome,
-		ttft_ms,duration_ms,attempt_count,created_at,completed_at,error_text)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		ttft_ms,duration_ms,attempt_count,created_at,completed_at,error_text,stream,
+		request_bytes,response_bytes,input_tokens,output_tokens,cached_tokens,stream_completed,
+		last_event,upstream_request_id,error_kind,error_source)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		record.RequestID, record.GroupID, record.FinalUpstreamID, record.Model, record.Endpoint,
 		record.KeyName, record.Status, record.Outcome, record.TTFTMs, record.DurationMs,
-		len(record.Attempts), s.timeValue(record.CreatedAt), s.timeValue(record.CompletedAt), record.Error)
+		len(record.Attempts), s.timeValue(record.CreatedAt), s.timeValue(record.CompletedAt), record.Error,
+		record.Stream, record.RequestBytes, record.ResponseBytes, record.InputTokens, record.OutputTokens,
+		record.CachedTokens, record.StreamCompleted, record.LastEvent, record.UpstreamRequestID,
+		record.ErrorKind, record.ErrorSource)
 	if err != nil {
 		return err
 	}
 	for _, attempt := range record.Attempts {
 		_, err = tx.Exec(`INSERT INTO request_attempts(
-			request_id,attempt_no,upstream_id,status,outcome,ttft_ms,duration_ms,created_at,completed_at,error_text)
-			VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			request_id,attempt_no,upstream_id,status,outcome,ttft_ms,duration_ms,created_at,completed_at,error_text,
+			priority,selection_reason,health_before,health_after,response_bytes,stream,stream_completed,last_event,
+			input_tokens,output_tokens,cached_tokens,upstream_request_id,error_kind,error_source)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			record.RequestID, attempt.AttemptNo, attempt.UpstreamID, attempt.Status, attempt.Outcome,
 			attempt.TTFTMs, attempt.DurationMs, s.timeValue(attempt.CreatedAt),
-			s.timeValue(attempt.CompletedAt), attempt.Error)
+			s.timeValue(attempt.CompletedAt), attempt.Error, attempt.Priority, attempt.SelectionReason,
+			attempt.HealthBefore, attempt.HealthAfter, attempt.ResponseBytes, attempt.Stream,
+			attempt.StreamCompleted, attempt.LastEvent, attempt.InputTokens, attempt.OutputTokens,
+			attempt.CachedTokens, attempt.UpstreamRequestID, attempt.ErrorKind, attempt.ErrorSource)
 		if err != nil {
 			return err
 		}
@@ -1127,38 +1257,144 @@ func (s *Store) writeRequest(record RequestRecord) error {
 	return tx.Commit()
 }
 
-func (s *Store) ListRequestsPage(beforeID int64, limit int, model, group, statusClass string) (*RequestPage, error) {
+type RequestFilter struct {
+	BeforeID   int64
+	Limit      int
+	Offset     int
+	Model      string
+	Group      string
+	Status     string
+	KeyName    string
+	Endpoint   string
+	ErrorKind  string
+	Query      string
+	Stream     string
+	UpstreamID int64
+	Since      time.Time
+	Until      time.Time
+	Retried    bool
+	SlowMs     int64
+}
+
+func (s *Store) requestWhere(filter RequestFilter, includeCursor bool) (string, []any) {
+	var where strings.Builder
+	where.WriteString(" WHERE 1=1")
+	var args []any
+	if includeCursor && filter.BeforeID > 0 {
+		where.WriteString(" AND r.id < ?")
+		args = append(args, filter.BeforeID)
+	}
+	if filter.Model != "" {
+		where.WriteString(" AND r.model = ?")
+		args = append(args, filter.Model)
+	}
+	if filter.Group != "" {
+		where.WriteString(" AND g.name = ?")
+		args = append(args, filter.Group)
+	}
+	if filter.KeyName != "" {
+		where.WriteString(" AND r.key_name = ?")
+		args = append(args, filter.KeyName)
+	}
+	if filter.Endpoint != "" {
+		where.WriteString(" AND r.endpoint = ?")
+		args = append(args, filter.Endpoint)
+	}
+	if filter.ErrorKind != "" {
+		where.WriteString(" AND r.error_kind = ?")
+		args = append(args, filter.ErrorKind)
+	}
+	if filter.Query != "" {
+		where.WriteString(" AND LOWER(CAST(r.request_id AS TEXT)) LIKE ?")
+		args = append(args, strings.ToLower(filter.Query)+"%")
+	}
+	if filter.UpstreamID > 0 {
+		where.WriteString(" AND EXISTS (SELECT 1 FROM request_attempts af WHERE af.request_id=r.request_id AND af.upstream_id=?)")
+		args = append(args, filter.UpstreamID)
+	}
+	if !filter.Since.IsZero() {
+		where.WriteString(" AND r.created_at >= ?")
+		args = append(args, s.timeValue(filter.Since))
+	}
+	if !filter.Until.IsZero() {
+		where.WriteString(" AND r.created_at < ?")
+		args = append(args, s.timeValue(filter.Until))
+	}
+	if filter.Retried {
+		where.WriteString(" AND r.attempt_count > 1")
+	}
+	if filter.SlowMs > 0 {
+		where.WriteString(" AND r.duration_ms >= ?")
+		args = append(args, filter.SlowMs)
+	}
+	switch filter.Stream {
+	case "stream":
+		where.WriteString(" AND r.stream=TRUE")
+	case "nonstream":
+		where.WriteString(" AND r.stream=FALSE")
+	}
+	switch filter.Status {
+	case "direct_success":
+		where.WriteString(" AND r.outcome='success' AND r.attempt_count<=1")
+	case "failover_success":
+		where.WriteString(" AND r.outcome='success' AND r.attempt_count>1")
+	case "failed":
+		where.WriteString(" AND r.outcome IN ('failed','unavailable')")
+	case "partial":
+		where.WriteString(" AND r.outcome='partial'")
+	case "canceled":
+		where.WriteString(" AND r.outcome='canceled'")
+	case "client_error":
+		where.WriteString(" AND r.outcome='client_error'")
+	case "ok":
+		where.WriteString(" AND r.outcome='success'")
+	case "fail":
+		where.WriteString(" AND r.outcome<>'success'")
+	}
+	return where.String(), args
+}
+
+func (s *Store) requestSelect(where string) string {
+	return fmt.Sprintf(`SELECT r.id,r.request_id,r.group_id,COALESCE(g.name,''),
+		r.final_upstream_id,COALESCE(u.name,''),r.model,r.endpoint,r.key_name,r.status,r.outcome,
+		r.ttft_ms,r.duration_ms,r.attempt_count,%s,%s,r.error_text,r.stream,r.request_bytes,
+		r.response_bytes,r.input_tokens,r.output_tokens,r.cached_tokens,r.stream_completed,r.last_event,
+		r.upstream_request_id,r.error_kind,r.error_source
+		FROM requests r
+		LEFT JOIN upstreams u ON u.id=r.final_upstream_id
+		LEFT JOIN groups g ON g.id=r.group_id%s`,
+		s.unixExpr("r.created_at"), s.unixExpr("r.completed_at"), where)
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanRequestEntry(row rowScanner) (*RequestEntry, error) {
+	e := &RequestEntry{}
+	err := row.Scan(
+		&e.ID, &e.RequestID, &e.GroupID, &e.GroupName, &e.FinalUpstreamID,
+		&e.FinalUpstreamName, &e.Model, &e.Endpoint, &e.KeyName, &e.Status, &e.Outcome,
+		&e.TTFTMs, &e.DurationMs, &e.AttemptCount, &e.CreatedAt, &e.CompletedAt, &e.Error,
+		&e.Stream, &e.RequestBytes, &e.ResponseBytes, &e.InputTokens, &e.OutputTokens,
+		&e.CachedTokens, &e.StreamCompleted, &e.LastEvent, &e.UpstreamRequestID,
+		&e.ErrorKind, &e.ErrorSource,
+	)
+	return e, err
+}
+
+func (s *Store) ListRequestsPage(filter RequestFilter) (*RequestPage, error) {
+	limit := filter.Limit
 	if limit <= 0 || limit > 500 {
 		limit = 50
 	}
-	q := fmt.Sprintf(`SELECT r.id,r.request_id,r.group_id,COALESCE(g.name,''),
-		r.final_upstream_id,COALESCE(u.name,''),r.model,r.endpoint,r.key_name,r.status,r.outcome,
-		r.ttft_ms,r.duration_ms,r.attempt_count,%s,%s,r.error_text
-		FROM requests r
-		LEFT JOIN upstreams u ON u.id=r.final_upstream_id
-		LEFT JOIN groups g ON g.id=r.group_id WHERE 1=1`,
-		s.unixExpr("r.created_at"), s.unixExpr("r.completed_at"))
-	var args []any
-	if beforeID > 0 {
-		q += " AND r.id < ?"
-		args = append(args, beforeID)
-	}
-	if model != "" {
-		q += " AND r.model = ?"
-		args = append(args, model)
-	}
-	if group != "" {
-		q += " AND g.name = ?"
-		args = append(args, group)
-	}
-	switch statusClass {
-	case "ok":
-		q += " AND r.outcome = 'success'"
-	case "fail":
-		q += " AND r.outcome <> 'success'"
-	}
-	q += " ORDER BY r.id DESC LIMIT ?"
+	where, args := s.requestWhere(filter, true)
+	q := s.requestSelect(where) + " ORDER BY r.id DESC LIMIT ?"
 	args = append(args, limit+1)
+	if filter.Offset > 0 {
+		q += " OFFSET ?"
+		args = append(args, filter.Offset)
+	}
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
@@ -1166,12 +1402,8 @@ func (s *Store) ListRequestsPage(beforeID int64, limit int, model, group, status
 	defer rows.Close()
 	page := &RequestPage{Entries: []*RequestEntry{}}
 	for rows.Next() {
-		e := &RequestEntry{}
-		if err := rows.Scan(
-			&e.ID, &e.RequestID, &e.GroupID, &e.GroupName, &e.FinalUpstreamID,
-			&e.FinalUpstreamName, &e.Model, &e.Endpoint, &e.KeyName, &e.Status, &e.Outcome,
-			&e.TTFTMs, &e.DurationMs, &e.AttemptCount, &e.CreatedAt, &e.CompletedAt, &e.Error,
-		); err != nil {
+		e, err := scanRequestEntry(rows)
+		if err != nil {
 			return nil, err
 		}
 		page.Entries = append(page.Entries, e)
@@ -1183,11 +1415,8 @@ func (s *Store) ListRequestsPage(beforeID int64, limit int, model, group, status
 		page.Entries = page.Entries[:limit]
 		page.HasMore = true
 	}
-	for _, entry := range page.Entries {
-		entry.Attempts, err = s.listRequestAttempts(entry.RequestID)
-		if err != nil {
-			return nil, err
-		}
+	if err := s.loadRouteSummaries(page.Entries); err != nil {
+		return nil, err
 	}
 	if n := len(page.Entries); n > 0 {
 		page.NextCursor = page.Entries[n-1].ID
@@ -1195,9 +1424,56 @@ func (s *Store) ListRequestsPage(beforeID int64, limit int, model, group, status
 	return page, nil
 }
 
+func (s *Store) loadRouteSummaries(entries []*RequestEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(entries))
+	args := make([]any, len(entries))
+	byRequest := make(map[string]*RequestEntry, len(entries))
+	for i, entry := range entries {
+		placeholders[i] = "?"
+		args[i] = entry.RequestID
+		byRequest[entry.RequestID] = entry
+	}
+	q := `SELECT CAST(a.request_id AS TEXT),a.attempt_no,a.upstream_id,COALESCE(u.name,''),
+		a.status,a.outcome,a.error_kind FROM request_attempts a
+		LEFT JOIN upstreams u ON u.id=a.upstream_id
+		WHERE CAST(a.request_id AS TEXT) IN (` + strings.Join(placeholders, ",") + `)
+		ORDER BY a.request_id,a.attempt_no`
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var requestID string
+		var step RequestRouteStep
+		if err := rows.Scan(&requestID, &step.AttemptNo, &step.UpstreamID, &step.UpstreamName,
+			&step.Status, &step.Outcome, &step.ErrorKind); err != nil {
+			return err
+		}
+		if entry := byRequest[requestID]; entry != nil {
+			entry.Route = append(entry.Route, step)
+		}
+	}
+	return rows.Err()
+}
+
+func (s *Store) GetRequest(id int64) (*RequestEntry, error) {
+	entry, err := scanRequestEntry(s.db.QueryRow(s.requestSelect(" WHERE r.id=?"), id))
+	if err != nil {
+		return nil, err
+	}
+	entry.Attempts, err = s.listRequestAttempts(entry.RequestID)
+	return entry, err
+}
+
 func (s *Store) listRequestAttempts(requestID string) ([]*RequestAttemptEntry, error) {
 	q := fmt.Sprintf(`SELECT a.id,a.attempt_no,a.upstream_id,COALESCE(u.name,''),a.status,a.outcome,
-		a.ttft_ms,a.duration_ms,%s,%s,a.error_text
+		a.ttft_ms,a.duration_ms,%s,%s,a.error_text,a.priority,a.selection_reason,a.health_before,
+		a.health_after,a.response_bytes,a.stream,a.stream_completed,a.last_event,a.input_tokens,
+		a.output_tokens,a.cached_tokens,a.upstream_request_id,a.error_kind,a.error_source
 		FROM request_attempts a LEFT JOIN upstreams u ON u.id=a.upstream_id
 		WHERE a.request_id=? ORDER BY a.attempt_no`,
 		s.unixExpr("a.created_at"), s.unixExpr("a.completed_at"))
@@ -1210,7 +1486,10 @@ func (s *Store) listRequestAttempts(requestID string) ([]*RequestAttemptEntry, e
 	for rows.Next() {
 		e := &RequestAttemptEntry{}
 		if err := rows.Scan(&e.ID, &e.AttemptNo, &e.UpstreamID, &e.UpstreamName, &e.Status,
-			&e.Outcome, &e.TTFTMs, &e.DurationMs, &e.CreatedAt, &e.CompletedAt, &e.Error); err != nil {
+			&e.Outcome, &e.TTFTMs, &e.DurationMs, &e.CreatedAt, &e.CompletedAt, &e.Error,
+			&e.Priority, &e.SelectionReason, &e.HealthBefore, &e.HealthAfter, &e.ResponseBytes,
+			&e.Stream, &e.StreamCompleted, &e.LastEvent, &e.InputTokens, &e.OutputTokens,
+			&e.CachedTokens, &e.UpstreamRequestID, &e.ErrorKind, &e.ErrorSource); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -1219,12 +1498,24 @@ func (s *Store) listRequestAttempts(requestID string) ([]*RequestAttemptEntry, e
 }
 
 type LogFilterOptions struct {
-	Models []string `json:"models"`
-	Groups []string `json:"groups"`
+	Models     []string            `json:"models"`
+	Groups     []string            `json:"groups"`
+	Keys       []string            `json:"keys"`
+	Endpoints  []string            `json:"endpoints"`
+	ErrorKinds []string            `json:"error_kinds"`
+	Upstreams  []LogUpstreamOption `json:"upstreams"`
+}
+
+type LogUpstreamOption struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
 }
 
 func (s *Store) LogFilterOptions() (*LogFilterOptions, error) {
-	opt := &LogFilterOptions{Models: []string{}, Groups: []string{}}
+	opt := &LogFilterOptions{
+		Models: []string{}, Groups: []string{}, Keys: []string{}, Endpoints: []string{},
+		ErrorKinds: []string{}, Upstreams: []LogUpstreamOption{},
+	}
 	collect := func(q string) ([]string, error) {
 		rows, err := s.db.Query(q)
 		if err != nil {
@@ -1250,7 +1541,157 @@ func (s *Store) LogFilterOptions() (*LogFilterOptions, error) {
 	if opt.Groups, err = collect(`SELECT DISTINCT g.name FROM requests r JOIN groups g ON g.id=r.group_id ORDER BY g.name`); err != nil {
 		return nil, err
 	}
+	if opt.Keys, err = collect(`SELECT DISTINCT key_name FROM requests WHERE key_name<>'' ORDER BY key_name`); err != nil {
+		return nil, err
+	}
+	if opt.Endpoints, err = collect(`SELECT DISTINCT endpoint FROM requests WHERE endpoint<>'' ORDER BY endpoint`); err != nil {
+		return nil, err
+	}
+	if opt.ErrorKinds, err = collect(`SELECT DISTINCT error_kind FROM requests WHERE error_kind<>'' ORDER BY error_kind`); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(`SELECT DISTINCT a.upstream_id,COALESCE(u.name,'')
+		FROM request_attempts a LEFT JOIN upstreams u ON u.id=a.upstream_id
+		WHERE a.upstream_id>0 ORDER BY a.upstream_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item LogUpstreamOption
+		if err := rows.Scan(&item.ID, &item.Name); err != nil {
+			return nil, err
+		}
+		if item.Name == "" {
+			item.Name = fmt.Sprintf("#%d", item.ID)
+		}
+		opt.Upstreams = append(opt.Upstreams, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return opt, nil
+}
+
+type RequestStats struct {
+	Total           int64   `json:"total"`
+	DirectSuccess   int64   `json:"direct_success"`
+	FailoverSuccess int64   `json:"failover_success"`
+	Failed          int64   `json:"failed"`
+	Partial         int64   `json:"partial"`
+	Canceled        int64   `json:"canceled"`
+	ClientError     int64   `json:"client_error"`
+	Retried         int64   `json:"retried"`
+	SuccessRate     float64 `json:"success_rate"`
+	P50TTFTMs       int64   `json:"p50_ttft_ms"`
+	P95TTFTMs       int64   `json:"p95_ttft_ms"`
+	P95DurationMs   int64   `json:"p95_duration_ms"`
+	InputTokens     int64   `json:"input_tokens"`
+	OutputTokens    int64   `json:"output_tokens"`
+	CachedTokens    int64   `json:"cached_tokens"`
+}
+
+func (s *Store) RequestStats(filter RequestFilter) (*RequestStats, error) {
+	where, args := s.requestWhere(filter, false)
+	if s.db.postgres {
+		stats := &RequestStats{}
+		err := s.db.QueryRow(`SELECT COUNT(*),
+			COALESCE(SUM(CASE WHEN r.outcome='success' AND r.attempt_count<=1 THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN r.outcome='success' AND r.attempt_count>1 THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN r.outcome NOT IN ('success','partial','canceled','client_error') THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN r.outcome='partial' THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN r.outcome='canceled' THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN r.outcome='client_error' THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN r.attempt_count>1 THEN 1 ELSE 0 END),0),
+			COALESCE(CAST(percentile_cont(0.50) WITHIN GROUP (ORDER BY r.ttft_ms)
+				FILTER (WHERE r.ttft_ms>0) AS BIGINT),0),
+			COALESCE(CAST(percentile_cont(0.95) WITHIN GROUP (ORDER BY r.ttft_ms)
+				FILTER (WHERE r.ttft_ms>0) AS BIGINT),0),
+			COALESCE(CAST(percentile_cont(0.95) WITHIN GROUP (ORDER BY r.duration_ms)
+				FILTER (WHERE r.duration_ms>0) AS BIGINT),0),
+			COALESCE(SUM(r.input_tokens),0),COALESCE(SUM(r.output_tokens),0),COALESCE(SUM(r.cached_tokens),0)
+			FROM requests r LEFT JOIN groups g ON g.id=r.group_id`+where, args...).Scan(
+			&stats.Total, &stats.DirectSuccess, &stats.FailoverSuccess, &stats.Failed,
+			&stats.Partial, &stats.Canceled, &stats.ClientError, &stats.Retried,
+			&stats.P50TTFTMs, &stats.P95TTFTMs, &stats.P95DurationMs,
+			&stats.InputTokens, &stats.OutputTokens, &stats.CachedTokens,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if stats.Total > 0 {
+			stats.SuccessRate = float64(stats.DirectSuccess+stats.FailoverSuccess) / float64(stats.Total)
+		}
+		return stats, nil
+	}
+	rows, err := s.db.Query(`SELECT r.outcome,r.attempt_count,r.ttft_ms,r.duration_ms,
+		r.input_tokens,r.output_tokens,r.cached_tokens
+		FROM requests r LEFT JOIN groups g ON g.id=r.group_id`+where, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	stats := &RequestStats{}
+	var ttfts, durations []int64
+	for rows.Next() {
+		var outcome string
+		var attempts int
+		var ttft, duration, input, output, cached int64
+		if err := rows.Scan(&outcome, &attempts, &ttft, &duration, &input, &output, &cached); err != nil {
+			return nil, err
+		}
+		stats.Total++
+		if attempts > 1 {
+			stats.Retried++
+		}
+		switch outcome {
+		case "success":
+			if attempts > 1 {
+				stats.FailoverSuccess++
+			} else {
+				stats.DirectSuccess++
+			}
+		case "partial":
+			stats.Partial++
+		case "canceled":
+			stats.Canceled++
+		case "client_error":
+			stats.ClientError++
+		default:
+			stats.Failed++
+		}
+		if ttft > 0 {
+			ttfts = append(ttfts, ttft)
+		}
+		if duration > 0 {
+			durations = append(durations, duration)
+		}
+		stats.InputTokens += input
+		stats.OutputTokens += output
+		stats.CachedTokens += cached
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if stats.Total > 0 {
+		stats.SuccessRate = float64(stats.DirectSuccess+stats.FailoverSuccess) / float64(stats.Total)
+	}
+	stats.P50TTFTMs = percentile(ttfts, 0.50)
+	stats.P95TTFTMs = percentile(ttfts, 0.95)
+	stats.P95DurationMs = percentile(durations, 0.95)
+	return stats, nil
+}
+
+func percentile(values []int64, quantile float64) int64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
+	index := int(float64(len(values)-1)*quantile + 0.5)
+	if index >= len(values) {
+		index = len(values) - 1
+	}
+	return values[index]
 }
 
 // RouteSample 一条历史路由样本，供启动时重建 (上游,模型) 的延迟/成功率 EWMA。
@@ -1288,9 +1729,15 @@ func (s *Store) RecentSamples(limit int) ([]RouteSample, error) {
 }
 
 func (s *Store) ListRequests(limit int) ([]*RequestEntry, error) {
-	page, err := s.ListRequestsPage(0, limit, "", "", "")
+	page, err := s.ListRequestsPage(RequestFilter{Limit: limit})
 	if err != nil {
 		return nil, err
+	}
+	for _, entry := range page.Entries {
+		entry.Attempts, err = s.listRequestAttempts(entry.RequestID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return page.Entries, nil
 }

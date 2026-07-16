@@ -195,11 +195,12 @@ function startRtPoll(fn) {
   rtTimer = setInterval(() => { fn().catch(() => {}) }, 8000)
 }
 function stopRtPoll() { if (rtTimer) { clearInterval(rtTimer); rtTimer = null } }
-function stopAllPoll() { stopMonPoll(); stopRtPoll() }
-onUnmounted(() => { stopMonPoll(); stopRtPoll() })
+function stopAllPoll() { stopMonPoll(); stopRtPoll(); stopLogPoll() }
+onUnmounted(() => { stopAllPoll() })
 
 function go(p) {
   page.value = p; detailGroup.value = null
+  cellDrawerId.value = null; logDetail.value = null
   loadEpoch++   // 离开详情，作废在途的 members/keys 加载
   stopAllPoll()
   guard(async () => {
@@ -207,7 +208,7 @@ function go(p) {
     else if (p === 'groups') { await loadGroups(); startRtPoll(loadGroups) }
     else if (p === 'upstreams') { await loadUpstreams(); startRtPoll(loadUpstreams) }
     else if (p === 'monitors') { await loadUpstreams(); await loadMonitors(); startMonPoll() }
-    else if (p === 'logs') { await loadLogOptions(); await loadLogs(false) }
+    else if (p === 'logs') { await loadLogOptions(); await loadLogs(true); startLogPoll() }
     else if (p === 'settings') { await loadSettings() }
   })
 }
@@ -255,8 +256,17 @@ function saveGroup() {
   })
 }
 
-function newUpstream() { dlg.type = 'upstream'; dlg.form = { name: '', base_url: '', api_key: '', proxy: '', enabled: true, channel_probe: false } }
-function editUpstream(u) { dlg.type = 'upstream'; dlg.form = { ...u, api_key: '' } }
+const protocolOptions = [
+  { value: 'passthrough', label: '透传' },
+  { value: 'openai', label: 'OpenAI Chat Completions' },
+  { value: 'openai-response', label: 'OpenAI Responses' },
+  { value: 'claude', label: 'Anthropic Messages' },
+  { value: 'codex', label: 'Codex Responses' },
+]
+const protocolLabels = Object.fromEntries(protocolOptions.map(option => [option.value, option.label]))
+function protocolLabel(protocol) { return protocolLabels[protocol || 'passthrough'] || protocol }
+function newUpstream() { dlg.type = 'upstream'; dlg.form = { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', enabled: true, channel_probe: false } }
+function editUpstream(u) { dlg.type = 'upstream'; dlg.form = { ...u, protocol: u.protocol || 'passthrough', api_key: '' } }
 function saveUpstream() {
   guard(async () => {
     const f = { ...dlg.form }
@@ -391,7 +401,6 @@ function toggleMember(m) {
 // 密钥
 const newKey = ref('')   // 生成后明文展示一次
 const copied = ref(0)    // 刚点击复制的密钥 id（短暂提示用）
-const errorTipId = ref(0) // 当前显示错误提示的日志 id
 const logRetention = ref('')           // 请求记录保留天数
 const effectiveLogRetention = ref('')
 const logRetentionSource = ref('')
@@ -429,11 +438,6 @@ function copyText(t, id) {
   navigator.clipboard?.writeText(t)
   copied.value = id
   setTimeout(() => { if (copied.value === id) copied.value = 0 }, 1200)
-}
-function copyError(text, id) {
-  navigator.clipboard?.writeText(text)
-  errorTipId.value = id
-  setTimeout(() => { if (errorTipId.value === id) errorTipId.value = 0 }, 1200)
 }
 async function loadSettings() {
   const s = await api.getSettings()
@@ -513,61 +517,212 @@ const sinceText = ts => {
   return Math.floor(s / 3600) + ' 小时前'
 }
 
-// --- 请求记录（游标分页 + 服务端筛选）---
-const logs = ref([])          // 已加载的累积列表
-const logPageSize = 50
-const logCursor = ref(0)      // 下一页游标（id<此值）；0=从最新开始
-const logHasMore = ref(false)
+// --- 请求记录（标准分页 + 服务端筛选）---
+const logs = ref([])
+const logPageSize = ref(20)
+const logCurrentPage = ref(1)
 const logLoading = ref(false)
-const expandedRequestId = ref(0)
-const logFGroup = ref('')     // 筛选：分组名（空=全部）
-const logFModel = ref('')     // 筛选：模型（空=全部）
-const logFStatus = ref('')    // 筛选：'' 全部 | 'ok' | 'fail'
-const logModelOpts = ref([])  // 全量去重选项（服务端给）
+const logDetail = ref(null)
+const logDetailLoading = ref(false)
+const logStats = ref({})
+const logSearch = ref('')
+const logFTime = ref('24h')
+const logFGroup = ref('')
+const logFModel = ref('')
+const logFStatus = ref('')
+const logFUpstream = ref('')
+const logFKey = ref('')
+const logFEndpoint = ref('')
+const logFErrorKind = ref('')
+const logFStream = ref('')
+const logFSlow = ref('')
+const logFRetried = ref(false)
+const logAutoRefresh = ref(false)
+const logMoreFilters = ref(false)
+const logModelOpts = ref([])
 const logGroupOpts = ref([])
+const logKeyOpts = ref([])
+const logEndpointOpts = ref([])
+const logErrorKindOpts = ref([])
+const logUpstreamOpts = ref([])
+const logPageSizeOptions = [
+  { value: 20, label: '20 条' },
+  { value: 50, label: '50 条' },
+  { value: 100, label: '100 条' },
+]
+const logTotalPages = computed(() => Math.max(1, Math.ceil((Number(logStats.value.total) || 0) / Number(logPageSize.value))))
+const logPageItems = computed(() => {
+  const total = logTotalPages.value
+  const current = Math.min(logCurrentPage.value, total)
+  if (total <= 7) return Array.from({ length: total }, (_, index) => ({ type: 'page', value: index + 1, key: `page-${index + 1}` }))
+  let start = Math.max(2, current - 1)
+  let end = Math.min(total - 1, current + 1)
+  if (current <= 4) end = 5
+  if (current >= total - 3) start = total - 4
+  const items = [{ type: 'page', value: 1, key: 'page-1' }]
+  if (start > 2) items.push({ type: 'ellipsis', key: 'ellipsis-left' })
+  for (let value = start; value <= end; value++) items.push({ type: 'page', value, key: `page-${value}` })
+  if (end < total - 1) items.push({ type: 'ellipsis', key: 'ellipsis-right' })
+  items.push({ type: 'page', value: total, key: `page-${total}` })
+  return items
+})
 const logGroupSelectOptions = computed(() => [{ value: '', label: '全部分组' }, ...logGroupOpts.value.map(g => ({ value: g, label: g }))])
 const logModelSelectOptions = computed(() => [{ value: '', label: '全部模型' }, ...logModelOpts.value.map(m => ({ value: m, label: m }))])
+const logKeySelectOptions = computed(() => [{ value: '', label: '全部密钥' }, ...logKeyOpts.value.map(k => ({ value: k, label: k }))])
+const logEndpointSelectOptions = computed(() => [{ value: '', label: '全部端点' }, ...logEndpointOpts.value.map(e => ({ value: e, label: fmtEndpoint(e) }))])
+const logErrorSelectOptions = computed(() => [{ value: '', label: '全部错误' }, ...logErrorKindOpts.value.map(e => ({ value: e, label: errorKindText(e) }))])
+const logUpstreamSelectOptions = computed(() => [{ value: '', label: '全部渠道' }, ...logUpstreamOpts.value.map(u => ({ value: u.id, label: u.name }))])
+const logTimeOptions = [
+  { value: '1h', label: '最近 1 小时' },
+  { value: '24h', label: '最近 24 小时' },
+  { value: '7d', label: '最近 7 天' },
+  { value: 'all', label: '全部记录' },
+]
 const logStatusOptions = [
   { value: '', label: '全部状态' },
-  { value: 'ok', label: '仅成功' },
-  { value: 'fail', label: '仅失败' },
+  { value: 'direct_success', label: '直接成功' },
+  { value: 'failover_success', label: '切换后成功' },
+  { value: 'failed', label: '失败' },
+  { value: 'partial', label: '流中断' },
+  { value: 'canceled', label: '客户端取消' },
+  { value: 'client_error', label: '请求错误' },
 ]
-// 首屏/筛选变化：重置后拉第一页；append=true 时翻下一页累积
-async function loadLogs(append = false) {
-  if (logLoading.value) return
+const logStreamOptions = [
+  { value: '', label: '全部模式' },
+  { value: 'stream', label: '流式请求' },
+  { value: 'nonstream', label: '非流式请求' },
+]
+const logSlowOptions = [
+  { value: '', label: '全部耗时' },
+  { value: 5000, label: '耗时 ≥ 5 秒' },
+  { value: 30000, label: '耗时 ≥ 30 秒' },
+  { value: 120000, label: '耗时 ≥ 2 分钟' },
+]
+
+function logFilterParams() {
+  const now = Math.floor(Date.now() / 1000)
+  const since = ({ '1h': now - 3600, '24h': now - 86400, '7d': now - 7 * 86400 })[logFTime.value] || ''
+  return {
+    q: logSearch.value.trim(), since, group: logFGroup.value, model: logFModel.value,
+    status: logFStatus.value, upstream_id: logFUpstream.value, key: logFKey.value,
+    endpoint: logFEndpoint.value, error_kind: logFErrorKind.value, stream: logFStream.value,
+    slow_ms: logFSlow.value, retried: logFRetried.value,
+  }
+}
+
+let logLoadEpoch = 0
+async function fetchLogPage(targetPage, refreshStats) {
+  const epoch = ++logLoadEpoch
   logLoading.value = true
   try {
-    if (!append) { logs.value = []; logCursor.value = 0 }
-    const page = await api.logs({
-      before: append ? logCursor.value : 0,
-      limit: logPageSize,
-      model: logFModel.value, group: logFGroup.value, status: logFStatus.value,
-    })
+    const pageSize = Number(logPageSize.value)
+    const params = { ...logFilterParams(), offset: (targetPage - 1) * pageSize, limit: pageSize }
+    const [page, stats] = refreshStats
+      ? await Promise.all([api.logs(params), api.logStats(params)])
+      : [await api.logs(params), null]
+    if (epoch !== logLoadEpoch) return false
     const rows = (page && page.entries) || []
-    logs.value = append ? logs.value.concat(rows) : rows
-    logHasMore.value = !!(page && page.has_more)
-    logCursor.value = (page && page.next_cursor) || 0
-  } finally { logLoading.value = false }
+    logs.value = rows
+    logCurrentPage.value = targetPage
+    if (stats) logStats.value = stats
+    return true
+  } finally {
+    if (epoch === logLoadEpoch) logLoading.value = false
+  }
 }
+async function loadLogs(resetPagination = false) {
+  return fetchLogPage(resetPagination ? 1 : logCurrentPage.value, true)
+}
+async function goLogPage(targetPage) {
+  if (logLoading.value) return
+  const normalized = Math.max(1, Math.min(Number(targetPage) || 1, logTotalPages.value))
+  if (normalized === logCurrentPage.value) return
+  await fetchLogPage(normalized, false)
+}
+function onLogPageSizeChange() { guard(() => loadLogs(true)) }
 async function loadLogOptions() {
   const o = await api.logOptions()
   logModelOpts.value = (o && o.models) || []
   logGroupOpts.value = (o && o.groups) || []
+  logKeyOpts.value = (o && o.keys) || []
+  logEndpointOpts.value = (o && o.endpoints) || []
+  logErrorKindOpts.value = (o && o.error_kinds) || []
+  logUpstreamOpts.value = (o && o.upstreams) || []
 }
-// 筛选变化即重新从第一页拉（服务端筛选，保证跨页正确）
-function onLogFilterChange() { guard(() => loadLogs(false)) }
-const logOk = l => l?.outcome === 'success'
-const toggleRequest = id => { expandedRequestId.value = expandedRequestId.value === id ? 0 : id }
+function onLogFilterChange() { guard(() => loadLogs(true)) }
+function resetLogFilters() {
+  logSearch.value = ''; logFTime.value = '24h'; logFGroup.value = ''; logFModel.value = ''
+  logFStatus.value = ''; logFUpstream.value = ''; logFKey.value = ''; logFEndpoint.value = ''
+  logFErrorKind.value = ''; logFStream.value = ''; logFSlow.value = ''; logFRetried.value = false
+  logMoreFilters.value = false
+  onLogFilterChange()
+}
+let logDetailEpoch = 0
+async function openLogDetail(entry) {
+  const epoch = ++logDetailEpoch
+  logDetailLoading.value = true
+  logDetail.value = entry
+  try {
+    const detail = await api.logDetail(entry.id)
+    if (epoch === logDetailEpoch) logDetail.value = detail
+  } finally {
+    if (epoch === logDetailEpoch) logDetailLoading.value = false
+  }
+}
+function closeLogDetail() { logDetailEpoch++; logDetail.value = null; logDetailLoading.value = false }
+
+let logTimer = null
+function startLogPoll() {
+  stopLogPoll()
+  if (!logAutoRefresh.value) return
+  logTimer = setInterval(() => {
+    if (page.value === 'logs' && logCurrentPage.value === 1 && !logLoading.value && !logDetail.value) loadLogs(false).catch(() => {})
+  }, 10000)
+}
+function stopLogPoll() { if (logTimer) { clearInterval(logTimer); logTimer = null } }
+function toggleLogAutoRefresh() { startLogPoll() }
+
+const logActiveFilters = computed(() => [logSearch.value, logFGroup.value, logFModel.value, logFStatus.value,
+  logFUpstream.value, logFKey.value, logFEndpoint.value, logFErrorKind.value, logFStream.value,
+  logFSlow.value, logFRetried.value].filter(Boolean).length)
+const logAdvancedFilters = computed(() => [logFGroup.value, logFModel.value, logFKey.value, logFEndpoint.value,
+  logFErrorKind.value, logFStream.value, logFSlow.value, logFRetried.value].filter(Boolean).length)
 const requestShort = id => id ? id.slice(0, 8) : '—'
 const fmtMs = ms => {
   const value = Number(ms) || 0
   if (!value) return '—'
   return value >= 1000 ? (value / 1000).toFixed(1) + 's' : value + 'ms'
 }
+const fmtBytes = bytes => {
+  const value = Number(bytes) || 0
+  if (!value) return '—'
+  if (value >= 1048576) return (value / 1048576).toFixed(1) + ' MB'
+  if (value >= 1024) return (value / 1024).toFixed(1) + ' KB'
+  return value + ' B'
+}
+const fmtNum = value => new Intl.NumberFormat('zh-CN').format(Number(value) || 0)
 const outcomeText = outcome => ({
   success: '成功', failed: '失败', canceled: '已取消', partial: '流中断',
   client_error: '请求错误', unsupported: '不支持', unavailable: '无可用渠道',
 }[outcome] || outcome || '未知')
+const requestOutcomeText = entry => entry.outcome === 'success' && entry.attempt_count > 1 ? '切换后成功' : outcomeText(entry.outcome)
+const requestOutcomeClass = entry => entry.outcome === 'success' ? (entry.attempt_count > 1 ? 'warn' : 'ok')
+  : entry.outcome === 'canceled' || entry.outcome === 'client_error' ? 'muted' : 'fail'
+const errorKindText = kind => ({
+  request_build: '请求构建失败', upstream_network: '上游网络失败', first_response_timeout: '首字节超时',
+  upstream_read: '上游读取失败', model_unsupported: '模型不支持', client_request: '客户端请求错误',
+  upstream_http: '上游 HTTP 错误', downstream_write: '下游写入失败', client_canceled: '客户端取消',
+  empty_response: '上游空响应', error_payload: '成功状态错误体', upstream_disconnect: '上游断流',
+  no_upstream: '无可用渠道', upstream_error: '上游失败', auth: '接入鉴权失败',
+  request_too_large: '请求体过大', request_read: '请求体读取失败',
+}[kind] || kind || '—')
+const errorSourceText = source => ({ upstream: '上游', client: '客户端', gateway: 'MuxAPI' }[source] || source || '—')
+const selectionText = reason => ({ initial: '首次选择', failover: '故障切换', recovery_trial: '恢复验证' }[reason] || reason || '—')
+const streamStateText = entry => {
+  if (!entry.stream) return '非流式'
+  if (entry.stream_completed) return entry.last_event ? `完整 · ${entry.last_event}` : '完整结束'
+  return entry.last_event ? `EOF · ${entry.last_event}` : '未见完成事件'
+}
 // 绝对时间 MM-DD HH:MM:SS（请求记录看具体时刻，不用相对）
 const fmtTime = ts => {
   if (!ts) return '—'
@@ -903,7 +1058,7 @@ function logout() {
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th></th><th>名称</th><th>地址</th><th>凭证</th><th>运行时</th><th>成功率</th><th>人工开关</th><th>操作</th></tr></thead>
+              <thead><tr><th></th><th>名称</th><th>地址</th><th>协议</th><th>凭证</th><th>运行时</th><th>成功率</th><th>人工开关</th><th>操作</th></tr></thead>
               <tbody>
                 <tr v-for="u in upstreamsFiltered" :key="u.id"
                   :class="{ disabled: !u.enabled, dragging: upstreamDragId === u.id, dragover: upstreamDragOverId === u.id }"
@@ -913,6 +1068,7 @@ function logout() {
                   <td class="drag-cell"><span class="mon-grip" title="拖拽调整顺序"><Icon name="grip" :size="16" /></span></td>
                   <td class="cell-name">{{ u.name }}</td>
                   <td class="cell-url">{{ u.base_url }}</td>
+                  <td><span class="tag">{{ protocolLabel(u.protocol) }}</span></td>
                   <td><code>{{ u.masked }}</code></td>
                   <td>
                     <span class="state-badge" :class="rtClass(u.health)">{{ u.enabled ? rtLabel(u.health) : '已停用' }}</span>
@@ -929,7 +1085,7 @@ function logout() {
                     <button class="icon-btn danger" @click="delUpstream(u)"><Icon name="trash" :size="16" /></button>
                   </td>
                 </tr>
-                <tr v-if="!upstreamsFiltered.length"><td colspan="8" class="empty-cell">{{ upstreams.length ? '没有符合筛选的上游。' : '还没有上游，点右上角新增。' }}</td></tr>
+                <tr v-if="!upstreamsFiltered.length"><td colspan="9" class="empty-cell">{{ upstreams.length ? '没有符合筛选的上游。' : '还没有上游，点右上角新增。' }}</td></tr>
               </tbody>
             </table>
           </div>
@@ -983,69 +1139,92 @@ function logout() {
           </div>
         </template>
 
-        <!-- 请求记录页：每行一个客户端请求，展开查看渠道尝试链 -->
+        <!-- 请求记录页：范围统计 + 服务端筛选 + 按需详情 -->
         <template v-else-if="page === 'logs'">
-          <div class="log-toolbar">
-            <FancySelect v-model="logFGroup" :options="logGroupSelectOptions" @change="onLogFilterChange" />
-            <FancySelect v-model="logFModel" :options="logModelSelectOptions" @change="onLogFilterChange" />
-            <FancySelect v-model="logFStatus" :options="logStatusOptions" @change="onLogFilterChange" />
-            <span class="log-count">已加载 {{ logs.length }} 条{{ logHasMore ? '＋' : '' }}</span>
-            <button class="btn btn-sm" :disabled="logLoading" @click="onLogFilterChange"><Icon name="refresh" :size="14" />刷新</button>
+          <div class="log-summary">
+            <div class="log-stat"><span>请求</span><b>{{ fmtNum(logStats.total) }}</b><em>{{ ((logStats.success_rate || 0) * 100).toFixed(1) }}% 成功</em></div>
+            <div class="log-stat success"><span>直接成功</span><b>{{ fmtNum(logStats.direct_success) }}</b><em>未切换渠道</em></div>
+            <div class="log-stat warn"><span>切换后成功</span><b>{{ fmtNum(logStats.failover_success) }}</b><em>{{ fmtNum(logStats.retried) }} 次发生重试</em></div>
+            <div class="log-stat danger"><span>异常</span><b>{{ fmtNum((logStats.failed || 0) + (logStats.partial || 0)) }}</b><em>{{ fmtNum(logStats.partial) }} 次流中断</em></div>
+            <div class="log-stat"><span>P95 TTFT</span><b>{{ fmtMs(logStats.p95_ttft_ms) }}</b><em>P50 {{ fmtMs(logStats.p50_ttft_ms) }}</em></div>
+            <div class="log-stat"><span>P95 总耗时</span><b>{{ fmtMs(logStats.p95_duration_ms) }}</b><em>所选时间范围</em></div>
+            <div class="log-stat tokens"><span>Token</span><b>{{ fmtNum((logStats.input_tokens || 0) + (logStats.output_tokens || 0)) }}</b><em>入 {{ fmtNum(logStats.input_tokens) }} · 出 {{ fmtNum(logStats.output_tokens) }} · 缓存 {{ fmtNum(logStats.cached_tokens) }}</em></div>
           </div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th class="log-expand-col"></th><th>时间</th><th>请求</th><th>密钥</th><th>端点</th><th>分组</th><th>模型</th><th>最终渠道</th><th>结果</th><th>TTFT</th><th>总耗时</th></tr></thead>
+
+          <div class="log-filter-band">
+            <div class="log-filter-primary">
+              <div class="search-box log-search">
+                <Icon class="ic" name="search" :size="16" />
+                <input v-model="logSearch" class="search-input" placeholder="请求 ID 前缀" @keyup.enter="onLogFilterChange" />
+              </div>
+              <FancySelect v-model="logFTime" :options="logTimeOptions" @change="onLogFilterChange" />
+              <FancySelect v-model="logFStatus" :options="logStatusOptions" @change="onLogFilterChange" />
+              <FancySelect v-model="logFUpstream" :options="logUpstreamSelectOptions" @change="onLogFilterChange" />
+              <button class="btn btn-sm log-more-filter-button" @click="logMoreFilters = !logMoreFilters"><Icon name="filter" :size="15" />筛选<span v-if="logAdvancedFilters">{{ logAdvancedFilters }}</span></button>
+              <label class="log-auto"><input v-model="logAutoRefresh" type="checkbox" @change="toggleLogAutoRefresh" /><span></span>自动刷新</label>
+              <span class="log-count">共 {{ fmtNum(logStats.total) }} 条</span>
+              <button class="icon-btn log-refresh" :disabled="logLoading" title="刷新当前页" @click="guard(() => loadLogs(false))"><Icon name="refresh" :size="17" /></button>
+            </div>
+            <div class="log-filter-secondary" :class="{ open: logMoreFilters }">
+              <FancySelect v-model="logFGroup" :options="logGroupSelectOptions" @change="onLogFilterChange" />
+              <FancySelect v-model="logFModel" :options="logModelSelectOptions" @change="onLogFilterChange" />
+              <FancySelect v-model="logFKey" :options="logKeySelectOptions" @change="onLogFilterChange" />
+              <FancySelect v-model="logFEndpoint" :options="logEndpointSelectOptions" @change="onLogFilterChange" />
+              <FancySelect v-model="logFErrorKind" :options="logErrorSelectOptions" @change="onLogFilterChange" />
+              <FancySelect v-model="logFStream" :options="logStreamOptions" @change="onLogFilterChange" />
+              <FancySelect v-model="logFSlow" :options="logSlowOptions" @change="onLogFilterChange" />
+              <label class="log-check"><input v-model="logFRetried" type="checkbox" @change="onLogFilterChange" />仅看重试</label>
+              <button v-if="logActiveFilters" class="btn-link sm log-reset" @click="resetLogFilters">清除 {{ logActiveFilters }} 项</button>
+            </div>
+          </div>
+
+          <div class="table-wrap log-table-wrap">
+            <table class="log-table">
+              <thead><tr><th>时间 / 请求</th><th>接入</th><th>端点 / 模型</th><th>路由链</th><th>结果</th><th>性能</th><th>Token</th><th>流量</th></tr></thead>
               <tbody>
-                <template v-for="l in logs" :key="l.id">
-                  <tr>
-                    <td class="log-expand-col">
-                      <button v-if="l.attempts?.length" class="icon-btn log-expand" :class="{ open: expandedRequestId === l.id }" title="查看尝试链" @click="toggleRequest(l.id)">
-                        <Icon name="chevron-right" :size="14" />
-                      </button>
-                    </td>
-                    <td class="log-time" :title="fmtTimeFull(l.created_at)">{{ fmtTime(l.created_at) }}</td>
-                    <td class="log-id" :title="l.request_id">{{ requestShort(l.request_id) }}</td>
-                    <td>{{ l.key_name || '—' }}</td>
-                    <td class="log-endpoint" :title="l.endpoint || ''">{{ fmtEndpoint(l.endpoint) }}</td>
-                    <td>{{ l.group_name || '—' }}</td>
-                    <td>{{ l.model || '—' }}</td>
-                    <td>{{ l.final_upstream_name || '—' }}<span v-if="l.attempt_count > 1" class="log-retry">{{ l.attempt_count }} 次</span></td>
-                    <td>
-                      <div class="log-status-wrap" @mouseenter="l.error && (errorTipId = 'r-' + l.id)" @mouseleave="errorTipId = 0">
-                        <span class="log-status" :class="logOk(l) ? 'ok' : 'fail'">{{ outcomeText(l.outcome) }} · {{ statusText(l.status) }}</span>
-                        <div v-if="l.error && errorTipId === 'r-' + l.id" class="error-tooltip" @click="copyError(l.error, l.id)">
-                          <div class="error-tooltip-text">{{ l.error }}</div>
-                          <div class="error-tooltip-hint">{{ copied === l.id ? '已复制 ✓' : '点击复制' }}</div>
-                        </div>
-                      </div>
-                    </td>
-                    <td>{{ fmtMs(l.ttft_ms) }}</td>
-                    <td>{{ fmtMs(l.duration_ms) }}</td>
-                  </tr>
-                  <tr v-if="expandedRequestId === l.id" class="attempt-detail-row">
-                    <td colspan="11">
-                      <table class="attempt-table">
-                        <thead><tr><th>尝试</th><th>渠道</th><th>结果</th><th>TTFT</th><th>耗时</th><th>错误</th></tr></thead>
-                        <tbody>
-                          <tr v-for="a in l.attempts" :key="a.id">
-                            <td>#{{ a.attempt_no }}</td><td>{{ a.upstream_name || ('#' + a.upstream_id) }}</td>
-                            <td><span class="log-status" :class="a.outcome === 'success' ? 'ok' : 'fail'">{{ outcomeText(a.outcome) }} · {{ statusText(a.status) }}</span></td>
-                            <td>{{ fmtMs(a.ttft_ms) }}</td><td>{{ fmtMs(a.duration_ms) }}</td>
-                            <td class="attempt-error" :title="a.error || ''">{{ a.error || '—' }}</td>
-                          </tr>
-                        </tbody>
-                      </table>
-                    </td>
-                  </tr>
-                </template>
-                <tr v-if="!logs.length"><td colspan="11" class="empty-cell">{{ logLoading ? '加载中…' : '没有符合条件的请求记录。客户端发起请求后这里会出现。' }}</td></tr>
+                <tr v-for="l in logs" :key="l.id" class="log-row" @click="openLogDetail(l)">
+                  <td>
+                    <div class="log-time" :title="fmtTimeFull(l.created_at)">{{ fmtTime(l.created_at) }}</div>
+                    <div class="log-id" :title="l.request_id">{{ requestShort(l.request_id) }}</div>
+                  </td>
+                  <td><b class="log-main">{{ l.group_name || '未知分组' }}</b><span class="log-sub">{{ l.key_name || '未知密钥' }}</span></td>
+                  <td><b class="log-main log-endpoint">{{ fmtEndpoint(l.endpoint) }}</b><span class="log-sub log-model" :title="l.model">{{ l.model || '未知模型' }}<i v-if="l.stream">流</i></span></td>
+                  <td>
+                    <div v-if="l.route?.length" class="route-chain">
+                      <template v-for="(step, index) in l.route" :key="step.attempt_no">
+                        <Icon v-if="index" name="chevron-right" :size="12" />
+                        <span class="route-step" :class="step.outcome === 'success' ? 'ok' : 'fail'" :title="`${outcomeText(step.outcome)} · ${statusText(step.status)}`">{{ step.upstream_name || ('#' + step.upstream_id) }}</span>
+                      </template>
+                    </div>
+                    <span v-else class="log-sub">{{ l.final_upstream_name || '未选择渠道' }}</span>
+                  </td>
+                  <td><span class="log-status" :class="requestOutcomeClass(l)">{{ requestOutcomeText(l) }} · {{ statusText(l.status) }}</span><span v-if="l.error_kind" class="log-sub error-kind">{{ errorKindText(l.error_kind) }}</span></td>
+                  <td><b class="log-metric">{{ fmtMs(l.ttft_ms) }}</b><span class="log-sub">总计 {{ fmtMs(l.duration_ms) }}</span></td>
+                  <td><b class="log-metric">{{ fmtNum(l.input_tokens) }} / {{ fmtNum(l.output_tokens) }}</b><span class="log-sub">缓存 {{ fmtNum(l.cached_tokens) }}</span></td>
+                  <td><b class="log-metric">{{ fmtBytes(l.response_bytes) }}</b><span class="log-sub">{{ streamStateText(l) }}</span></td>
+                </tr>
+                <tr v-if="!logs.length"><td colspan="8" class="empty-cell">{{ logLoading ? '加载中…' : '没有符合条件的请求记录。' }}</td></tr>
               </tbody>
             </table>
           </div>
-          <div v-if="logHasMore" class="log-more">
-            <button class="btn btn-sm" :disabled="logLoading" @click="guard(() => loadLogs(true))">
-              {{ logLoading ? '加载中…' : '加载更多' }}
-            </button>
+          <div v-if="Number(logStats.total) > 0" class="log-pager">
+            <div class="log-page-size">
+              <span>每页</span>
+              <FancySelect v-model="logPageSize" :options="logPageSizeOptions" :disabled="logLoading" @change="onLogPageSizeChange" />
+            </div>
+            <div class="log-page-controls">
+              <button class="icon-btn log-page-arrow prev" title="上一页" aria-label="上一页" :disabled="logLoading || logCurrentPage === 1" @click="guard(() => goLogPage(logCurrentPage - 1))">
+                <Icon name="chevron-right" :size="15" />
+              </button>
+              <template v-for="item in logPageItems" :key="item.key">
+                <button v-if="item.type === 'page'" class="log-page-number" :class="{ active: item.value === logCurrentPage }"
+                  :aria-current="item.value === logCurrentPage ? 'page' : undefined" :disabled="logLoading" @click="guard(() => goLogPage(item.value))">{{ item.value }}</button>
+                <span v-else class="log-page-ellipsis">…</span>
+              </template>
+              <button class="icon-btn log-page-arrow" title="下一页" aria-label="下一页" :disabled="logLoading || logCurrentPage === logTotalPages" @click="guard(() => goLogPage(logCurrentPage + 1))">
+                <Icon name="chevron-right" :size="15" />
+              </button>
+            </div>
           </div>
         </template>
 
@@ -1146,6 +1325,89 @@ function logout() {
       </div>
     </div>
 
+    <!-- 请求审计详情 -->
+    <div class="drawer-mask" v-if="logDetail" @click.self="closeLogDetail">
+      <aside class="drawer log-detail-drawer">
+        <div class="dw-head log-detail-head">
+          <span class="log-status" :class="requestOutcomeClass(logDetail)">{{ requestOutcomeText(logDetail) }} · {{ statusText(logDetail.status) }}</span>
+          <div class="dw-id">
+            <div class="dw-title">{{ requestShort(logDetail.request_id) }}</div>
+            <div class="dw-sub">{{ fmtTimeFull(logDetail.created_at) }}</div>
+          </div>
+          <button class="icon-btn" title="复制请求 ID" @click="copyText(logDetail.request_id, 'request-id')"><Icon name="copy" :size="17" /></button>
+          <button class="icon-btn" title="关闭" @click="closeLogDetail"><Icon name="x" :size="18" /></button>
+        </div>
+
+        <div v-if="logDetailLoading" class="log-detail-loading"><Icon name="loader" :size="18" />加载详情</div>
+        <div v-else class="log-detail-scroll">
+          <section class="log-detail-section">
+            <h4>请求上下文</h4>
+            <dl class="log-detail-grid">
+              <div><dt>请求 ID</dt><dd class="mono">{{ logDetail.request_id }}</dd></div>
+              <div><dt>分组 / 密钥</dt><dd>{{ logDetail.group_name || '—' }} / {{ logDetail.key_name || '—' }}</dd></div>
+              <div><dt>端点</dt><dd class="mono">{{ logDetail.endpoint || '—' }}</dd></div>
+              <div><dt>模型</dt><dd>{{ logDetail.model || '—' }}</dd></div>
+              <div><dt>请求模式</dt><dd>{{ logDetail.stream ? '流式' : '非流式' }}</dd></div>
+              <div><dt>上游 Request ID</dt><dd class="mono">{{ logDetail.upstream_request_id || '—' }}</dd></div>
+              <div><dt>开始</dt><dd>{{ fmtTimeFull(logDetail.created_at) }}</dd></div>
+              <div><dt>完成</dt><dd>{{ fmtTimeFull(logDetail.completed_at) }}</dd></div>
+            </dl>
+          </section>
+
+          <section class="log-detail-section">
+            <h4>性能与用量</h4>
+            <div class="log-detail-metrics">
+              <div><span>TTFT</span><b>{{ fmtMs(logDetail.ttft_ms) }}</b></div>
+              <div><span>总耗时</span><b>{{ fmtMs(logDetail.duration_ms) }}</b></div>
+              <div><span>请求体</span><b>{{ fmtBytes(logDetail.request_bytes) }}</b></div>
+              <div><span>响应体</span><b>{{ fmtBytes(logDetail.response_bytes) }}</b></div>
+              <div><span>输入 Token</span><b>{{ fmtNum(logDetail.input_tokens) }}</b></div>
+              <div><span>输出 Token</span><b>{{ fmtNum(logDetail.output_tokens) }}</b></div>
+              <div><span>缓存 Token</span><b>{{ fmtNum(logDetail.cached_tokens) }}</b></div>
+              <div><span>流结束</span><b>{{ streamStateText(logDetail) }}</b></div>
+            </div>
+          </section>
+
+          <section class="log-detail-section">
+            <h4>渠道尝试 <span>{{ logDetail.attempts?.length || 0 }}</span></h4>
+            <div v-if="logDetail.attempts?.length" class="attempt-timeline">
+              <article v-for="attempt in logDetail.attempts" :key="attempt.id" class="attempt-item">
+                <div class="attempt-marker" :class="attempt.outcome === 'success' ? 'ok' : 'fail'">{{ attempt.attempt_no }}</div>
+                <div class="attempt-content">
+                  <header>
+                    <div><b>{{ attempt.upstream_name || ('#' + attempt.upstream_id) }}</b><span>{{ selectionText(attempt.selection_reason) }} · 优先级 {{ attempt.priority || '—' }}</span></div>
+                    <span class="log-status" :class="attempt.outcome === 'success' ? 'ok' : attempt.outcome === 'canceled' ? 'muted' : 'fail'">{{ outcomeText(attempt.outcome) }} · {{ statusText(attempt.status) }}</span>
+                  </header>
+                  <div class="attempt-facts">
+                    <span>熔断 {{ attempt.health_before || '—' }} → {{ attempt.health_after || '—' }}</span>
+                    <span>TTFT {{ fmtMs(attempt.ttft_ms) }}</span>
+                    <span>耗时 {{ fmtMs(attempt.duration_ms) }}</span>
+                    <span>响应 {{ fmtBytes(attempt.response_bytes) }}</span>
+                    <span>Token {{ fmtNum(attempt.input_tokens) }} / {{ fmtNum(attempt.output_tokens) }}</span>
+                    <span v-if="attempt.stream">{{ attempt.stream_completed ? '流完成' : '未见完成事件' }} · {{ attempt.last_event || 'EOF' }}</span>
+                  </div>
+                  <div v-if="attempt.error_kind" class="attempt-error-meta"><b>{{ errorKindText(attempt.error_kind) }}</b><span>来源：{{ errorSourceText(attempt.error_source) }}</span></div>
+                  <button v-if="attempt.error" class="log-error-block" title="复制错误" @click="copyText(attempt.error, 'attempt-' + attempt.id)">
+                    <code>{{ attempt.error }}</code><Icon name="copy" :size="14" />
+                  </button>
+                  <div v-if="attempt.upstream_request_id" class="attempt-request-id">Upstream ID <code>{{ attempt.upstream_request_id }}</code></div>
+                </div>
+              </article>
+            </div>
+            <div v-else class="empty log-detail-empty">没有渠道尝试记录</div>
+          </section>
+
+          <section v-if="logDetail.error" class="log-detail-section">
+            <h4>最终错误</h4>
+            <div class="log-final-error-head"><b>{{ errorKindText(logDetail.error_kind) }}</b><span>来源：{{ errorSourceText(logDetail.error_source) }}</span></div>
+            <button class="log-error-block final" title="复制错误" @click="copyText(logDetail.error, 'final-error')">
+              <code>{{ logDetail.error }}</code><Icon name="copy" :size="14" />
+            </button>
+          </section>
+        </div>
+      </aside>
+    </div>
+
     <!-- 新密钥明文展示（生成后一次性） -->
     <div class="mask" v-if="newKey" @click.self="copyKey">
       <div class="dialog">
@@ -1221,6 +1483,7 @@ function logout() {
           <h3>{{ dlg.form.id ? '编辑上游' : '新增上游' }}</h3>
           <div class="field"><label>名称</label><input v-model="dlg.form.name" /></div>
           <div class="field"><label>base_url</label><input v-model="dlg.form.base_url" placeholder="https://..." /></div>
+          <div class="field"><label>协议</label><FancySelect v-model="dlg.form.protocol" :options="protocolOptions" /></div>
           <div class="field"><label>api_key</label><input v-model="dlg.form.api_key" :placeholder="dlg.form.id ? '留空则不修改' : 'sk-...'" /></div>
           <div class="field"><label>代理</label><input v-model="dlg.form.proxy" placeholder="留空=直连/环境变量；如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></div>
           <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>

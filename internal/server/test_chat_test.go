@@ -1,44 +1,116 @@
 package server
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mirainya/muxapi/internal/translate"
+	"github.com/mirainya/muxapi/internal/upstream"
 )
 
-// 验证 relayChatStream 正确把上游 OpenAI SSE 的 delta 拼成 content 事件，并以 test_complete 收尾。
-func TestRelayChatStream(t *testing.T) {
-	upstream := strings.Join([]string{
+func TestRelayTranslatedTestStreamOpenAI(t *testing.T) {
+	original := []byte(`{"model":"gpt-test","input":"hello","stream":true}`)
+	exchange, err := translate.NewExchange(translate.OpenAIResponses, translate.OpenAI, "gpt-test", true, original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := strings.Join([]string{
 		`data: {"choices":[{"delta":{"content":"Hel"}}]}`,
 		`data: {"choices":[{"delta":{"content":"lo"}}]}`,
-		`data: {"choices":[{"delta":{}}]}`, // 无内容块，跳过
 		`data: [DONE]`,
-	}, "\n")
+	}, "\n\n")
 
 	var events []testEvent
-	(&Server{}).relayChatStream(strings.NewReader(upstream), func(e testEvent) { events = append(events, e) }, time.Now())
+	(&Server{}).relayTranslatedTestStream(context.Background(), strings.NewReader(stream), exchange, func(event testEvent) {
+		events = append(events, event)
+	}, time.Now())
 
-	var text, last string
-	for _, e := range events {
-		if e.Type == "content" {
-			text += e.Text
+	var text string
+	for _, event := range events {
+		if event.Type == "content" {
+			text += event.Text
 		}
-		last = e.Type
 	}
 	if text != "Hello" {
-		t.Fatalf("应拼出 Hello，实际 %q", text)
+		t.Fatalf("translated content = %q", text)
 	}
-	if last != "test_complete" || !events[len(events)-1].Success {
-		t.Fatalf("应以 test_complete success 收尾，实际 %+v", events[len(events)-1])
+	last := events[len(events)-1]
+	if last.Type != "test_complete" || !last.Success {
+		t.Fatalf("last event = %+v", last)
 	}
 }
 
-// 验证上游 SSE 里夹带 error 块时立即转成 error 事件并停止。
-func TestRelayChatStreamError(t *testing.T) {
-	upstream := `data: {"error":{"message":"rate limited"}}`
+func TestRelayTranslatedTestStreamRejectsEarlyEOF(t *testing.T) {
+	original := []byte(`{"model":"gpt-test","input":"hello","stream":true}`)
+	exchange, err := translate.NewExchange(translate.OpenAIResponses, translate.OpenAIResponses, "gpt-test", true, original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := `data: {"type":"response.output_text.delta","delta":"partial"}`
 	var events []testEvent
-	(&Server{}).relayChatStream(strings.NewReader(upstream), func(e testEvent) { events = append(events, e) }, time.Now())
-	if events[0].Type != "error" || events[0].Error != "rate limited" {
-		t.Fatalf("应转成 error 事件，实际 %+v", events)
+	(&Server{}).relayTranslatedTestStream(context.Background(), strings.NewReader(stream), exchange, func(event testEvent) {
+		events = append(events, event)
+	}, time.Now())
+	last := events[len(events)-1]
+	if last.Type != "error" || !strings.Contains(last.Error, "response.completed") {
+		t.Fatalf("last event = %+v", last)
+	}
+}
+
+func TestAdminUpstreamTestUsesConfiguredClaudeProtocol(t *testing.T) {
+	type observedRequest struct {
+		path             string
+		anthropicVersion string
+		body             string
+	}
+	observed := make(chan observedRequest, 1)
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		observed <- observedRequest{r.URL.Path, r.Header.Get("anthropic-version"), string(body)}
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, event := range []string{
+			"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":2}}}\n\n",
+			"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+			"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"translated hello\"}}\n\n",
+			"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+			"data: {\"type\":\"message_stop\"}\n\n",
+		} {
+			io.WriteString(w, event)
+		}
+	}))
+	defer upstreamServer.Close()
+
+	server, store, token := newAdminTestServer(t)
+	if err := store.Create(&upstream.Upstream{
+		Name: "claude", BaseURL: upstreamServer.URL, APIKey: "key", Protocol: "claude", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	upstreams, err := store.List()
+	if err != nil || len(upstreams) != 1 {
+		t.Fatalf("upstreams = %+v, err = %v", upstreams, err)
+	}
+	response := adminReq(t, http.MethodPost, server.URL+"/admin/upstreams/1/test?model=claude-test", token, "")
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "translated hello") || !strings.Contains(string(body), "test_complete") {
+		t.Fatalf("status=%d body=%s", response.StatusCode, body)
+	}
+
+	request := <-observed
+	if request.path != "/v1/messages" || request.anthropicVersion == "" {
+		t.Fatalf("request = %+v", request)
+	}
+	if !strings.Contains(request.body, `"messages"`) || strings.Contains(request.body, `"input"`) {
+		t.Fatalf("request was not translated: %s", request.body)
 	}
 }

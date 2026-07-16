@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -636,5 +637,141 @@ func TestStreamingLatencyUsesTTFT(t *testing.T) {
 	}
 	if got := hm.Snapshot(1).LatencyMs; got >= 100 {
 		t.Fatalf("routing latency should be TTFT, not total stream duration: %dms", got)
+	}
+}
+
+func TestForwardTranslatesResponsesToClaude(t *testing.T) {
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Fatalf("upstream path = %q", r.URL.Path)
+		}
+		if r.Header.Get("anthropic-version") == "" {
+			t.Fatal("missing anthropic-version header")
+		}
+		requestBody, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(requestBody), `"messages"`) || strings.Contains(string(requestBody), `"input"`) {
+			t.Fatalf("request was not translated to Claude: %s", requestBody)
+		}
+		if !strings.Contains(string(requestBody), `"stream":true`) {
+			t.Fatalf("translated request should use upstream streaming: %s", requestBody)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":2}}}\n\n")
+		io.WriteString(w, "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
+		io.WriteString(w, "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"translated hello\"}}\n\n")
+		io.WriteString(w, "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+		io.WriteString(w, "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n")
+		io.WriteString(w, "data: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer upstreamServer.Close()
+
+	upstreams := []*upstream.Upstream{{ID: 1, BaseURL: upstreamServer.URL, APIKey: "k", Protocol: "claude", Priority: 1, Weight: 1}}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 1)
+	body := []byte(`{"model":"claude-test","input":"hello","stream":false}`)
+	recorder := httptest.NewRecorder()
+	result := fwd.Forward(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body)), body, 1, "")
+
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "translated hello") {
+		t.Fatalf("translated response status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if result.Outcome != OutcomeSuccess || len(result.Attempts) != 1 {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestForwardTranslatesClaudeClientErrorEnvelope(t *testing.T) {
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"type":"error","error":{"type":"invalid_request_error","message":"invalid prompt"}}`)
+	}))
+	defer upstreamServer.Close()
+
+	upstreams := []*upstream.Upstream{{ID: 1, BaseURL: upstreamServer.URL, APIKey: "k", Protocol: "claude", Priority: 1, Weight: 1}}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 1)
+	body := []byte(`{"model":"claude-test","input":"hello","stream":false}`)
+	recorder := httptest.NewRecorder()
+	result := fwd.Forward(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body)), body, 1, "")
+
+	var response struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.Code != http.StatusBadRequest || response.Error.Message != "invalid prompt" || response.Error.Type != "invalid_request_error" {
+		t.Fatalf("status=%d response=%s", recorder.Code, recorder.Body.String())
+	}
+	if result.Outcome != OutcomeClientError {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestForwardTranslatesClaudeStreamBeforeCommit(t *testing.T) {
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		for _, event := range []string{
+			"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":2}}}\n\n",
+			"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+			"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"stream hello\"}}\n\n",
+			"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+			"data: {\"type\":\"message_stop\"}\n\n",
+		} {
+			io.WriteString(w, event)
+			flusher.Flush()
+		}
+	}))
+	defer upstreamServer.Close()
+
+	upstreams := []*upstream.Upstream{{ID: 1, BaseURL: upstreamServer.URL, APIKey: "k", Protocol: "claude", Priority: 1, Weight: 1}}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 1)
+	body := []byte(`{"model":"claude-test","input":"hello","stream":true}`)
+	recorder := httptest.NewRecorder()
+	result := fwd.Forward(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body)), body, 1, "")
+
+	response := recorder.Body.String()
+	if recorder.Code != http.StatusOK || !strings.Contains(response, "response.created") || !strings.Contains(response, "stream hello") {
+		t.Fatalf("translated stream status=%d body=%s", recorder.Code, response)
+	}
+	if !result.StreamCompleted {
+		t.Fatalf("translated stream should complete: %+v", result)
+	}
+}
+
+func TestProtocolMismatchDoesNotConsumeRetryBudget(t *testing.T) {
+	var backupHits int32
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&backupHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	defer backup.Close()
+
+	upstreams := []*upstream.Upstream{
+		{ID: 1, BaseURL: "http://unused.invalid", APIKey: "k", Protocol: "openai-response", Priority: 1, Weight: 1},
+		{ID: 2, BaseURL: backup.URL, APIKey: "k", Protocol: "passthrough", Priority: 2, Weight: 1},
+	}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 1)
+	body := []byte(`{"model":"claude-test","messages":[],"stream":false}`)
+	recorder := httptest.NewRecorder()
+	result := fwd.Forward(recorder, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)), body, 1, "")
+
+	if recorder.Code != http.StatusOK || backupHits != 1 {
+		t.Fatalf("backup was not used, status=%d hits=%d body=%s", recorder.Code, backupHits, recorder.Body.String())
+	}
+	if len(result.Attempts) != 2 || result.Attempts[0].ErrorKind != "protocol_unsupported" {
+		t.Fatalf("attempts = %+v", result.Attempts)
+	}
+	if hm.EffectiveState(1) != "CLOSED" {
+		t.Fatal("protocol mismatch must not affect channel health")
 	}
 }

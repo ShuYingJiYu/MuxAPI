@@ -84,16 +84,27 @@ export const api = {
   getSettings: () => req('GET', '/settings'),
   saveSettings: s => req('PUT', '/settings', s),
 
-  // 请求记录（游标分页 + 服务端筛选）。opts: {before, limit, model, group, status}
+  // 请求记录（游标分页 + 服务端筛选）。
   logs: (opts = {}) => {
     const p = new URLSearchParams()
-    if (opts.before) p.set('before', opts.before)
-    if (opts.limit) p.set('limit', opts.limit)
-    if (opts.model) p.set('model', opts.model)
-    if (opts.group) p.set('group', opts.group)
-    if (opts.status) p.set('status', opts.status)
+    for (const key of ['before', 'offset', 'limit', 'model', 'group', 'status', 'key', 'endpoint', 'error_kind',
+      'q', 'stream', 'upstream_id', 'since', 'until', 'slow_ms']) {
+      if (opts[key] !== undefined && opts[key] !== null && opts[key] !== '') p.set(key, opts[key])
+    }
+    if (opts.retried) p.set('retried', 'true')
     const qs = p.toString()
     return req('GET', '/logs' + (qs ? '?' + qs : ''))
   },
+  logStats: (opts = {}) => {
+    const p = new URLSearchParams()
+    for (const key of ['model', 'group', 'status', 'key', 'endpoint', 'error_kind', 'q', 'stream',
+      'upstream_id', 'since', 'until', 'slow_ms']) {
+      if (opts[key] !== undefined && opts[key] !== null && opts[key] !== '') p.set(key, opts[key])
+    }
+    if (opts.retried) p.set('retried', 'true')
+    const qs = p.toString()
+    return req('GET', '/logs/stats' + (qs ? '?' + qs : ''))
+  },
+  logDetail: id => req('GET', '/logs/' + id),
   logOptions: () => req('GET', '/logs/options'),
 }

@@ -1,6 +1,7 @@
 package forward
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mirainya/muxapi/internal/translate"
 	"github.com/mirainya/muxapi/internal/upstream"
 )
 
@@ -67,42 +69,106 @@ const (
 )
 
 type AttemptResult struct {
-	AttemptNo   int
-	UpstreamID  int64
-	Status      int
-	Outcome     string
-	TTFTMs      int64
-	DurationMs  int64
-	CreatedAt   time.Time
-	CompletedAt time.Time
-	Error       string
+	AttemptNo         int
+	UpstreamID        int64
+	Priority          int
+	SelectionReason   string
+	HealthBefore      string
+	HealthAfter       string
+	Status            int
+	Outcome           string
+	TTFTMs            int64
+	DurationMs        int64
+	ResponseBytes     int64
+	Stream            bool
+	StreamCompleted   bool
+	LastEvent         string
+	InputTokens       int64
+	OutputTokens      int64
+	CachedTokens      int64
+	UpstreamRequestID string
+	ErrorKind         string
+	ErrorSource       string
+	CreatedAt         time.Time
+	CompletedAt       time.Time
+	Error             string
 }
 
 type Result struct {
-	Status          int
-	Outcome         string
-	FinalUpstreamID int64
-	TTFTMs          int64
-	Error           string
-	Attempts        []AttemptResult
+	Status            int
+	Outcome           string
+	FinalUpstreamID   int64
+	TTFTMs            int64
+	ResponseBytes     int64
+	StreamCompleted   bool
+	LastEvent         string
+	InputTokens       int64
+	OutputTokens      int64
+	CachedTokens      int64
+	UpstreamRequestID string
+	ErrorKind         string
+	ErrorSource       string
+	Error             string
+	Attempts          []AttemptResult
 }
 
-func attemptResult(number int, upstreamID int64, status int, outcome string, ttft int64, started time.Time, errText string) AttemptResult {
+type attemptContext struct {
+	number          int
+	upstreamID      int64
+	priority        int
+	selectionReason string
+	healthBefore    string
+	started         time.Time
+}
+
+type healthStateReporter interface {
+	EffectiveState(id int64) string
+}
+
+func healthState(h Health, id int64) string {
+	if reporter, ok := h.(healthStateReporter); ok {
+		return reporter.EffectiveState(id)
+	}
+	return ""
+}
+
+func (a attemptContext) finish(h Health, status int, outcome string, relay relayResult, errorKind, errorSource, errText string) AttemptResult {
 	completed := time.Now()
 	return AttemptResult{
-		AttemptNo: number, UpstreamID: upstreamID, Status: status, Outcome: outcome,
-		TTFTMs: ttft, DurationMs: completed.Sub(started).Milliseconds(),
-		CreatedAt: started, CompletedAt: completed, Error: clipErr(errText),
+		AttemptNo: a.number, UpstreamID: a.upstreamID, Priority: a.priority,
+		SelectionReason: a.selectionReason, HealthBefore: a.healthBefore, HealthAfter: healthState(h, a.upstreamID),
+		Status: status, Outcome: outcome, TTFTMs: relay.ttftMs, DurationMs: completed.Sub(a.started).Milliseconds(),
+		ResponseBytes: relay.bytesSent, Stream: relay.stream, StreamCompleted: relay.streamCompleted,
+		LastEvent: relay.lastEvent, InputTokens: relay.usage.input, OutputTokens: relay.usage.output,
+		CachedTokens: relay.usage.cached, UpstreamRequestID: relay.upstreamRequestID,
+		ErrorKind: errorKind, ErrorSource: errorSource,
+		CreatedAt: a.started, CompletedAt: completed, Error: clipErr(errText),
+	}
+}
+
+func resultFromAttempt(attempt AttemptResult, attempts []AttemptResult) Result {
+	return Result{
+		Status: attempt.Status, Outcome: attempt.Outcome, FinalUpstreamID: attempt.UpstreamID,
+		TTFTMs: attempt.TTFTMs, ResponseBytes: attempt.ResponseBytes,
+		StreamCompleted: attempt.StreamCompleted, LastEvent: attempt.LastEvent,
+		InputTokens: attempt.InputTokens, OutputTokens: attempt.OutputTokens, CachedTokens: attempt.CachedTokens,
+		UpstreamRequestID: attempt.UpstreamRequestID, ErrorKind: attempt.ErrorKind,
+		ErrorSource: attempt.ErrorSource, Error: attempt.Error, Attempts: attempts,
 	}
 }
 
 func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte, groupID int64, keyName string) Result {
 	model := parseModel(body)
+	streamRequested := parseStream(body)
+	sourceFormat, sourceKnown := translate.SourceFromPath(r.URL.Path)
+	if !sourceKnown {
+		sourceFormat = translate.Passthrough
+	}
 	tried := map[int64]bool{}
 	var lastErr error
 	attempts := make([]AttemptResult, 0, f.maxAttempts)
 
-	for attempt := 0; attempt < f.maxAttempts; attempt++ {
+	for upstreamAttempts := 0; upstreamAttempts < f.maxAttempts; {
 		candidate, err := f.picker.PickExcluding(groupID, model, tried)
 		if err != nil {
 			break
@@ -110,33 +176,78 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		tried[candidate.ID] = true
 		release := func() { f.health.ReleaseClaim(candidate.ID, model) }
 		attemptStarted := time.Now()
-		attemptNo := attempt + 1
+		attemptNo := len(attempts) + 1
+		selectionReason := "initial"
+		if attemptNo > 1 {
+			selectionReason = "failover"
+		}
+		beforeState := healthState(f.health, candidate.ID)
+		if beforeState == "HALF_OPEN" {
+			selectionReason = "recovery_trial"
+		}
+		attemptCtx := attemptContext{
+			number: attemptNo, upstreamID: candidate.ID, priority: candidate.Priority,
+			selectionReason: selectionReason, healthBefore: beforeState, started: attemptStarted,
+		}
 
-		req, err := candidate.BuildRequest(r.Method, r.URL.RequestURI(), bytes.NewReader(body), r.Header)
-		if err != nil {
-			f.health.Report(candidate.ID, model, false, 0)
+		targetFormat, validProtocol := translate.NormalizeFormat(candidate.Protocol)
+		if !validProtocol {
 			release()
-			attempts = append(attempts, attemptResult(attemptNo, candidate.ID, 0, OutcomeFailed, 0, attemptStarted, err.Error()))
+			err = errors.New("unsupported upstream protocol: " + candidate.Protocol)
+			attempts = append(attempts, attemptCtx.finish(f.health, 0, OutcomeUnsupported, relayResult{}, "protocol_unsupported", "gateway", err.Error()))
 			lastErr = err
 			continue
 		}
+		exchange, err := translate.NewExchange(sourceFormat, targetFormat, model, streamRequested, body)
+		if err != nil {
+			release()
+			attempts = append(attempts, attemptCtx.finish(f.health, 0, OutcomeUnsupported, relayResult{}, "protocol_unsupported", "gateway", err.Error()))
+			lastErr = err
+			continue
+		}
+		targetPath, err := translate.TargetPath(targetFormat, r.URL.Path)
+		if err != nil {
+			release()
+			attempts = append(attempts, attemptCtx.finish(f.health, 0, OutcomeUnsupported, relayResult{}, "protocol_unsupported", "gateway", err.Error()))
+			lastErr = err
+			continue
+		}
+		if r.URL.RawQuery != "" {
+			targetPath += "?" + r.URL.RawQuery
+		}
+		upstreamAttempts++
+		req, err := candidate.BuildRequest(r.Method, targetPath, bytes.NewReader(exchange.UpstreamRequest), r.Header)
+		if err != nil {
+			f.health.Report(candidate.ID, model, false, 0)
+			release()
+			attempts = append(attempts, attemptCtx.finish(f.health, 0, OutcomeFailed, relayResult{}, "request_build", "gateway", err.Error()))
+			lastErr = err
+			continue
+		}
+		translate.ConfigureRequestHeaders(req.Header, targetFormat, exchange.Translated())
 
-		ctx, cancel := context.WithCancel(r.Context())
-		firstByteTimer := time.AfterFunc(f.firstByteTimeout(), cancel)
+		ctx, cancel := context.WithCancelCause(r.Context())
+		firstByteTimer := time.AfterFunc(f.firstByteTimeout(), func() { cancel(errFirstResponseTimeout) })
 		req = req.WithContext(ctx)
 		client := &http.Client{Timeout: 0, Transport: candidate.NewTransport()}
 		start := time.Now()
 		resp, err := client.Do(req)
 		if err != nil {
 			firstByteTimer.Stop()
-			cancel()
+			cause := context.Cause(ctx)
+			cancel(nil)
 			release()
 			if r.Context().Err() != nil {
-				attempts = append(attempts, attemptResult(attemptNo, candidate.ID, StatusClientClosedRequest, OutcomeCanceled, 0, attemptStarted, r.Context().Err().Error()))
-				return Result{Status: StatusClientClosedRequest, Outcome: OutcomeCanceled, FinalUpstreamID: candidate.ID, Error: clipErr(r.Context().Err().Error()), Attempts: attempts}
+				finished := attemptCtx.finish(f.health, StatusClientClosedRequest, OutcomeCanceled, relayResult{}, "client_canceled", "client", r.Context().Err().Error())
+				attempts = append(attempts, finished)
+				return resultFromAttempt(finished, attempts)
+			}
+			errorKind := "upstream_network"
+			if errors.Is(cause, errFirstResponseTimeout) {
+				errorKind = "first_response_timeout"
 			}
 			f.health.Report(candidate.ID, model, false, 0)
-			attempts = append(attempts, attemptResult(attemptNo, candidate.ID, 0, OutcomeFailed, 0, attemptStarted, err.Error()))
+			attempts = append(attempts, attemptCtx.finish(f.health, 0, OutcomeFailed, relayResult{}, errorKind, "upstream", err.Error()))
 			lastErr = err
 			continue
 		}
@@ -144,72 +255,91 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound {
 			payload, readErr := readLimitedBody(resp.Body, 2<<20)
 			firstByteTimer.Stop()
-			cancel()
+			cause := context.Cause(ctx)
+			cancel(nil)
 			resp.Body.Close()
 			if readErr != nil {
 				release()
 				if r.Context().Err() != nil {
-					attempts = append(attempts, attemptResult(attemptNo, candidate.ID, StatusClientClosedRequest, OutcomeCanceled, 0, attemptStarted, r.Context().Err().Error()))
-					return Result{Status: StatusClientClosedRequest, Outcome: OutcomeCanceled, FinalUpstreamID: candidate.ID, Error: clipErr(r.Context().Err().Error()), Attempts: attempts}
+					finished := attemptCtx.finish(f.health, StatusClientClosedRequest, OutcomeCanceled, relayResult{}, "client_canceled", "client", r.Context().Err().Error())
+					attempts = append(attempts, finished)
+					return resultFromAttempt(finished, attempts)
+				}
+				errorKind := "upstream_read"
+				if errors.Is(cause, errFirstResponseTimeout) {
+					errorKind = "first_response_timeout"
 				}
 				f.health.Report(candidate.ID, model, false, 0)
-				attempts = append(attempts, attemptResult(attemptNo, candidate.ID, 0, OutcomeFailed, 0, attemptStarted, readErr.Error()))
+				attempts = append(attempts, attemptCtx.finish(f.health, 0, OutcomeFailed, relayResult{}, errorKind, "upstream", readErr.Error()))
 				lastErr = readErr
 				continue
 			}
+			responseMeta := relayResult{ttftMs: time.Since(start).Milliseconds(), upstreamRequestID: upstreamRequestID(resp.Header)}
 			if upstream.IsModelUnsupported(resp.StatusCode, model, string(payload)) {
 				f.health.MarkModelUnsupported(candidate.ID, model)
 				release()
-				attempts = append(attempts, attemptResult(attemptNo, candidate.ID, resp.StatusCode, OutcomeUnsupported,
-					time.Since(start).Milliseconds(), attemptStarted, string(payload)))
+				attempts = append(attempts, attemptCtx.finish(f.health, resp.StatusCode, OutcomeUnsupported,
+					responseMeta, "model_unsupported", "upstream", string(payload)))
 				continue
 			}
 
 			// Other 4xx responses describe the client request. Relay them without
 			// changing channel health.
-			resp.Body = io.NopCloser(bytes.NewReader(payload))
+			clientPayload := payload
+			if exchange.Translated() {
+				clientPayload = translate.ErrorResponse(sourceFormat, resp.StatusCode, payload)
+				resp.Header.Del("Content-Length")
+				resp.Header.Del("Content-Encoding")
+				resp.Header.Set("Content-Type", "application/json")
+			}
+			resp.Body = io.NopCloser(bytes.NewReader(clientPayload))
 			result := relayResponse(w, resp, start, nil)
 			release()
 			if result.err != nil {
-				attempts = append(attempts, attemptResult(attemptNo, candidate.ID, StatusClientClosedRequest, OutcomeCanceled,
-					result.ttftMs, attemptStarted, result.err.Error()))
-				return Result{Status: StatusClientClosedRequest, Outcome: OutcomeCanceled, FinalUpstreamID: candidate.ID,
-					TTFTMs: result.ttftMs, Error: clipErr(result.err.Error()), Attempts: attempts}
+				finished := attemptCtx.finish(f.health, StatusClientClosedRequest, OutcomeCanceled,
+					result, "downstream_write", "client", result.err.Error())
+				attempts = append(attempts, finished)
+				return resultFromAttempt(finished, attempts)
 			}
-			attempts = append(attempts, attemptResult(attemptNo, candidate.ID, resp.StatusCode, OutcomeClientError,
-				result.ttftMs, attemptStarted, string(payload)))
-			return Result{Status: resp.StatusCode, Outcome: OutcomeClientError, FinalUpstreamID: candidate.ID,
-				TTFTMs: result.ttftMs, Error: clipErr(string(payload)), Attempts: attempts}
+			finished := attemptCtx.finish(f.health, resp.StatusCode, OutcomeClientError,
+				result, "client_request", "client", string(payload))
+			attempts = append(attempts, finished)
+			return resultFromAttempt(finished, attempts)
 		}
 
 		if upstream.IsFailureStatus(resp.StatusCode) {
 			payload, _ := readLimitedBody(resp.Body, 64<<10)
 			firstByteTimer.Stop()
 			resp.Body.Close()
-			cancel()
+			cancel(nil)
 			latency := time.Since(start).Milliseconds()
 			f.health.Report(candidate.ID, model, false, latency)
 			release()
-			attempts = append(attempts, attemptResult(attemptNo, candidate.ID, resp.StatusCode, OutcomeFailed, latency, attemptStarted, string(payload)))
+			responseMeta := relayResult{ttftMs: latency, upstreamRequestID: upstreamRequestID(resp.Header)}
+			attempts = append(attempts, attemptCtx.finish(f.health, resp.StatusCode, OutcomeFailed,
+				responseMeta, "upstream_http", "upstream", string(payload)))
 			lastErr = errors.New(http.StatusText(resp.StatusCode))
 			continue
 		}
 
-		result := relayResponse(w, resp, start, func() { firstByteTimer.Stop() })
+		result := relayTranslatedResponse(r.Context(), w, resp, start, func() { firstByteTimer.Stop() }, exchange)
 		firstByteTimer.Stop()
-		cancel()
+		cause := context.Cause(ctx)
+		cancel(nil)
 		release()
 
 		if result.err != nil {
 			if result.source == relayDownstream || r.Context().Err() != nil {
 				errText := result.err.Error()
+				errorKind := "downstream_write"
 				if r.Context().Err() != nil {
 					errText = r.Context().Err().Error()
+					errorKind = "client_canceled"
 				}
-				attempts = append(attempts, attemptResult(attemptNo, candidate.ID, StatusClientClosedRequest, OutcomeCanceled,
-					result.ttftMs, attemptStarted, errText))
-				return Result{Status: StatusClientClosedRequest, Outcome: OutcomeCanceled, FinalUpstreamID: candidate.ID,
-					TTFTMs: result.ttftMs, Error: clipErr(errText), Attempts: attempts}
+				finished := attemptCtx.finish(f.health, StatusClientClosedRequest, OutcomeCanceled,
+					result, errorKind, "client", errText)
+				attempts = append(attempts, finished)
+				return resultFromAttempt(finished, attempts)
 			}
 			f.health.Report(candidate.ID, model, false, result.ttftMs)
 			outcome := OutcomeFailed
@@ -218,14 +348,14 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 				outcome = OutcomePartial
 				status = resp.StatusCode
 			}
-			attempts = append(attempts, attemptResult(attemptNo, candidate.ID, status, outcome,
-				result.ttftMs, attemptStarted, result.err.Error()))
+			errorKind := relayErrorKind(result.err, cause)
+			finished := attemptCtx.finish(f.health, status, outcome, result, errorKind, "upstream", result.err.Error())
+			attempts = append(attempts, finished)
 			lastErr = result.err
 			if !result.committed {
 				continue
 			}
-			return Result{Status: resp.StatusCode, Outcome: OutcomePartial, FinalUpstreamID: candidate.ID,
-				TTFTMs: result.ttftMs, Error: clipErr(result.err.Error()), Attempts: attempts}
+			return resultFromAttempt(finished, attempts)
 		}
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -236,22 +366,49 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		if resp.StatusCode >= 400 {
 			outcome = OutcomeClientError
 		}
-		attempts = append(attempts, attemptResult(attemptNo, candidate.ID, resp.StatusCode, outcome,
-			result.ttftMs, attemptStarted, ""))
-		return Result{Status: resp.StatusCode, Outcome: outcome, FinalUpstreamID: candidate.ID,
-			TTFTMs: result.ttftMs, Attempts: attempts}
+		errorKind, errorSource := "", ""
+		if outcome == OutcomeClientError {
+			errorKind, errorSource = "client_request", "client"
+		}
+		finished := attemptCtx.finish(f.health, resp.StatusCode, outcome, result, errorKind, errorSource, "")
+		attempts = append(attempts, finished)
+		return resultFromAttempt(finished, attempts)
 	}
 
 	if len(tried) == 0 {
 		http.Error(w, "no upstream available", http.StatusServiceUnavailable)
-		return Result{Status: http.StatusServiceUnavailable, Outcome: OutcomeUnavailable, Error: "no upstream available", Attempts: attempts}
+		return Result{Status: http.StatusServiceUnavailable, Outcome: OutcomeUnavailable,
+			ErrorKind: "no_upstream", ErrorSource: "gateway", Error: "no upstream available", Attempts: attempts}
 	}
 	if lastErr != nil {
 		http.Error(w, "upstream error: "+lastErr.Error(), http.StatusBadGateway)
-		return Result{Status: http.StatusBadGateway, Outcome: OutcomeFailed, Error: clipErr(lastErr.Error()), Attempts: attempts}
+		if len(attempts) > 0 {
+			final := attempts[len(attempts)-1]
+			result := resultFromAttempt(final, attempts)
+			result.Status = http.StatusBadGateway
+			result.Outcome = OutcomeFailed
+			result.Error = clipErr(lastErr.Error())
+			return result
+		}
+		return Result{Status: http.StatusBadGateway, Outcome: OutcomeFailed,
+			ErrorKind: "upstream_error", ErrorSource: "upstream", Error: clipErr(lastErr.Error()), Attempts: attempts}
 	}
 	http.Error(w, "all upstreams failed", http.StatusBadGateway)
-	return Result{Status: http.StatusBadGateway, Outcome: OutcomeFailed, Error: "all upstreams failed", Attempts: attempts}
+	return Result{Status: http.StatusBadGateway, Outcome: OutcomeFailed,
+		ErrorKind: "upstream_error", ErrorSource: "upstream", Error: "all upstreams failed", Attempts: attempts}
+}
+
+func relayErrorKind(err error, cause error) string {
+	switch {
+	case errors.Is(cause, errFirstResponseTimeout):
+		return "first_response_timeout"
+	case errors.Is(err, errEmptyResponse):
+		return "empty_response"
+	case errors.Is(err, errErrorPayload):
+		return "error_payload"
+	default:
+		return "upstream_disconnect"
+	}
 }
 
 func clipErr(value string) string {
@@ -274,8 +431,17 @@ func parseModel(body []byte) string {
 	return payload.Model
 }
 
+func parseStream(body []byte) bool {
+	var payload struct {
+		Stream bool `json:"stream"`
+	}
+	_ = json.Unmarshal(body, &payload)
+	return payload.Stream
+}
+
 var errEmptyResponse = errors.New("upstream returned an empty response")
 var errErrorPayload = errors.New("upstream returned an error payload with a successful status")
+var errFirstResponseTimeout = errors.New("upstream first response timeout")
 
 type relaySource int
 
@@ -285,19 +451,211 @@ const (
 )
 
 type relayResult struct {
-	err       error
-	source    relaySource
-	ttftMs    int64
-	committed bool
+	err               error
+	source            relaySource
+	ttftMs            int64
+	committed         bool
+	bytesSent         int64
+	stream            bool
+	streamCompleted   bool
+	lastEvent         string
+	usage             tokenUsage
+	upstreamRequestID string
 }
 
 func relayResponse(w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func()) relayResult {
-	defer resp.Body.Close()
+	return relayTranslatedResponse(context.Background(), w, resp, start, onFirstByte, nil)
+}
+
+func relayTranslatedResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func(), exchange *translate.Exchange) relayResult {
 	contentType := resp.Header.Get("Content-Type")
-	if strings.HasPrefix(contentType, "text/event-stream") {
-		return relaySSE(w, resp, start, onFirstByte)
+	stream := strings.HasPrefix(contentType, "text/event-stream")
+	audited := newAuditReadCloser(resp.Body, stream)
+	resp.Body = audited
+	defer resp.Body.Close()
+	var result relayResult
+	if stream && exchange != nil && exchange.Translated() {
+		if exchange.Stream {
+			result = relayTranslatedSSE(ctx, w, resp, start, onFirstByte, exchange)
+		} else {
+			result = relayTranslatedSSEToBody(ctx, w, resp, start, onFirstByte, exchange)
+		}
+	} else if stream {
+		result = relaySSE(w, resp, start, onFirstByte)
+	} else if exchange != nil && exchange.Translated() {
+		result = relayTranslatedBody(ctx, w, resp, start, onFirstByte, exchange)
+	} else {
+		result = relayBody(w, resp, start, onFirstByte)
 	}
-	return relayBody(w, resp, start, onFirstByte)
+	audited.audit.finish()
+	result.stream = stream
+	result.streamCompleted = audited.audit.streamCompleted
+	result.lastEvent = audited.audit.lastEvent
+	result.usage = audited.audit.usage
+	result.upstreamRequestID = upstreamRequestID(resp.Header)
+	return result
+}
+
+func relayTranslatedSSE(ctx context.Context, w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func(), exchange *translate.Exchange) relayResult {
+	flusher, canFlush := w.(http.Flusher)
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 52_428_800)
+	committed := false
+	ttft := int64(0)
+	bytesSent := int64(0)
+	for scanner.Scan() {
+		line := bytes.Clone(scanner.Bytes())
+		chunks, err := exchange.TranslateStream(ctx, line)
+		if err != nil {
+			return relayResult{err: err, source: relayUpstream, ttftMs: ttft, committed: committed, bytesSent: bytesSent}
+		}
+		for _, chunk := range chunks {
+			chunk = frameSSEChunk(chunk)
+			if len(chunk) == 0 {
+				continue
+			}
+			if !committed {
+				ttft = time.Since(start).Milliseconds()
+				if onFirstByte != nil {
+					onFirstByte()
+				}
+				copyTranslatedResponseHeaders(w.Header(), resp.Header, true)
+				w.WriteHeader(resp.StatusCode)
+				committed = true
+			}
+			written, writeErr := w.Write(chunk)
+			bytesSent += int64(written)
+			if writeErr != nil {
+				return relayResult{err: writeErr, source: relayDownstream, ttftMs: ttft, committed: true, bytesSent: bytesSent}
+			}
+			if canFlush {
+				flusher.Flush()
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return relayResult{err: err, source: relayUpstream, ttftMs: ttft, committed: committed, bytesSent: bytesSent}
+	}
+	if !committed {
+		return relayResult{err: errEmptyResponse, source: relayUpstream}
+	}
+	return relayResult{ttftMs: ttft, committed: true, bytesSent: bytesSent}
+}
+
+func relayTranslatedSSEToBody(ctx context.Context, w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func(), exchange *translate.Exchange) relayResult {
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 52_428_800)
+	ttft := int64(0)
+	firstLine := true
+	var rawStream bytes.Buffer
+	var terminalPayload []byte
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		rawStream.Write(line)
+		rawStream.WriteByte('\n')
+		if len(line) == 0 || !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		if firstLine {
+			firstLine = false
+			ttft = time.Since(start).Milliseconds()
+			if onFirstByte != nil {
+				onFirstByte()
+			}
+		}
+		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if bytes.Equal(payload, []byte("[DONE]")) || !json.Valid(payload) {
+			continue
+		}
+		terminalPayload = append(terminalPayload[:0], payload...)
+	}
+	if err := scanner.Err(); err != nil {
+		return relayResult{err: err, source: relayUpstream, ttftMs: ttft}
+	}
+	translationInput := terminalPayload
+	if exchange.Target == translate.Claude {
+		translationInput = rawStream.Bytes()
+	}
+	if len(translationInput) == 0 {
+		return relayResult{err: errEmptyResponse, source: relayUpstream, ttftMs: ttft}
+	}
+	translated, err := exchange.TranslateNonStream(ctx, translationInput)
+	if err != nil || len(translated) == 0 {
+		if err == nil {
+			err = errEmptyResponse
+		}
+		return relayResult{err: err, source: relayUpstream, ttftMs: ttft}
+	}
+	copyTranslatedResponseHeaders(w.Header(), resp.Header, false)
+	w.WriteHeader(resp.StatusCode)
+	written, err := w.Write(translated)
+	if err != nil {
+		return relayResult{err: err, source: relayDownstream, ttftMs: ttft, committed: true, bytesSent: int64(written)}
+	}
+	return relayResult{ttftMs: ttft, committed: true, bytesSent: int64(written)}
+}
+
+func relayTranslatedBody(ctx context.Context, w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func(), exchange *translate.Exchange) relayResult {
+	buffer := make([]byte, 32*1024)
+	var body bytes.Buffer
+	ttft := int64(0)
+	firstByte := true
+	for {
+		n, readErr := resp.Body.Read(buffer)
+		if n > 0 {
+			if firstByte {
+				firstByte = false
+				ttft = time.Since(start).Milliseconds()
+				if onFirstByte != nil {
+					onFirstByte()
+				}
+			}
+			body.Write(buffer[:n])
+		}
+		if readErr != nil {
+			if readErr != io.EOF {
+				return relayResult{err: readErr, source: relayUpstream, ttftMs: ttft}
+			}
+			break
+		}
+	}
+	if body.Len() == 0 {
+		return relayResult{err: errEmptyResponse, source: relayUpstream, ttftMs: ttft}
+	}
+	translated, err := exchange.TranslateNonStream(ctx, body.Bytes())
+	if err != nil {
+		return relayResult{err: err, source: relayUpstream, ttftMs: ttft}
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 && upstream.IsErrorPayload(translated) {
+		return relayResult{err: errErrorPayload, source: relayUpstream, ttftMs: ttft}
+	}
+	copyTranslatedResponseHeaders(w.Header(), resp.Header, false)
+	w.WriteHeader(resp.StatusCode)
+	written, writeErr := w.Write(translated)
+	if writeErr != nil {
+		return relayResult{err: writeErr, source: relayDownstream, ttftMs: ttft, committed: true, bytesSent: int64(written)}
+	}
+	return relayResult{ttftMs: ttft, committed: true, bytesSent: int64(written)}
+}
+
+func frameSSEChunk(chunk []byte) []byte {
+	chunk = bytes.TrimSpace(chunk)
+	if len(chunk) == 0 {
+		return nil
+	}
+	out := append([]byte(nil), chunk...)
+	return append(out, '\n', '\n')
+}
+
+func copyTranslatedResponseHeaders(dst, src http.Header, stream bool) {
+	copyResponseHeaders(dst, src)
+	dst.Del("Content-Length")
+	dst.Del("Content-Encoding")
+	if stream {
+		dst.Set("Content-Type", "text/event-stream")
+	} else {
+		dst.Set("Content-Type", "application/json")
+	}
 }
 
 func relaySSE(w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func()) relayResult {
@@ -305,6 +663,7 @@ func relaySSE(w http.ResponseWriter, resp *http.Response, start time.Time, onFir
 	buffer := make([]byte, 32*1024)
 	committed := false
 	ttft := int64(0)
+	bytesSent := int64(0)
 
 	for {
 		n, readErr := resp.Body.Read(buffer)
@@ -318,8 +677,10 @@ func relaySSE(w http.ResponseWriter, resp *http.Response, start time.Time, onFir
 				w.WriteHeader(resp.StatusCode)
 				committed = true
 			}
-			if _, err := w.Write(buffer[:n]); err != nil {
-				return relayResult{err: err, source: relayDownstream, ttftMs: ttft, committed: true}
+			written, err := w.Write(buffer[:n])
+			bytesSent += int64(written)
+			if err != nil {
+				return relayResult{err: err, source: relayDownstream, ttftMs: ttft, committed: true, bytesSent: bytesSent}
 			}
 			if canFlush {
 				flusher.Flush()
@@ -328,12 +689,12 @@ func relaySSE(w http.ResponseWriter, resp *http.Response, start time.Time, onFir
 
 		if readErr != nil {
 			if readErr == io.EOF && committed {
-				return relayResult{ttftMs: ttft, committed: true}
+				return relayResult{ttftMs: ttft, committed: true, bytesSent: bytesSent}
 			}
 			if readErr == io.EOF {
 				readErr = errEmptyResponse
 			}
-			return relayResult{err: readErr, source: relayUpstream, ttftMs: ttft, committed: committed}
+			return relayResult{err: readErr, source: relayUpstream, ttftMs: ttft, committed: committed, bytesSent: bytesSent}
 		}
 	}
 }
@@ -344,6 +705,7 @@ func relayBody(w http.ResponseWriter, resp *http.Response, start time.Time, onFi
 	ttft := int64(0)
 	firstByteSeen := false
 	var pending bytes.Buffer
+	bytesSent := int64(0)
 	for pending.Len() <= inspectLimit {
 		n, readErr := resp.Body.Read(buffer)
 		if n > 0 {
@@ -373,30 +735,36 @@ func relayBody(w http.ResponseWriter, resp *http.Response, start time.Time, onFi
 			}
 			copyResponseHeaders(w.Header(), resp.Header)
 			w.WriteHeader(resp.StatusCode)
-			if _, err := w.Write(pending.Bytes()); err != nil {
-				return relayResult{err: err, source: relayDownstream, ttftMs: ttft, committed: true}
+			written, err := w.Write(pending.Bytes())
+			bytesSent += int64(written)
+			if err != nil {
+				return relayResult{err: err, source: relayDownstream, ttftMs: ttft, committed: true, bytesSent: bytesSent}
 			}
-			return relayResult{ttftMs: ttft, committed: true}
+			return relayResult{ttftMs: ttft, committed: true, bytesSent: bytesSent}
 		}
 	}
 
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	if _, err := w.Write(pending.Bytes()); err != nil {
-		return relayResult{err: err, source: relayDownstream, ttftMs: ttft, committed: true}
+	written, err := w.Write(pending.Bytes())
+	bytesSent += int64(written)
+	if err != nil {
+		return relayResult{err: err, source: relayDownstream, ttftMs: ttft, committed: true, bytesSent: bytesSent}
 	}
 	for {
 		n, readErr := resp.Body.Read(buffer)
 		if n > 0 {
-			if _, err := w.Write(buffer[:n]); err != nil {
-				return relayResult{err: err, source: relayDownstream, ttftMs: ttft, committed: true}
+			written, err := w.Write(buffer[:n])
+			bytesSent += int64(written)
+			if err != nil {
+				return relayResult{err: err, source: relayDownstream, ttftMs: ttft, committed: true, bytesSent: bytesSent}
 			}
 		}
 		if readErr != nil {
 			if readErr == io.EOF {
-				return relayResult{ttftMs: ttft, committed: true}
+				return relayResult{ttftMs: ttft, committed: true, bytesSent: bytesSent}
 			}
-			return relayResult{err: readErr, source: relayUpstream, ttftMs: ttft, committed: true}
+			return relayResult{err: readErr, source: relayUpstream, ttftMs: ttft, committed: true, bytesSent: bytesSent}
 		}
 	}
 }

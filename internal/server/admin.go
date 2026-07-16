@@ -14,6 +14,7 @@ import (
 	"github.com/mirainya/muxapi/internal/monitor"
 	"github.com/mirainya/muxapi/internal/scheduler"
 	"github.com/mirainya/muxapi/internal/store"
+	"github.com/mirainya/muxapi/internal/translate"
 	"github.com/mirainya/muxapi/internal/upstream"
 )
 
@@ -28,22 +29,76 @@ func (s *Server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/groups/", s.auth(s.adminGroupSub))        // /{id} 改/删 ; /{id}/upstreams 成员 ; /{id}/keys 密钥
 	mux.HandleFunc("/admin/keys/", s.auth(s.adminKeyItem))           // PUT 启停 / DELETE 删
 	mux.HandleFunc("/admin/logs", s.auth(s.adminLogs))               // GET 调用日志(游标分页+筛选)
+	mux.HandleFunc("/admin/logs/stats", s.auth(s.adminLogStats))     // GET 当前筛选范围统计
 	mux.HandleFunc("/admin/logs/options", s.auth(s.adminLogOptions)) // GET 筛选下拉选项(全量去重)
+	mux.HandleFunc("/admin/logs/", s.auth(s.adminLogItem))           // GET 单条请求完整尝试链
 	mux.HandleFunc("/admin/settings", s.auth(s.adminSettings))       // GET/PUT 运行时设置
 }
 
-// adminLogs 游标分页返回调用日志。
-// 查询参: before(游标,id<此值;0=最新), limit(默认50,上限500), model/group(精确), status(ok|fail)。
+// adminLogs 返回调用日志，兼容游标和偏移量分页。
+// 查询参: before(游标), offset(页偏移), limit(默认50,上限500)及业务筛选项。
 func (s *Server) adminLogs(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	before, _ := strconv.ParseInt(q.Get("before"), 10, 64)
-	limit, _ := strconv.Atoi(q.Get("limit"))
-	page, err := s.store.ListRequestsPage(before, limit, q.Get("model"), q.Get("group"), q.Get("status"))
+	page, err := s.store.ListRequestsPage(parseLogFilter(r.URL.Query()))
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	writeJSON(w, page)
+}
+
+func parseLogFilter(q url.Values) store.RequestFilter {
+	before, _ := strconv.ParseInt(q.Get("before"), 10, 64)
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	offset, _ := strconv.Atoi(q.Get("offset"))
+	if offset < 0 {
+		offset = 0
+	}
+	upstreamID, _ := strconv.ParseInt(q.Get("upstream_id"), 10, 64)
+	slowMs, _ := strconv.ParseInt(q.Get("slow_ms"), 10, 64)
+	sinceUnix, _ := strconv.ParseInt(q.Get("since"), 10, 64)
+	untilUnix, _ := strconv.ParseInt(q.Get("until"), 10, 64)
+	filter := store.RequestFilter{
+		BeforeID: before, Limit: limit, Offset: offset, Model: q.Get("model"), Group: q.Get("group"),
+		Status: q.Get("status"), KeyName: q.Get("key"), Endpoint: q.Get("endpoint"),
+		ErrorKind: q.Get("error_kind"), Query: strings.TrimSpace(q.Get("q")),
+		Stream: q.Get("stream"), UpstreamID: upstreamID, Retried: q.Get("retried") == "true",
+		SlowMs: slowMs,
+	}
+	if sinceUnix > 0 {
+		filter.Since = time.Unix(sinceUnix, 0)
+	}
+	if untilUnix > 0 {
+		filter.Until = time.Unix(untilUnix, 0)
+	}
+	return filter
+}
+
+func (s *Server) adminLogStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.store.RequestStats(parseLogFilter(r.URL.Query()))
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	writeJSON(w, stats)
+}
+
+func (s *Server) adminLogItem(w http.ResponseWriter, r *http.Request) {
+	idText := strings.Trim(strings.TrimPrefix(r.URL.Path, "/admin/logs/"), "/")
+	id, err := strconv.ParseInt(idText, 10, 64)
+	if err != nil || id <= 0 {
+		http.Error(w, "invalid request record id", http.StatusBadRequest)
+		return
+	}
+	entry, err := s.store.GetRequest(id)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "request record not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, entry)
 }
 
 // adminLogOptions 返回日志筛选下拉的全量去重选项(模型/分组)。
@@ -333,6 +388,7 @@ type upstreamDTO struct {
 	Name         string            `json:"name"`
 	BaseURL      string            `json:"base_url"`
 	Proxy        string            `json:"proxy"`
+	Protocol     string            `json:"protocol"`
 	APIKey       string            `json:"api_key,omitempty"` // 输入用；输出时脱敏到 masked
 	Masked       string            `json:"masked,omitempty"`
 	Enabled      bool              `json:"enabled"`
@@ -359,7 +415,7 @@ func (s *Server) adminUpstreams(w http.ResponseWriter, r *http.Request) {
 		out := make([]upstreamDTO, 0, len(list))
 		for _, u := range list {
 			out = append(out, upstreamDTO{
-				ID: u.ID, Name: u.Name, BaseURL: u.BaseURL, Proxy: u.Proxy,
+				ID: u.ID, Name: u.Name, BaseURL: u.BaseURL, Proxy: u.Proxy, Protocol: u.Protocol,
 				Masked: mask(u.APIKey), Enabled: u.Enabled, ChannelProbe: u.ChannelProbe,
 				Health:      toHealthView(s.health.Snapshot(u.ID), s.health.EffectiveState(u.ID)),
 				ModelHealth: toModelHealthViews(s.health.ModelStates(u.ID)),
@@ -685,6 +741,7 @@ func decodeUpstream(r *http.Request) (*upstream.Upstream, error) {
 	}
 	d.Name = strings.TrimSpace(d.Name)
 	d.BaseURL = strings.TrimSpace(d.BaseURL)
+	d.Protocol = strings.TrimSpace(d.Protocol)
 	if d.Name == "" {
 		return nil, errors.New("name is required")
 	}
@@ -693,9 +750,13 @@ func decodeUpstream(r *http.Request) (*upstream.Upstream, error) {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, errors.New("base_url must be a valid http(s) URL")
 	}
+	protocol, ok := translate.NormalizeFormat(d.Protocol)
+	if !ok {
+		return nil, errors.New("unsupported upstream protocol")
+	}
 	return &upstream.Upstream{
 		Name: d.Name, BaseURL: d.BaseURL, APIKey: d.APIKey, Proxy: d.Proxy, Enabled: d.Enabled,
-		ChannelProbe: d.ChannelProbe,
+		Protocol: string(protocol), ChannelProbe: d.ChannelProbe,
 	}, nil
 }
 

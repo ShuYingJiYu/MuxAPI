@@ -95,12 +95,13 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	requestID := uuid.NewString()
 	w.Header().Set("X-Request-ID", requestID)
-	endpoint := r.URL.RequestURI()
+	endpoint := r.URL.Path
 	groupID, keyName, ok := s.store.GroupAndKeyByKey(clientKey(r))
 	if !ok {
 		http.Error(w, "unauthorized: unknown access key", http.StatusUnauthorized)
-		s.recordRequest(requestID, started, 0, "unknown", "", endpoint,
-			forward.Result{Status: http.StatusUnauthorized, Outcome: forward.OutcomeClientError, Error: "unauthorized: unknown access key"})
+		s.recordRequest(requestID, started, 0, "unknown", "", endpoint, false, 0,
+			forward.Result{Status: http.StatusUnauthorized, Outcome: forward.OutcomeClientError,
+				ErrorKind: "auth", ErrorSource: "client", Error: "unauthorized: unknown access key"})
 		return
 	}
 	// 限制请求体大小，防无上限 io.ReadAll 被超大 body 打爆内存(DoS)。
@@ -112,44 +113,63 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		var mbErr *http.MaxBytesError
 		if errors.As(err, &mbErr) {
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
-			s.recordRequest(requestID, started, groupID, keyName, parseBodyModel(body), endpoint,
-				forward.Result{Status: http.StatusRequestEntityTooLarge, Outcome: forward.OutcomeClientError, Error: "request body too large"})
+			model, stream := parseBodyAudit(body)
+			s.recordRequest(requestID, started, groupID, keyName, model, endpoint, stream, int64(len(body)),
+				forward.Result{Status: http.StatusRequestEntityTooLarge, Outcome: forward.OutcomeClientError,
+					ErrorKind: "request_too_large", ErrorSource: "client", Error: "request body too large"})
 			return
 		}
 		http.Error(w, "read body failed", http.StatusBadRequest)
-		s.recordRequest(requestID, started, groupID, keyName, parseBodyModel(body), endpoint,
-			forward.Result{Status: http.StatusBadRequest, Outcome: forward.OutcomeClientError, Error: "read body failed"})
+		model, stream := parseBodyAudit(body)
+		s.recordRequest(requestID, started, groupID, keyName, model, endpoint, stream, int64(len(body)),
+			forward.Result{Status: http.StatusBadRequest, Outcome: forward.OutcomeClientError,
+				ErrorKind: "request_read", ErrorSource: "client", Error: "read body failed"})
 		return
 	}
-	model := parseBodyModel(body)
+	model, stream := parseBodyAudit(body)
 	result := s.fwd.Forward(w, r, body, groupID, keyName)
-	s.recordRequest(requestID, started, groupID, keyName, model, endpoint, result)
+	s.recordRequest(requestID, started, groupID, keyName, model, endpoint, stream, int64(len(body)), result)
 }
 
-func (s *Server) recordRequest(requestID string, started time.Time, groupID int64, keyName, model, endpoint string, result forward.Result) {
+func (s *Server) recordRequest(requestID string, started time.Time, groupID int64, keyName, model, endpoint string, stream bool, requestBytes int64, result forward.Result) {
 	completed := time.Now()
 	attempts := make([]store.RequestAttemptRecord, len(result.Attempts))
 	for i, attempt := range result.Attempts {
 		attempts[i] = store.RequestAttemptRecord{
-			AttemptNo: attempt.AttemptNo, UpstreamID: attempt.UpstreamID, Status: attempt.Status,
-			Outcome: attempt.Outcome, TTFTMs: attempt.TTFTMs, DurationMs: attempt.DurationMs,
+			AttemptNo: attempt.AttemptNo, UpstreamID: attempt.UpstreamID, Priority: attempt.Priority,
+			SelectionReason: attempt.SelectionReason, HealthBefore: attempt.HealthBefore, HealthAfter: attempt.HealthAfter,
+			Status: attempt.Status, Outcome: attempt.Outcome, TTFTMs: attempt.TTFTMs, DurationMs: attempt.DurationMs,
+			ResponseBytes: attempt.ResponseBytes, Stream: attempt.Stream, StreamCompleted: attempt.StreamCompleted,
+			LastEvent: attempt.LastEvent, InputTokens: attempt.InputTokens, OutputTokens: attempt.OutputTokens,
+			CachedTokens: attempt.CachedTokens, UpstreamRequestID: attempt.UpstreamRequestID,
+			ErrorKind: attempt.ErrorKind, ErrorSource: attempt.ErrorSource,
 			CreatedAt: attempt.CreatedAt, CompletedAt: attempt.CompletedAt, Error: attempt.Error,
 		}
 	}
 	s.store.EnqueueRequest(store.RequestRecord{
 		RequestID: requestID, GroupID: groupID, FinalUpstreamID: result.FinalUpstreamID,
-		Model: model, Endpoint: endpoint, KeyName: keyName, Status: result.Status,
+		Model: model, Endpoint: endpoint, KeyName: keyName, Stream: stream, RequestBytes: requestBytes,
+		ResponseBytes: result.ResponseBytes, InputTokens: result.InputTokens, OutputTokens: result.OutputTokens,
+		CachedTokens: result.CachedTokens, StreamCompleted: result.StreamCompleted, LastEvent: result.LastEvent,
+		UpstreamRequestID: result.UpstreamRequestID, ErrorKind: result.ErrorKind, ErrorSource: result.ErrorSource,
+		Status:  result.Status,
 		Outcome: result.Outcome, TTFTMs: result.TTFTMs, DurationMs: completed.Sub(started).Milliseconds(),
 		CreatedAt: started, CompletedAt: completed, Error: result.Error, Attempts: attempts,
 	})
 }
 
 func parseBodyModel(body []byte) string {
+	model, _ := parseBodyAudit(body)
+	return model
+}
+
+func parseBodyAudit(body []byte) (string, bool) {
 	var payload struct {
-		Model string `json:"model"`
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
 	}
 	_ = json.Unmarshal(body, &payload)
-	return payload.Model
+	return payload.Model, payload.Stream
 }
 
 // listModels 下游模型清单：按接入 key 找到分组，实时汇总分组内各启用上游的

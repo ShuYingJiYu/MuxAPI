@@ -251,6 +251,102 @@ func TestRequestAuditAndPrune(t *testing.T) {
 	}
 }
 
+func TestRequestAuditDetailFiltersAndStats(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	groupID, _ := st.CreateGroup("codex", "")
+	_ = st.Create(&upstream.Upstream{Name: "primary", BaseURL: "http://primary", APIKey: "k", Enabled: true})
+	_ = st.Create(&upstream.Upstream{Name: "backup", BaseURL: "http://backup", APIKey: "k", Enabled: true})
+	upstreams, _ := st.List()
+	primary, backup := upstreams[0].ID, upstreams[1].ID
+	now := time.Now()
+
+	records := []RequestRecord{
+		{
+			RequestID: "20000000-0000-0000-0000-000000000001", GroupID: groupID,
+			FinalUpstreamID: primary, Model: "gpt-a", Endpoint: "/v1/responses", KeyName: "key-a",
+			Stream: true, RequestBytes: 120, ResponseBytes: 800, InputTokens: 10, OutputTokens: 20,
+			CachedTokens: 3, StreamCompleted: true, LastEvent: "response.completed",
+			Status: 200, Outcome: "success", TTFTMs: 100, DurationMs: 500,
+			CreatedAt: now, CompletedAt: now,
+			Attempts: []RequestAttemptRecord{{AttemptNo: 1, UpstreamID: primary, Priority: 1,
+				SelectionReason: "initial", HealthBefore: "CLOSED", HealthAfter: "CLOSED",
+				Status: 200, Outcome: "success", TTFTMs: 100, DurationMs: 500, ResponseBytes: 800,
+				Stream: true, StreamCompleted: true, LastEvent: "response.completed",
+				InputTokens: 10, OutputTokens: 20, CachedTokens: 3, CreatedAt: now, CompletedAt: now}},
+		},
+		{
+			RequestID: "20000000-0000-0000-0000-000000000002", GroupID: groupID,
+			FinalUpstreamID: backup, Model: "gpt-a", Endpoint: "/v1/responses", KeyName: "key-a",
+			Stream: true, ResponseBytes: 900, InputTokens: 12, OutputTokens: 22,
+			Status: 200, Outcome: "success", TTFTMs: 150, DurationMs: 900,
+			CreatedAt: now, CompletedAt: now,
+			Attempts: []RequestAttemptRecord{
+				{AttemptNo: 1, UpstreamID: primary, Priority: 1, SelectionReason: "initial",
+					Status: 502, Outcome: "failed", TTFTMs: 80, DurationMs: 90,
+					ErrorKind: "upstream_http", ErrorSource: "upstream", Error: "bad gateway", CreatedAt: now, CompletedAt: now},
+				{AttemptNo: 2, UpstreamID: backup, Priority: 2, SelectionReason: "failover",
+					Status: 200, Outcome: "success", TTFTMs: 150, DurationMs: 800, ResponseBytes: 900,
+					InputTokens: 12, OutputTokens: 22, CreatedAt: now, CompletedAt: now},
+			},
+		},
+		{
+			RequestID: "20000000-0000-0000-0000-000000000003", GroupID: groupID,
+			FinalUpstreamID: primary, Model: "gpt-b", Endpoint: "/v1/messages", KeyName: "key-b",
+			Stream: true, ResponseBytes: 300, Status: 200, Outcome: "partial", TTFTMs: 200, DurationMs: 1200,
+			ErrorKind: "upstream_disconnect", ErrorSource: "upstream", Error: "unexpected EOF",
+			CreatedAt: now, CompletedAt: now,
+			Attempts: []RequestAttemptRecord{{AttemptNo: 1, UpstreamID: primary, Priority: 1,
+				Status: 200, Outcome: "partial", TTFTMs: 200, DurationMs: 1200, ResponseBytes: 300,
+				Stream: true, ErrorKind: "upstream_disconnect", ErrorSource: "upstream", Error: "unexpected EOF",
+				CreatedAt: now, CompletedAt: now}},
+		},
+	}
+	for _, record := range records {
+		if !st.EnqueueRequest(record) {
+			t.Fatal("enqueue request audit")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := st.FlushRequests(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := st.ListRequestsPage(RequestFilter{Status: "failover_success", Limit: 10})
+	if err != nil || len(page.Entries) != 1 || len(page.Entries[0].Route) != 2 {
+		t.Fatalf("failover page mismatch: page=%+v err=%v", page, err)
+	}
+	page, err = st.ListRequestsPage(RequestFilter{ErrorKind: "upstream_disconnect", Limit: 10})
+	if err != nil || len(page.Entries) != 1 || page.Entries[0].Outcome != "partial" {
+		t.Fatalf("error filter mismatch: page=%+v err=%v", page, err)
+	}
+	page, err = st.ListRequestsPage(RequestFilter{Query: "20000000-0000-0000-0000-000000000002", Limit: 10})
+	if err != nil || len(page.Entries) != 1 {
+		t.Fatalf("request id filter mismatch: page=%+v err=%v", page, err)
+	}
+	offsetPage, err := st.ListRequestsPage(RequestFilter{Limit: 1, Offset: 1})
+	if err != nil || len(offsetPage.Entries) != 1 || offsetPage.Entries[0].RequestID != "20000000-0000-0000-0000-000000000002" {
+		t.Fatalf("offset page mismatch: page=%+v err=%v", offsetPage, err)
+	}
+
+	detail, err := st.GetRequest(page.Entries[0].ID)
+	if err != nil || len(detail.Attempts) != 2 || detail.Attempts[0].ErrorKind != "upstream_http" {
+		t.Fatalf("request detail mismatch: detail=%+v err=%v", detail, err)
+	}
+	stats, err := st.RequestStats(RequestFilter{})
+	if err != nil || stats.Total != 3 || stats.DirectSuccess != 1 || stats.FailoverSuccess != 1 || stats.Partial != 1 {
+		t.Fatalf("request stats mismatch: stats=%+v err=%v", stats, err)
+	}
+	if stats.InputTokens != 22 || stats.OutputTokens != 42 || stats.CachedTokens != 3 {
+		t.Fatalf("token stats mismatch: %+v", stats)
+	}
+}
+
 // 直接按指定时刻插探测行（绕过 InsertProbe 的 now），便于构造跨小时桶。
 func insertProbeAt(t *testing.T, st *Store, monitorID int64, status int, latMs, ts int64) {
 	t.Helper()
