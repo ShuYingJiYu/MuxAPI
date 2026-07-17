@@ -1,4 +1,6 @@
 <script setup>
+// 单页管理后台：集中管理页面状态、轮询、表单动作和管理 API 调用。
+// 大型派生视图使用 computed，跨页面异步请求使用 epoch 防止旧响应覆盖新状态。
 import { ref, reactive, onMounted, onUnmounted, computed } from 'vue'
 import Icon from './Icon.vue'
 import Fence from './Fence.vue'
@@ -8,6 +10,7 @@ import { api } from './api.js'
 const page = ref('overview')      // overview | groups | upstreams | monitors
 const detailGroup = ref(null)     // 进入分组详情时设置
 
+// 后端资源缓存；详情页成员与密钥只对应 detailGroup。
 const groups = ref([])
 const upstreams = ref([])         // 全局上游池
 const members = ref([])           // 当前详情分组的成员
@@ -46,6 +49,7 @@ function monitorItemState(monitor, upstream) {
   return monitor.snapshot?.state || 'NODATA'
 }
 
+// 将监控项与上游元数据合并，后续筛选和汇总只消费这一种视图对象。
 const monitorItems = computed(() => {
   const upstreamByID = new Map(upstreams.value.map(item => [item.id, item]))
   return monitors.value.map(monitor => {
@@ -214,6 +218,7 @@ async function loadDetail(gid) {
   if (ep === loadEpoch) keys.value = ks
 }
 
+// guard 统一展示接口错误，并在管理凭证失效时返回登录页。
 async function guard(fn) {
   err.value = ''
   try { await fn() } catch (e) {
@@ -810,6 +815,7 @@ function logFilterParams() {
 }
 
 let logLoadEpoch = 0
+// epoch 保证快速翻页或筛选时，较慢的旧请求不能覆盖最新结果。
 async function fetchLogPage(targetPage, refreshStats) {
   const epoch = ++logLoadEpoch
   logLoading.value = true

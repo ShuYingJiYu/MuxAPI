@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+// 本文件将渠道熔断翻转转换为带去抖控制的 Webhook 通知。
+
 // alertPayload 推送给 webhook 的 JSON 载荷：在 AlertEvent 基础上补充上游名。
 type alertPayload struct {
 	UpstreamID   int64  `json:"upstream_id"`

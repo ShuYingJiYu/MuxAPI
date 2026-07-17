@@ -63,6 +63,7 @@ function cfg() {
 
 onMounted(() => { chart = new Chart(el.value, cfg()) })
 onBeforeUnmount(() => chart?.destroy())
+// 数据变化时复用 Chart 实例，避免轮询刷新导致 canvas 和监听器重复创建。
 watch(() => [props.labels, props.data], () => {
   if (!chart) return
   chart.data.labels = props.labels

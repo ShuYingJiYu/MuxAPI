@@ -14,6 +14,7 @@ import (
 	"github.com/mirainya/muxapi/internal/translate"
 )
 
+// testEvent 是管理后台“测试上游”接口向浏览器发送的统一事件格式。
 type testEvent struct {
 	Type      string `json:"type"` // test_start | content | test_complete | error
 	Model     string `json:"model,omitempty"`
@@ -109,6 +110,7 @@ func (s *Server) testUpstreamChat(w http.ResponseWriter, r *http.Request, id int
 		return
 	}
 
+	// 无论上游返回流还是完整 JSON，最终都转换成 testEvent 流供界面消费。
 	if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
 		s.relayTranslatedTestStream(r.Context(), resp.Body, exchange, send, start)
 		return
@@ -128,6 +130,7 @@ func (s *Server) testUpstreamChat(w http.ResponseWriter, r *http.Request, id int
 	s.relayTestResponseBody(body, send, start)
 }
 
+// relayTranslatedTestStream 逐行转换上游 SSE，并在终态事件后立即结束测试。
 func (s *Server) relayTranslatedTestStream(ctx context.Context, body io.Reader, exchange *translate.Exchange, send func(testEvent), start time.Time) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 52_428_800)
@@ -157,6 +160,7 @@ func (s *Server) relayTranslatedTestStream(ctx context.Context, body io.Reader, 
 	send(testEvent{Type: "error", Error: "stream ended before response.completed", LatencyMs: time.Since(start).Milliseconds()})
 }
 
+// relayTestResponseBody 从标准 Responses JSON 中提取文本和错误。
 func (s *Server) relayTestResponseBody(body []byte, send func(testEvent), start time.Time) {
 	var response struct {
 		Error  json.RawMessage `json:"error"`
@@ -185,6 +189,7 @@ func (s *Server) relayTestResponseBody(body []byte, send func(testEvent), start 
 	send(testEvent{Type: "test_complete", Success: true, LatencyMs: time.Since(start).Milliseconds()})
 }
 
+// emitTestResponseEvents 将标准 Responses SSE 事件压缩成界面需要的三类事件。
 func emitTestResponseEvents(chunk []byte, send func(testEvent), start time.Time) (terminal, failed bool) {
 	lines := strings.Split(strings.ReplaceAll(string(chunk), "\r\n", "\n"), "\n")
 	for _, line := range lines {
@@ -238,6 +243,7 @@ func emitTestResponseEvents(chunk []byte, send func(testEvent), start time.Time)
 	return false, false
 }
 
+// responseErrorMessage 兼容字符串错误和常见的结构化错误对象。
 func responseErrorMessage(raw json.RawMessage) string {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {

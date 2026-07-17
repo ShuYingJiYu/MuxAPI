@@ -1,3 +1,4 @@
+// Package upstream 定义上游配置、请求构建、代理连接和错误分类。
 package upstream
 
 import (
@@ -220,4 +221,5 @@ type HTTPError struct {
 	Body   string
 }
 
+// Error 返回上游响应体片段，便于管理接口展示真实失败原因。
 func (e *HTTPError) Error() string { return e.Body }

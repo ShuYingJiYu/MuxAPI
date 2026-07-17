@@ -1,3 +1,4 @@
+// Package health 管理渠道熔断、模型能力缓存、路由统计与状态告警。
 package health
 
 import (
@@ -101,6 +102,7 @@ type Manager struct {
 	alerter       Alerter
 }
 
+// New 创建渠道级健康管理器，并规范化失败阈值与冷却时间。
 func New(failThreshold int, cooldown time.Duration) *Manager {
 	if failThreshold < 1 {
 		failThreshold = 1
@@ -116,6 +118,7 @@ func New(failThreshold int, cooldown time.Duration) *Manager {
 	}
 }
 
+// SetAlerter 设置状态翻转通知器。
 func (m *Manager) SetAlerter(a Alerter) { m.alerter = a }
 
 func (m *Manager) get(id int64) *breaker {
@@ -129,6 +132,7 @@ func (m *Manager) get(id int64) *breaker {
 
 func (m *Manager) canServe(b *breaker) bool {
 	now := time.Now()
+	// 冷却到期只进入半开态，真正恢复仍需后续成功结果确认。
 	if b.state == Open {
 		if now.Before(b.openUntil) {
 			return false
@@ -297,6 +301,7 @@ func (m *Manager) ObserveProbe(id int64, model string, ok bool, latencyMs int64)
 	}
 }
 
+// drive 是业务请求与主动探测共用的熔断状态机。
 func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) (from, to State) {
 	from = b.state
 	b.succEWMA = mixEWMA(b.succEWMA, boolToF(ok))
@@ -340,6 +345,7 @@ func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) (from, to State) {
 	return from, b.state
 }
 
+// backoff 对反复熔断使用指数冷却，最长为五分钟或基础冷却时间。
 func (m *Manager) backoff(reopenCount int) time.Duration {
 	if reopenCount < 1 {
 		return m.cooldown
@@ -394,6 +400,7 @@ func boolToF(ok bool) float64 {
 	return 0
 }
 
+// RouteSample 是从历史审计恢复路由 EWMA 所需的最小数据。
 type RouteSample struct {
 	UpstreamID int64
 	Model      string
@@ -418,6 +425,7 @@ func (m *Manager) Seed(samples []RouteSample) {
 	}
 }
 
+// Snapshot 是管理接口读取的渠道级健康快照。
 type Snapshot struct {
 	State     string
 	Fails     int
@@ -432,6 +440,7 @@ type Snapshot struct {
 	Trend     []TrendPoint
 }
 
+// Snapshot 返回指定渠道的累计统计与当前熔断状态副本。
 func (m *Manager) Snapshot(id int64) Snapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -486,6 +495,7 @@ func (m *Manager) EffectiveState(id int64) string {
 	return m.get(id).state.String()
 }
 
+// Sample 将累计请求计数转换成一个趋势采样点，并限制内存窗口长度。
 func (m *Manager) Sample() {
 	m.mu.Lock()
 	defer m.mu.Unlock()

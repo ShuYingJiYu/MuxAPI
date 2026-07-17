@@ -1,3 +1,4 @@
+// Package config 从环境变量和可选的 .env 文件加载启动配置。
 package config
 
 import (
@@ -41,6 +42,7 @@ type Config struct {
 	MaxBody       int64         // 请求体最大字节数（防 DoS），默认 32MB
 }
 
+// Load 返回带默认值的启动配置；同名系统环境变量优先于 .env。
 func Load() *Config {
 	loadDotEnv(".env")
 	return &Config{

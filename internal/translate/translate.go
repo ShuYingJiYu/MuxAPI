@@ -1,3 +1,4 @@
+// Package translate 封装不同 AI API 协议之间的请求、响应和 SSE 事件转换。
 package translate
 
 import (
@@ -23,8 +24,10 @@ const (
 	Codex           Format = "codex"
 )
 
+// ErrUnsupported 表示当前源协议与目标协议之间没有完整的双向转换链。
 var ErrUnsupported = errors.New("protocol translation is not supported")
 
+// NormalizeFormat 清理数据库中的协议值，并验证其是否受支持。
 func NormalizeFormat(value string) (Format, bool) {
 	format := Format(strings.ToLower(strings.TrimSpace(value)))
 	if format == "" {
@@ -38,6 +41,7 @@ func NormalizeFormat(value string) (Format, bool) {
 	}
 }
 
+// SourceFromPath 根据客户端入口路径识别请求协议。
 func SourceFromPath(path string) (Format, bool) {
 	switch strings.TrimSuffix(strings.TrimSpace(path), "/") {
 	case "/v1/chat/completions":
@@ -51,6 +55,7 @@ func SourceFromPath(path string) (Format, bool) {
 	}
 }
 
+// TargetPath 返回目标协议的标准端点；透传模式保留原路径。
 func TargetPath(format Format, originalPath string) (string, error) {
 	switch format {
 	case Passthrough:
@@ -202,7 +207,9 @@ type Exchange struct {
 	state    any
 }
 
+// NewExchange 校验双向转换能力，并从原始客户端正文生成上游请求。
 func NewExchange(source, target Format, model string, stream bool, original []byte) (exchange *Exchange, err error) {
+	// 第三方转换器的旧实现可能 panic，协议边界统一转换成普通错误。
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			exchange = nil
@@ -223,6 +230,7 @@ func NewExchange(source, target Format, model string, stream bool, original []by
 		OriginalRequest: append([]byte(nil), original...),
 		registry:        muxbuiltin.Registry(),
 	}
+	// 部分目标转换器只提供流式输出，非流式客户端也先请求流，再由转发层聚合。
 	exchange.UpstreamStream = stream || (exchange.Translated() && (target == Claude || target == Codex))
 	if !exchange.Translated() {
 		exchange.UpstreamRequest = append([]byte(nil), original...)
@@ -247,10 +255,12 @@ func NewExchange(source, target Format, model string, stream bool, original []by
 	return exchange, nil
 }
 
+// Translated 判断本次交换是否需要跨协议转换。
 func (e *Exchange) Translated() bool {
 	return e != nil && e.Target != Passthrough && e.Source != e.Target
 }
 
+// TranslateNonStream 将完整上游响应还原为客户端协议。
 func (e *Exchange) TranslateNonStream(ctx context.Context, body []byte) (out []byte, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {

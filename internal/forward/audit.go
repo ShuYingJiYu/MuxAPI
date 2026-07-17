@@ -10,6 +10,7 @@ import (
 
 const maxAuditPayload = 2 << 20
 
+// tokenUsage 保存跨协议统一后的 Token 用量。
 type tokenUsage struct {
 	input  int64
 	output int64
@@ -17,6 +18,7 @@ type tokenUsage struct {
 }
 
 func (u *tokenUsage) merge(other tokenUsage) {
+	// 流式协议通常重复发送累计值，取最大值可避免重复计数。
 	if other.input > u.input {
 		u.input = other.input
 	}
@@ -28,6 +30,8 @@ func (u *tokenUsage) merge(other tokenUsage) {
 	}
 }
 
+// responseAudit 在不影响响应转发的前提下提取完成状态和用量。
+// 非流式正文超过上限后放弃解析，防止审计逻辑放大内存占用。
 type responseAudit struct {
 	stream          bool
 	body            []byte
@@ -38,6 +42,7 @@ type responseAudit struct {
 	streamCompleted bool
 }
 
+// auditReadCloser 装饰上游正文，使所有转发分支共享同一套审计解析。
 type auditReadCloser struct {
 	io.ReadCloser
 	audit *responseAudit
@@ -60,6 +65,7 @@ func (r *auditReadCloser) Read(p []byte) (int, error) {
 
 func (a *responseAudit) feed(chunk []byte) {
 	if a.stream {
+		// TCP 读取边界与 SSE 事件边界无关，残缺事件留到下一批数据继续解析。
 		a.sseBuffer = append(a.sseBuffer, chunk...)
 		for {
 			end, skip := nextSSEBlock(a.sseBuffer)
@@ -98,6 +104,7 @@ func (a *responseAudit) finish() {
 	}
 }
 
+// nextSSEBlock 同时支持 LF 和 CRLF 两种合法的 SSE 事件分隔符。
 func nextSSEBlock(data []byte) (end, separatorLength int) {
 	lf := bytes.Index(data, []byte("\n\n"))
 	crlf := bytes.Index(data, []byte("\r\n\r\n"))
@@ -111,6 +118,7 @@ func nextSSEBlock(data []byte) (end, separatorLength int) {
 	}
 }
 
+// consumeSSEBlock 兼容 event 字段、JSON type 字段和 [DONE] 三类完成标记。
 func (a *responseAudit) consumeSSEBlock(block []byte) {
 	var eventName string
 	var dataLines []string
@@ -176,6 +184,7 @@ func usageFromJSON(data []byte) tokenUsage {
 	return usageFromValue(value)
 }
 
+// usageFromValue 兼容顶层 usage 以及 Responses/Claude 的嵌套 usage。
 func usageFromValue(value any) tokenUsage {
 	root, ok := value.(map[string]any)
 	if !ok {
@@ -196,6 +205,7 @@ func usageFromValue(value any) tokenUsage {
 	return out
 }
 
+// parseUsageObject 将 OpenAI 与 Claude 的字段名归一为统一计数。
 func parseUsageObject(usage map[string]any) tokenUsage {
 	input := maxInt64(number(usage["input_tokens"]), number(usage["prompt_tokens"]))
 	output := maxInt64(number(usage["output_tokens"]), number(usage["completion_tokens"]))
@@ -227,6 +237,7 @@ func maxInt64(a, b int64) int64 {
 	return b
 }
 
+// upstreamRequestID 按常见网关头的优先顺序提取链路标识。
 func upstreamRequestID(header http.Header) string {
 	for _, key := range []string{"X-Request-ID", "Request-ID", "OpenAI-Request-ID", "CF-Ray"} {
 		if value := strings.TrimSpace(header.Get(key)); value != "" {

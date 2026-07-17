@@ -1,4 +1,5 @@
 <script setup>
+// 原生 select 的样式化替代组件，保持 v-model 与 change 双事件兼容。
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import Icon from './Icon.vue'
 
@@ -32,6 +33,7 @@ function onKey(e) {
 }
 
 onMounted(() => {
+  // 全局监听用于点击外部和 Escape 关闭，下线时必须成对移除。
   document.addEventListener('click', onDocClick)
   document.addEventListener('keydown', onKey)
 })
@@ -65,4 +67,3 @@ onUnmounted(() => {
     </Transition>
   </div>
 </template>
-

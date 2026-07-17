@@ -1,3 +1,4 @@
+// Package server 提供客户端 API、管理 API 与内嵌前端的 HTTP 接入层。
 package server
 
 import (
@@ -29,6 +30,7 @@ type modelCacheEntry struct {
 	ts     time.Time
 }
 
+// Server 汇集转发、健康、监控和存储依赖，并维护模型列表缓存。
 type Server struct {
 	fwd        *forward.Forwarder
 	adminToken string
@@ -42,11 +44,13 @@ type Server struct {
 	modelCache map[int64]modelCacheEntry // 按 upstream_id 缓存其 /v1/models 结果，TTL=modelsTTL
 }
 
+// New 创建 HTTP 服务；maxBody 控制客户端请求正文上限。
 func New(fwd *forward.Forwarder, adminToken string, st *store.Store, hm *health.Manager, mon *monitor.Manager, mp *monitor.Prober, maxBody int64) *Server {
 	return &Server{fwd: fwd, adminToken: adminToken, store: st, health: hm, mon: mon, monProber: mp, maxBody: maxBody,
 		modelCache: make(map[int64]modelCacheEntry)}
 }
 
+// Handler 注册客户端、管理、健康检查和静态前端路由。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -83,6 +87,7 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// clientKey 兼容 Bearer 与 x-api-key 两种接入凭证头。
 func clientKey(r *http.Request) string {
 	if k := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "); k != "" {
 		return k
@@ -131,6 +136,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	s.recordRequest(requestID, started, groupID, keyName, model, endpoint, stream, int64(len(body)), result)
 }
 
+// recordRequest 将转发结果转换为异步持久化的请求与尝试记录。
 func (s *Server) recordRequest(requestID string, started time.Time, groupID int64, keyName, model, endpoint string, stream bool, requestBytes int64, result forward.Result) {
 	completed := time.Now()
 	attempts := make([]store.RequestAttemptRecord, len(result.Attempts))

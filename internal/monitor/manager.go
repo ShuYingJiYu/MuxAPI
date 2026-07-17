@@ -1,3 +1,4 @@
+// Package monitor 执行主动探测，并为管理看板组装持久化统计。
 package monitor
 
 import (
@@ -14,13 +15,13 @@ const (
 
 // Snapshot 看板视图。探测统计已落库按小时分桶（见 store），本类型仅做组装。
 type Snapshot struct {
-	State    string           `json:"state"`     // OK/DEGRADED/DOWN/NODATA
-	Reqs     int64            `json:"reqs"`      // 近 24h 探测次数
-	SuccRate float64          `json:"succ_rate"` // 近 24h 成功率 0..1
-	LastMs   int64            `json:"last_ms"`   // 最近一次延迟
-	AvgMs    int64            `json:"avg_ms"`    // 近 24h 成功平均延迟
-	Trend    []store.HourPoint `json:"trend"`    // 近 24h 按小时分桶的成功率栅栏
-	LastTS   int64            `json:"last_ts"`   // 最后探测时间(unix秒)，0=未探测
+	State    string            `json:"state"`     // OK/DEGRADED/DOWN/NODATA
+	Reqs     int64             `json:"reqs"`      // 近 24h 探测次数
+	SuccRate float64           `json:"succ_rate"` // 近 24h 成功率 0..1
+	LastMs   int64             `json:"last_ms"`   // 最近一次延迟
+	AvgMs    int64             `json:"avg_ms"`    // 近 24h 成功平均延迟
+	Trend    []store.HourPoint `json:"trend"`     // 近 24h 按小时分桶的成功率栅栏
+	LastTS   int64             `json:"last_ts"`   // 最后探测时间(unix秒)，0=未探测
 }
 
 // Manager 监控统计管理：探测器调 Record 落库，看板读 Snapshot 按小时聚合。
@@ -29,6 +30,7 @@ type Manager struct {
 	store *store.Store
 }
 
+// New 创建基于持久化存储的监控统计管理器。
 func New(st *store.Store) *Manager { return &Manager{store: st} }
 
 // Record 记录一次探测结果落库。status: 1正常 2降级(如429) 3故障。

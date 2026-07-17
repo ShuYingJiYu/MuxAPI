@@ -21,6 +21,7 @@ type breakerReporter interface {
 	ObserveProbe(id int64, model string, ok bool, latencyMs int64)
 }
 
+// capabilityReporter 将明确的模型支持结果写入短期能力缓存。
 type capabilityReporter interface {
 	MarkModelUnsupported(id int64, model string)
 	MarkModelSupported(id int64, model string)
@@ -41,6 +42,7 @@ type Prober struct {
 	path     func() string        // 内置默认探测端点；监控项 path 为空时用它
 }
 
+// NewProber 创建探测器；nil 默认值会回退到五分钟和 chat completions 端点。
 func NewProber(mgr *Manager, st *store.Store, breaker breakerReporter, interval func() time.Duration, path func() string) *Prober {
 	if interval == nil {
 		interval = func() time.Duration { return 5 * time.Minute }

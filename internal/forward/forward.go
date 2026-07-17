@@ -1,3 +1,5 @@
+// Package forward 负责选取上游、协议转换、故障切换及响应转发。
+// 它以“响应尚未写给客户端”为换源边界，避免流式响应重复输出。
 package forward
 
 import (
@@ -17,6 +19,7 @@ import (
 
 const defaultFirstResponseTimeout = 120 * time.Second
 
+// Health 汇总转发层需要的熔断反馈、并发占用和模型能力接口。
 type Health interface {
 	Report(id int64, model string, ok bool, latencyMs int64)
 	ReleaseClaim(id int64, model string)
@@ -24,10 +27,12 @@ type Health interface {
 	MarkModelSupported(id int64, model string)
 }
 
+// Picker 从指定分组选择一个未尝试且可用的上游。
 type Picker interface {
 	PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, error)
 }
 
+// Forwarder 协调一次客户端请求的选路、重试、协议转换和响应审计。
 type Forwarder struct {
 	picker               Picker
 	health               Health
@@ -35,6 +40,7 @@ type Forwarder struct {
 	firstResponseTimeout func() time.Duration
 }
 
+// New 创建转发器；maxRetries 实际表示单个请求最多尝试的上游数。
 func New(p Picker, h Health, maxRetries int) *Forwarder {
 	maxAttempts := maxRetries
 	if maxAttempts < 1 {
@@ -43,6 +49,7 @@ func New(p Picker, h Health, maxRetries int) *Forwarder {
 	return &Forwarder{picker: p, health: h, maxAttempts: maxAttempts}
 }
 
+// SetFirstResponseTimeout 设置动态首响应超时读取器，便于运行时修改配置。
 func (f *Forwarder) SetFirstResponseTimeout(timeout func() time.Duration) {
 	f.firstResponseTimeout = timeout
 }
@@ -56,8 +63,10 @@ func (f *Forwarder) firstByteTimeout() time.Duration {
 	return defaultFirstResponseTimeout
 }
 
+// StatusClientClosedRequest 用于审计客户端提前断开；Go 标准库没有该常量。
 const StatusClientClosedRequest = 499
 
+// Outcome* 是请求审计使用的稳定结果分类。
 const (
 	OutcomeSuccess     = "success"
 	OutcomeFailed      = "failed"
@@ -68,6 +77,7 @@ const (
 	OutcomeUnavailable = "unavailable"
 )
 
+// AttemptResult 记录一次上游尝试，完整请求可能包含多次尝试。
 type AttemptResult struct {
 	AttemptNo         int
 	UpstreamID        int64
@@ -94,6 +104,7 @@ type AttemptResult struct {
 	Error             string
 }
 
+// Result 汇总最终响应及按时间排列的全部上游尝试。
 type Result struct {
 	Status            int
 	Outcome           string
@@ -157,6 +168,7 @@ func resultFromAttempt(attempt AttemptResult, attempts []AttemptResult) Result {
 	}
 }
 
+// Forward 执行一次请求。只有在响应尚未提交给客户端时，失败才会切换上游。
 func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte, groupID int64, keyName string) Result {
 	model := parseModel(body)
 	streamRequested := parseStream(body)
@@ -169,6 +181,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 	attempts := make([]AttemptResult, 0, f.maxAttempts)
 
 	for upstreamAttempts := 0; upstreamAttempts < f.maxAttempts; {
+		// tried 同时防止重复选择；本地协议不兼容不消耗实际网络尝试次数。
 		candidate, err := f.picker.PickExcluding(groupID, model, tried)
 		if err != nil {
 			break
@@ -190,6 +203,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			selectionReason: selectionReason, healthBefore: beforeState, started: attemptStarted,
 		}
 
+		// 每次换源都从原始客户端请求重新转换，不能复用上一上游的请求体。
 		targetFormat, validProtocol := translate.NormalizeFormat(candidate.Protocol)
 		if !validProtocol {
 			release()
@@ -226,6 +240,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		}
 		translate.ConfigureRequestHeaders(req.Header, targetFormat, exchange.Translated())
 
+		// 超时覆盖建立连接到首个响应正文；正文开始后由回调停止计时器。
 		ctx, cancel := context.WithCancelCause(r.Context())
 		firstByteTimer := time.AfterFunc(f.firstByteTimeout(), func() { cancel(errFirstResponseTimeout) })
 		req = req.WithContext(ctx)
@@ -252,6 +267,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			continue
 		}
 
+		// 400/404 需要先读取正文，以区分“不支持模型”和普通客户端参数错误。
 		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound {
 			payload, readErr := readLimitedBody(resp.Body, 2<<20)
 			firstByteTimer.Stop()
@@ -283,8 +299,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 				continue
 			}
 
-			// Other 4xx responses describe the client request. Relay them without
-			// changing channel health.
+			// 其他 4xx 描述客户端请求，不改变渠道健康状态，也不换源。
 			clientPayload := payload
 			if exchange.Translated() {
 				clientPayload = translate.ErrorResponse(sourceFormat, resp.StatusCode, payload)
@@ -307,6 +322,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			return resultFromAttempt(finished, attempts)
 		}
 
+		// 认证、限流及 5xx 属于渠道失败：记录熔断反馈后尝试下一个上游。
 		if upstream.IsFailureStatus(resp.StatusCode) {
 			payload, _ := readLimitedBody(resp.Body, 64<<10)
 			firstByteTimer.Stop()
@@ -322,6 +338,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			continue
 		}
 
+		// relayResult.committed 表示响应是否已写出；只有未写出时才能安全换源。
 		result := relayTranslatedResponse(r.Context(), w, resp, start, func() { firstByteTimer.Stop() }, exchange)
 		firstByteTimer.Stop()
 		cause := context.Cause(ctx)
@@ -375,6 +392,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		return resultFromAttempt(finished, attempts)
 	}
 
+	// 循环结束后统一生成网关错误，并保留最后一次尝试的审计信息。
 	if len(tried) == 0 {
 		http.Error(w, "no upstream available", http.StatusServiceUnavailable)
 		return Result{Status: http.StatusServiceUnavailable, Outcome: OutcomeUnavailable,
@@ -450,6 +468,7 @@ const (
 	relayDownstream
 )
 
+// relayResult 区分上游读取错误和客户端写入错误，并标记响应提交边界。
 type relayResult struct {
 	err               error
 	source            relaySource
@@ -467,6 +486,8 @@ func relayResponse(w http.ResponseWriter, resp *http.Response, start time.Time, 
 	return relayTranslatedResponse(context.Background(), w, resp, start, onFirstByte, nil)
 }
 
+// relayTranslatedResponse 按“上游是否流式”和“客户端是否要求流式”选择转发方式。
+// auditReadCloser 在同一次读取中旁路提取完成事件、Token 用量和请求 ID。
 func relayTranslatedResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func(), exchange *translate.Exchange) relayResult {
 	contentType := resp.Header.Get("Content-Type")
 	stream := strings.HasPrefix(contentType, "text/event-stream")
@@ -496,6 +517,7 @@ func relayTranslatedResponse(ctx context.Context, w http.ResponseWriter, resp *h
 	return result
 }
 
+// relayTranslatedSSE 逐行翻译 SSE；翻译器可能将一个上游事件展开为多个客户端事件。
 func relayTranslatedSSE(ctx context.Context, w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func(), exchange *translate.Exchange) relayResult {
 	flusher, canFlush := w.(http.Flusher)
 	scanner := bufio.NewScanner(resp.Body)
@@ -514,6 +536,7 @@ func relayTranslatedSSE(ctx context.Context, w http.ResponseWriter, resp *http.R
 			if len(chunk) == 0 {
 				continue
 			}
+			// 首个有效翻译结果才提交响应；此前的读取或翻译错误仍可换源。
 			if !committed {
 				ttft = time.Since(start).Milliseconds()
 				if onFirstByte != nil {
@@ -542,6 +565,7 @@ func relayTranslatedSSE(ctx context.Context, w http.ResponseWriter, resp *http.R
 	return relayResult{ttftMs: ttft, committed: true, bytesSent: bytesSent}
 }
 
+// relayTranslatedSSEToBody 汇集流式上游的终态，再向非流式客户端输出单个 JSON。
 func relayTranslatedSSEToBody(ctx context.Context, w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func(), exchange *translate.Exchange) relayResult {
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 52_428_800)
@@ -572,6 +596,7 @@ func relayTranslatedSSEToBody(ctx context.Context, w http.ResponseWriter, resp *
 	if err := scanner.Err(); err != nil {
 		return relayResult{err: err, source: relayUpstream, ttftMs: ttft}
 	}
+	// Claude 转换器需要完整事件序列；其他转换器只需最后一个终态载荷。
 	translationInput := terminalPayload
 	if exchange.Target == translate.Claude {
 		translationInput = rawStream.Bytes()
@@ -595,6 +620,7 @@ func relayTranslatedSSEToBody(ctx context.Context, w http.ResponseWriter, resp *
 	return relayResult{ttftMs: ttft, committed: true, bytesSent: int64(written)}
 }
 
+// relayTranslatedBody 必须先读完整正文再转换，因此转换成功前不会提交响应。
 func relayTranslatedBody(ctx context.Context, w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func(), exchange *translate.Exchange) relayResult {
 	buffer := make([]byte, 32*1024)
 	var body bytes.Buffer
@@ -658,6 +684,7 @@ func copyTranslatedResponseHeaders(dst, src http.Header, stream bool) {
 	}
 }
 
+// relaySSE 透明转发 SSE，并在每次写入后立即刷新可用的 Flusher。
 func relaySSE(w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func()) relayResult {
 	flusher, canFlush := w.(http.Flusher)
 	buffer := make([]byte, 32*1024)
@@ -699,6 +726,8 @@ func relaySSE(w http.ResponseWriter, resp *http.Response, start time.Time, onFir
 	}
 }
 
+// relayBody 先暂存最多 64 KiB，用于识别“HTTP 2xx 包含错误 JSON”的异常上游。
+// 超过检查窗口后立即提交并继续流式复制，避免大响应全部驻留内存。
 func relayBody(w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func()) relayResult {
 	const inspectLimit = 64 << 10
 	buffer := make([]byte, 32*1024)
@@ -769,6 +798,7 @@ func relayBody(w http.ResponseWriter, resp *http.Response, start time.Time, onFi
 	}
 }
 
+// copyResponseHeaders 仅复制端到端响应头，逐跳头由当前 HTTP 连接重新生成。
 func copyResponseHeaders(dst, src http.Header) {
 	for key, values := range src {
 		if isHopByHopHeader(key) {

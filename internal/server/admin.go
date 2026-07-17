@@ -20,6 +20,7 @@ import (
 
 var errBadMonitor = errors.New("monitor requires upstream_id and model")
 
+// registerAdmin 集中注册管理接口，并统一套用管理员鉴权。
 func (s *Server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/upstreams", s.auth(s.adminUpstreams))     // GET 全局池 / POST 新增
 	mux.HandleFunc("/admin/upstreams/", s.auth(s.adminUpstreamItem)) // PUT 改 / DELETE 删
@@ -48,6 +49,7 @@ func (s *Server) adminLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, page)
 }
 
+// parseLogFilter 将查询参数转换为存储层筛选条件，并限制分页大小。
 func parseLogFilter(q url.Values) store.RequestFilter {
 	before, _ := strconv.ParseInt(q.Get("before"), 10, 64)
 	limit, _ := strconv.Atoi(q.Get("limit"))
@@ -326,7 +328,7 @@ type groupOut struct {
 	Runtime groupRuntime `json:"runtime"`
 }
 
-// computeGroupRuntime 算一个分组的运行时概览。
+// computeGroupRuntime 汇总分组当前生效层及各渠道健康数量。
 func (s *Server) computeGroupRuntime(gid int64) groupRuntime {
 	ms, _ := s.store.ListGroupMembers(gid)
 	// 缓存各成员「聚合后对外状态」（含模型级聚合），避免重复加锁查询
@@ -410,6 +412,7 @@ func mask(key string) string {
 	return key[:4] + "****" + key[len(key)-4:]
 }
 
+// adminUpstreams 处理上游全局池的列表与创建。
 func (s *Server) adminUpstreams(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -827,6 +830,7 @@ func (s *Server) probeMonitorNow(w http.ResponseWriter, r *http.Request, id int6
 	writeJSON(w, s.mon.Snapshot(id))
 }
 
+// decodeMonitor 校验并规范化监控项输入，负数配置恢复为默认值。
 func decodeMonitor(r *http.Request) (*store.Monitor, error) {
 	var in monitorInput
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
@@ -862,6 +866,7 @@ type upstreamInput struct {
 	TagIDs       *[]int64 `json:"tag_ids"`
 }
 
+// decodeUpstream 在系统边界校验 URL、协议和标签字段。
 func decodeUpstream(r *http.Request) (*upstream.Upstream, error) {
 	var d upstreamInput
 	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {

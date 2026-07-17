@@ -1,3 +1,5 @@
+// migrate-sqlite 将旧版 SQLite 配置一次性迁移到 PostgreSQL。
+// 请求审计等运行数据不在迁移范围内。
 package main
 
 import (
@@ -62,6 +64,7 @@ func main() {
 	defer source.Close()
 	source.SetMaxOpenConns(1)
 
+	// 先将源配置读入内存，再连接目标库，避免源读取与目标写入交错。
 	groups := loadGroups(source)
 	upstreams := loadUpstreams(source)
 	members := loadMembers(source)
@@ -77,6 +80,7 @@ func main() {
 	if err := target.Ping(); err != nil {
 		log.Fatalf("connect target: %v", err)
 	}
+	// 所有表在同一事务内按外键依赖顺序写入，任一步失败都会整体回滚。
 	tx, err := target.Begin()
 	if err != nil {
 		log.Fatal(err)
@@ -124,6 +128,7 @@ func main() {
 	}
 	mustExec(tx, `INSERT INTO settings(key,value) VALUES('request_retention_days','7')
 		ON CONFLICT(key) DO UPDATE SET value='7'`)
+	// 保留旧 ID 后同步序列，防止迁移后的新记录与现有主键冲突。
 	for _, table := range []string{"groups", "upstreams", "access_keys", "monitors"} {
 		mustExec(tx, fmt.Sprintf(`SELECT setval(pg_get_serial_sequence('%s','id'),
 			COALESCE(MAX(id),1),COUNT(*)>0) FROM %s`, table, table))
@@ -135,6 +140,7 @@ func main() {
 		len(groups), len(upstreams), len(members), len(keys), len(monitors), len(settings)+1)
 }
 
+// 以下 must* 辅助函数采用快速失败语义，错误时由 main 的延迟回滚撤销事务。
 func mustExec(tx *sql.Tx, query string, args ...any) {
 	if _, err := tx.Exec(query, args...); err != nil {
 		log.Fatalf("migration failed: %v", err)
@@ -155,6 +161,7 @@ func loadGroups(db *sql.DB) []groupRow {
 }
 
 func loadUpstreams(db *sql.DB) []upstreamRow {
+	// 兼容尚未增加 protocol 列的旧库，缺失时按透传协议迁移。
 	protocolColumn := `'passthrough'`
 	if sqliteColumnExists(db, "upstreams", "protocol") {
 		protocolColumn = `COALESCE(protocol,'passthrough')`

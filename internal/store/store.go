@@ -1,3 +1,4 @@
+// Package store 持久化配置、监控和请求审计，并兼容 PostgreSQL 与测试用 SQLite。
 package store
 
 import (
@@ -20,6 +21,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// dbAdapter 统一两种数据库的占位符和时间表达式差异。
 type dbAdapter struct {
 	*sql.DB
 	postgres bool
@@ -30,6 +32,7 @@ type txAdapter struct {
 	postgres bool
 }
 
+// bindPostgres 只替换 SQL 字符串字面量之外的问号占位符。
 func bindPostgres(query string) string {
 	var b strings.Builder
 	b.Grow(len(query) + 16)
@@ -105,6 +108,7 @@ type requestWrite struct {
 	barrier chan struct{}
 }
 
+// Store 封装数据库访问；请求审计通过有界队列异步串行写入。
 type Store struct {
 	db           *dbAdapter
 	requestQueue chan requestWrite
@@ -200,6 +204,7 @@ type Monitor struct {
 	ChannelProbe bool   `json:"-"` // 兼容旧数据；运行时不再改变熔断粒度
 }
 
+// Open 根据连接串选择数据库；PostgreSQL 会在返回前执行嵌入式迁移。
 func Open(databaseURL string) (*Store, error) {
 	if strings.HasPrefix(databaseURL, "postgres://") || strings.HasPrefix(databaseURL, "postgresql://") {
 		db, err := sql.Open("pgx", databaseURL)
@@ -227,6 +232,7 @@ func Open(databaseURL string) (*Store, error) {
 	return openSQLite(databaseURL)
 }
 
+// runPostgresMigrations 按文件名顺序执行尚未记录的迁移，每个文件独占事务。
 func runPostgresMigrations(ctx context.Context, db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version TEXT PRIMARY KEY,
@@ -1411,6 +1417,7 @@ type RequestPage struct {
 	NextCursor int64           `json:"next_cursor"`
 }
 
+// EnqueueRequest 非阻塞提交审计记录；队列已满时返回 false 并累计丢弃数。
 func (s *Store) EnqueueRequest(record RequestRecord) bool {
 	select {
 	case s.requestQueue <- requestWrite{record: &record}:
@@ -1424,6 +1431,7 @@ func (s *Store) EnqueueRequest(record RequestRecord) bool {
 	}
 }
 
+// FlushRequests 等待调用前已入队的审计记录写完，常用于测试和关闭流程。
 func (s *Store) FlushRequests(ctx context.Context) error {
 	done := make(chan struct{})
 	select {
@@ -1439,8 +1447,10 @@ func (s *Store) FlushRequests(ctx context.Context) error {
 	}
 }
 
+// RequestDrops 返回因队列满或数据库写入失败而丢失的审计数。
 func (s *Store) RequestDrops() uint64 { return s.requestDrops.Load() }
 
+// runRequestWriter 单协程消费队列，保证屏障与先前审计记录的顺序。
 func (s *Store) runRequestWriter() {
 	defer close(s.requestDone)
 	for item := range s.requestQueue {

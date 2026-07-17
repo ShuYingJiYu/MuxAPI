@@ -1,5 +1,5 @@
 <script setup>
-// 复刻 sub2api 的 Heroicons 风格单色描边图标
+// 统一图标组件：name 映射到内置 path，尺寸与描边样式由组件集中控制。
 const props = defineProps({ name: String, size: { type: Number, default: 18 } })
 const icons = {
   bolt: 'M13 10V3L4 14h7v7l9-11h-7z',

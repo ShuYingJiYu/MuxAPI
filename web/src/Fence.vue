@@ -12,6 +12,7 @@ const props = defineProps({
 const COLORS = { 0: 'var(--g200)', 1: '#10b981', 2: '#f59e0b', 3: '#ef4444' }
 const LABEL = { 0: '无数据', 1: '正常', 2: '降级', 3: '熔断' }
 
+// 固定输出 cap 个格子，避免不同数据量导致卡片宽度变化。
 const bars = computed(() => {
   const pts = props.trend.slice(-props.cap)
   const pad = Math.max(0, props.cap - pts.length)

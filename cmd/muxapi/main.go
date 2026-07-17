@@ -1,3 +1,4 @@
+// Command muxapi 组装网关各层，并管理 HTTP 服务与后台任务的生命周期。
 package main
 
 import (
@@ -44,7 +45,7 @@ func main() {
 		return ups
 	}
 
-	// 组装四层
+	// 依赖顺序：健康状态 -> 调度 -> 转发 -> 主动监控 -> HTTP 接入。
 	hm := health.New(cfg.FailThreshold, cfg.Cooldown)
 	// 重启恢复：用最近的转发样本重建选路预估(延迟/成功率 EWMA)，不重建熔断状态
 	if samples, err := st.RecentSamples(2000); err != nil {

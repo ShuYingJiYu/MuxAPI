@@ -1,3 +1,4 @@
+// Package scheduler 在最高可用优先级层内使用加权 P2C 选择上游。
 package scheduler
 
 import (
@@ -8,6 +9,7 @@ import (
 	"github.com/mirainya/muxapi/internal/upstream"
 )
 
+// ErrNoUpstream 表示分组中没有可声明占用的健康渠道。
 var ErrNoUpstream = errors.New("no healthy upstream available")
 
 // Health is the channel-level state required by the scheduler.
@@ -26,6 +28,7 @@ type Scheduler struct {
 	health Health
 }
 
+// New 创建调度器；list 在每次选择时读取最新分组成员。
 func New(list func(groupID int64) []*upstream.Upstream, h Health) *Scheduler {
 	return &Scheduler{list: list, health: h}
 }
@@ -34,10 +37,12 @@ func New(list func(groupID int64) []*upstream.Upstream, h Health) *Scheduler {
 // P2C, so runtime smart-routing settings no longer alter the algorithm.
 func (s *Scheduler) SetRouting(tolerance func() float64, enabled func() bool) {}
 
+// Pick 选择一个上游，并在健康管理器中声明并发占用。
 func (s *Scheduler) Pick(groupID int64, model string) (*upstream.Upstream, error) {
 	return s.PickExcluding(groupID, model, nil)
 }
 
+// PickExcluding 排除已尝试渠道，供转发层故障切换时重复调用。
 func (s *Scheduler) PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, error) {
 	blocked := make(map[int64]bool, len(exclude))
 	for id, value := range exclude {
@@ -69,6 +74,7 @@ func (s *Scheduler) PickExcluding(groupID int64, model string, exclude map[int64
 			}
 		}
 
+		// IsAvailable 与 Claim 分离，声明失败时重新选择可处理并发半开竞争。
 		chosen := s.pickP2C(tier, model)
 		if s.health.Claim(chosen.ID, model) {
 			return chosen, nil
@@ -95,6 +101,7 @@ func (s *Scheduler) pickP2C(tier []*upstream.Upstream, model string) *upstream.U
 	return a
 }
 
+// p2cScore 用延迟乘以当前并发数，使慢渠道和繁忙渠道自然降低胜率。
 func p2cScore(candidate *upstream.Upstream, health Health, model string, baseline int64) float64 {
 	latency := health.LatencyEWMA(candidate.ID, model)
 	if latency <= 0 {

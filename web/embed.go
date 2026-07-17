@@ -1,3 +1,4 @@
+// Package web 暴露编译进 Go 二进制的前端静态文件。
 package web
 
 import "embed"

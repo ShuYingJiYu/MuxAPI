@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
+// 开发环境将管理 API 转发到本地 Go 服务；生产环境由 Go 内嵌 dist。
 export default defineConfig({
   plugins: [vue()],
   server: {

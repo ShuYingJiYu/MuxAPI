@@ -11,11 +11,13 @@ async function req(method, path, body) {
     headers,
     body: body ? JSON.stringify(body) : undefined,
   })
+  // 保留状态码供页面统一处理 401，响应文本作为具体错误信息。
   if (!res.ok) {
     const e = new Error((await res.text()) || String(res.status))
     e.status = res.status
     throw e
   }
+  // DELETE/PUT 可能返回空正文，只对 JSON 响应调用解析器。
   const ct = res.headers.get('content-type') || ''
   return ct.includes('json') ? res.json() : null
 }
