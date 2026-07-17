@@ -91,21 +91,51 @@ func TestUpstreamSourceAndBatchUpdate(t *testing.T) {
 		t.Fatalf("source was not persisted: %+v, err=%v", list, err)
 	}
 
+	primaryID, err := st.CreateTag("Primary", "blue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	extraID, err := st.CreateTag("Codex", "purple")
+	if err != nil {
+		t.Fatal(err)
+	}
 	disabled := false
-	source := "Primary"
-	if err := st.BatchUpdateUpstreams([]int64{list[0].ID, list[1].ID}, &disabled, &source); err != nil {
+	if err := st.BatchUpdateUpstreams([]int64{list[0].ID, list[1].ID}, UpstreamBatchUpdate{
+		Enabled: &disabled, PrimaryTagID: &primaryID, AddTagIDs: []int64{extraID},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	updated, _ := st.List()
 	for _, item := range updated {
-		if item.Enabled || item.Source != "Primary" {
+		if item.Enabled || item.Source != "Primary" || item.PrimaryTagID != primaryID || len(item.Tags) != 2 {
 			t.Fatalf("batch update failed: %+v", item)
 		}
 	}
 	if updated[0].APIKey != "ka" || updated[1].APIKey != "kb" {
 		t.Fatal("batch update changed credentials")
 	}
-	if err := st.BatchUpdateUpstreams(nil, &disabled, nil); err == nil {
+	if err := st.UpdateTag(primaryID, "Primary API", "green"); err != nil {
+		t.Fatal(err)
+	}
+	renamed, _ := st.Get(list[0].ID)
+	if renamed.Source != "Primary API" || renamed.Tags[0].Name == "Primary" {
+		t.Fatalf("tag rename was not propagated: %+v", renamed)
+	}
+	if err := st.BatchUpdateUpstreams([]int64{list[0].ID}, UpstreamBatchUpdate{RemoveTagIDs: []int64{extraID}}); err != nil {
+		t.Fatal(err)
+	}
+	withoutExtra, _ := st.Get(list[0].ID)
+	if len(withoutExtra.Tags) != 1 || withoutExtra.PrimaryTagID != primaryID {
+		t.Fatalf("auxiliary tag removal changed primary tag: %+v", withoutExtra)
+	}
+	if err := st.DeleteTag(primaryID); err != nil {
+		t.Fatal(err)
+	}
+	withoutPrimary, _ := st.Get(list[0].ID)
+	if withoutPrimary.Source != "" || withoutPrimary.PrimaryTagID != 0 || len(withoutPrimary.Tags) != 0 {
+		t.Fatalf("tag deletion did not clear grouping: %+v", withoutPrimary)
+	}
+	if err := st.BatchUpdateUpstreams(nil, UpstreamBatchUpdate{Enabled: &disabled}); err == nil {
 		t.Fatal("empty batch must be rejected")
 	}
 }

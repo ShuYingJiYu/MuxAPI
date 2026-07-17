@@ -17,6 +17,10 @@ type Upstream struct {
 	ID           int64
 	Name         string
 	Source       string // 管理视图中的来源/供应商；不参与路由判定
+	PrimaryTagID int64
+	TagIDs       []int64
+	Tags         []Tag
+	TagsSet      bool
 	BaseURL      string // 中转站地址
 	APIKey       string // 透传凭证
 	Proxy        string // 转发/探测走的代理出口(空=按环境变量或直连)
@@ -25,6 +29,15 @@ type Upstream struct {
 	Weight       int    // 组内视图：同优先级层分流权重
 	Enabled      bool
 	ChannelProbe bool // 兼容旧数据；熔断固定为渠道级
+}
+
+// Tag is user-managed upstream metadata. IsPrimary controls visual grouping;
+// other tags are filters and never affect routing or health.
+type Tag struct {
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	Color     string `json:"color"`
+	IsPrimary bool   `json:"is_primary,omitempty"`
 }
 
 // ProxyTransport 按代理 URL 构建 Transport：空则回退到环境变量(HTTPS_PROXY)，解析失败也回退。

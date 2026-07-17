@@ -154,25 +154,43 @@ func TestCreateUpstreamValidatesInput(t *testing.T) {
 
 func TestUpstreamSourceAndBatchAPI(t *testing.T) {
 	ts, st, tok := newAdminTestServer(t)
+	tag := adminReq(t, http.MethodPost, ts.URL+"/admin/tags", tok, `{"name":"Backup","color":"blue"}`)
+	var createdTag map[string]int64
+	if err := json.NewDecoder(tag.Body).Decode(&createdTag); err != nil {
+		t.Fatal(err)
+	}
+	tag.Body.Close()
+	if tag.StatusCode != http.StatusCreated || createdTag["id"] == 0 {
+		t.Fatalf("tag create returned %d: %+v", tag.StatusCode, createdTag)
+	}
 	create := adminReq(t, http.MethodPost, ts.URL+"/admin/upstreams", tok,
-		`{"name":"relay-a","source":" Relay ","base_url":"https://api.example.com","api_key":"secret","enabled":true}`)
+		`{"name":"relay-a","base_url":"https://api.example.com","api_key":"secret","enabled":true,"primary_tag_id":`+itoa(createdTag["id"])+`,"tag_ids":[]}`)
 	create.Body.Close()
 	if create.StatusCode != http.StatusCreated {
 		t.Fatalf("create returned %d", create.StatusCode)
 	}
 	list, _ := st.List()
-	if len(list) != 1 || list[0].Source != "Relay" {
-		t.Fatalf("source was not normalized: %+v", list)
+	if len(list) != 1 || list[0].Source != "Backup" || list[0].PrimaryTagID != createdTag["id"] {
+		t.Fatalf("primary tag was not saved: %+v", list)
+	}
+	get := adminReq(t, http.MethodGet, ts.URL+"/admin/upstreams", tok, "")
+	var upstreams []upstreamDTO
+	if err := json.NewDecoder(get.Body).Decode(&upstreams); err != nil {
+		t.Fatal(err)
+	}
+	get.Body.Close()
+	if len(upstreams) != 1 || upstreams[0].PrimaryTagID != createdTag["id"] || len(upstreams[0].Tags) != 1 || !upstreams[0].Tags[0].IsPrimary {
+		t.Fatalf("admin upstream tags missing: %+v", upstreams)
 	}
 
 	batch := adminReq(t, http.MethodPost, ts.URL+"/admin/upstreams/batch", tok,
-		`{"ids":[`+itoa(list[0].ID)+`],"source":"Backup","enabled":false}`)
+		`{"ids":[`+itoa(list[0].ID)+`],"primary_tag_id":0,"enabled":false}`)
 	batch.Body.Close()
 	if batch.StatusCode != http.StatusNoContent {
 		t.Fatalf("batch returned %d", batch.StatusCode)
 	}
 	updated, _ := st.Get(list[0].ID)
-	if updated.Source != "Backup" || updated.Enabled || updated.APIKey != "secret" {
+	if updated.Source != "" || updated.PrimaryTagID != 0 || updated.Enabled || updated.APIKey != "secret" {
 		t.Fatalf("unexpected batch result: %+v", updated)
 	}
 
@@ -180,6 +198,37 @@ func TestUpstreamSourceAndBatchAPI(t *testing.T) {
 	bad.Body.Close()
 	if bad.StatusCode != http.StatusBadRequest {
 		t.Fatalf("empty batch should return 400, got %d", bad.StatusCode)
+	}
+}
+
+func TestTagAPIValidatesAndUpdates(t *testing.T) {
+	ts, st, tok := newAdminTestServer(t)
+	bad := adminReq(t, http.MethodPost, ts.URL+"/admin/tags", tok, `{"name":"","color":"orange"}`)
+	bad.Body.Close()
+	if bad.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid tag should return 400, got %d", bad.StatusCode)
+	}
+
+	created := adminReq(t, http.MethodPost, ts.URL+"/admin/tags", tok, `{"name":"Coding","color":"purple"}`)
+	var body map[string]int64
+	if err := json.NewDecoder(created.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	created.Body.Close()
+	id := body["id"]
+	updated := adminReq(t, http.MethodPut, ts.URL+"/admin/tags/"+itoa(id), tok, `{"name":"Code","color":"green"}`)
+	updated.Body.Close()
+	if updated.StatusCode != http.StatusNoContent {
+		t.Fatalf("tag update returned %d", updated.StatusCode)
+	}
+	tags, _ := st.ListTags()
+	if len(tags) != 1 || tags[0].Name != "Code" || tags[0].Color != "green" {
+		t.Fatalf("unexpected tags: %+v", tags)
+	}
+	deleted := adminReq(t, http.MethodDelete, ts.URL+"/admin/tags/"+itoa(id), tok, "")
+	deleted.Body.Close()
+	if deleted.StatusCode != http.StatusNoContent {
+		t.Fatalf("tag delete returned %d", deleted.StatusCode)
 	}
 }
 

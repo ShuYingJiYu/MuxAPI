@@ -23,6 +23,8 @@ var errBadMonitor = errors.New("monitor requires upstream_id and model")
 func (s *Server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/upstreams", s.auth(s.adminUpstreams))     // GET 全局池 / POST 新增
 	mux.HandleFunc("/admin/upstreams/", s.auth(s.adminUpstreamItem)) // PUT 改 / DELETE 删
+	mux.HandleFunc("/admin/tags", s.auth(s.adminTags))               // GET 列表 / POST 新增
+	mux.HandleFunc("/admin/tags/", s.auth(s.adminTagItem))           // PUT 改 / DELETE 删
 	mux.HandleFunc("/admin/monitors", s.auth(s.adminMonitors))       // GET 监控列表 / POST 新增
 	mux.HandleFunc("/admin/monitors/", s.auth(s.adminMonitorItem))   // PUT 改 / DELETE 删 / {id}/probe 立即探测
 	mux.HandleFunc("/admin/groups", s.auth(s.adminGroups))           // GET 列表 / POST 新增
@@ -387,6 +389,9 @@ type upstreamDTO struct {
 	ID           int64             `json:"id"`
 	Name         string            `json:"name"`
 	Source       string            `json:"source"`
+	PrimaryTagID int64             `json:"primary_tag_id"`
+	TagIDs       []int64           `json:"tag_ids"`
+	Tags         []upstream.Tag    `json:"tags"`
 	BaseURL      string            `json:"base_url"`
 	Proxy        string            `json:"proxy"`
 	Protocol     string            `json:"protocol"`
@@ -417,6 +422,7 @@ func (s *Server) adminUpstreams(w http.ResponseWriter, r *http.Request) {
 		for _, u := range list {
 			out = append(out, upstreamDTO{
 				ID: u.ID, Name: u.Name, Source: u.Source, BaseURL: u.BaseURL, Proxy: u.Proxy, Protocol: u.Protocol,
+				PrimaryTagID: u.PrimaryTagID, TagIDs: u.TagIDs, Tags: u.Tags,
 				Masked: mask(u.APIKey), Enabled: u.Enabled, ChannelProbe: u.ChannelProbe,
 				Health:      toHealthView(s.health.Snapshot(u.ID), s.health.EffectiveState(u.ID)),
 				ModelHealth: toModelHealthViews(s.health.ModelStates(u.ID)),
@@ -493,19 +499,106 @@ func (s *Server) adminUpstreamItem(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) batchUpdateUpstreams(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		IDs     []int64 `json:"ids"`
-		Enabled *bool   `json:"enabled"`
-		Source  *string `json:"source"`
+		IDs          []int64 `json:"ids"`
+		Enabled      *bool   `json:"enabled"`
+		PrimaryTagID *int64  `json:"primary_tag_id"`
+		AddTagIDs    []int64 `json:"add_tag_ids"`
+		RemoveTagIDs []int64 `json:"remove_tag_ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	if err := s.store.BatchUpdateUpstreams(in.IDs, in.Enabled, in.Source); err != nil {
+	update := store.UpstreamBatchUpdate{
+		Enabled: in.Enabled, PrimaryTagID: in.PrimaryTagID,
+		AddTagIDs: in.AddTagIDs, RemoveTagIDs: in.RemoveTagIDs,
+	}
+	if err := s.store.BatchUpdateUpstreams(in.IDs, update); err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+var tagColors = map[string]bool{
+	"gray": true, "green": true, "amber": true, "red": true,
+	"blue": true, "purple": true, "pink": true,
+}
+
+func decodeTag(r *http.Request) (string, string, error) {
+	var in struct {
+		Name  string `json:"name"`
+		Color string `json:"color"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		return "", "", err
+	}
+	in.Name = strings.TrimSpace(in.Name)
+	in.Color = strings.TrimSpace(in.Color)
+	if in.Name == "" || len([]rune(in.Name)) > 40 {
+		return "", "", errors.New("tag name must be 1-40 characters")
+	}
+	if !tagColors[in.Color] {
+		return "", "", errors.New("unsupported tag color")
+	}
+	return in.Name, in.Color, nil
+}
+
+func (s *Server) adminTags(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		tags, err := s.store.ListTags()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		writeJSON(w, tags)
+	case http.MethodPost:
+		name, color, err := decodeTag(r)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		id, err := s.store.CreateTag(name, color)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]int64{"id": id})
+	default:
+		http.Error(w, "method not allowed", 405)
+	}
+}
+
+func (s *Server) adminTagItem(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(strings.TrimPrefix(r.URL.Path, "/admin/tags/"), 10, 64)
+	if err != nil || id <= 0 {
+		http.Error(w, "bad id", 400)
+		return
+	}
+	switch r.Method {
+	case http.MethodPut:
+		name, color, err := decodeTag(r)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if err := s.store.UpdateTag(id, name, color); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	case http.MethodDelete:
+		if err := s.store.DeleteTag(id); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "method not allowed", 405)
+	}
 }
 
 // testUpstream 实时拉该上游 /v1/models：既是连通测试，也返回模型列表。
@@ -756,8 +849,21 @@ func decodeMonitor(r *http.Request) (*store.Monitor, error) {
 	}, nil
 }
 
+type upstreamInput struct {
+	Name         string   `json:"name"`
+	Source       string   `json:"source"`
+	BaseURL      string   `json:"base_url"`
+	Proxy        string   `json:"proxy"`
+	Protocol     string   `json:"protocol"`
+	APIKey       string   `json:"api_key"`
+	Enabled      bool     `json:"enabled"`
+	ChannelProbe bool     `json:"channel_probe"`
+	PrimaryTagID *int64   `json:"primary_tag_id"`
+	TagIDs       *[]int64 `json:"tag_ids"`
+}
+
 func decodeUpstream(r *http.Request) (*upstream.Upstream, error) {
-	var d upstreamDTO
+	var d upstreamInput
 	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
 		return nil, err
 	}
@@ -777,10 +883,20 @@ func decodeUpstream(r *http.Request) (*upstream.Upstream, error) {
 	if !ok {
 		return nil, errors.New("unsupported upstream protocol")
 	}
-	return &upstream.Upstream{
+	result := &upstream.Upstream{
 		Name: d.Name, Source: d.Source, BaseURL: d.BaseURL, APIKey: d.APIKey, Proxy: d.Proxy, Enabled: d.Enabled,
 		Protocol: string(protocol), ChannelProbe: d.ChannelProbe,
-	}, nil
+	}
+	if d.PrimaryTagID != nil || d.TagIDs != nil {
+		result.TagsSet = true
+		if d.PrimaryTagID != nil && *d.PrimaryTagID > 0 {
+			result.PrimaryTagID = *d.PrimaryTagID
+		}
+		if d.TagIDs != nil {
+			result.TagIDs = *d.TagIDs
+		}
+	}
+	return result, nil
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

@@ -91,6 +91,13 @@ func (t *txAdapter) Exec(query string, args ...any) (sql.Result, error) {
 	return t.Tx.Exec(query, args...)
 }
 
+func (t *txAdapter) QueryRow(query string, args ...any) *sql.Row {
+	if t.postgres {
+		query = bindPostgres(query)
+	}
+	return t.Tx.QueryRow(query, args...)
+}
+
 const requestQueueSize = 4096
 
 type requestWrite struct {
@@ -293,6 +300,10 @@ func openSQLite(path string) (*Store, error) {
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN proxy TEXT NOT NULL DEFAULT ''`)
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN protocol TEXT NOT NULL DEFAULT 'passthrough'`)
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN source TEXT NOT NULL DEFAULT ''`)
+	db.Exec(`INSERT OR IGNORE INTO tags(name,color,sort_order)
+		SELECT DISTINCT TRIM(source),'gray',0 FROM upstreams WHERE TRIM(source)<>''`)
+	db.Exec(`INSERT OR IGNORE INTO upstream_tags(upstream_id,tag_id,is_primary)
+		SELECT u.id,t.id,1 FROM upstreams u JOIN tags t ON LOWER(t.name)=LOWER(TRIM(u.source)) WHERE TRIM(u.source)<>''`)
 	// 迁移：保留旧 channel_probe 列，运行时已固定使用渠道级熔断。
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN channel_probe INTEGER NOT NULL DEFAULT 1`)
 	// 迁移：旧库 upstreams 补 sort_order 列（拖拽排序权重，0=未排过按 id）
@@ -364,6 +375,23 @@ CREATE TABLE IF NOT EXISTS upstreams (
 	channel_probe INTEGER NOT NULL DEFAULT 1,
 	sort_order INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS tags (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	name       TEXT NOT NULL,
+	color      TEXT NOT NULL DEFAULT 'gray',
+	sort_order INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_name_ci ON tags(LOWER(name));
+CREATE TABLE IF NOT EXISTS upstream_tags (
+	upstream_id INTEGER NOT NULL,
+	tag_id      INTEGER NOT NULL,
+	is_primary INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (upstream_id, tag_id),
+	FOREIGN KEY (upstream_id) REFERENCES upstreams(id) ON DELETE CASCADE,
+	FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_upstream_primary_tag ON upstream_tags(upstream_id) WHERE is_primary=1;
+CREATE INDEX IF NOT EXISTS idx_upstream_tags_tag ON upstream_tags(tag_id, upstream_id);
 CREATE TABLE IF NOT EXISTS group_upstreams (
 	group_id    INTEGER NOT NULL,
 	upstream_id INTEGER NOT NULL,
@@ -486,6 +514,120 @@ CREATE INDEX IF NOT EXISTS idx_attempts_upstream_time ON request_attempts(upstre
 
 // --- 上游全局池 ---
 
+func (s *Store) ListTags() ([]upstream.Tag, error) {
+	rows, err := s.db.Query(`SELECT id,name,color FROM tags ORDER BY sort_order,id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tags []upstream.Tag
+	for rows.Next() {
+		var tag upstream.Tag
+		if err := rows.Scan(&tag.ID, &tag.Name, &tag.Color); err != nil {
+			return nil, err
+		}
+		tags = append(tags, tag)
+	}
+	return tags, rows.Err()
+}
+
+func (s *Store) CreateTag(name, color string) (int64, error) {
+	var id int64
+	err := s.db.QueryRow(`INSERT INTO tags(name,color,sort_order)
+		VALUES(?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM tags)) RETURNING id`, name, color).Scan(&id)
+	return id, err
+}
+
+func (s *Store) UpdateTag(id int64, name, color string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE tags SET name=?,color=? WHERE id=?`, name, color, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE upstreams SET source=? WHERE id IN
+		(SELECT upstream_id FROM upstream_tags WHERE tag_id=? AND is_primary=TRUE)`, name, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) DeleteTag(id int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE upstreams SET source='' WHERE id IN
+		(SELECT upstream_id FROM upstream_tags WHERE tag_id=? AND is_primary=TRUE)`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM tags WHERE id=?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) loadUpstreamTags(list []*upstream.Upstream) error {
+	if len(list) == 0 {
+		return nil
+	}
+	byID := make(map[int64]*upstream.Upstream, len(list))
+	for _, item := range list {
+		item.Tags = []upstream.Tag{}
+		item.TagIDs = []int64{}
+		byID[item.ID] = item
+	}
+	rows, err := s.db.Query(`SELECT ut.upstream_id,t.id,t.name,t.color,ut.is_primary
+		FROM upstream_tags ut JOIN tags t ON t.id=ut.tag_id ORDER BY t.sort_order,t.id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var upstreamID int64
+		var tag upstream.Tag
+		if err := rows.Scan(&upstreamID, &tag.ID, &tag.Name, &tag.Color, &tag.IsPrimary); err != nil {
+			return err
+		}
+		item := byID[upstreamID]
+		if item == nil {
+			continue
+		}
+		item.Tags = append(item.Tags, tag)
+		item.TagIDs = append(item.TagIDs, tag.ID)
+		if tag.IsPrimary {
+			item.PrimaryTagID = tag.ID
+		}
+	}
+	return rows.Err()
+}
+
+func replaceUpstreamTags(tx *txAdapter, upstreamID, primaryTagID int64, tagIDs []int64) error {
+	if _, err := tx.Exec(`DELETE FROM upstream_tags WHERE upstream_id=?`, upstreamID); err != nil {
+		return err
+	}
+	ids := make(map[int64]bool, len(tagIDs)+1)
+	for _, id := range tagIDs {
+		if id > 0 {
+			ids[id] = false
+		}
+	}
+	if primaryTagID > 0 {
+		ids[primaryTagID] = true
+	}
+	for id, primary := range ids {
+		if _, err := tx.Exec(`INSERT INTO upstream_tags(upstream_id,tag_id,is_primary) VALUES(?,?,?)`, upstreamID, id, primary); err != nil {
+			return err
+		}
+	}
+	_, err := tx.Exec(`UPDATE upstreams SET source=COALESCE((SELECT t.name FROM upstream_tags ut
+		JOIN tags t ON t.id=ut.tag_id WHERE ut.upstream_id=? AND ut.is_primary=TRUE),'') WHERE id=?`, upstreamID, upstreamID)
+	return err
+}
+
 // scanUps 扫描含组内视图 priority/weight 的行（JOIN 查询用）。
 func scanUps(rows *sql.Rows) ([]*upstream.Upstream, error) {
 	defer rows.Close()
@@ -518,7 +660,14 @@ func (s *Store) List() ([]*upstream.Upstream, error) {
 	if err != nil {
 		return nil, err
 	}
-	return scanUps(rows)
+	list, err := scanUps(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.loadUpstreamTags(list); err != nil {
+		return nil, err
+	}
+	return list, nil
 }
 
 // Get 按 id 取单个上游（含完整 api_key，供连通测试用）。
@@ -526,14 +675,29 @@ func (s *Store) Get(id int64) (*upstream.Upstream, error) {
 	u := &upstream.Upstream{}
 	err := s.db.QueryRow(`SELECT id,name,source,base_url,api_key,proxy,protocol,enabled,channel_probe FROM upstreams WHERE id=?`, id).
 		Scan(&u.ID, &u.Name, &u.Source, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Protocol, &u.Enabled, &u.ChannelProbe)
+	if err == nil {
+		err = s.loadUpstreamTags([]*upstream.Upstream{u})
+	}
 	return u, err
 }
 
 func (s *Store) Create(u *upstream.Upstream) error {
-	_, err := s.db.Exec(`INSERT INTO upstreams(name,source,base_url,api_key,proxy,protocol,enabled,channel_probe,sort_order)
-		VALUES(?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM upstreams))`,
-		u.Name, u.Source, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := tx.QueryRow(`INSERT INTO upstreams(name,source,base_url,api_key,proxy,protocol,enabled,channel_probe,sort_order)
+		VALUES(?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM upstreams)) RETURNING id`,
+		u.Name, u.Source, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe).Scan(&u.ID); err != nil {
+		return err
+	}
+	if u.TagsSet {
+		if err := replaceUpstreamTags(tx, u.ID, u.PrimaryTagID, u.TagIDs); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // ReorderUpstreams 按给定 id 顺序写入 sort_order 权重（从 1 起）。
@@ -552,20 +716,39 @@ func (s *Store) ReorderUpstreams(ids []int64) error {
 }
 
 func (s *Store) Update(u *upstream.Upstream) error {
-	if u.APIKey == "" { // 留空则不改凭证（对齐后台「留空则不修改」语义）
-		_, err := s.db.Exec(`UPDATE upstreams SET name=?,source=?,base_url=?,proxy=?,protocol=?,enabled=?,channel_probe=? WHERE id=?`,
-			u.Name, u.Source, u.BaseURL, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe, u.ID)
+	tx, err := s.db.Begin()
+	if err != nil {
 		return err
 	}
-	_, err := s.db.Exec(`UPDATE upstreams SET name=?,source=?,base_url=?,api_key=?,proxy=?,protocol=?,enabled=?,channel_probe=? WHERE id=?`,
-		u.Name, u.Source, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe, u.ID)
-	return err
+	defer tx.Rollback()
+	if u.APIKey == "" { // 留空则不改凭证（对齐后台「留空则不修改」语义）
+		_, err = tx.Exec(`UPDATE upstreams SET name=?,source=?,base_url=?,proxy=?,protocol=?,enabled=?,channel_probe=? WHERE id=?`,
+			u.Name, u.Source, u.BaseURL, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe, u.ID)
+	} else {
+		_, err = tx.Exec(`UPDATE upstreams SET name=?,source=?,base_url=?,api_key=?,proxy=?,protocol=?,enabled=?,channel_probe=? WHERE id=?`,
+			u.Name, u.Source, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe, u.ID)
+	}
+	if err != nil {
+		return err
+	}
+	if u.TagsSet {
+		if err := replaceUpstreamTags(tx, u.ID, u.PrimaryTagID, u.TagIDs); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
-// BatchUpdateUpstreams updates management metadata without touching credentials
-// or routing membership. Nil fields are left unchanged.
-func (s *Store) BatchUpdateUpstreams(ids []int64, enabled *bool, source *string) error {
-	if len(ids) == 0 || (enabled == nil && source == nil) {
+type UpstreamBatchUpdate struct {
+	Enabled      *bool
+	PrimaryTagID *int64
+	AddTagIDs    []int64
+	RemoveTagIDs []int64
+}
+
+// BatchUpdateUpstreams updates management metadata without touching credentials or routing membership.
+func (s *Store) BatchUpdateUpstreams(ids []int64, update UpstreamBatchUpdate) error {
+	if len(ids) == 0 || (update.Enabled == nil && update.PrimaryTagID == nil && len(update.AddTagIDs) == 0 && len(update.RemoveTagIDs) == 0) {
 		return errors.New("batch update requires ids and at least one field")
 	}
 	tx, err := s.db.Begin()
@@ -577,13 +760,37 @@ func (s *Store) BatchUpdateUpstreams(ids []int64, enabled *bool, source *string)
 		if id <= 0 {
 			return errors.New("invalid upstream id")
 		}
-		if enabled != nil {
-			if _, err := tx.Exec(`UPDATE upstreams SET enabled=? WHERE id=?`, *enabled, id); err != nil {
+		if update.Enabled != nil {
+			if _, err := tx.Exec(`UPDATE upstreams SET enabled=? WHERE id=?`, *update.Enabled, id); err != nil {
 				return err
 			}
 		}
-		if source != nil {
-			if _, err := tx.Exec(`UPDATE upstreams SET source=? WHERE id=?`, strings.TrimSpace(*source), id); err != nil {
+		for _, tagID := range update.AddTagIDs {
+			if tagID <= 0 {
+				continue
+			}
+			if _, err := tx.Exec(`INSERT INTO upstream_tags(upstream_id,tag_id,is_primary) VALUES(?,?,FALSE)
+				ON CONFLICT(upstream_id,tag_id) DO NOTHING`, id, tagID); err != nil {
+				return err
+			}
+		}
+		for _, tagID := range update.RemoveTagIDs {
+			if _, err := tx.Exec(`DELETE FROM upstream_tags WHERE upstream_id=? AND tag_id=? AND is_primary=FALSE`, id, tagID); err != nil {
+				return err
+			}
+		}
+		if update.PrimaryTagID != nil {
+			if _, err := tx.Exec(`UPDATE upstream_tags SET is_primary=FALSE WHERE upstream_id=?`, id); err != nil {
+				return err
+			}
+			if *update.PrimaryTagID > 0 {
+				if _, err := tx.Exec(`INSERT INTO upstream_tags(upstream_id,tag_id,is_primary) VALUES(?,?,TRUE)
+					ON CONFLICT(upstream_id,tag_id) DO UPDATE SET is_primary=TRUE`, id, *update.PrimaryTagID); err != nil {
+					return err
+				}
+			}
+			if _, err := tx.Exec(`UPDATE upstreams SET source=COALESCE((SELECT t.name FROM upstream_tags ut
+				JOIN tags t ON t.id=ut.tag_id WHERE ut.upstream_id=? AND ut.is_primary=TRUE),'') WHERE id=?`, id, id); err != nil {
 				return err
 			}
 		}

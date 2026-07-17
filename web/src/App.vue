@@ -13,6 +13,7 @@ const upstreams = ref([])         // 全局上游池
 const members = ref([])           // 当前详情分组的成员
 const keys = ref([])              // 当前详情分组的密钥
 const monitors = ref([])          // 监控项（含探测快照）
+const tags = ref([])              // 上游管理标签
 const err = ref('')
 const loggedIn = ref(!!api.getToken())
 const loginForm = reactive({ token: api.getToken() })
@@ -20,6 +21,7 @@ const loginForm = reactive({ token: api.getToken() })
 async function loadGroups() { groups.value = (await api.groups()) || [] }
 async function loadUpstreams() { upstreams.value = (await api.upstreams()) || [] }
 async function loadMonitors() { monitors.value = (await api.monitors()) || [] }
+async function loadTags() { tags.value = (await api.tags()) || [] }
 
 // 单项「立即探测」：探完用返回的快照原地更新该卡片
 // 用 Set 记录正在探测的卡片 id，支持多卡并发互不串台
@@ -32,83 +34,31 @@ async function probeOne(m) {
   } finally { probing.delete(m.id) }
 }
 
-function upstreamSource(u) {
-  const explicit = String(u?.source || '').trim()
-  if (explicit) return explicit
-  try { return new URL(u?.base_url || '').hostname || '未分类' } catch { return '未分类' }
-}
+const primaryTagFor = upstream => upstream?.tags?.find(tag => tag.is_primary) || null
+const auxiliaryTagsFor = upstream => (upstream?.tags || []).filter(tag => !tag.is_primary)
+const tagGroupKey = tag => tag ? `tag-${tag.id}` : 'untagged'
+const tagGroupName = tag => tag?.name || '未分类'
 
-function aggregateMonitorSnapshots(items) {
-  const enabled = items.filter(m => m.enabled)
-  let state = 'NODATA'
-  if (enabled.some(m => m.snapshot?.state === 'DOWN')) state = 'DOWN'
-  else if (enabled.some(m => m.snapshot?.state === 'DEGRADED')) state = 'DEGRADED'
-  else if (enabled.some(m => m.snapshot?.state === 'OK')) state = 'OK'
-
-  let reqs = 0, successes = 0, latencyTotal = 0, latencySamples = 0, lastTs = 0, lastMs = 0
-  const hourly = new Map()
-  for (const m of enabled) {
-    const snapshot = m.snapshot || {}
-    const count = Number(snapshot.reqs) || 0
-    reqs += count
-    successes += count * (Number(snapshot.succ_rate) || 0)
-    if (count && snapshot.avg_ms) {
-      latencyTotal += Number(snapshot.avg_ms) * count
-      latencySamples += count
-    }
-    if ((Number(snapshot.last_ts) || 0) >= lastTs) {
-      lastTs = Number(snapshot.last_ts) || 0
-      lastMs = Number(snapshot.last_ms) || 0
-    }
-    for (const point of snapshot.trend || []) {
-      const bucket = hourly.get(point.ts) || { ts: point.ts, total: 0, succ: 0 }
-      bucket.total += Number(point.total) || 0
-      bucket.succ += Number(point.succ) || 0
-      hourly.set(point.ts, bucket)
-    }
-  }
-  const trend = [...hourly.values()].sort((a, b) => a.ts - b.ts).map(point => {
-    const succRate = point.total ? point.succ / point.total : 0
-    return { ...point, succ_rate: succRate, status: !point.total ? 0 : succRate >= .95 ? 1 : succRate >= .8 ? 2 : 3 }
-  })
-  return {
-    state, reqs, succ_rate: reqs ? successes / reqs : 0,
-    avg_ms: latencySamples ? Math.round(latencyTotal / latencySamples) : 0,
-    last_ts: lastTs, last_ms: lastMs, trend,
-  }
-}
-
-function channelMonitorState(upstream, snapshot) {
-  if (!upstream.enabled) return 'DISABLED'
+function monitorItemState(monitor, upstream) {
+  if (!monitor.enabled || !upstream?.enabled) return 'DISABLED'
   if (upstream.health?.state === 'OPEN') return 'DOWN'
   if (upstream.health?.state === 'HALF_OPEN') return 'DEGRADED'
-  if (snapshot.state !== 'NODATA') return snapshot.state
-  if (upstream.health?.reqs || upstream.health?.last_probe) return 'OK'
-  return 'NODATA'
+  return monitor.snapshot?.state || 'NODATA'
 }
 
-const monitorCards = computed(() => {
-  const itemsByUpstream = new Map()
-  for (const monitor of monitors.value) {
-    if (!itemsByUpstream.has(monitor.upstream_id)) itemsByUpstream.set(monitor.upstream_id, [])
-    itemsByUpstream.get(monitor.upstream_id).push(monitor)
-  }
-  return upstreams.value.map(upstream => {
-    const items = itemsByUpstream.get(upstream.id) || []
-    const snapshot = aggregateMonitorSnapshots(items)
-    return {
-      id: upstream.id, upstream, items, snapshot,
-      source: upstreamSource(upstream),
-      state: channelMonitorState(upstream, snapshot),
-      enabledMonitors: items.filter(m => m.enabled).length,
-    }
+const monitorItems = computed(() => {
+  const upstreamByID = new Map(upstreams.value.map(item => [item.id, item]))
+  return monitors.value.map(monitor => {
+    const upstream = upstreamByID.get(monitor.upstream_id) || { id: monitor.upstream_id, name: monitor.upstream_name, enabled: true, tags: [] }
+    const primaryTag = primaryTagFor(upstream)
+    return { ...monitor, upstream, primaryTag, groupKey: tagGroupKey(primaryTag), state: monitorItemState(monitor, upstream) }
   })
 })
 
 const monitorSearch = ref('')
 const monitorStatusFilter = ref('')
-const monitorSourceFilter = ref('')
-const collapsedMonitorSources = reactive(new Set())
+const monitorTagFilter = ref('')
+const collapsedMonitorTags = reactive(new Set())
 const monitorStatusOptions = [
   { value: '', label: '状态：全部' },
   { value: 'DOWN', label: '故障' },
@@ -117,65 +67,59 @@ const monitorStatusOptions = [
   { value: 'NODATA', label: '待探测' },
   { value: 'DISABLED', label: '已停用' },
 ]
-const monitorSourceOptions = computed(() => [
-  { value: '', label: '来源：全部' },
-  ...[...new Set(monitorCards.value.map(card => card.source))].sort().map(source => ({ value: source, label: source })),
+const monitorTagOptions = computed(() => [
+  { value: '', label: '主标签：全部' },
+  { value: 'untagged', label: '未分类' },
+  ...tags.value.map(tag => ({ value: `tag-${tag.id}`, label: tag.name })),
 ])
 const monitorStateRank = { DOWN: 0, DEGRADED: 1, NODATA: 2, OK: 3, DISABLED: 4 }
 const monitorSections = computed(() => {
   const query = monitorSearch.value.trim().toLowerCase()
-  const filtered = monitorCards.value.filter(card => {
-    if (monitorStatusFilter.value && card.state !== monitorStatusFilter.value) return false
-    if (monitorSourceFilter.value && card.source !== monitorSourceFilter.value) return false
+  const tagOrder = new Map(tags.value.map((tag, index) => [tag.id, index]))
+  const filtered = monitorItems.value.filter(item => {
+    if (monitorStatusFilter.value && item.state !== monitorStatusFilter.value) return false
+    if (monitorTagFilter.value && item.groupKey !== monitorTagFilter.value) return false
     if (!query) return true
-    return [card.upstream.name, card.upstream.base_url, card.source, ...card.items.map(m => m.model)]
+    return [item.upstream.name, item.upstream.base_url, item.model, ...(item.upstream.tags || []).map(tag => tag.name)]
       .some(value => String(value || '').toLowerCase().includes(query))
   })
   const sections = new Map()
-  for (const card of filtered) {
-    if (!sections.has(card.source)) sections.set(card.source, [])
-    sections.get(card.source).push(card)
+  for (const item of filtered) {
+    if (!sections.has(item.groupKey)) sections.set(item.groupKey, { tag: item.primaryTag, items: [] })
+    sections.get(item.groupKey).items.push(item)
   }
-  return [...sections.entries()].map(([source, cards]) => {
-    cards.sort((a, b) => monitorStateRank[a.state] - monitorStateRank[b.state] || a.upstream.name.localeCompare(b.upstream.name))
-    const down = cards.filter(card => card.state === 'DOWN').length
-    const degraded = cards.filter(card => card.state === 'DEGRADED').length
-    const nodata = cards.filter(card => card.state === 'NODATA').length
-    const enabled = cards.filter(card => card.state !== 'DISABLED')
-    const reqs = enabled.reduce((sum, card) => sum + card.snapshot.reqs, 0)
-    const success = enabled.reduce((sum, card) => sum + card.snapshot.reqs * card.snapshot.succ_rate, 0)
+  return [...sections.entries()].map(([key, section]) => {
+    const items = section.items.sort((a, b) => monitorStateRank[a.state] - monitorStateRank[b.state] || a.upstream.name.localeCompare(b.upstream.name) || a.model.localeCompare(b.model))
+    const down = items.filter(item => item.state === 'DOWN').length
+    const degraded = items.filter(item => item.state === 'DEGRADED').length
+    const nodata = items.filter(item => item.state === 'NODATA').length
+    const enabled = items.filter(item => item.state !== 'DISABLED')
+    const reqs = enabled.reduce((sum, item) => sum + (Number(item.snapshot?.reqs) || 0), 0)
+    const success = enabled.reduce((sum, item) => sum + (Number(item.snapshot?.reqs) || 0) * (Number(item.snapshot?.succ_rate) || 0), 0)
     const state = !enabled.length ? 'DISABLED' : down ? 'DOWN' : degraded ? 'DEGRADED' : nodata ? 'NODATA' : 'OK'
-    return { source, cards, down, degraded, nodata, enabled: enabled.length, state, rate: reqs ? success / reqs : 0, reqs }
-  }).sort((a, b) => monitorStateRank[a.state] - monitorStateRank[b.state] || a.source.localeCompare(b.source))
+    return { key, tag: section.tag, name: tagGroupName(section.tag), items, down, degraded, nodata, enabled: enabled.length, state, rate: reqs ? success / reqs : 0, reqs }
+  }).sort((a, b) => (tagOrder.get(a.tag?.id) ?? Number.MAX_SAFE_INTEGER) - (tagOrder.get(b.tag?.id) ?? Number.MAX_SAFE_INTEGER))
 })
 
-const monitorVisibleChannels = computed(() => monitorSections.value.reduce((sum, section) => sum + section.cards.length, 0))
+const monitorVisibleCount = computed(() => monitorSections.value.reduce((sum, section) => sum + section.items.length, 0))
 const summary = computed(() => {
-  const cards = monitorCards.value.filter(card => card.state !== 'DISABLED')
-  const down = cards.filter(card => card.state === 'DOWN').length
-  const degraded = cards.filter(card => card.state === 'DEGRADED').length
-  const nodata = cards.filter(card => card.state === 'NODATA').length
-  const reqs = cards.reduce((sum, card) => sum + card.snapshot.reqs, 0)
-  const success = cards.reduce((sum, card) => sum + card.snapshot.reqs * card.snapshot.succ_rate, 0)
+  const items = monitorItems.value.filter(item => item.state !== 'DISABLED')
+  const down = items.filter(item => item.state === 'DOWN').length
+  const degraded = items.filter(item => item.state === 'DEGRADED').length
+  const nodata = items.filter(item => item.state === 'NODATA').length
+  const reqs = items.reduce((sum, item) => sum + (Number(item.snapshot?.reqs) || 0), 0)
+  const success = items.reduce((sum, item) => sum + (Number(item.snapshot?.reqs) || 0) * (Number(item.snapshot?.succ_rate) || 0), 0)
   return {
-    total: cards.length, down, degraded, nodata,
-    up: cards.filter(card => card.state === 'OK').length,
+    total: items.length, down, degraded, nodata,
+    up: items.filter(item => item.state === 'OK').length,
     rate: reqs ? success / reqs : 0,
     probeReqs: reqs,
-    allOk: cards.length > 0 && down === 0 && degraded === 0 && nodata === 0,
+    allOk: items.length > 0 && down === 0 && degraded === 0 && nodata === 0,
   }
 })
-function toggleMonitorSource(source) {
-  if (collapsedMonitorSources.has(source)) collapsedMonitorSources.delete(source)
-  else collapsedMonitorSources.add(source)
-}
-async function probeChannel(card) {
-  await Promise.all(card.items.filter(m => m.enabled).map(probeOne))
-}
-async function toggleChannelMonitors(card) {
-  const enabled = card.enabledMonitors === 0
-  await Promise.all(card.items.map(m => api.updateMonitor(m.id, { ...m, enabled })))
-  await loadMonitors()
+function toggleMonitorTag(key) {
+  if (collapsedMonitorTags.has(key)) collapsedMonitorTags.delete(key)
+  else collapsedMonitorTags.add(key)
 }
 
 // ===== 总览：按上游分组的模型探活状态 =====
@@ -284,7 +228,7 @@ async function guard(fn) {
 }
 
 onMounted(() => {
-  if (loggedIn.value) guard(async () => { await loadUpstreams(); await loadMonitors(); await loadSettings(); startMonPoll() })
+  if (loggedIn.value) guard(async () => { await loadTags(); await loadUpstreams(); await loadMonitors(); await loadSettings(); startMonPoll() })
 })
 
 // 看板自动刷新：探测间隔 5min，这里每 60s 拉一次快照即可，离开即停
@@ -314,8 +258,8 @@ function go(p) {
   guard(async () => {
     if (p === 'overview') { await loadUpstreams(); await loadMonitors(); startMonPoll() }
     else if (p === 'groups') { await loadGroups(); startRtPoll(loadGroups) }
-    else if (p === 'upstreams') { await loadUpstreams(); startRtPoll(loadUpstreams) }
-    else if (p === 'monitors') { await loadUpstreams(); await loadMonitors(); startMonPoll() }
+    else if (p === 'upstreams') { await loadTags(); await loadUpstreams(); startRtPoll(loadUpstreams) }
+    else if (p === 'monitors') { await loadTags(); await loadUpstreams(); await loadMonitors(); startMonPoll() }
     else if (p === 'logs') { await loadLogOptions(); await loadLogs(true); startLogPoll() }
     else if (p === 'settings') { await loadSettings() }
   })
@@ -338,8 +282,8 @@ const addable = computed(() => upstreams.value.filter(u => !memberIds.value.has(
 const pages = {
   overview: { title: '总览', desc: '上游 × 模型健康矩阵，一屏看全所有渠道的实时状态' },
   groups: { title: '分组管理', desc: '每个分组是一个独立的调度池，拥有自己的上游与接入密钥' },
-  upstreams: { title: '上游池', desc: '按来源管理全局渠道，并供多个路由分组复用' },
-  monitors: { title: '监控看板', desc: '按来源聚合渠道状态、模型探测与运行时健康' },
+  upstreams: { title: '上游池', desc: '按主标签管理全局渠道，并用普通标签快速筛选' },
+  monitors: { title: '监控看板', desc: '按主标签组织模型探测卡片与运行时健康' },
   logs: { title: '请求记录', desc: '每一次转发请求的真实去向：模型 → 选中渠道 → 状态 → 延迟' },
   settings: { title: '设置', desc: '运行时配置，保存后即时生效（无需重启）' },
 }
@@ -373,11 +317,23 @@ const protocolOptions = [
 ]
 const protocolLabels = Object.fromEntries(protocolOptions.map(option => [option.value, option.label]))
 function protocolLabel(protocol) { return protocolLabels[protocol || 'passthrough'] || protocol }
-function newUpstream() { dlg.type = 'upstream'; dlg.form = { name: '', source: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', enabled: true, channel_probe: false } }
-function editUpstream(u) { dlg.type = 'upstream'; dlg.form = { ...u, protocol: u.protocol || 'passthrough', api_key: '' } }
+const primaryTagOptions = computed(() => [
+  { value: 0, label: '未分类' },
+  ...tags.value.map(tag => ({ value: tag.id, label: tag.name })),
+])
+const tagFilterOptions = computed(() => [
+  { value: '', label: '普通标签：全部' },
+  ...tags.value.map(tag => ({ value: String(tag.id), label: tag.name })),
+])
+const batchTagOptions = computed(() => [
+  { value: '', label: '选择标签' },
+  ...primaryTagOptions.value,
+])
+function newUpstream() { dlg.type = 'upstream'; dlg.form = { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] } }
+function editUpstream(u) { dlg.type = 'upstream'; dlg.form = { ...u, protocol: u.protocol || 'passthrough', api_key: '', primary_tag_id: u.primary_tag_id || 0, tag_ids: [...(u.tag_ids || [])] } }
 function saveUpstream() {
   guard(async () => {
-    const f = { ...dlg.form }
+    const f = { ...dlg.form, primary_tag_id: Number(dlg.form.primary_tag_id) || 0, tag_ids: [...new Set((dlg.form.tag_ids || []).map(Number).filter(Boolean))] }
     if (f.id) await api.updateUpstream(f.id, f)
     else await api.createUpstream(f)
     closeDlg(); await loadUpstreams()
@@ -390,13 +346,15 @@ function delUpstream(u) {
 
 const upstreamRunFilter = ref('')
 const upstreamEnabledFilter = ref('')
-const upstreamSourceFilter = ref('')
+const upstreamPrimaryTagFilter = ref('')
+const upstreamAnyTagFilter = ref('')
 const upstreamProtocolFilter = ref('')
 const upstreamSearch = ref('')
 const upstreamPageSize = ref(20)
 const upstreamCurrentPage = ref(1)
 const upstreamSelected = reactive(new Set())
-const upstreamBatchSource = ref('')
+const upstreamBatchTagID = ref('')
+const collapsedUpstreamTags = reactive(new Set())
 const upstreamDragId = ref(null)
 const upstreamDragOverId = ref(null)
 const upstreamRunOptions = [
@@ -416,9 +374,10 @@ const upstreamPageSizeOptions = [
   { value: 50, label: '50 条' },
   { value: 100, label: '100 条' },
 ]
-const upstreamSourceOptions = computed(() => [
-  { value: '', label: '来源：全部' },
-  ...[...new Set(upstreams.value.map(upstreamSource))].sort().map(source => ({ value: source, label: source })),
+const upstreamPrimaryTagOptions = computed(() => [
+  { value: '', label: '主标签：全部' },
+  { value: 'untagged', label: '未分类' },
+  ...tags.value.map(tag => ({ value: `tag-${tag.id}`, label: tag.name })),
 ])
 const upstreamProtocolOptions = [
   { value: '', label: '协议：全部' },
@@ -426,21 +385,40 @@ const upstreamProtocolOptions = [
 ]
 
 const upstreamRunValue = u => rtUnprobed(u.health) ? 'UNPROBED' : (u.health?.state || '')
-const upstreamsFiltered = computed(() => upstreams.value.filter(u => {
-  const query = upstreamSearch.value.trim().toLowerCase()
-  if (upstreamEnabledFilter.value === 'enabled' && !u.enabled) return false
-  if (upstreamEnabledFilter.value === 'disabled' && u.enabled) return false
-  if (upstreamRunFilter.value && upstreamRunValue(u) !== upstreamRunFilter.value) return false
-  if (upstreamSourceFilter.value && upstreamSource(u) !== upstreamSourceFilter.value) return false
-  if (upstreamProtocolFilter.value && (u.protocol || 'passthrough') !== upstreamProtocolFilter.value) return false
-  if (query && ![u.name, u.base_url, upstreamSource(u), u.protocol].some(value => String(value || '').toLowerCase().includes(query))) return false
-  return true
-}))
+const upstreamsFiltered = computed(() => {
+  const tagOrder = new Map(tags.value.map((tag, index) => [tag.id, index]))
+  const filtered = upstreams.value.filter(u => {
+    const query = upstreamSearch.value.trim().toLowerCase()
+    const groupKey = tagGroupKey(primaryTagFor(u))
+    if (upstreamEnabledFilter.value === 'enabled' && !u.enabled) return false
+    if (upstreamEnabledFilter.value === 'disabled' && u.enabled) return false
+    if (upstreamRunFilter.value && upstreamRunValue(u) !== upstreamRunFilter.value) return false
+    if (upstreamPrimaryTagFilter.value && groupKey !== upstreamPrimaryTagFilter.value) return false
+    if (upstreamAnyTagFilter.value && !auxiliaryTagsFor(u).some(tag => String(tag.id) === String(upstreamAnyTagFilter.value))) return false
+    if (upstreamProtocolFilter.value && (u.protocol || 'passthrough') !== upstreamProtocolFilter.value) return false
+    if (query && ![u.name, u.base_url, u.protocol, ...(u.tags || []).map(tag => tag.name)].some(value => String(value || '').toLowerCase().includes(query))) return false
+    return true
+  })
+  return filtered.sort((a, b) => {
+    const aTag = primaryTagFor(a), bTag = primaryTagFor(b)
+    return (tagOrder.get(aTag?.id) ?? Number.MAX_SAFE_INTEGER) - (tagOrder.get(bTag?.id) ?? Number.MAX_SAFE_INTEGER)
+  })
+})
 const upstreamTotalPages = computed(() => Math.max(1, Math.ceil(upstreamsFiltered.value.length / Number(upstreamPageSize.value))))
 const upstreamPageRows = computed(() => {
   const page = Math.min(upstreamCurrentPage.value, upstreamTotalPages.value)
   const offset = (page - 1) * Number(upstreamPageSize.value)
   return upstreamsFiltered.value.slice(offset, offset + Number(upstreamPageSize.value))
+})
+const upstreamPageSections = computed(() => {
+  const sections = new Map()
+  for (const item of upstreamPageRows.value) {
+    const tag = primaryTagFor(item)
+    const key = tagGroupKey(tag)
+    if (!sections.has(key)) sections.set(key, { key, tag, name: tagGroupName(tag), rows: [] })
+    sections.get(key).rows.push(item)
+  }
+  return [...sections.values()]
 })
 function buildPageItems(total, current) {
   if (total <= 7) return Array.from({ length: total }, (_, index) => ({ type: 'page', value: index + 1, key: `page-${index + 1}` }))
@@ -455,18 +433,52 @@ function buildPageItems(total, current) {
   items.push({ type: 'page', value: total, key: `page-${total}` })
   return items
 }
+function toggleUpstreamFormTag(id) {
+  const set = new Set(dlg.form.tag_ids || [])
+  if (set.has(id)) set.delete(id)
+  else set.add(id)
+  dlg.form.tag_ids = [...set]
+}
+
+const tagColorChoices = [
+  { value: 'gray', label: '灰' }, { value: 'green', label: '绿' },
+  { value: 'amber', label: '黄' }, { value: 'red', label: '红' },
+  { value: 'blue', label: '蓝' }, { value: 'purple', label: '紫' },
+  { value: 'pink', label: '粉' },
+]
+const tagDraft = reactive({ id: 0, name: '', color: 'gray' })
+function resetTagDraft() { Object.assign(tagDraft, { id: 0, name: '', color: 'gray' }) }
+function openTagManager() { dlg.type = 'tags'; dlg.form = {}; resetTagDraft() }
+function editTagDraft(tag) { Object.assign(tagDraft, { id: tag.id, name: tag.name, color: tag.color }) }
+function saveTag() {
+  guard(async () => {
+    const payload = { name: tagDraft.name.trim(), color: tagDraft.color }
+    if (!payload.name) return
+    if (tagDraft.id) await api.updateTag(tagDraft.id, payload)
+    else await api.createTag(payload)
+    await Promise.all([loadTags(), loadUpstreams()])
+    resetTagDraft()
+  })
+}
+function delTag(tag) {
+  closeDlg()
+  ask(`删除标签「${tag.name}」？上游不会被删除。`, () => guard(async () => {
+    await api.deleteTag(tag.id)
+    await Promise.all([loadTags(), loadUpstreams()])
+    resetTagDraft()
+  }))
+}
 const upstreamPageItems = computed(() => buildPageItems(upstreamTotalPages.value, Math.min(upstreamCurrentPage.value, upstreamTotalPages.value)))
 const upstreamSelectedCount = computed(() => upstreamSelected.size)
-const upstreamPageAllSelected = computed(() => upstreamPageRows.value.length > 0 && upstreamPageRows.value.every(u => upstreamSelected.has(u.id)))
 function onUpstreamFilterChange() { upstreamCurrentPage.value = 1 }
 function goUpstreamPage(page) { upstreamCurrentPage.value = Math.max(1, Math.min(Number(page) || 1, upstreamTotalPages.value)) }
 function toggleUpstreamSelection(id) {
   if (upstreamSelected.has(id)) upstreamSelected.delete(id)
   else upstreamSelected.add(id)
 }
-function toggleUpstreamPageSelection() {
-  const selected = upstreamPageAllSelected.value
-  upstreamPageRows.value.forEach(u => selected ? upstreamSelected.delete(u.id) : upstreamSelected.add(u.id))
+function toggleUpstreamSectionSelection(rows) {
+  const selected = rows.length > 0 && rows.every(u => upstreamSelected.has(u.id))
+  rows.forEach(u => selected ? upstreamSelected.delete(u.id) : upstreamSelected.add(u.id))
 }
 async function batchUpdateUpstreams(payload, message) {
   const ids = [...upstreamSelected]
@@ -476,11 +488,19 @@ async function batchUpdateUpstreams(payload, message) {
   await loadUpstreams()
   flash(message)
 }
-async function applyBatchSource() {
-  const source = upstreamBatchSource.value.trim()
-  if (!source) return
-  await batchUpdateUpstreams({ source }, `已设置 ${upstreamSelectedCount.value} 个渠道的来源`)
-  upstreamBatchSource.value = ''
+async function applyBatchTag(mode) {
+  const tagID = Number(upstreamBatchTagID.value) || 0
+  const count = upstreamSelectedCount.value
+  if (mode !== 'primary' && !tagID) return
+  const payload = mode === 'primary' ? { primary_tag_id: tagID }
+    : mode === 'add' ? { add_tag_ids: [tagID] } : { remove_tag_ids: [tagID] }
+  const verb = mode === 'primary' ? '设置主标签' : mode === 'add' ? '添加标签' : '移除标签'
+  await batchUpdateUpstreams(payload, `已为 ${count} 个渠道${verb}`)
+  upstreamBatchTagID.value = ''
+}
+function toggleUpstreamTagSection(key) {
+  if (collapsedUpstreamTags.has(key)) collapsedUpstreamTags.delete(key)
+  else collapsedUpstreamTags.add(key)
 }
 
 function onUpstreamDragStart(u, e) {
@@ -492,7 +512,8 @@ function onUpstreamDragOver(u, e) {
   if (u.id !== upstreamDragId.value) upstreamDragOverId.value = u.id
 }
 function onUpstreamDrop(target) {
-  const visible = upstreamsFiltered.value
+  const groupKey = tagGroupKey(primaryTagFor(target))
+  const visible = upstreamsFiltered.value.filter(item => tagGroupKey(primaryTagFor(item)) === groupKey)
   const from = visible.findIndex(x => x.id === upstreamDragId.value)
   const to = visible.findIndex(x => x.id === target.id)
   if (from < 0 || to < 0 || from === to) { onUpstreamDragEnd(); return }
@@ -1001,13 +1022,13 @@ function login() {
   if (!loginForm.token.trim()) { err.value = '请输入管理 Token'; return }
   api.setToken(loginForm.token.trim())
   loggedIn.value = true
-  guard(async () => { await loadUpstreams(); await loadMonitors(); await loadSettings(); startMonPoll() })
+  guard(async () => { await loadTags(); await loadUpstreams(); await loadMonitors(); await loadSettings(); startMonPoll() })
 }
 function logout() {
   api.clearToken()
   loggedIn.value = false
   loginForm.token = ''
-  groups.value = []; upstreams.value = []; members.value = []; keys.value = []; monitors.value = []
+  groups.value = []; upstreams.value = []; members.value = []; keys.value = []; monitors.value = []; tags.value = []
   stopAllPoll()
 }
 </script>
@@ -1231,57 +1252,62 @@ function logout() {
               <span class="count">{{ upstreamsFiltered.length }} / {{ upstreams.length }} 个上游</span>
               <div class="search-box upstream-search">
                 <Icon class="ic" name="search" :size="16" />
-                <input v-model="upstreamSearch" class="search-input" placeholder="名称、地址或来源" @input="onUpstreamFilterChange" />
+                <input v-model="upstreamSearch" class="search-input" placeholder="名称、地址或标签" @input="onUpstreamFilterChange" />
               </div>
-              <FancySelect v-model="upstreamSourceFilter" :options="upstreamSourceOptions" @change="onUpstreamFilterChange" />
+              <FancySelect v-model="upstreamPrimaryTagFilter" :options="upstreamPrimaryTagOptions" @change="onUpstreamFilterChange" />
+              <FancySelect v-model="upstreamAnyTagFilter" :options="tagFilterOptions" @change="onUpstreamFilterChange" />
               <FancySelect v-model="upstreamProtocolFilter" :options="upstreamProtocolOptions" @change="onUpstreamFilterChange" />
               <FancySelect v-model="upstreamRunFilter" :options="upstreamRunOptions" @change="onUpstreamFilterChange" />
               <FancySelect v-model="upstreamEnabledFilter" :options="upstreamEnabledOptions" @change="onUpstreamFilterChange" />
             </div>
-            <button class="btn" @click="newUpstream"><Icon name="plus" :size="16" />新增上游</button>
+            <div class="toolbar-actions">
+              <button class="btn btn-ghost" @click="openTagManager"><Icon name="filter" :size="16" />标签管理</button>
+              <button class="btn" @click="newUpstream"><Icon name="plus" :size="16" />新增上游</button>
+            </div>
           </div>
           <div v-if="upstreamSelectedCount" class="upstream-batchbar">
             <b>已选 {{ upstreamSelectedCount }} 项</b>
             <button class="btn btn-sm" @click="guard(() => batchUpdateUpstreams({ enabled: true }, `已启用 ${upstreamSelectedCount} 个渠道`))"><Icon name="check" :size="15" />启用</button>
             <button class="btn btn-sm btn-ghost" @click="guard(() => batchUpdateUpstreams({ enabled: false }, `已停用 ${upstreamSelectedCount} 个渠道`))"><Icon name="x" :size="15" />停用</button>
             <span class="batch-separator"></span>
-            <input v-model="upstreamBatchSource" list="upstream-source-list" placeholder="设置来源" @keyup.enter="guard(applyBatchSource)" />
-            <button class="btn btn-sm btn-ghost" :disabled="!upstreamBatchSource.trim()" @click="guard(applyBatchSource)">应用来源</button>
+            <FancySelect v-model="upstreamBatchTagID" :options="batchTagOptions" />
+            <button class="btn btn-sm btn-ghost" @click="guard(() => applyBatchTag('primary'))">设为主标签</button>
+            <button class="btn btn-sm btn-ghost" :disabled="!upstreamBatchTagID" @click="guard(() => applyBatchTag('add'))">添加标签</button>
+            <button class="btn btn-sm btn-ghost" :disabled="!upstreamBatchTagID" @click="guard(() => applyBatchTag('remove'))">移除标签</button>
             <button class="icon-btn batch-clear" title="取消选择" @click="upstreamSelected.clear()"><Icon name="x" :size="16" /></button>
           </div>
-          <datalist id="upstream-source-list"><option v-for="option in upstreamSourceOptions.slice(1)" :key="option.value" :value="option.value" /></datalist>
-          <div class="table-wrap upstream-table-wrap">
-            <table class="upstream-table">
-              <thead><tr><th class="select-cell"><input type="checkbox" :checked="upstreamPageAllSelected" aria-label="选择当前页" @change="toggleUpstreamPageSelection" /></th><th></th><th>名称</th><th>来源</th><th>地址</th><th>协议</th><th>运行时</th><th>成功率</th><th>操作</th></tr></thead>
-              <tbody>
-                <tr v-for="u in upstreamPageRows" :key="u.id"
-                  :class="{ disabled: !u.enabled, dragging: upstreamDragId === u.id, dragover: upstreamDragOverId === u.id }"
-                  draggable="true"
-                  @dragstart="onUpstreamDragStart(u, $event)" @dragover="onUpstreamDragOver(u, $event)"
-                  @drop="onUpstreamDrop(u)" @dragend="onUpstreamDragEnd">
-                  <td class="select-cell"><input type="checkbox" :checked="upstreamSelected.has(u.id)" :aria-label="`选择 ${u.name}`" @change="toggleUpstreamSelection(u.id)" /></td>
-                  <td class="drag-cell"><span class="mon-grip" title="拖拽调整顺序"><Icon name="grip" :size="16" /></span></td>
-                  <td class="cell-name">{{ u.name }}</td>
-                  <td><span class="source-label" :class="{ inferred: !u.source }">{{ upstreamSource(u) }}</span></td>
-                  <td class="cell-url">{{ u.base_url }}</td>
-                  <td><span class="tag">{{ protocolLabel(u.protocol) }}</span></td>
-                  <td>
-                    <span class="state-badge" :class="rtClass(u.health)">{{ u.enabled ? rtLabel(u.health) : '已停用' }}</span>
-                    <div v-if="visibleDots(u).length" class="model-dots">
-                      <span v-for="mh in visibleDots(u)" :key="mh.model" class="model-dot" :class="mhClass(mh)" :title="mhTitle(mh)">{{ mh.model }}</span>
-                    </div>
-                  </td>
-                  <td>{{ rtRate(u.health) }}</td>
-                  <td>
-                    <button class="btn-link sm" @click="testUpstream(u)">测试</button>
-                    <button class="btn-link sm" @click="openBatchMonitors(u)">建监控</button>
-                    <button class="icon-btn" @click="editUpstream(u)"><Icon name="edit" :size="16" /></button>
-                    <button class="icon-btn danger" @click="delUpstream(u)"><Icon name="trash" :size="16" /></button>
-                  </td>
-                </tr>
-                <tr v-if="!upstreamsFiltered.length"><td colspan="9" class="empty-cell">{{ upstreams.length ? '没有符合筛选的上游。' : '还没有上游，点右上角新增。' }}</td></tr>
-              </tbody>
-            </table>
+          <div class="upstream-tag-groups">
+            <section v-for="section in upstreamPageSections" :key="section.key" class="upstream-tag-section">
+              <button class="upstream-tag-head" @click="toggleUpstreamTagSection(section.key)">
+                <Icon class="source-chevron" :class="{ collapsed: collapsedUpstreamTags.has(section.key) }" name="chevron-right" :size="16" />
+                <span class="tag-color-dot" :class="`tag-${section.tag?.color || 'gray'}`"></span>
+                <strong>{{ section.name }}</strong><span>{{ section.rows.length }} 个上游</span>
+                <label class="section-select" @click.stop><input type="checkbox" :checked="section.rows.every(u => upstreamSelected.has(u.id))" @change="toggleUpstreamSectionSelection(section.rows)" />选择本组</label>
+              </button>
+              <div v-if="!collapsedUpstreamTags.has(section.key)" class="table-wrap upstream-table-wrap">
+                <table class="upstream-table">
+                  <thead><tr><th class="select-cell"><input type="checkbox" :checked="section.rows.every(u => upstreamSelected.has(u.id))" :aria-label="`选择 ${section.name}`" @change="toggleUpstreamSectionSelection(section.rows)" /></th><th></th><th>名称</th><th>标签</th><th>地址</th><th>协议</th><th>运行时</th><th>成功率</th><th>操作</th></tr></thead>
+                  <tbody>
+                    <tr v-for="u in section.rows" :key="u.id" :class="{ disabled: !u.enabled, dragging: upstreamDragId === u.id, dragover: upstreamDragOverId === u.id }"
+                      draggable="true" @dragstart="onUpstreamDragStart(u, $event)" @dragover="onUpstreamDragOver(u, $event)" @drop="onUpstreamDrop(u)" @dragend="onUpstreamDragEnd">
+                      <td class="select-cell"><input type="checkbox" :checked="upstreamSelected.has(u.id)" :aria-label="`选择 ${u.name}`" @change="toggleUpstreamSelection(u.id)" /></td>
+                      <td class="drag-cell"><span class="mon-grip" title="拖拽调整顺序"><Icon name="grip" :size="16" /></span></td>
+                      <td class="cell-name">{{ u.name }}</td>
+                      <td><div class="tag-chip-row"><span v-for="tag in auxiliaryTagsFor(u)" :key="tag.id" class="manage-tag" :class="`tag-${tag.color}`">{{ tag.name }}</span><span v-if="!auxiliaryTagsFor(u).length" class="tag-empty">—</span></div></td>
+                      <td class="cell-url">{{ u.base_url }}</td>
+                      <td><span class="tag">{{ protocolLabel(u.protocol) }}</span></td>
+                      <td><span class="state-badge" :class="rtClass(u.health)">{{ u.enabled ? rtLabel(u.health) : '已停用' }}</span></td>
+                      <td>{{ rtRate(u.health) }}</td>
+                      <td>
+                        <button class="btn-link sm" @click="testUpstream(u)">测试</button><button class="btn-link sm" @click="openBatchMonitors(u)">建监控</button>
+                        <button class="icon-btn" @click="editUpstream(u)"><Icon name="edit" :size="16" /></button><button class="icon-btn danger" @click="delUpstream(u)"><Icon name="trash" :size="16" /></button>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </section>
+            <div v-if="!upstreamsFiltered.length" class="empty">{{ upstreams.length ? '没有符合筛选的上游。' : '还没有上游，点右上角新增。' }}</div>
           </div>
           <div v-if="upstreamsFiltered.length" class="log-pager upstream-pager">
             <div class="log-page-size"><span>每页</span><FancySelect v-model="upstreamPageSize" :options="upstreamPageSizeOptions" @change="onUpstreamFilterChange" /></div>
@@ -1304,62 +1330,55 @@ function logout() {
           <div class="hbanner" :class="summary.allOk ? 'ok' : (summary.down ? 'down' : 'warn')">
             <div class="hb-icon"><Icon :name="summary.allOk ? 'check' : 'alert'" :size="20" /></div>
             <div class="hb-text">
-              <div class="hb-title">{{ summary.allOk ? '所有渠道运行正常' : (summary.down ? `${summary.down} 个渠道故障` : summary.degraded ? `${summary.degraded} 个渠道降级` : `${summary.nodata} 个渠道待探测`) }}</div>
-              <div class="hb-sub">{{ summary.total }} 个渠道 · {{ summary.up }} 正常 · {{ summary.degraded }} 降级 · {{ summary.down }} 故障 · {{ summary.nodata }} 待探测 · 探测成功率 {{ summary.probeReqs ? (summary.rate * 100).toFixed(1) + '%' : '—' }}</div>
+              <div class="hb-title">{{ summary.allOk ? '所有模型探测运行正常' : (summary.down ? `${summary.down} 个模型探测故障` : summary.degraded ? `${summary.degraded} 个模型探测降级` : `${summary.nodata} 个模型待探测`) }}</div>
+              <div class="hb-sub">{{ summary.total }} 个启用模型探测 · {{ summary.up }} 正常 · {{ summary.degraded }} 降级 · {{ summary.down }} 故障 · {{ summary.nodata }} 待探测 · 成功率 {{ summary.probeReqs ? (summary.rate * 100).toFixed(1) + '%' : '—' }}</div>
             </div>
             <button class="btn" @click="newMonitor"><Icon name="plus" :size="16" />新增监控</button>
           </div>
           <div class="monitor-toolbar">
-            <div class="search-box monitor-search"><Icon class="ic" name="search" :size="16" /><input v-model="monitorSearch" class="search-input" placeholder="渠道、来源或模型" /></div>
-            <FancySelect v-model="monitorSourceFilter" :options="monitorSourceOptions" />
+            <div class="search-box monitor-search"><Icon class="ic" name="search" :size="16" /><input v-model="monitorSearch" class="search-input" placeholder="渠道、模型或标签" /></div>
+            <FancySelect v-model="monitorTagFilter" :options="monitorTagOptions" />
             <FancySelect v-model="monitorStatusFilter" :options="monitorStatusOptions" />
-            <span class="monitor-result-count">{{ monitorVisibleChannels }} / {{ monitorCards.length }} 个渠道</span>
+            <span class="monitor-result-count">{{ monitorVisibleCount }} / {{ monitorItems.length }} 个模型探测</span>
           </div>
 
           <div class="monitor-wall">
-            <section v-for="section in monitorSections" :key="section.source" class="monitor-source-section">
-              <button class="monitor-source-head" @click="toggleMonitorSource(section.source)">
-                <Icon class="source-chevron" :class="{ collapsed: collapsedMonitorSources.has(section.source) }" name="chevron-right" :size="17" />
-                <span class="ovg-dot" :class="dotClass(section.state)"></span>
-                <strong>{{ section.source }}</strong>
-                <span>{{ section.enabled }} 个启用渠道</span>
+            <section v-for="section in monitorSections" :key="section.key" class="monitor-source-section">
+              <button class="monitor-source-head" @click="toggleMonitorTag(section.key)">
+                <Icon class="source-chevron" :class="{ collapsed: collapsedMonitorTags.has(section.key) }" name="chevron-right" :size="17" />
+                <span class="tag-color-dot" :class="`tag-${section.tag?.color || 'gray'}`"></span>
+                <strong>{{ section.name }}</strong>
+                <span>{{ section.enabled }} 个启用模型</span>
                 <span v-if="section.down" class="source-stat down">{{ section.down }} 故障</span>
                 <span v-if="section.degraded" class="source-stat warn">{{ section.degraded }} 降级</span>
                 <span v-if="section.nodata" class="source-stat">{{ section.nodata }} 待探测</span>
                 <em>{{ section.reqs ? (section.rate * 100).toFixed(1) + '% 探测成功' : '暂无探测数据' }}</em>
               </button>
-              <div v-if="!collapsedMonitorSources.has(section.source)" class="channel-card-grid">
-                <article v-for="card in section.cards" :key="card.id" class="card channel-monitor-card" :class="[dotClass(card.state), { disabled: card.state === 'DISABLED' }]">
+              <div v-if="!collapsedMonitorTags.has(section.key)" class="channel-card-grid monitor-model-grid">
+                <article v-for="m in section.items" :key="m.id" class="card mon-card model-monitor-card" :class="[dotClass(m.state), { disabled: m.state === 'DISABLED' }]">
                   <div class="mon-head">
-                    <span class="channel-state-mark" :class="dotClass(card.state)"><Icon :name="card.state === 'DOWN' ? 'alert' : card.state === 'OK' ? 'check' : 'server'" :size="17" /></span>
+                    <span class="mon-avatar" :class="dotClass(m.state)">{{ initial(m) }}</span>
                     <div class="mon-id">
-                      <span class="mon-name">{{ card.upstream.name }}</span>
-                      <span class="mon-sub">{{ protocolLabel(card.upstream.protocol) }} · {{ card.enabledMonitors }}/{{ card.items.length }} 个模型探测</span>
+                      <span class="mon-name">{{ m.model }}</span>
+                      <span class="mon-sub">{{ m.upstream.name }}<span v-if="m.stream" class="tag on">流式</span></span>
                     </div>
-                    <span class="state-badge" :class="dotClass(card.state)">{{ card.state === 'DISABLED' ? '已停用' : stateLabel(card.state) }}</span>
+                    <span class="state-badge" :class="dotClass(m.state)">{{ m.state === 'DISABLED' ? '已停用' : stateLabel(m.state) }}</span>
                   </div>
                   <div class="channel-runtime-row">
-                    <span>路由 <b :class="rtClass(card.upstream.health)">{{ card.upstream.enabled ? rtLabel(card.upstream.health) : '已停用' }}</b></span>
-                    <span>业务成功率 <b>{{ rtRate(card.upstream.health) }}</b></span>
+                    <span>渠道 <b>{{ m.upstream.name }}</b></span><span>路由 <b :class="rtClass(m.upstream.health)">{{ m.upstream.enabled ? rtLabel(m.upstream.health) : '已停用' }}</b></span>
                   </div>
                   <div class="card-metrics">
-                    <div class="metric-item"><span class="metric-label">探测成功率<small class="mh">24h</small></span><span class="metric-value" :class="card.snapshot.reqs && card.snapshot.succ_rate < .95 ? 'warn' : ''">{{ card.snapshot.reqs ? (card.snapshot.succ_rate * 100).toFixed(0) + '%' : '—' }}</span></div>
-                    <div class="metric-item"><span class="metric-label">平均延迟<small class="mh">24h</small></span><span class="metric-value">{{ card.snapshot.avg_ms || card.snapshot.last_ms || card.upstream.health?.avg_lat_ms || 0 }}<small>ms</small></span></div>
-                    <div class="metric-item"><span class="metric-label">最后探测</span><span class="metric-value sm">{{ sinceText(card.snapshot.last_ts || card.upstream.health?.last_probe) }}</span></div>
+                    <div class="metric-item"><span class="metric-label">成功率<small class="mh">24h</small></span><span class="metric-value" :class="m.snapshot.reqs && m.snapshot.succ_rate < .95 ? 'warn' : ''">{{ m.snapshot.reqs ? (m.snapshot.succ_rate * 100).toFixed(0) + '%' : '—' }}</span></div>
+                    <div class="metric-item"><span class="metric-label">平均延迟<small class="mh">24h</small></span><span class="metric-value">{{ m.snapshot.avg_ms || m.snapshot.last_ms || 0 }}<small>ms</small></span></div>
+                    <div class="metric-item"><span class="metric-label">最后探测</span><span class="metric-value sm">{{ sinceText(m.snapshot.last_ts) }}</span></div>
                   </div>
-                  <Fence :trend="card.snapshot.trend || []" unit="探测" />
-                  <div v-if="card.items.length" class="channel-models">
-                    <button v-for="m in card.items" :key="m.id" class="channel-model-chip" :class="[dotClass(m.snapshot.state), { off: !m.enabled }]" :title="`${m.model} · ${m.enabled ? stateLabel(m.snapshot.state) : '已停用'}`" @click="openCell(m)">
-                      <span></span>{{ m.model }}
-                    </button>
-                  </div>
-                  <div v-else class="channel-model-empty">尚未配置模型探测</div>
+                  <Fence :trend="m.snapshot.trend || []" unit="探测" />
+                  <div class="tag-chip-row monitor-card-tags"><span v-for="tag in auxiliaryTagsFor(m.upstream)" :key="tag.id" class="manage-tag" :class="`tag-${tag.color}`">{{ tag.name }}</span></div>
                   <div class="mon-foot">
-                    <button class="btn-link sm" :disabled="!card.enabledMonitors || card.items.some(m => probing.has(m.id))" @click="guard(() => probeChannel(card))">{{ card.items.some(m => probing.has(m.id)) ? '探测中…' : '立即探测' }}</button>
-                    <button class="btn-link sm" @click="openBatchMonitors(card.upstream)">配置模型</button>
+                    <button class="btn-link sm" :disabled="probing.has(m.id)" @click="guard(() => probeOne(m))">{{ probing.has(m.id) ? '探测中…' : '立即探测' }}</button>
                     <span class="hspacer" />
-                    <button v-if="card.items.length" class="btn-link sm" @click="guard(() => toggleChannelMonitors(card))">{{ card.enabledMonitors ? '停用探测' : '启用探测' }}</button>
-                    <button class="icon-btn" title="测试渠道" @click="testUpstream(card.upstream)"><Icon name="play" :size="15" /></button>
+                    <button class="btn-link sm" @click="toggleMonitor(m)">{{ m.enabled ? '停用' : '启用' }}</button>
+                    <button class="icon-btn" @click="editMonitor(m)"><Icon name="edit" :size="16" /></button><button class="icon-btn danger" @click="delMonitor(m)"><Icon name="trash" :size="16" /></button>
                   </div>
                 </article>
               </div>
@@ -1715,13 +1734,37 @@ function logout() {
         <template v-else-if="dlg.type === 'upstream'">
           <h3>{{ dlg.form.id ? '编辑上游' : '新增上游' }}</h3>
           <div class="field"><label>名称</label><input v-model="dlg.form.name" /></div>
-          <div class="field"><label>来源</label><input v-model="dlg.form.source" list="upstream-source-list" placeholder="供应商或来源；留空按域名归类" /></div>
+          <div class="field"><label>主标签</label><FancySelect v-model="dlg.form.primary_tag_id" :options="primaryTagOptions" /></div>
+          <div class="field"><label>普通标签</label><div class="tag-picker"><button v-for="tag in tags" :key="tag.id" type="button" class="manage-tag" :class="[`tag-${tag.color}`, { selected: dlg.form.tag_ids?.includes(tag.id), primary: Number(dlg.form.primary_tag_id) === tag.id }]" :disabled="Number(dlg.form.primary_tag_id) === tag.id" @click="toggleUpstreamFormTag(tag.id)"><Icon v-if="dlg.form.tag_ids?.includes(tag.id)" name="check" :size="12" />{{ tag.name }}</button><span v-if="!tags.length" class="hint">请先创建标签</span></div></div>
           <div class="field"><label>base_url</label><input v-model="dlg.form.base_url" placeholder="https://..." /></div>
           <div class="field"><label>协议</label><FancySelect v-model="dlg.form.protocol" :options="protocolOptions" /></div>
           <div class="field"><label>api_key</label><input v-model="dlg.form.api_key" :placeholder="dlg.form.id ? '留空则不修改' : 'sk-...'" /></div>
           <div class="field"><label>代理</label><input v-model="dlg.form.proxy" placeholder="留空=直连/环境变量；如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></div>
           <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>
           <div class="dialog-foot"><button class="btn btn-ghost" @click="closeDlg">取消</button><button class="btn" @click="saveUpstream">保存</button></div>
+        </template>
+
+        <template v-else-if="dlg.type === 'tags'">
+          <h3>标签管理</h3>
+          <div class="tag-manager">
+            <div class="tag-manager-list">
+              <button v-for="tag in tags" :key="tag.id" class="tag-manager-item" :class="{ active: tagDraft.id === tag.id }" @click="editTagDraft(tag)">
+                <span class="tag-color-dot" :class="`tag-${tag.color}`"></span><span>{{ tag.name }}</span><Icon name="edit" :size="14" />
+              </button>
+              <div v-if="!tags.length" class="tag-manager-empty">暂无标签</div>
+            </div>
+            <div class="tag-manager-form">
+              <div class="field"><label>名称</label><input v-model="tagDraft.name" maxlength="40" placeholder="如 RelayCat、低价备用" @keyup.enter="saveTag" /></div>
+              <div class="field"><label>颜色</label><div class="tag-color-picker"><button v-for="color in tagColorChoices" :key="color.value" type="button" :class="[`tag-${color.value}`, { active: tagDraft.color === color.value }]" :title="color.label" @click="tagDraft.color = color.value"><span></span></button></div></div>
+              <div class="tag-manager-actions">
+                <button v-if="tagDraft.id" class="btn btn-danger btn-sm" @click="delTag(tagDraft)"><Icon name="trash" :size="14" />删除</button>
+                <span class="hspacer"></span>
+                <button v-if="tagDraft.id" class="btn btn-ghost btn-sm" @click="resetTagDraft">新建</button>
+                <button class="btn btn-sm" :disabled="!tagDraft.name.trim()" @click="saveTag">{{ tagDraft.id ? '保存' : '创建' }}</button>
+              </div>
+            </div>
+          </div>
+          <div class="dialog-foot"><button class="btn btn-ghost" @click="closeDlg">关闭</button></div>
         </template>
 
         <template v-else-if="dlg.type === 'monitor'">

@@ -33,6 +33,11 @@ export const api = {
   reorderUpstreams: ids => req('POST', '/upstreams/reorder', { ids }),
   testUpstream: id => req('GET', `/upstreams/${id}/models`),
   createMonitorsBatch: (id, payload) => req('POST', `/upstreams/${id}/monitors`, payload),
+  // 管理标签
+  tags: () => req('GET', '/tags'),
+  createTag: tag => req('POST', '/tags', tag),
+  updateTag: (id, tag) => req('PUT', '/tags/' + id, tag),
+  deleteTag: id => req('DELETE', '/tags/' + id),
   // 真实对话测试：发 hi 请求，SSE 逐块回调 onEvent({type,text,...})。EventSource 不能带鉴权头，故用 fetch 流式解析。
   testUpstreamStream: async (id, model, onEvent, signal) => {
     const headers = {}
