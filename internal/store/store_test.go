@@ -73,6 +73,43 @@ func TestStoreCRUD(t *testing.T) {
 	}
 }
 
+func TestUpstreamSourceAndBatchUpdate(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if err := st.Create(&upstream.Upstream{Name: "A", Source: "Relay", BaseURL: "http://a", APIKey: "ka", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Create(&upstream.Upstream{Name: "B", BaseURL: "http://b", APIKey: "kb", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	list, err := st.List()
+	if err != nil || len(list) != 2 || list[0].Source != "Relay" {
+		t.Fatalf("source was not persisted: %+v, err=%v", list, err)
+	}
+
+	disabled := false
+	source := "Primary"
+	if err := st.BatchUpdateUpstreams([]int64{list[0].ID, list[1].ID}, &disabled, &source); err != nil {
+		t.Fatal(err)
+	}
+	updated, _ := st.List()
+	for _, item := range updated {
+		if item.Enabled || item.Source != "Primary" {
+			t.Fatalf("batch update failed: %+v", item)
+		}
+	}
+	if updated[0].APIKey != "ka" || updated[1].APIKey != "kb" {
+		t.Fatal("batch update changed credentials")
+	}
+	if err := st.BatchUpdateUpstreams(nil, &disabled, nil); err == nil {
+		t.Fatal("empty batch must be rejected")
+	}
+}
+
 func TestMemberEnabled(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {

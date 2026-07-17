@@ -386,6 +386,7 @@ func (s *Server) computeRoutePreviews(eff []*store.Member) map[int64][]routeShar
 type upstreamDTO struct {
 	ID           int64             `json:"id"`
 	Name         string            `json:"name"`
+	Source       string            `json:"source"`
 	BaseURL      string            `json:"base_url"`
 	Proxy        string            `json:"proxy"`
 	Protocol     string            `json:"protocol"`
@@ -415,7 +416,7 @@ func (s *Server) adminUpstreams(w http.ResponseWriter, r *http.Request) {
 		out := make([]upstreamDTO, 0, len(list))
 		for _, u := range list {
 			out = append(out, upstreamDTO{
-				ID: u.ID, Name: u.Name, BaseURL: u.BaseURL, Proxy: u.Proxy, Protocol: u.Protocol,
+				ID: u.ID, Name: u.Name, Source: u.Source, BaseURL: u.BaseURL, Proxy: u.Proxy, Protocol: u.Protocol,
 				Masked: mask(u.APIKey), Enabled: u.Enabled, ChannelProbe: u.ChannelProbe,
 				Health:      toHealthView(s.health.Snapshot(u.ID), s.health.EffectiveState(u.ID)),
 				ModelHealth: toModelHealthViews(s.health.ModelStates(u.ID)),
@@ -441,6 +442,10 @@ func (s *Server) adminUpstreams(w http.ResponseWriter, r *http.Request) {
 func (s *Server) adminUpstreamItem(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/admin/upstreams/")
 	parts := strings.Split(rest, "/")
+	if parts[0] == "batch" && r.Method == http.MethodPost {
+		s.batchUpdateUpstreams(w, r)
+		return
+	}
 	if parts[0] == "reorder" && r.Method == http.MethodPost {
 		s.reorderUpstreams(w, r)
 		return
@@ -484,6 +489,23 @@ func (s *Server) adminUpstreamItem(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", 405)
 	}
+}
+
+func (s *Server) batchUpdateUpstreams(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		IDs     []int64 `json:"ids"`
+		Enabled *bool   `json:"enabled"`
+		Source  *string `json:"source"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if err := s.store.BatchUpdateUpstreams(in.IDs, in.Enabled, in.Source); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // testUpstream 实时拉该上游 /v1/models：既是连通测试，也返回模型列表。
@@ -740,6 +762,7 @@ func decodeUpstream(r *http.Request) (*upstream.Upstream, error) {
 		return nil, err
 	}
 	d.Name = strings.TrimSpace(d.Name)
+	d.Source = strings.TrimSpace(d.Source)
 	d.BaseURL = strings.TrimSpace(d.BaseURL)
 	d.Protocol = strings.TrimSpace(d.Protocol)
 	if d.Name == "" {
@@ -755,7 +778,7 @@ func decodeUpstream(r *http.Request) (*upstream.Upstream, error) {
 		return nil, errors.New("unsupported upstream protocol")
 	}
 	return &upstream.Upstream{
-		Name: d.Name, BaseURL: d.BaseURL, APIKey: d.APIKey, Proxy: d.Proxy, Enabled: d.Enabled,
+		Name: d.Name, Source: d.Source, BaseURL: d.BaseURL, APIKey: d.APIKey, Proxy: d.Proxy, Enabled: d.Enabled,
 		Protocol: string(protocol), ChannelProbe: d.ChannelProbe,
 	}, nil
 }

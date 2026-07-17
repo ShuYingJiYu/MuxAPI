@@ -29,6 +29,7 @@ export const api = {
   createUpstream: u => req('POST', '/upstreams', u),
   updateUpstream: (id, u) => req('PUT', '/upstreams/' + id, u),
   deleteUpstream: id => req('DELETE', '/upstreams/' + id),
+  batchUpdateUpstreams: payload => req('POST', '/upstreams/batch', payload),
   reorderUpstreams: ids => req('POST', '/upstreams/reorder', { ids }),
   testUpstream: id => req('GET', `/upstreams/${id}/models`),
   createMonitorsBatch: (id, payload) => req('POST', `/upstreams/${id}/monitors`, payload),

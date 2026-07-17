@@ -152,6 +152,37 @@ func TestCreateUpstreamValidatesInput(t *testing.T) {
 	}
 }
 
+func TestUpstreamSourceAndBatchAPI(t *testing.T) {
+	ts, st, tok := newAdminTestServer(t)
+	create := adminReq(t, http.MethodPost, ts.URL+"/admin/upstreams", tok,
+		`{"name":"relay-a","source":" Relay ","base_url":"https://api.example.com","api_key":"secret","enabled":true}`)
+	create.Body.Close()
+	if create.StatusCode != http.StatusCreated {
+		t.Fatalf("create returned %d", create.StatusCode)
+	}
+	list, _ := st.List()
+	if len(list) != 1 || list[0].Source != "Relay" {
+		t.Fatalf("source was not normalized: %+v", list)
+	}
+
+	batch := adminReq(t, http.MethodPost, ts.URL+"/admin/upstreams/batch", tok,
+		`{"ids":[`+itoa(list[0].ID)+`],"source":"Backup","enabled":false}`)
+	batch.Body.Close()
+	if batch.StatusCode != http.StatusNoContent {
+		t.Fatalf("batch returned %d", batch.StatusCode)
+	}
+	updated, _ := st.Get(list[0].ID)
+	if updated.Source != "Backup" || updated.Enabled || updated.APIKey != "secret" {
+		t.Fatalf("unexpected batch result: %+v", updated)
+	}
+
+	bad := adminReq(t, http.MethodPost, ts.URL+"/admin/upstreams/batch", tok, `{"ids":[]}`)
+	bad.Body.Close()
+	if bad.StatusCode != http.StatusBadRequest {
+		t.Fatalf("empty batch should return 400, got %d", bad.StatusCode)
+	}
+}
+
 // L15 回归：创建监控引用不存在的 upstream_id 必须 404，不产生孤儿监控行。
 func TestCreateMonitorRejectsMissingUpstream(t *testing.T) {
 	ts, st, tok := newAdminTestServer(t)

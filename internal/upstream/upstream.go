@@ -16,6 +16,7 @@ import (
 type Upstream struct {
 	ID           int64
 	Name         string
+	Source       string // 管理视图中的来源/供应商；不参与路由判定
 	BaseURL      string // 中转站地址
 	APIKey       string // 透传凭证
 	Proxy        string // 转发/探测走的代理出口(空=按环境变量或直连)

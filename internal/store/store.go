@@ -292,6 +292,7 @@ func openSQLite(path string) (*Store, error) {
 	// 迁移：旧库 upstreams 补 proxy 列（已存在则忽略报错）
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN proxy TEXT NOT NULL DEFAULT ''`)
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN protocol TEXT NOT NULL DEFAULT 'passthrough'`)
+	db.Exec(`ALTER TABLE upstreams ADD COLUMN source TEXT NOT NULL DEFAULT ''`)
 	// 迁移：保留旧 channel_probe 列，运行时已固定使用渠道级熔断。
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN channel_probe INTEGER NOT NULL DEFAULT 1`)
 	// 迁移：旧库 upstreams 补 sort_order 列（拖拽排序权重，0=未排过按 id）
@@ -354,6 +355,7 @@ CREATE TABLE IF NOT EXISTS groups (
 CREATE TABLE IF NOT EXISTS upstreams (
 	id       INTEGER PRIMARY KEY AUTOINCREMENT,
 	name     TEXT NOT NULL,
+	source   TEXT NOT NULL DEFAULT '',
 	base_url TEXT NOT NULL,
 	api_key  TEXT NOT NULL,
 	proxy    TEXT NOT NULL DEFAULT '',
@@ -490,7 +492,7 @@ func scanUps(rows *sql.Rows) ([]*upstream.Upstream, error) {
 	var list []*upstream.Upstream
 	for rows.Next() {
 		u := &upstream.Upstream{}
-		if err := rows.Scan(&u.ID, &u.Name, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Protocol, &u.Enabled, &u.Priority, &u.Weight, &u.ChannelProbe); err != nil {
+		if err := rows.Scan(&u.ID, &u.Name, &u.Source, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Protocol, &u.Enabled, &u.Priority, &u.Weight, &u.ChannelProbe); err != nil {
 			return nil, err
 		}
 		list = append(list, u)
@@ -501,7 +503,7 @@ func scanUps(rows *sql.Rows) ([]*upstream.Upstream, error) {
 // ListEnabledByGroup 返回某分组下启用的上游，JOIN 中间表填充组内 priority/weight，
 // 按组内优先级升序（调度用）。
 func (s *Store) ListEnabledByGroup(groupID int64) ([]*upstream.Upstream, error) {
-	rows, err := s.db.Query(`SELECT u.id,u.name,u.base_url,u.api_key,u.proxy,u.protocol,u.enabled,gu.priority,gu.weight,u.channel_probe
+	rows, err := s.db.Query(`SELECT u.id,u.name,u.source,u.base_url,u.api_key,u.proxy,u.protocol,u.enabled,gu.priority,gu.weight,u.channel_probe
 		FROM upstreams u JOIN group_upstreams gu ON gu.upstream_id=u.id
 		WHERE gu.group_id=? AND u.enabled=TRUE AND gu.enabled=TRUE ORDER BY gu.priority ASC`, groupID)
 	if err != nil {
@@ -512,7 +514,7 @@ func (s *Store) ListEnabledByGroup(groupID int64) ([]*upstream.Upstream, error) 
 
 // List 返回全部上游(含停用)，priority/weight 置 0（全局池无组内语义），供探测与后台管理。
 func (s *Store) List() ([]*upstream.Upstream, error) {
-	rows, err := s.db.Query(`SELECT id,name,base_url,api_key,proxy,protocol,enabled,0,0,channel_probe FROM upstreams ORDER BY sort_order, id`)
+	rows, err := s.db.Query(`SELECT id,name,source,base_url,api_key,proxy,protocol,enabled,0,0,channel_probe FROM upstreams ORDER BY sort_order, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -522,15 +524,15 @@ func (s *Store) List() ([]*upstream.Upstream, error) {
 // Get 按 id 取单个上游（含完整 api_key，供连通测试用）。
 func (s *Store) Get(id int64) (*upstream.Upstream, error) {
 	u := &upstream.Upstream{}
-	err := s.db.QueryRow(`SELECT id,name,base_url,api_key,proxy,protocol,enabled,channel_probe FROM upstreams WHERE id=?`, id).
-		Scan(&u.ID, &u.Name, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Protocol, &u.Enabled, &u.ChannelProbe)
+	err := s.db.QueryRow(`SELECT id,name,source,base_url,api_key,proxy,protocol,enabled,channel_probe FROM upstreams WHERE id=?`, id).
+		Scan(&u.ID, &u.Name, &u.Source, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Protocol, &u.Enabled, &u.ChannelProbe)
 	return u, err
 }
 
 func (s *Store) Create(u *upstream.Upstream) error {
-	_, err := s.db.Exec(`INSERT INTO upstreams(name,base_url,api_key,proxy,protocol,enabled,channel_probe,sort_order)
-		VALUES(?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM upstreams))`,
-		u.Name, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe)
+	_, err := s.db.Exec(`INSERT INTO upstreams(name,source,base_url,api_key,proxy,protocol,enabled,channel_probe,sort_order)
+		VALUES(?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM upstreams))`,
+		u.Name, u.Source, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe)
 	return err
 }
 
@@ -551,13 +553,42 @@ func (s *Store) ReorderUpstreams(ids []int64) error {
 
 func (s *Store) Update(u *upstream.Upstream) error {
 	if u.APIKey == "" { // 留空则不改凭证（对齐后台「留空则不修改」语义）
-		_, err := s.db.Exec(`UPDATE upstreams SET name=?,base_url=?,proxy=?,protocol=?,enabled=?,channel_probe=? WHERE id=?`,
-			u.Name, u.BaseURL, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe, u.ID)
+		_, err := s.db.Exec(`UPDATE upstreams SET name=?,source=?,base_url=?,proxy=?,protocol=?,enabled=?,channel_probe=? WHERE id=?`,
+			u.Name, u.Source, u.BaseURL, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe, u.ID)
 		return err
 	}
-	_, err := s.db.Exec(`UPDATE upstreams SET name=?,base_url=?,api_key=?,proxy=?,protocol=?,enabled=?,channel_probe=? WHERE id=?`,
-		u.Name, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe, u.ID)
+	_, err := s.db.Exec(`UPDATE upstreams SET name=?,source=?,base_url=?,api_key=?,proxy=?,protocol=?,enabled=?,channel_probe=? WHERE id=?`,
+		u.Name, u.Source, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe, u.ID)
 	return err
+}
+
+// BatchUpdateUpstreams updates management metadata without touching credentials
+// or routing membership. Nil fields are left unchanged.
+func (s *Store) BatchUpdateUpstreams(ids []int64, enabled *bool, source *string) error {
+	if len(ids) == 0 || (enabled == nil && source == nil) {
+		return errors.New("batch update requires ids and at least one field")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		if id <= 0 {
+			return errors.New("invalid upstream id")
+		}
+		if enabled != nil {
+			if _, err := tx.Exec(`UPDATE upstreams SET enabled=? WHERE id=?`, *enabled, id); err != nil {
+				return err
+			}
+		}
+		if source != nil {
+			if _, err := tx.Exec(`UPDATE upstreams SET source=? WHERE id=?`, strings.TrimSpace(*source), id); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Delete(id int64) error {
