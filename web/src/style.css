@@ -354,6 +354,10 @@ tbody tr:nth-child(even) td { background: rgba(255,245,250,.4); }
 tbody tr:hover td { background: linear-gradient(90deg, rgba(255,179,198,.16), rgba(125,226,209,.12)); }
 .cell-name { font-weight: 700; color: var(--g900); }
 .cell-url { color: var(--g500); font-size: 13px; }
+.upstream-url-link { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; color: var(--p600); text-decoration: none; vertical-align: middle; }
+.upstream-url-link span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upstream-url-link svg { flex: none; }
+.upstream-url-link:hover { color: var(--p700); text-decoration: underline; text-underline-offset: 2px; }
 code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size: 12px; font-family: ui-monospace, monospace; color: var(--g600); }
 
 /* Tag / badge (rounded-full) */

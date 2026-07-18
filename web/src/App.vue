@@ -180,6 +180,14 @@ const protocolOptions = [
 ]
 const protocolLabels = Object.fromEntries(protocolOptions.map(option => [option.value, option.label]))
 function protocolLabel(protocol) { return protocolLabels[protocol || 'passthrough'] || protocol }
+function upstreamHref(value) {
+  try {
+    const url = new URL(String(value || '').trim())
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : ''
+  } catch {
+    return ''
+  }
+}
 const primaryTagOptions = computed(() => [
   { value: 0, label: '未分类' },
   ...tags.value.map(tag => ({ value: tag.id, label: tag.name })),
@@ -824,7 +832,12 @@ function logout() {
               <tbody>
                 <tr v-for="m in members" :key="m.upstream_id" :class="{ 'row-eff': m.effective }">
                   <td class="cell-name">{{ m.name }}<span v-if="m.effective" class="eff-badge">生效中</span></td>
-                  <td class="cell-url">{{ m.base_url }}</td>
+                  <td class="cell-url">
+                    <a v-if="upstreamHref(m.base_url)" class="upstream-url-link" :href="upstreamHref(m.base_url)" target="_blank" rel="noopener noreferrer" :title="`打开 ${m.base_url}`">
+                      <span>{{ m.base_url }}</span><Icon name="external-link" :size="13" />
+                    </a>
+                    <span v-else>{{ m.base_url }}</span>
+                  </td>
                   <td>{{ m.priority }}</td>
                   <td>{{ m.weight }}</td>
                   <td>
@@ -948,7 +961,12 @@ function logout() {
                       <td class="drag-cell"><span class="mon-grip" title="拖拽调整顺序"><Icon name="grip" :size="16" /></span></td>
                       <td class="cell-name">{{ u.name }}</td>
                       <td><div class="tag-chip-row"><span v-for="tag in auxiliaryTagsFor(u)" :key="tag.id" class="manage-tag" :class="`tag-${tag.color}`">{{ tag.name }}</span><span v-if="!auxiliaryTagsFor(u).length" class="tag-empty">—</span></div></td>
-                      <td class="cell-url">{{ u.base_url }}</td>
+                      <td class="cell-url">
+                        <a v-if="upstreamHref(u.base_url)" class="upstream-url-link" :href="upstreamHref(u.base_url)" target="_blank" rel="noopener noreferrer" :title="`打开 ${u.base_url}`">
+                          <span>{{ u.base_url }}</span><Icon name="external-link" :size="13" />
+                        </a>
+                        <span v-else>{{ u.base_url }}</span>
+                      </td>
                       <td><span class="tag">{{ protocolLabel(u.protocol) }}</span></td>
                       <td><span class="state-badge" :class="rtClass(u.health)">{{ u.enabled ? rtLabel(u.health) : '已停用' }}</span></td>
                       <td>{{ rtRate(u.health) }}</td>
