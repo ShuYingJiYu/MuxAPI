@@ -185,6 +185,8 @@ func TestIngressFailuresAreLogged(t *testing.T) {
 
 	bad, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/messages", strings.NewReader(`{"model":"x"}`))
 	bad.Header.Set("Authorization", "Bearer bad-key")
+	bad.Header.Set("User-Agent", "claude-cli/2.1.0")
+	bad.Header.Set("CF-Connecting-IP", "203.0.113.10")
 	resp, err := http.DefaultClient.Do(bad)
 	if err != nil {
 		t.Fatal(err)
@@ -196,6 +198,8 @@ func TestIngressFailuresAreLogged(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/messages", strings.NewReader(`{"model":"x"}`))
 	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("User-Agent", "curl/8.10.1")
+	req.Header.Set("X-Forwarded-For", "203.0.113.20, 127.0.0.1")
 	resp2, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -220,8 +224,28 @@ func TestIngressFailuresAreLogged(t *testing.T) {
 	if logs[0].Status != http.StatusServiceUnavailable || logs[0].Model != "x" {
 		t.Fatalf("latest log should be 503 with model x, got status=%d model=%q", logs[0].Status, logs[0].Model)
 	}
+	if logs[0].ClientIP != "203.0.113.20" || logs[0].UserAgent != "curl/8.10.1" {
+		t.Fatalf("latest log client metadata = %q %q", logs[0].ClientIP, logs[0].UserAgent)
+	}
 	if logs[1].Status != http.StatusUnauthorized {
 		t.Fatalf("older log should be 401, got status=%d", logs[1].Status)
+	}
+	if logs[1].ClientIP != "203.0.113.10" || logs[1].UserAgent != "claude-cli/2.1.0" {
+		t.Fatalf("older log client metadata = %q %q", logs[1].ClientIP, logs[1].UserAgent)
+	}
+}
+
+func TestRequestClientIPRejectsSpoofedForwardingHeaders(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	request.RemoteAddr = "198.51.100.25:4321"
+	request.Header.Set("X-Forwarded-For", "203.0.113.9")
+	if got := requestClientIP(request); got != "198.51.100.25" {
+		t.Fatalf("untrusted peer client IP = %q", got)
+	}
+
+	request.RemoteAddr = "[::ffff:127.0.0.1]:4321"
+	if got := requestClientIP(request); got != "203.0.113.9" {
+		t.Fatalf("trusted proxy client IP = %q", got)
 	}
 }
 

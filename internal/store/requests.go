@@ -54,8 +54,9 @@ func (s *Store) requestWhere(filter RequestFilter, includeCursor bool) (string, 
 		args = append(args, filter.ErrorKind)
 	}
 	if filter.Query != "" {
-		where.WriteString(" AND LOWER(CAST(r.request_id AS TEXT)) LIKE ?")
-		args = append(args, strings.ToLower(filter.Query)+"%")
+		query := strings.ToLower(filter.Query)
+		where.WriteString(" AND (LOWER(CAST(r.request_id AS TEXT)) LIKE ? OR LOWER(r.client_ip) LIKE ? OR LOWER(r.user_agent) LIKE ?)")
+		args = append(args, query+"%", "%"+query+"%", "%"+query+"%")
 	}
 	if filter.UpstreamID > 0 {
 		where.WriteString(" AND EXISTS (SELECT 1 FROM request_attempts af WHERE af.request_id=r.request_id AND af.upstream_id=?)")
@@ -105,7 +106,7 @@ func (s *Store) requestWhere(filter RequestFilter, includeCursor bool) (string, 
 
 func (s *Store) requestSelect(where string) string {
 	return fmt.Sprintf(`SELECT r.id,r.request_id,r.group_id,COALESCE(g.name,''),
-		r.final_upstream_id,COALESCE(u.name,''),r.model,r.endpoint,r.key_name,r.status,r.outcome,
+		r.final_upstream_id,COALESCE(u.name,''),r.model,r.endpoint,r.key_name,r.client_ip,r.user_agent,r.status,r.outcome,
 		r.ttft_ms,r.duration_ms,r.attempt_count,%s,%s,r.error_text,r.stream,r.request_bytes,
 		r.response_bytes,r.input_tokens,r.output_tokens,r.cached_tokens,r.stream_completed,r.last_event,
 		r.upstream_request_id,r.error_kind,r.error_source
@@ -123,7 +124,7 @@ func scanRequestEntry(row rowScanner) (*RequestEntry, error) {
 	e := &RequestEntry{}
 	err := row.Scan(
 		&e.ID, &e.RequestID, &e.GroupID, &e.GroupName, &e.FinalUpstreamID,
-		&e.FinalUpstreamName, &e.Model, &e.Endpoint, &e.KeyName, &e.Status, &e.Outcome,
+		&e.FinalUpstreamName, &e.Model, &e.Endpoint, &e.KeyName, &e.ClientIP, &e.UserAgent, &e.Status, &e.Outcome,
 		&e.TTFTMs, &e.DurationMs, &e.AttemptCount, &e.CreatedAt, &e.CompletedAt, &e.Error,
 		&e.Stream, &e.RequestBytes, &e.ResponseBytes, &e.InputTokens, &e.OutputTokens,
 		&e.CachedTokens, &e.StreamCompleted, &e.LastEvent, &e.UpstreamRequestID,

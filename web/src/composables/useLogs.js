@@ -174,6 +174,25 @@ export function useLogs({ page, guard }) {
     logFSlow.value, logFRetried.value].filter(Boolean).length)
   const logAdvancedFilters = computed(() => [logFGroup.value, logFModel.value, logFKey.value, logFEndpoint.value,
     logFErrorKind.value, logFStream.value, logFSlow.value, logFRetried.value].filter(Boolean).length)
+  const clientName = userAgent => {
+    const value = String(userAgent || '').trim()
+    if (!value) return '未知客户端'
+    const clients = [
+      [/claude(?:-code|-cli)?\/([^\s]+)/i, 'Claude CLI'],
+      [/codex(?:_cli_rs|-cli)?\/([^\s]+)/i, 'Codex CLI'],
+      [/openai-(?:node|python)\/([^\s]+)/i, 'OpenAI SDK'],
+      [/anthropic(?:-typescript|-python)?\/([^\s]+)/i, 'Anthropic SDK'],
+      [/curl\/([^\s]+)/i, 'curl'],
+      [/postmanruntime\/([^\s]+)/i, 'Postman'],
+      [/go-http-client\/([^\s]+)/i, 'Go HTTP'],
+    ]
+    for (const [pattern, name] of clients) {
+      const match = value.match(pattern)
+      if (match) return `${name} ${match[1]}`
+    }
+    const product = value.split(/\s+/, 1)[0]
+    return product.length > 36 ? product.slice(0, 35) + '…' : product
+  }
   const requestShort = id => id ? id.slice(0, 8) : '—'
   const fmtMs = ms => {
     const value = Number(ms) || 0
@@ -239,6 +258,6 @@ export function useLogs({ page, guard }) {
     toggleLogAutoRefresh, logActiveFilters, logAdvancedFilters, requestShort, fmtMs,
     fmtBytes, fmtNum, requestOutcomeText, requestOutcomeClass, errorKindText,
     errorSourceText, selectionText, streamStateText, outcomeText, fmtTime, fmtTimeFull, statusText,
-    fmtEndpoint,
+    fmtEndpoint, clientName,
   }
 }

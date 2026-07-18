@@ -680,6 +680,97 @@ func TestForwardTranslatesResponsesToClaude(t *testing.T) {
 	}
 }
 
+func TestForwardTranslatesClaudeToOpenAI(t *testing.T) {
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("upstream path = %q", r.URL.Path)
+		}
+		if r.Header.Get("anthropic-version") != "" {
+			t.Fatal("anthropic-version header should not reach OpenAI upstream")
+		}
+		requestBody, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(requestBody), `"messages"`) || !strings.Contains(string(requestBody), `"max_tokens":16`) {
+			t.Fatalf("request was not translated to OpenAI: %s", requestBody)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"chatcmpl_1","object":"chat.completion","created":1,"model":"gpt-test","choices":[{"index":0,"message":{"role":"assistant","content":"translated hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`)
+	}))
+	defer upstreamServer.Close()
+
+	upstreams := []*upstream.Upstream{{ID: 1, BaseURL: upstreamServer.URL, APIKey: "k", Protocol: "openai", Priority: 1, Weight: 1}}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 1)
+	body := []byte(`{"model":"gpt-test","max_tokens":16,"messages":[{"role":"user","content":"hello"}],"stream":false}`)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	request.Header.Set("anthropic-version", "2023-06-01")
+	result := fwd.Forward(recorder, request, body, 1, "")
+
+	var response struct {
+		Type       string `json:"type"`
+		Role       string `json:"role"`
+		StopReason string `json:"stop_reason"`
+		Content    []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.Code != http.StatusOK || response.Type != "message" || response.Role != "assistant" ||
+		response.StopReason != "end_turn" || len(response.Content) != 1 || response.Content[0].Text != "translated hello" {
+		t.Fatalf("translated response status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if result.Outcome != OutcomeSuccess || len(result.Attempts) != 1 {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestForwardTranslatesClaudeStreamToCodex(t *testing.T) {
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("upstream path = %q", r.URL.Path)
+		}
+		if r.Header.Get("anthropic-version") != "" {
+			t.Fatal("anthropic-version header should not reach Codex upstream")
+		}
+		requestBody, _ := io.ReadAll(r.Body)
+		var request map[string]any
+		if err := json.Unmarshal(requestBody, &request); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := request["input"]; !ok || request["stream"] != true || request["store"] != false {
+			t.Fatalf("request was not translated to Codex: %s", requestBody)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\"}}\n\n")
+		io.WriteString(w, "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\"},\"content_index\":0,\"output_index\":0}\n\n")
+		io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"translated hello\"}\n\n")
+		io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\",\"stop_reason\":\"stop\",\"usage\":{\"input_tokens\":2,\"output_tokens\":3},\"output\":[]}}\n\n")
+	}))
+	defer upstreamServer.Close()
+
+	upstreams := []*upstream.Upstream{{ID: 1, BaseURL: upstreamServer.URL, APIKey: "k", Protocol: "codex", Priority: 1, Weight: 1}}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 1)
+	body := []byte(`{"model":"gpt-test","max_tokens":16,"messages":[{"role":"user","content":"hello"}],"stream":true}`)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	request.Header.Set("anthropic-version", "2023-06-01")
+	result := fwd.Forward(recorder, request, body, 1, "")
+
+	response := recorder.Body.String()
+	for _, want := range []string{"event: message_start", "event: content_block_delta", "translated hello", "event: message_stop"} {
+		if !strings.Contains(response, want) {
+			t.Fatalf("translated stream missing %q: %s", want, response)
+		}
+	}
+	if recorder.Code != http.StatusOK || result.Outcome != OutcomeSuccess || len(result.Attempts) != 1 {
+		t.Fatalf("status=%d result=%+v body=%s", recorder.Code, result, response)
+	}
+}
+
 func TestForwardTranslatesClaudeClientErrorEnvelope(t *testing.T) {
 	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -336,6 +336,7 @@ func TestRequestAuditDetailFiltersAndStats(t *testing.T) {
 		{
 			RequestID: "20000000-0000-0000-0000-000000000001", GroupID: groupID,
 			FinalUpstreamID: primary, Model: "gpt-a", Endpoint: "/v1/responses", KeyName: "key-a",
+			ClientIP: "203.0.113.8", UserAgent: "claude-cli/2.1.0",
 			Stream: true, RequestBytes: 120, ResponseBytes: 800, InputTokens: 10, OutputTokens: 20,
 			CachedTokens: 3, StreamCompleted: true, LastEvent: "response.completed",
 			Status: 200, Outcome: "success", TTFTMs: 100, DurationMs: 500,
@@ -396,12 +397,21 @@ func TestRequestAuditDetailFiltersAndStats(t *testing.T) {
 	if err != nil || len(page.Entries) != 1 {
 		t.Fatalf("request id filter mismatch: page=%+v err=%v", page, err)
 	}
+	failoverRequestID := page.Entries[0].ID
+	page, err = st.ListRequestsPage(RequestFilter{Query: "203.0.113.8", Limit: 10})
+	if err != nil || len(page.Entries) != 1 || page.Entries[0].UserAgent != "claude-cli/2.1.0" {
+		t.Fatalf("client IP filter mismatch: page=%+v err=%v", page, err)
+	}
+	page, err = st.ListRequestsPage(RequestFilter{Query: "claude-cli", Limit: 10})
+	if err != nil || len(page.Entries) != 1 || page.Entries[0].ClientIP != "203.0.113.8" {
+		t.Fatalf("user agent filter mismatch: page=%+v err=%v", page, err)
+	}
 	offsetPage, err := st.ListRequestsPage(RequestFilter{Limit: 1, Offset: 1})
 	if err != nil || len(offsetPage.Entries) != 1 || offsetPage.Entries[0].RequestID != "20000000-0000-0000-0000-000000000002" {
 		t.Fatalf("offset page mismatch: page=%+v err=%v", offsetPage, err)
 	}
 
-	detail, err := st.GetRequest(page.Entries[0].ID)
+	detail, err := st.GetRequest(failoverRequestID)
 	if err != nil || len(detail.Attempts) != 2 || detail.Attempts[0].ErrorKind != "upstream_http" {
 		t.Fatalf("request detail mismatch: detail=%+v err=%v", detail, err)
 	}

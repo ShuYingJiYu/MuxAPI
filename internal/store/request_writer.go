@@ -41,6 +41,8 @@ type RequestRecord struct {
 	Model             string
 	Endpoint          string
 	KeyName           string
+	ClientIP          string
+	UserAgent         string
 	Stream            bool
 	RequestBytes      int64
 	ResponseBytes     int64
@@ -109,6 +111,8 @@ type RequestEntry struct {
 	Model             string                 `json:"model"`
 	Endpoint          string                 `json:"endpoint"`
 	KeyName           string                 `json:"key_name"`
+	ClientIP          string                 `json:"client_ip"`
+	UserAgent         string                 `json:"user_agent"`
 	Stream            bool                   `json:"stream"`
 	RequestBytes      int64                  `json:"request_bytes"`
 	ResponseBytes     int64                  `json:"response_bytes"`
@@ -193,13 +197,13 @@ func (s *Store) writeRequest(record RequestRecord) error {
 	}
 	defer tx.Rollback()
 	_, err = tx.Exec(`INSERT INTO requests(
-		request_id,group_id,final_upstream_id,model,endpoint,key_name,status,outcome,
+		request_id,group_id,final_upstream_id,model,endpoint,key_name,client_ip,user_agent,status,outcome,
 		ttft_ms,duration_ms,attempt_count,created_at,completed_at,error_text,stream,
 		request_bytes,response_bytes,input_tokens,output_tokens,cached_tokens,stream_completed,
 		last_event,upstream_request_id,error_kind,error_source)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		record.RequestID, record.GroupID, record.FinalUpstreamID, record.Model, record.Endpoint,
-		record.KeyName, record.Status, record.Outcome, record.TTFTMs, record.DurationMs,
+		record.KeyName, record.ClientIP, record.UserAgent, record.Status, record.Outcome, record.TTFTMs, record.DurationMs,
 		len(record.Attempts), s.timeValue(record.CreatedAt), s.timeValue(record.CompletedAt), record.Error,
 		record.Stream, record.RequestBytes, record.ResponseBytes, record.InputTokens, record.OutputTokens,
 		record.CachedTokens, record.StreamCompleted, record.LastEvent, record.UpstreamRequestID,

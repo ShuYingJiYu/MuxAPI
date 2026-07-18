@@ -5,6 +5,7 @@ import { ref, reactive, onMounted, onUnmounted, computed } from 'vue'
 import Icon from './Icon.vue'
 import Fence from './Fence.vue'
 import FancySelect from './FancySelect.vue'
+import UpstreamPicker from './UpstreamPicker.vue'
 import { api } from './api.js'
 import { useLogs } from './composables/useLogs.js'
 import { useMonitorViews } from './composables/useMonitorViews.js'
@@ -444,7 +445,7 @@ function delGroup(g) {
 }
 
 // 组成员
-function addMember() { dlg.type = 'member'; dlg.form = { upstream_id: addable.value[0]?.id, priority: 50, weight: 1 } }
+function addMember() { dlg.type = 'member'; dlg.form = { upstream_id: '', priority: 50, weight: 1 } }
 function saveMember() {
   guard(async () => {
     await api.addMember(detailGroup.value.id, { ...dlg.form, upstream_id: Number(dlg.form.upstream_id) })
@@ -591,7 +592,7 @@ const {
   toggleLogAutoRefresh, logActiveFilters, logAdvancedFilters, requestShort, fmtMs,
   fmtBytes, fmtNum, requestOutcomeText, requestOutcomeClass, errorKindText,
   errorSourceText, selectionText, streamStateText, outcomeText, fmtTime, fmtTimeFull, statusText,
-  fmtEndpoint,
+  fmtEndpoint, clientName,
 } = useLogs({ page, guard })
 // 监控项 CRUD
 const monModels = ref([])  // 当前对话框选中渠道的可选模型（datalist）
@@ -602,7 +603,6 @@ const testModelOptions = computed(() => {
   return opts
 })
 const upstreamSelectOptions = computed(() => upstreams.value.map(u => ({ value: u.id, label: `${u.name} — ${u.base_url}` })))
-const addableSelectOptions = computed(() => addable.value.map(u => ({ value: u.id, label: `${u.name} — ${u.base_url}` })))
 function loadMonModels(uid) {
   monModels.value = []
   if (!uid) return
@@ -1057,7 +1057,7 @@ function logout() {
             <div class="log-filter-primary">
               <div class="search-box log-search">
                 <Icon class="ic" name="search" :size="16" />
-                <input v-model="logSearch" class="search-input" placeholder="请求 ID 前缀" @keyup.enter="onLogFilterChange" />
+                <input v-model="logSearch" class="search-input" placeholder="请求 ID、客户端或 IP" @keyup.enter="onLogFilterChange" />
               </div>
               <FancySelect v-model="logFTime" :options="logTimeOptions" @change="onLogFilterChange" />
               <FancySelect v-model="logFStatus" :options="logStatusOptions" @change="onLogFilterChange" />
@@ -1082,7 +1082,7 @@ function logout() {
 
           <div class="table-wrap log-table-wrap">
             <table class="log-table">
-              <thead><tr><th>时间 / 请求</th><th>接入</th><th>端点 / 模型</th><th>路由链</th><th>结果</th><th>性能</th><th>Token</th><th>流量</th></tr></thead>
+              <thead><tr><th>时间 / 请求</th><th>接入</th><th>客户端 / IP</th><th>端点 / 模型</th><th>路由链</th><th>结果</th><th>性能</th><th>Token</th><th>流量</th></tr></thead>
               <tbody>
                 <tr v-for="l in logs" :key="l.id" class="log-row" @click="openLogDetail(l)">
                   <td>
@@ -1090,6 +1090,7 @@ function logout() {
                     <div class="log-id" :title="l.request_id">{{ requestShort(l.request_id) }}</div>
                   </td>
                   <td><b class="log-main">{{ l.group_name || '未知分组' }}</b><span class="log-sub">{{ l.key_name || '未知密钥' }}</span></td>
+                  <td><b class="log-main" :title="l.user_agent">{{ clientName(l.user_agent) }}</b><span class="log-sub mono" :title="l.client_ip">{{ l.client_ip || '未知 IP' }}</span></td>
                   <td><b class="log-main log-endpoint">{{ fmtEndpoint(l.endpoint) }}</b><span class="log-sub log-model" :title="l.model">{{ l.model || '未知模型' }}<i v-if="l.stream">流</i></span></td>
                   <td>
                     <div v-if="l.route?.length" class="route-chain">
@@ -1105,7 +1106,7 @@ function logout() {
                   <td><b class="log-metric">{{ fmtNum(l.input_tokens) }} / {{ fmtNum(l.output_tokens) }}</b><span class="log-sub">缓存 {{ fmtNum(l.cached_tokens) }}</span></td>
                   <td><b class="log-metric">{{ fmtBytes(l.response_bytes) }}</b><span class="log-sub">{{ streamStateText(l) }}</span></td>
                 </tr>
-                <tr v-if="!logs.length"><td colspan="8" class="empty-cell">{{ logLoading ? '加载中…' : '没有符合条件的请求记录。' }}</td></tr>
+                <tr v-if="!logs.length"><td colspan="9" class="empty-cell">{{ logLoading ? '加载中…' : '没有符合条件的请求记录。' }}</td></tr>
               </tbody>
             </table>
           </div>
@@ -1251,12 +1252,15 @@ function logout() {
             <dl class="log-detail-grid">
               <div><dt>请求 ID</dt><dd class="mono">{{ logDetail.request_id }}</dd></div>
               <div><dt>分组 / 密钥</dt><dd>{{ logDetail.group_name || '—' }} / {{ logDetail.key_name || '—' }}</dd></div>
+              <div><dt>客户端</dt><dd>{{ clientName(logDetail.user_agent) }}</dd></div>
+              <div><dt>来源 IP</dt><dd class="mono">{{ logDetail.client_ip || '—' }}</dd></div>
               <div><dt>端点</dt><dd class="mono">{{ logDetail.endpoint || '—' }}</dd></div>
               <div><dt>模型</dt><dd>{{ logDetail.model || '—' }}</dd></div>
               <div><dt>请求模式</dt><dd>{{ logDetail.stream ? '流式' : '非流式' }}</dd></div>
               <div><dt>上游 Request ID</dt><dd class="mono">{{ logDetail.upstream_request_id || '—' }}</dd></div>
               <div><dt>开始</dt><dd>{{ fmtTimeFull(logDetail.created_at) }}</dd></div>
               <div><dt>完成</dt><dd>{{ fmtTimeFull(logDetail.completed_at) }}</dd></div>
+              <div class="wide"><dt>User-Agent</dt><dd class="mono">{{ logDetail.user_agent || '—' }}</dd></div>
             </dl>
           </section>
 
@@ -1479,8 +1483,8 @@ function logout() {
         <template v-else-if="dlg.type === 'member'">
           <h3>{{ dlg.form.locked ? '调整组内策略' : '添加上游到分组' }}</h3>
           <div class="field" v-if="!dlg.form.locked">
-            <label>选择上游</label>
-            <FancySelect v-model="dlg.form.upstream_id" :options="addableSelectOptions" />
+            <label>选择上游（{{ addable.length }} 个可选）</label>
+            <UpstreamPicker v-model="dlg.form.upstream_id" :upstreams="addable" />
           </div>
           <div class="field" v-else><label>上游</label><input :value="upName(dlg.form.upstream_id)" disabled /></div>
           <div class="field-row">
@@ -1488,7 +1492,7 @@ function logout() {
             <div class="field" style="flex:1"><label>权重</label><input type="number" v-model.number="dlg.form.weight" /></div>
           </div>
           <p class="hint" style="margin:0">优先级越小越先用；同优先级按权重分流。</p>
-          <div class="dialog-foot"><button class="btn btn-ghost" @click="closeDlg">取消</button><button class="btn" @click="saveMember">保存</button></div>
+          <div class="dialog-foot"><button class="btn btn-ghost" @click="closeDlg">取消</button><button class="btn" :disabled="!dlg.form.upstream_id" @click="saveMember">保存</button></div>
         </template>
       </div>
     </div>

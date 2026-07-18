@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -95,16 +96,60 @@ func clientKey(r *http.Request) string {
 	return r.Header.Get("x-api-key")
 }
 
+// requestClientIP trusts forwarding headers only when the direct peer is a local reverse proxy.
+func requestClientIP(r *http.Request) string {
+	peer, ok := parseRequestIP(r.RemoteAddr)
+	if !ok {
+		return ""
+	}
+	peer = peer.Unmap()
+	if peer.IsLoopback() {
+		for _, value := range []string{
+			r.Header.Get("CF-Connecting-IP"),
+			r.Header.Get("X-Real-IP"),
+			strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0],
+		} {
+			if forwarded, valid := parseRequestIP(value); valid && !forwarded.IsUnspecified() {
+				return forwarded.Unmap().String()
+			}
+		}
+	}
+	return peer.String()
+}
+
+func parseRequestIP(value string) (netip.Addr, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return netip.Addr{}, false
+	}
+	if address, err := netip.ParseAddrPort(value); err == nil {
+		return address.Addr(), true
+	}
+	address, err := netip.ParseAddr(strings.Trim(value, "[]"))
+	return address, err == nil
+}
+
+func requestUserAgent(r *http.Request) string {
+	const maxRunes = 512
+	value := strings.TrimSpace(r.UserAgent())
+	runes := []rune(value)
+	if len(runes) > maxRunes {
+		value = string(runes[:maxRunes])
+	}
+	return value
+}
+
 // messages 转发入口：按接入 key 找到分组，在组内调度转发。
 func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	requestID := uuid.NewString()
 	w.Header().Set("X-Request-ID", requestID)
 	endpoint := r.URL.Path
+	clientIP, userAgent := requestClientIP(r), requestUserAgent(r)
 	groupID, keyName, ok := s.store.GroupAndKeyByKey(clientKey(r))
 	if !ok {
 		http.Error(w, "unauthorized: unknown access key", http.StatusUnauthorized)
-		s.recordRequest(requestID, started, 0, "unknown", "", endpoint, false, 0,
+		s.recordRequest(requestID, started, 0, "unknown", "", endpoint, clientIP, userAgent, false, 0,
 			forward.Result{Status: http.StatusUnauthorized, Outcome: forward.OutcomeClientError,
 				ErrorKind: "auth", ErrorSource: "client", Error: "unauthorized: unknown access key"})
 		return
@@ -119,25 +164,25 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, &mbErr) {
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			model, stream := parseBodyAudit(body)
-			s.recordRequest(requestID, started, groupID, keyName, model, endpoint, stream, int64(len(body)),
+			s.recordRequest(requestID, started, groupID, keyName, model, endpoint, clientIP, userAgent, stream, int64(len(body)),
 				forward.Result{Status: http.StatusRequestEntityTooLarge, Outcome: forward.OutcomeClientError,
 					ErrorKind: "request_too_large", ErrorSource: "client", Error: "request body too large"})
 			return
 		}
 		http.Error(w, "read body failed", http.StatusBadRequest)
 		model, stream := parseBodyAudit(body)
-		s.recordRequest(requestID, started, groupID, keyName, model, endpoint, stream, int64(len(body)),
+		s.recordRequest(requestID, started, groupID, keyName, model, endpoint, clientIP, userAgent, stream, int64(len(body)),
 			forward.Result{Status: http.StatusBadRequest, Outcome: forward.OutcomeClientError,
 				ErrorKind: "request_read", ErrorSource: "client", Error: "read body failed"})
 		return
 	}
 	model, stream := parseBodyAudit(body)
 	result := s.fwd.Forward(w, r, body, groupID, keyName)
-	s.recordRequest(requestID, started, groupID, keyName, model, endpoint, stream, int64(len(body)), result)
+	s.recordRequest(requestID, started, groupID, keyName, model, endpoint, clientIP, userAgent, stream, int64(len(body)), result)
 }
 
 // recordRequest 将转发结果转换为异步持久化的请求与尝试记录。
-func (s *Server) recordRequest(requestID string, started time.Time, groupID int64, keyName, model, endpoint string, stream bool, requestBytes int64, result forward.Result) {
+func (s *Server) recordRequest(requestID string, started time.Time, groupID int64, keyName, model, endpoint, clientIP, userAgent string, stream bool, requestBytes int64, result forward.Result) {
 	completed := time.Now()
 	attempts := make([]store.RequestAttemptRecord, len(result.Attempts))
 	for i, attempt := range result.Attempts {
@@ -154,7 +199,8 @@ func (s *Server) recordRequest(requestID string, started time.Time, groupID int6
 	}
 	s.store.EnqueueRequest(store.RequestRecord{
 		RequestID: requestID, GroupID: groupID, FinalUpstreamID: result.FinalUpstreamID,
-		Model: model, Endpoint: endpoint, KeyName: keyName, Stream: stream, RequestBytes: requestBytes,
+		Model: model, Endpoint: endpoint, KeyName: keyName, ClientIP: clientIP, UserAgent: userAgent,
+		Stream: stream, RequestBytes: requestBytes,
 		ResponseBytes: result.ResponseBytes, InputTokens: result.InputTokens, OutputTokens: result.OutputTokens,
 		CachedTokens: result.CachedTokens, StreamCompleted: result.StreamCompleted, LastEvent: result.LastEvent,
 		UpstreamRequestID: result.UpstreamRequestID, ErrorKind: result.ErrorKind, ErrorSource: result.ErrorSource,
