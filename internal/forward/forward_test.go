@@ -775,3 +775,117 @@ func TestProtocolMismatchDoesNotConsumeRetryBudget(t *testing.T) {
 		t.Fatal("protocol mismatch must not affect channel health")
 	}
 }
+
+// 连续验证完整请求链：首选渠道正常时命中首选，故障时切到备用，
+// 主动探测确认恢复后，下一个请求立即回到高优先级渠道。
+func TestForwardStrictPriorityFailoverAndAutomaticFailback(t *testing.T) {
+	var primaryFails atomic.Bool
+	var primaryHits, backupHits atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryHits.Add(1)
+		if primaryFails.Load() {
+			http.Error(w, "primary unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"source":"primary"}`)
+	}))
+	defer primary.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"source":"backup"}`)
+	}))
+	defer backup.Close()
+
+	upstreams := []*upstream.Upstream{
+		{ID: 1, Name: "primary", BaseURL: primary.URL, APIKey: "k", Protocol: "passthrough", Priority: 1, Weight: 1},
+		{ID: 2, Name: "backup", BaseURL: backup.URL, APIKey: "k", Protocol: "passthrough", Priority: 2, Weight: 1},
+	}
+	hm := health.New(1, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 2)
+	body := []byte(`{"model":"gpt-test","stream":false}`)
+	forwardOnce := func() (Result, string) {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+		result := fwd.Forward(recorder, request, body, 1, "")
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+		}
+		return result, recorder.Body.String()
+	}
+
+	first, firstBody := forwardOnce()
+	if first.FinalUpstreamID != 1 || len(first.Attempts) != 1 || !strings.Contains(firstBody, "primary") {
+		t.Fatalf("initial request should use primary: result=%+v body=%s", first, firstBody)
+	}
+
+	primaryFails.Store(true)
+	second, secondBody := forwardOnce()
+	if second.FinalUpstreamID != 2 || len(second.Attempts) != 2 || !strings.Contains(secondBody, "backup") {
+		t.Fatalf("failed primary should switch to backup: result=%+v body=%s", second, secondBody)
+	}
+	if hm.EffectiveState(1) != "OPEN" {
+		t.Fatalf("primary should be open after failure, state=%s", hm.EffectiveState(1))
+	}
+
+	primaryFails.Store(false)
+	hm.ObserveProbe(1, "gpt-test", true, 20)
+	hm.ObserveProbe(1, "gpt-test", true, 18)
+	third, thirdBody := forwardOnce()
+	if third.FinalUpstreamID != 1 || len(third.Attempts) != 1 || !strings.Contains(thirdBody, "primary") {
+		t.Fatalf("recovered primary should receive next request: result=%+v body=%s", third, thirdBody)
+	}
+	if primaryHits.Load() != 3 || backupHits.Load() != 1 {
+		t.Fatalf("unexpected hit counts: primary=%d backup=%d", primaryHits.Load(), backupHits.Load())
+	}
+}
+
+// 验证换源后仍从原始客户端正文重新翻译，备用 Claude 渠道能够接管
+// Responses 请求并将流式上游结果聚合为非流式客户端响应。
+func TestForwardFailoverToTranslatedClaudeUpstream(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "primary unavailable", http.StatusServiceUnavailable)
+	}))
+	defer primary.Close()
+	var backupHits atomic.Int32
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		if r.URL.Path != "/v1/messages" {
+			t.Fatalf("translated backup path = %q", r.URL.Path)
+		}
+		requestBody, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(requestBody), `"messages"`) || !strings.Contains(string(requestBody), `"stream":true`) {
+			t.Fatalf("backup request was not translated to Claude: %s", requestBody)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_backup\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":2}}}\n\n")
+		io.WriteString(w, "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
+		io.WriteString(w, "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"translated backup\"}}\n\n")
+		io.WriteString(w, "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+		io.WriteString(w, "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n")
+		io.WriteString(w, "data: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer backup.Close()
+
+	upstreams := []*upstream.Upstream{
+		{ID: 1, BaseURL: primary.URL, APIKey: "k", Protocol: "passthrough", Priority: 1, Weight: 1},
+		{ID: 2, BaseURL: backup.URL, APIKey: "k", Protocol: "claude", Priority: 2, Weight: 1},
+	}
+	hm := health.New(1, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 2)
+	body := []byte(`{"model":"claude-test","input":"hello","stream":false}`)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	result := fwd.Forward(recorder, request, body, 1, "")
+
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "translated backup") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if result.FinalUpstreamID != 2 || len(result.Attempts) != 2 || result.Attempts[0].Outcome != OutcomeFailed {
+		t.Fatalf("result = %+v", result)
+	}
+	if backupHits.Load() != 1 {
+		t.Fatalf("backup hits = %d", backupHits.Load())
+	}
+}
