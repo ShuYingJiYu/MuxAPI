@@ -154,7 +154,9 @@ const pages = {
 
 // --- 弹窗状态 ---
 const dlg = reactive({ type: '', form: {} })
-function closeDlg() { dlg.type = '' }
+const upstreamFormTagSearch = ref('')
+const tagManagerSearch = ref('')
+function closeDlg() { dlg.type = ''; upstreamFormTagSearch.value = ''; tagManagerSearch.value = '' }
 
 // 通用确认弹窗：confirm(消息, 危险操作回调)
 const confirmState = reactive({ show: false, msg: '', onOk: null })
@@ -201,11 +203,33 @@ const batchTagOptions = computed(() => [
   { value: '', label: '选择标签' },
   ...primaryTagOptions.value,
 ])
-function newUpstream() { dlg.type = 'upstream'; dlg.form = { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] } }
-function editUpstream(u) { dlg.type = 'upstream'; dlg.form = { ...u, protocol: u.protocol || 'passthrough', api_key: '', primary_tag_id: u.primary_tag_id || 0, tag_ids: [...(u.tag_ids || [])] } }
+const upstreamFormSelectedTags = computed(() => {
+  const selected = new Set((dlg.form.tag_ids || []).map(Number))
+  const primary = Number(dlg.form.primary_tag_id) || 0
+  return tags.value.filter(tag => selected.has(tag.id) && tag.id !== primary)
+})
+const upstreamFormAvailableTags = computed(() => {
+  const selected = new Set(upstreamFormSelectedTags.value.map(tag => tag.id))
+  const primary = Number(dlg.form.primary_tag_id) || 0
+  const query = upstreamFormTagSearch.value.trim().toLowerCase()
+  return tags.value.filter(tag => tag.id !== primary && !selected.has(tag.id)
+    && (!query || tag.name.toLowerCase().includes(query)))
+})
+function newUpstream() {
+  upstreamFormTagSearch.value = ''
+  dlg.type = 'upstream'
+  dlg.form = { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] }
+}
+function editUpstream(u) {
+  upstreamFormTagSearch.value = ''
+  dlg.type = 'upstream'
+  dlg.form = { ...u, protocol: u.protocol || 'passthrough', api_key: '', primary_tag_id: u.primary_tag_id || 0, tag_ids: [...(u.tag_ids || [])] }
+}
 function saveUpstream() {
   guard(async () => {
-    const f = { ...dlg.form, primary_tag_id: Number(dlg.form.primary_tag_id) || 0, tag_ids: [...new Set((dlg.form.tag_ids || []).map(Number).filter(Boolean))] }
+    const primaryTagID = Number(dlg.form.primary_tag_id) || 0
+    const tagIDs = [...new Set((dlg.form.tag_ids || []).map(Number).filter(id => id && id !== primaryTagID))]
+    const f = { ...dlg.form, primary_tag_id: primaryTagID, tag_ids: tagIDs }
     if (f.id) await api.updateUpstream(f.id, f)
     else await api.createUpstream(f)
     closeDlg(); await loadUpstreams()
@@ -314,13 +338,19 @@ function toggleUpstreamFormTag(id) {
 
 const tagColorChoices = [
   { value: 'gray', label: '灰' }, { value: 'green', label: '绿' },
-  { value: 'amber', label: '黄' }, { value: 'red', label: '红' },
-  { value: 'blue', label: '蓝' }, { value: 'purple', label: '紫' },
-  { value: 'pink', label: '粉' },
+  { value: 'teal', label: '青绿' }, { value: 'cyan', label: '青' },
+  { value: 'blue', label: '蓝' }, { value: 'indigo', label: '靛蓝' },
+  { value: 'purple', label: '紫' }, { value: 'pink', label: '粉' },
+  { value: 'red', label: '红' }, { value: 'orange', label: '橙' },
+  { value: 'amber', label: '黄' }, { value: 'lime', label: '青柠' },
 ]
 const tagDraft = reactive({ id: 0, name: '', color: 'gray' })
+const filteredManagedTags = computed(() => {
+  const query = tagManagerSearch.value.trim().toLowerCase()
+  return query ? tags.value.filter(tag => tag.name.toLowerCase().includes(query)) : tags.value
+})
 function resetTagDraft() { Object.assign(tagDraft, { id: 0, name: '', color: 'gray' }) }
-function openTagManager() { dlg.type = 'tags'; dlg.form = {}; resetTagDraft() }
+function openTagManager() { tagManagerSearch.value = ''; dlg.type = 'tags'; dlg.form = {}; resetTagDraft() }
 function editTagDraft(tag) { Object.assign(tagDraft, { id: tag.id, name: tag.name, color: tag.color }) }
 function saveTag() {
   guard(async () => {
@@ -973,7 +1003,7 @@ function logout() {
                       <td>{{ rtRate(u.health) }}</td>
                       <td>
                         <button class="btn-link sm" @click="testUpstream(u)">测试</button><button class="btn-link sm" @click="openBatchMonitors(u)">建监控</button>
-                        <button class="icon-btn" @click="editUpstream(u)"><Icon name="edit" :size="16" /></button><button class="icon-btn danger" @click="delUpstream(u)"><Icon name="trash" :size="16" /></button>
+                        <button class="icon-btn" title="编辑上游" @click="editUpstream(u)"><Icon name="edit" :size="16" /></button><button class="icon-btn danger" title="删除上游" @click="delUpstream(u)"><Icon name="trash" :size="16" /></button>
                       </td>
                     </tr>
                   </tbody>
@@ -1393,7 +1423,7 @@ function logout() {
 
     <!-- 表单弹窗 -->
     <div class="mask" v-if="dlg.type" @click.self="closeDlg">
-      <div class="dialog">
+      <div class="dialog" :class="dlg.type === 'tags' ? 'tag-dialog' : (dlg.type === 'upstream' ? 'upstream-dialog' : '')">
         <template v-if="dlg.type === 'group'">
           <h3>{{ dlg.form.id ? '编辑分组' : '新建分组' }}</h3>
           <div class="field"><label>名称</label><input v-model="dlg.form.name" placeholder="如 Claude 池" /></div>
@@ -1412,7 +1442,24 @@ function logout() {
           <h3>{{ dlg.form.id ? '编辑上游' : '新增上游' }}</h3>
           <div class="field"><label>名称</label><input v-model="dlg.form.name" /></div>
           <div class="field"><label>主标签</label><FancySelect v-model="dlg.form.primary_tag_id" :options="primaryTagOptions" /></div>
-          <div class="field"><label>普通标签</label><div class="tag-picker"><button v-for="tag in tags" :key="tag.id" type="button" class="manage-tag" :class="[`tag-${tag.color}`, { selected: dlg.form.tag_ids?.includes(tag.id), primary: Number(dlg.form.primary_tag_id) === tag.id }]" :disabled="Number(dlg.form.primary_tag_id) === tag.id" @click="toggleUpstreamFormTag(tag.id)"><Icon v-if="dlg.form.tag_ids?.includes(tag.id)" name="check" :size="12" />{{ tag.name }}</button><span v-if="!tags.length" class="hint">请先创建标签</span></div></div>
+          <div class="field">
+            <label class="field-label-row"><span>普通标签</span><small>{{ upstreamFormSelectedTags.length }} 个已选</small></label>
+            <div class="tag-picker-panel">
+              <div v-if="upstreamFormSelectedTags.length" class="tag-picker-selected">
+                <button v-for="tag in upstreamFormSelectedTags" :key="tag.id" type="button" class="manage-tag selected" :class="`tag-${tag.color}`" :title="`移除 ${tag.name}`" @click="toggleUpstreamFormTag(tag.id)">
+                  {{ tag.name }}<Icon name="x" :size="12" />
+                </button>
+              </div>
+              <div class="tag-picker-search"><Icon name="search" :size="15" /><input v-model="upstreamFormTagSearch" placeholder="搜索普通标签" /></div>
+              <div class="tag-picker-options">
+                <button v-for="tag in upstreamFormAvailableTags" :key="tag.id" type="button" class="tag-picker-option" @click="toggleUpstreamFormTag(tag.id)">
+                  <span class="tag-color-dot" :class="`tag-${tag.color}`"></span><span>{{ tag.name }}</span><Icon name="plus" :size="14" />
+                </button>
+                <span v-if="!tags.length" class="tag-picker-empty">请先在标签管理中创建标签</span>
+                <span v-else-if="!upstreamFormAvailableTags.length" class="tag-picker-empty">没有可添加的标签</span>
+              </div>
+            </div>
+          </div>
           <div class="field"><label>base_url</label><input v-model="dlg.form.base_url" placeholder="https://..." /></div>
           <div class="field"><label>协议</label><FancySelect v-model="dlg.form.protocol" :options="protocolOptions" /></div>
           <div class="field"><label>api_key</label><input v-model="dlg.form.api_key" :placeholder="dlg.form.id ? '留空则不修改' : 'sk-...'" /></div>
@@ -1424,11 +1471,14 @@ function logout() {
         <template v-else-if="dlg.type === 'tags'">
           <h3>标签管理</h3>
           <div class="tag-manager">
-            <div class="tag-manager-list">
-              <button v-for="tag in tags" :key="tag.id" class="tag-manager-item" :class="{ active: tagDraft.id === tag.id }" @click="editTagDraft(tag)">
-                <span class="tag-color-dot" :class="`tag-${tag.color}`"></span><span>{{ tag.name }}</span><Icon name="edit" :size="14" />
-              </button>
-              <div v-if="!tags.length" class="tag-manager-empty">暂无标签</div>
+            <div class="tag-manager-browser">
+              <div class="tag-manager-search"><Icon name="search" :size="15" /><input v-model="tagManagerSearch" placeholder="搜索标签" /></div>
+              <div class="tag-manager-list">
+                <button v-for="tag in filteredManagedTags" :key="tag.id" class="tag-manager-item" :class="{ active: tagDraft.id === tag.id }" @click="editTagDraft(tag)">
+                  <span class="tag-color-dot" :class="`tag-${tag.color}`"></span><span>{{ tag.name }}</span><Icon name="edit" :size="14" />
+                </button>
+                <div v-if="!filteredManagedTags.length" class="tag-manager-empty">没有匹配的标签</div>
+              </div>
             </div>
             <div class="tag-manager-form">
               <div class="field"><label>名称</label><input v-model="tagDraft.name" maxlength="40" placeholder="如 RelayCat、低价备用" @keyup.enter="saveTag" /></div>

@@ -209,20 +209,20 @@ func TestTagAPIValidatesAndUpdates(t *testing.T) {
 		t.Fatalf("invalid tag should return 400, got %d", bad.StatusCode)
 	}
 
-	created := adminReq(t, http.MethodPost, ts.URL+"/admin/tags", tok, `{"name":"Coding","color":"purple"}`)
+	created := adminReq(t, http.MethodPost, ts.URL+"/admin/tags", tok, `{"name":"Coding","color":"orange"}`)
 	var body map[string]int64
 	if err := json.NewDecoder(created.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
 	created.Body.Close()
 	id := body["id"]
-	updated := adminReq(t, http.MethodPut, ts.URL+"/admin/tags/"+itoa(id), tok, `{"name":"Code","color":"green"}`)
+	updated := adminReq(t, http.MethodPut, ts.URL+"/admin/tags/"+itoa(id), tok, `{"name":"Code","color":"teal"}`)
 	updated.Body.Close()
 	if updated.StatusCode != http.StatusNoContent {
 		t.Fatalf("tag update returned %d", updated.StatusCode)
 	}
 	tags, _ := st.ListTags()
-	if len(tags) != 1 || tags[0].Name != "Code" || tags[0].Color != "green" {
+	if len(tags) != 1 || tags[0].Name != "Code" || tags[0].Color != "teal" {
 		t.Fatalf("unexpected tags: %+v", tags)
 	}
 	deleted := adminReq(t, http.MethodDelete, ts.URL+"/admin/tags/"+itoa(id), tok, "")

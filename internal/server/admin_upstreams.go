@@ -152,7 +152,8 @@ func (s *Server) batchUpdateUpstreams(w http.ResponseWriter, r *http.Request) {
 
 var tagColors = map[string]bool{
 	"gray": true, "green": true, "amber": true, "red": true,
-	"blue": true, "purple": true, "pink": true,
+	"blue": true, "purple": true, "pink": true, "teal": true,
+	"cyan": true, "indigo": true, "orange": true, "lime": true,
 }
 
 func decodeTag(r *http.Request) (string, string, error) {
