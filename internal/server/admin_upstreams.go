@@ -1,0 +1,297 @@
+package server
+
+import (
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/mirainya/muxapi/internal/store"
+	"github.com/mirainya/muxapi/internal/upstream"
+)
+
+// upstreamDTO 对外视图：api_key 脱敏，不回显完整凭证。
+type upstreamDTO struct {
+	ID           int64             `json:"id"`
+	Name         string            `json:"name"`
+	Source       string            `json:"source"`
+	PrimaryTagID int64             `json:"primary_tag_id"`
+	TagIDs       []int64           `json:"tag_ids"`
+	Tags         []upstream.Tag    `json:"tags"`
+	BaseURL      string            `json:"base_url"`
+	Proxy        string            `json:"proxy"`
+	Protocol     string            `json:"protocol"`
+	APIKey       string            `json:"api_key,omitempty"` // 输入用；输出时脱敏到 masked
+	Masked       string            `json:"masked,omitempty"`
+	Enabled      bool              `json:"enabled"`
+	ChannelProbe bool              `json:"channel_probe"`          // 兼容旧数据；熔断固定为渠道级
+	Health       healthView        `json:"health"`                 // 运行时健康（仅 GET 列表填充）
+	ModelHealth  []modelHealthView `json:"model_health,omitempty"` // 模型级健康（仅 GET 列表填充，无则省略）
+}
+
+func mask(key string) string {
+	if len(key) <= 8 {
+		return "****"
+	}
+	return key[:4] + "****" + key[len(key)-4:]
+}
+
+// adminUpstreams 处理上游全局池的列表与创建。
+func (s *Server) adminUpstreams(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		list, err := s.store.List()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		out := make([]upstreamDTO, 0, len(list))
+		for _, u := range list {
+			out = append(out, upstreamDTO{
+				ID: u.ID, Name: u.Name, Source: u.Source, BaseURL: u.BaseURL, Proxy: u.Proxy, Protocol: u.Protocol,
+				PrimaryTagID: u.PrimaryTagID, TagIDs: u.TagIDs, Tags: u.Tags,
+				Masked: mask(u.APIKey), Enabled: u.Enabled, ChannelProbe: u.ChannelProbe,
+				Health:      toHealthView(s.health.Snapshot(u.ID), s.health.EffectiveState(u.ID)),
+				ModelHealth: toModelHealthViews(s.health.ModelStates(u.ID)),
+			})
+		}
+		writeJSON(w, out)
+	case http.MethodPost:
+		u, err := decodeUpstream(r)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if err := s.store.Create(u); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.WriteHeader(201)
+	default:
+		http.Error(w, "method not allowed", 405)
+	}
+}
+
+func (s *Server) adminUpstreamItem(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/admin/upstreams/")
+	parts := strings.Split(rest, "/")
+	if parts[0] == "batch" && r.Method == http.MethodPost {
+		s.batchUpdateUpstreams(w, r)
+		return
+	}
+	if parts[0] == "reorder" && r.Method == http.MethodPost {
+		s.reorderUpstreams(w, r)
+		return
+	}
+	id, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		http.Error(w, "bad id", 400)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "models" { // 连通测试 + 拉模型
+		s.testUpstream(w, r, id)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "test" { // 真实对话测试(SSE流式回显)
+		s.testUpstreamChat(w, r, id)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "monitors" && r.Method == http.MethodPost { // 批量建监控
+		s.batchCreateMonitors(w, r, id)
+		return
+	}
+	switch r.Method {
+	case http.MethodPut:
+		u, err := decodeUpstream(r)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		u.ID = id
+		if err := s.store.Update(u); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.WriteHeader(204)
+	case http.MethodDelete:
+		if err := s.store.Delete(id); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.WriteHeader(204)
+	default:
+		http.Error(w, "method not allowed", 405)
+	}
+}
+
+func (s *Server) batchUpdateUpstreams(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		IDs          []int64 `json:"ids"`
+		Enabled      *bool   `json:"enabled"`
+		PrimaryTagID *int64  `json:"primary_tag_id"`
+		AddTagIDs    []int64 `json:"add_tag_ids"`
+		RemoveTagIDs []int64 `json:"remove_tag_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	update := store.UpstreamBatchUpdate{
+		Enabled: in.Enabled, PrimaryTagID: in.PrimaryTagID,
+		AddTagIDs: in.AddTagIDs, RemoveTagIDs: in.RemoveTagIDs,
+	}
+	if err := s.store.BatchUpdateUpstreams(in.IDs, update); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+var tagColors = map[string]bool{
+	"gray": true, "green": true, "amber": true, "red": true,
+	"blue": true, "purple": true, "pink": true,
+}
+
+func decodeTag(r *http.Request) (string, string, error) {
+	var in struct {
+		Name  string `json:"name"`
+		Color string `json:"color"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		return "", "", err
+	}
+	in.Name = strings.TrimSpace(in.Name)
+	in.Color = strings.TrimSpace(in.Color)
+	if in.Name == "" || len([]rune(in.Name)) > 40 {
+		return "", "", errors.New("tag name must be 1-40 characters")
+	}
+	if !tagColors[in.Color] {
+		return "", "", errors.New("unsupported tag color")
+	}
+	return in.Name, in.Color, nil
+}
+
+func (s *Server) adminTags(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		tags, err := s.store.ListTags()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		writeJSON(w, tags)
+	case http.MethodPost:
+		name, color, err := decodeTag(r)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		id, err := s.store.CreateTag(name, color)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]int64{"id": id})
+	default:
+		http.Error(w, "method not allowed", 405)
+	}
+}
+
+func (s *Server) adminTagItem(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(strings.TrimPrefix(r.URL.Path, "/admin/tags/"), 10, 64)
+	if err != nil || id <= 0 {
+		http.Error(w, "bad id", 400)
+		return
+	}
+	switch r.Method {
+	case http.MethodPut:
+		name, color, err := decodeTag(r)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if err := s.store.UpdateTag(id, name, color); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	case http.MethodDelete:
+		if err := s.store.DeleteTag(id); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "method not allowed", 405)
+	}
+}
+
+// testUpstream 实时拉该上游 /v1/models：既是连通测试，也返回模型列表。
+func (s *Server) testUpstream(w http.ResponseWriter, r *http.Request, id int64) {
+	u, err := s.store.Get(id)
+	if err != nil {
+		http.Error(w, "upstream not found", 404)
+		return
+	}
+	type result struct {
+		OK        bool     `json:"ok"`
+		Status    int      `json:"status,omitempty"`
+		LatencyMs int64    `json:"latency_ms"`
+		Models    []string `json:"models,omitempty"`
+		Error     string   `json:"error,omitempty"`
+	}
+	start := time.Now()
+	models, status, err := u.FetchModels(10 * time.Second)
+	lat := time.Since(start).Milliseconds()
+	if err != nil {
+		writeJSON(w, result{Status: status, LatencyMs: lat, Error: err.Error()})
+		return
+	}
+	writeJSON(w, result{OK: true, Status: status, LatencyMs: lat, Models: models})
+}
+
+// batchCreateMonitors 为某上游的一批模型批量建监控，已存在的跳过。
+// body: {models:[], stream, probe_text, max_tokens, interval_sec, path, enabled}
+func (s *Server) batchCreateMonitors(w http.ResponseWriter, r *http.Request, id int64) {
+	var in struct {
+		Models      []string `json:"models"`
+		Enabled     bool     `json:"enabled"`
+		Stream      bool     `json:"stream"`
+		ProbeText   string   `json:"probe_text"`
+		MaxTokens   int      `json:"max_tokens"`
+		IntervalSec int      `json:"interval_sec"`
+		Path        string   `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if len(in.Models) == 0 {
+		http.Error(w, "no models selected", 400)
+		return
+	}
+	// 校验 upstream 存在：与单建监控同口径，杜绝孤儿监控行
+	if _, err := s.store.Get(id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "upstream not found", 404)
+			return
+		}
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	tmpl := store.Monitor{
+		Enabled: in.Enabled, Stream: in.Stream, ProbeText: strings.TrimSpace(in.ProbeText),
+		MaxTokens: in.MaxTokens, IntervalSec: in.IntervalSec, Path: strings.TrimSpace(in.Path),
+	}
+	created, skipped, err := s.store.BatchCreateMonitors(id, in.Models, tmpl)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	writeJSON(w, map[string]int{"created": created, "skipped": skipped})
+}

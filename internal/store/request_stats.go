@@ -1,0 +1,268 @@
+package store
+
+import (
+	"fmt"
+	"sort"
+	"time"
+)
+
+type LogFilterOptions struct {
+	Models     []string            `json:"models"`
+	Groups     []string            `json:"groups"`
+	Keys       []string            `json:"keys"`
+	Endpoints  []string            `json:"endpoints"`
+	ErrorKinds []string            `json:"error_kinds"`
+	Upstreams  []LogUpstreamOption `json:"upstreams"`
+}
+
+type LogUpstreamOption struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+}
+
+func (s *Store) LogFilterOptions() (*LogFilterOptions, error) {
+	opt := &LogFilterOptions{
+		Models: []string{}, Groups: []string{}, Keys: []string{}, Endpoints: []string{},
+		ErrorKinds: []string{}, Upstreams: []LogUpstreamOption{},
+	}
+	collect := func(q string) ([]string, error) {
+		rows, err := s.db.Query(q)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var value string
+			if err := rows.Scan(&value); err != nil {
+				return nil, err
+			}
+			if value != "" {
+				out = append(out, value)
+			}
+		}
+		return out, rows.Err()
+	}
+	var err error
+	if opt.Models, err = collect(`SELECT DISTINCT model FROM requests WHERE model<>'' ORDER BY model`); err != nil {
+		return nil, err
+	}
+	if opt.Groups, err = collect(`SELECT DISTINCT g.name FROM requests r JOIN groups g ON g.id=r.group_id ORDER BY g.name`); err != nil {
+		return nil, err
+	}
+	if opt.Keys, err = collect(`SELECT DISTINCT key_name FROM requests WHERE key_name<>'' ORDER BY key_name`); err != nil {
+		return nil, err
+	}
+	if opt.Endpoints, err = collect(`SELECT DISTINCT endpoint FROM requests WHERE endpoint<>'' ORDER BY endpoint`); err != nil {
+		return nil, err
+	}
+	if opt.ErrorKinds, err = collect(`SELECT DISTINCT error_kind FROM requests WHERE error_kind<>'' ORDER BY error_kind`); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(`SELECT DISTINCT a.upstream_id,COALESCE(u.name,'')
+		FROM request_attempts a LEFT JOIN upstreams u ON u.id=a.upstream_id
+		WHERE a.upstream_id>0 ORDER BY a.upstream_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item LogUpstreamOption
+		if err := rows.Scan(&item.ID, &item.Name); err != nil {
+			return nil, err
+		}
+		if item.Name == "" {
+			item.Name = fmt.Sprintf("#%d", item.ID)
+		}
+		opt.Upstreams = append(opt.Upstreams, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return opt, nil
+}
+
+type RequestStats struct {
+	Total           int64   `json:"total"`
+	DirectSuccess   int64   `json:"direct_success"`
+	FailoverSuccess int64   `json:"failover_success"`
+	Failed          int64   `json:"failed"`
+	Partial         int64   `json:"partial"`
+	Canceled        int64   `json:"canceled"`
+	ClientError     int64   `json:"client_error"`
+	Retried         int64   `json:"retried"`
+	SuccessRate     float64 `json:"success_rate"`
+	P50TTFTMs       int64   `json:"p50_ttft_ms"`
+	P95TTFTMs       int64   `json:"p95_ttft_ms"`
+	P95DurationMs   int64   `json:"p95_duration_ms"`
+	InputTokens     int64   `json:"input_tokens"`
+	OutputTokens    int64   `json:"output_tokens"`
+	CachedTokens    int64   `json:"cached_tokens"`
+}
+
+func (s *Store) RequestStats(filter RequestFilter) (*RequestStats, error) {
+	where, args := s.requestWhere(filter, false)
+	if s.db.postgres {
+		stats := &RequestStats{}
+		err := s.db.QueryRow(`SELECT COUNT(*),
+			COALESCE(SUM(CASE WHEN r.outcome='success' AND r.attempt_count<=1 THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN r.outcome='success' AND r.attempt_count>1 THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN r.outcome NOT IN ('success','partial','canceled','client_error') THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN r.outcome='partial' THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN r.outcome='canceled' THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN r.outcome='client_error' THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN r.attempt_count>1 THEN 1 ELSE 0 END),0),
+			COALESCE(CAST(percentile_cont(0.50) WITHIN GROUP (ORDER BY r.ttft_ms)
+				FILTER (WHERE r.ttft_ms>0) AS BIGINT),0),
+			COALESCE(CAST(percentile_cont(0.95) WITHIN GROUP (ORDER BY r.ttft_ms)
+				FILTER (WHERE r.ttft_ms>0) AS BIGINT),0),
+			COALESCE(CAST(percentile_cont(0.95) WITHIN GROUP (ORDER BY r.duration_ms)
+				FILTER (WHERE r.duration_ms>0) AS BIGINT),0),
+			COALESCE(SUM(r.input_tokens),0),COALESCE(SUM(r.output_tokens),0),COALESCE(SUM(r.cached_tokens),0)
+			FROM requests r LEFT JOIN groups g ON g.id=r.group_id`+where, args...).Scan(
+			&stats.Total, &stats.DirectSuccess, &stats.FailoverSuccess, &stats.Failed,
+			&stats.Partial, &stats.Canceled, &stats.ClientError, &stats.Retried,
+			&stats.P50TTFTMs, &stats.P95TTFTMs, &stats.P95DurationMs,
+			&stats.InputTokens, &stats.OutputTokens, &stats.CachedTokens,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if stats.Total > 0 {
+			stats.SuccessRate = float64(stats.DirectSuccess+stats.FailoverSuccess) / float64(stats.Total)
+		}
+		return stats, nil
+	}
+	rows, err := s.db.Query(`SELECT r.outcome,r.attempt_count,r.ttft_ms,r.duration_ms,
+		r.input_tokens,r.output_tokens,r.cached_tokens
+		FROM requests r LEFT JOIN groups g ON g.id=r.group_id`+where, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	stats := &RequestStats{}
+	var ttfts, durations []int64
+	for rows.Next() {
+		var outcome string
+		var attempts int
+		var ttft, duration, input, output, cached int64
+		if err := rows.Scan(&outcome, &attempts, &ttft, &duration, &input, &output, &cached); err != nil {
+			return nil, err
+		}
+		stats.Total++
+		if attempts > 1 {
+			stats.Retried++
+		}
+		switch outcome {
+		case "success":
+			if attempts > 1 {
+				stats.FailoverSuccess++
+			} else {
+				stats.DirectSuccess++
+			}
+		case "partial":
+			stats.Partial++
+		case "canceled":
+			stats.Canceled++
+		case "client_error":
+			stats.ClientError++
+		default:
+			stats.Failed++
+		}
+		if ttft > 0 {
+			ttfts = append(ttfts, ttft)
+		}
+		if duration > 0 {
+			durations = append(durations, duration)
+		}
+		stats.InputTokens += input
+		stats.OutputTokens += output
+		stats.CachedTokens += cached
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if stats.Total > 0 {
+		stats.SuccessRate = float64(stats.DirectSuccess+stats.FailoverSuccess) / float64(stats.Total)
+	}
+	stats.P50TTFTMs = percentile(ttfts, 0.50)
+	stats.P95TTFTMs = percentile(ttfts, 0.95)
+	stats.P95DurationMs = percentile(durations, 0.95)
+	return stats, nil
+}
+
+func percentile(values []int64, quantile float64) int64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
+	index := int(float64(len(values)-1)*quantile + 0.5)
+	if index >= len(values) {
+		index = len(values) - 1
+	}
+	return values[index]
+}
+
+// RouteSample 一条历史路由样本，供启动时重建 (上游,模型) 的延迟/成功率 EWMA。
+type RouteSample struct {
+	UpstreamID int64
+	Model      string
+	OK         bool
+	LatencyMs  int64
+}
+
+// RecentSamples 只回放会影响路由健康的成功或失败尝试。
+func (s *Store) RecentSamples(limit int) ([]RouteSample, error) {
+	if limit <= 0 {
+		limit = 2000
+	}
+	rows, err := s.db.Query(`SELECT a.upstream_id,r.model,a.outcome,a.ttft_ms FROM
+		(SELECT id,request_id,upstream_id,outcome,ttft_ms FROM request_attempts
+		 WHERE upstream_id>0 AND outcome IN ('success','failed') ORDER BY id DESC LIMIT ?) a
+		JOIN requests r ON r.request_id=a.request_id ORDER BY a.id ASC`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RouteSample
+	for rows.Next() {
+		var s RouteSample
+		var outcome string
+		if err := rows.Scan(&s.UpstreamID, &s.Model, &outcome, &s.LatencyMs); err != nil {
+			return nil, err
+		}
+		s.OK = outcome == "success"
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListRequests(limit int) ([]*RequestEntry, error) {
+	page, err := s.ListRequestsPage(RequestFilter{Limit: limit})
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range page.Entries {
+		entry.Attempts, err = s.listRequestAttempts(entry.RequestID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return page.Entries, nil
+}
+
+// PruneRequests 每轮分批删除超过 keepDays 天的请求，尝试记录由外键级联删除。
+func (s *Store) PruneRequests(keepDays, batch int) (int64, error) {
+	if keepDays <= 0 || batch <= 0 {
+		return 0, nil
+	}
+	cutoff := s.timeValue(time.Now().Add(-time.Duration(keepDays) * 24 * time.Hour))
+	res, err := s.db.Exec(`DELETE FROM requests WHERE id IN (
+		SELECT id FROM requests WHERE created_at < ? ORDER BY created_at LIMIT ?
+	)`, cutoff, batch)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}

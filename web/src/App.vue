@@ -6,6 +6,8 @@ import Icon from './Icon.vue'
 import Fence from './Fence.vue'
 import FancySelect from './FancySelect.vue'
 import { api } from './api.js'
+import { useLogs } from './composables/useLogs.js'
+import { useMonitorViews } from './composables/useMonitorViews.js'
 
 const page = ref('overview')      // overview | groups | upstreams | monitors
 const detailGroup = ref(null)     // 进入分组详情时设置
@@ -37,157 +39,12 @@ async function probeOne(m) {
   } finally { probing.delete(m.id) }
 }
 
-const primaryTagFor = upstream => upstream?.tags?.find(tag => tag.is_primary) || null
-const auxiliaryTagsFor = upstream => (upstream?.tags || []).filter(tag => !tag.is_primary)
-const tagGroupKey = tag => tag ? `tag-${tag.id}` : 'untagged'
-const tagGroupName = tag => tag?.name || '未分类'
-
-function monitorItemState(monitor, upstream) {
-  if (!monitor.enabled || !upstream?.enabled) return 'DISABLED'
-  if (upstream.health?.state === 'OPEN') return 'DOWN'
-  if (upstream.health?.state === 'HALF_OPEN') return 'DEGRADED'
-  return monitor.snapshot?.state || 'NODATA'
-}
-
-// 将监控项与上游元数据合并，后续筛选和汇总只消费这一种视图对象。
-const monitorItems = computed(() => {
-  const upstreamByID = new Map(upstreams.value.map(item => [item.id, item]))
-  return monitors.value.map(monitor => {
-    const upstream = upstreamByID.get(monitor.upstream_id) || { id: monitor.upstream_id, name: monitor.upstream_name, enabled: true, tags: [] }
-    const primaryTag = primaryTagFor(upstream)
-    return { ...monitor, upstream, primaryTag, groupKey: tagGroupKey(primaryTag), state: monitorItemState(monitor, upstream) }
-  })
-})
-
-const monitorSearch = ref('')
-const monitorStatusFilter = ref('')
-const monitorTagFilter = ref('')
-const collapsedMonitorTags = reactive(new Set())
-const monitorStatusOptions = [
-  { value: '', label: '状态：全部' },
-  { value: 'DOWN', label: '故障' },
-  { value: 'DEGRADED', label: '降级' },
-  { value: 'OK', label: '正常' },
-  { value: 'NODATA', label: '待探测' },
-  { value: 'DISABLED', label: '已停用' },
-]
-const monitorTagOptions = computed(() => [
-  { value: '', label: '主标签：全部' },
-  { value: 'untagged', label: '未分类' },
-  ...tags.value.map(tag => ({ value: `tag-${tag.id}`, label: tag.name })),
-])
-const monitorStateRank = { DOWN: 0, DEGRADED: 1, NODATA: 2, OK: 3, DISABLED: 4 }
-const monitorSections = computed(() => {
-  const query = monitorSearch.value.trim().toLowerCase()
-  const tagOrder = new Map(tags.value.map((tag, index) => [tag.id, index]))
-  const filtered = monitorItems.value.filter(item => {
-    if (monitorStatusFilter.value && item.state !== monitorStatusFilter.value) return false
-    if (monitorTagFilter.value && item.groupKey !== monitorTagFilter.value) return false
-    if (!query) return true
-    return [item.upstream.name, item.upstream.base_url, item.model, ...(item.upstream.tags || []).map(tag => tag.name)]
-      .some(value => String(value || '').toLowerCase().includes(query))
-  })
-  const sections = new Map()
-  for (const item of filtered) {
-    if (!sections.has(item.groupKey)) sections.set(item.groupKey, { tag: item.primaryTag, items: [] })
-    sections.get(item.groupKey).items.push(item)
-  }
-  return [...sections.entries()].map(([key, section]) => {
-    const items = section.items.sort((a, b) => monitorStateRank[a.state] - monitorStateRank[b.state] || a.upstream.name.localeCompare(b.upstream.name) || a.model.localeCompare(b.model))
-    const down = items.filter(item => item.state === 'DOWN').length
-    const degraded = items.filter(item => item.state === 'DEGRADED').length
-    const nodata = items.filter(item => item.state === 'NODATA').length
-    const enabled = items.filter(item => item.state !== 'DISABLED')
-    const reqs = enabled.reduce((sum, item) => sum + (Number(item.snapshot?.reqs) || 0), 0)
-    const success = enabled.reduce((sum, item) => sum + (Number(item.snapshot?.reqs) || 0) * (Number(item.snapshot?.succ_rate) || 0), 0)
-    const state = !enabled.length ? 'DISABLED' : down ? 'DOWN' : degraded ? 'DEGRADED' : nodata ? 'NODATA' : 'OK'
-    return { key, tag: section.tag, name: tagGroupName(section.tag), items, down, degraded, nodata, enabled: enabled.length, state, rate: reqs ? success / reqs : 0, reqs }
-  }).sort((a, b) => (tagOrder.get(a.tag?.id) ?? Number.MAX_SAFE_INTEGER) - (tagOrder.get(b.tag?.id) ?? Number.MAX_SAFE_INTEGER))
-})
-
-const monitorVisibleCount = computed(() => monitorSections.value.reduce((sum, section) => sum + section.items.length, 0))
-const summary = computed(() => {
-  const items = monitorItems.value.filter(item => item.state !== 'DISABLED')
-  const down = items.filter(item => item.state === 'DOWN').length
-  const degraded = items.filter(item => item.state === 'DEGRADED').length
-  const nodata = items.filter(item => item.state === 'NODATA').length
-  const reqs = items.reduce((sum, item) => sum + (Number(item.snapshot?.reqs) || 0), 0)
-  const success = items.reduce((sum, item) => sum + (Number(item.snapshot?.reqs) || 0) * (Number(item.snapshot?.succ_rate) || 0), 0)
-  return {
-    total: items.length, down, degraded, nodata,
-    up: items.filter(item => item.state === 'OK').length,
-    rate: reqs ? success / reqs : 0,
-    probeReqs: reqs,
-    allOk: items.length > 0 && down === 0 && degraded === 0 && nodata === 0,
-  }
-})
-function toggleMonitorTag(key) {
-  if (collapsedMonitorTags.has(key)) collapsedMonitorTags.delete(key)
-  else collapsedMonitorTags.add(key)
-}
-
-// ===== 总览：按上游分组的模型探活状态 =====
-// 数据源 = monitors（每项 = 一个 (上游,模型)，含探测快照）。
-// 监控只是探活子集，各上游监控的模型数不同 —— 故不拼矩阵，
-// 而是按上游分组，每组平铺它实际监控的模型芯片（有几个显几个）。
-const stateRank = { DOWN: 0, DEGRADED: 1, OK: 2 } // 故障置顶用
-const matrix = computed(() => {
-  const byUp = new Map()
-  for (const m of monitors.value) {
-    if (!byUp.has(m.upstream_id)) byUp.set(m.upstream_id, { id: m.upstream_id, name: m.upstream_name, items: [] })
-    byUp.get(m.upstream_id).items.push(m)
-  }
-  const rows = [...byUp.values()].map(g => {
-    // 组内健康汇总 + 模型按状态排序（故障/降级置顶，停用沉底）
-    let down = 0, degraded = 0
-    for (const m of g.items) {
-      if (!m.enabled) continue
-      const s = m.snapshot.state
-      if (s === 'DOWN') down++
-      else if (s === 'DEGRADED') degraded++
-    }
-    // 排序副本，避免在 computed 内原地改 monitors 派生数组（保 computed 纯净）
-    const items = [...g.items].sort((a, b) => {
-      if (a.enabled !== b.enabled) return a.enabled ? -1 : 1
-      const ra = stateRank[a.snapshot.state] ?? 3, rb = stateRank[b.snapshot.state] ?? 3
-      return ra - rb || a.model.localeCompare(b.model)
-    })
-    return { ...g, items, down, degraded, worst: down ? 0 : degraded ? 1 : 2 }
-  })
-  // 组排序：有故障的上游置顶，其次降级，再按名字
-  rows.sort((a, b) => a.worst - b.worst || a.name.localeCompare(b.name))
-  return { rows }
-})
-// 总览汇总卡（粉/薄荷/黄/紫 四色块）
-const ovSummary = computed(() => {
-  const ms = monitors.value.filter(m => m.enabled)
-  const st = m => m.snapshot.state
-  const down = ms.filter(m => st(m) === 'DOWN').length
-  const degraded = ms.filter(m => st(m) === 'DEGRADED').length
-  const rated = ms.filter(m => m.snapshot.reqs > 0)
-  const rate = rated.length ? rated.reduce((a, m) => a + m.snapshot.succ_rate, 0) / rated.length : 1
-  const lats = rated.filter(m => m.snapshot.avg_ms).map(m => m.snapshot.avg_ms)
-  const avgLat = lats.length ? Math.round(lats.reduce((a, b) => a + b, 0) / lats.length) : 0
-  return {
-    upstreams: matrix.value.rows.length,
-    combos: ms.length,
-    models: new Set(ms.map(m => m.model)).size,
-    healthy: ms.length - down - degraded, degraded, down,
-    rate, avgLat,
-  }
-})
-// 点格子 → 抽屉看详情（含趋势 + 立即探测）
-// 只存 id，抽屉对象用 computed 从 monitors 实时 find——
-// 这样 60s 轮询整替 monitors 后，抽屉内容随之刷新而非冻结在旧引用。
-const cellDrawerId = ref(null)
-const cellDrawer = computed(() => cellDrawerId.value == null ? null : monitors.value.find(x => x.id === cellDrawerId.value) || null)
-function openCell(m) { if (m) cellDrawerId.value = m.id }
-function closeCell() { cellDrawerId.value = null }
-async function probeCell() {
-  const m = cellDrawer.value
-  if (!m) return
-  await probeOne(m)
-}
+const {
+  primaryTagFor, auxiliaryTagsFor, monitorItems, monitorSearch, monitorStatusFilter,
+  monitorTagFilter, collapsedMonitorTags, monitorStatusOptions, monitorTagOptions,
+  monitorSections, monitorVisibleCount, summary, toggleMonitorTag, matrix, ovSummary,
+  cellDrawerId, cellDrawer, openCell, closeCell, probeCell,
+} = useMonitorViews({ monitors, upstreams, tags, probeOne })
 // 分组详情加载守卫：每次切换详情/返回都自增 epoch，
 // 参数化加载(members/keys)返回时校验 epoch 未变才写入，避免快速切换短暂错配。
 let loadEpoch = 0
@@ -721,230 +578,21 @@ const sinceText = ts => {
   return Math.floor(s / 3600) + ' 小时前'
 }
 
-// --- 请求记录（标准分页 + 服务端筛选）---
-const logs = ref([])
-const logPageSize = ref(20)
-const logCurrentPage = ref(1)
-const logLoading = ref(false)
-const logDetail = ref(null)
-const logDetailLoading = ref(false)
-const logStats = ref({})
-const logSearch = ref('')
-const logFTime = ref('24h')
-const logFGroup = ref('')
-const logFModel = ref('')
-const logFStatus = ref('')
-const logFUpstream = ref('')
-const logFKey = ref('')
-const logFEndpoint = ref('')
-const logFErrorKind = ref('')
-const logFStream = ref('')
-const logFSlow = ref('')
-const logFRetried = ref(false)
-const logAutoRefresh = ref(false)
-const logMoreFilters = ref(false)
-const logModelOpts = ref([])
-const logGroupOpts = ref([])
-const logKeyOpts = ref([])
-const logEndpointOpts = ref([])
-const logErrorKindOpts = ref([])
-const logUpstreamOpts = ref([])
-const logPageSizeOptions = [
-  { value: 20, label: '20 条' },
-  { value: 50, label: '50 条' },
-  { value: 100, label: '100 条' },
-]
-const logTotalPages = computed(() => Math.max(1, Math.ceil((Number(logStats.value.total) || 0) / Number(logPageSize.value))))
-const logPageItems = computed(() => {
-  const total = logTotalPages.value
-  const current = Math.min(logCurrentPage.value, total)
-  if (total <= 7) return Array.from({ length: total }, (_, index) => ({ type: 'page', value: index + 1, key: `page-${index + 1}` }))
-  let start = Math.max(2, current - 1)
-  let end = Math.min(total - 1, current + 1)
-  if (current <= 4) end = 5
-  if (current >= total - 3) start = total - 4
-  const items = [{ type: 'page', value: 1, key: 'page-1' }]
-  if (start > 2) items.push({ type: 'ellipsis', key: 'ellipsis-left' })
-  for (let value = start; value <= end; value++) items.push({ type: 'page', value, key: `page-${value}` })
-  if (end < total - 1) items.push({ type: 'ellipsis', key: 'ellipsis-right' })
-  items.push({ type: 'page', value: total, key: `page-${total}` })
-  return items
-})
-const logGroupSelectOptions = computed(() => [{ value: '', label: '全部分组' }, ...logGroupOpts.value.map(g => ({ value: g, label: g }))])
-const logModelSelectOptions = computed(() => [{ value: '', label: '全部模型' }, ...logModelOpts.value.map(m => ({ value: m, label: m }))])
-const logKeySelectOptions = computed(() => [{ value: '', label: '全部密钥' }, ...logKeyOpts.value.map(k => ({ value: k, label: k }))])
-const logEndpointSelectOptions = computed(() => [{ value: '', label: '全部端点' }, ...logEndpointOpts.value.map(e => ({ value: e, label: fmtEndpoint(e) }))])
-const logErrorSelectOptions = computed(() => [{ value: '', label: '全部错误' }, ...logErrorKindOpts.value.map(e => ({ value: e, label: errorKindText(e) }))])
-const logUpstreamSelectOptions = computed(() => [{ value: '', label: '全部渠道' }, ...logUpstreamOpts.value.map(u => ({ value: u.id, label: u.name }))])
-const logTimeOptions = [
-  { value: '1h', label: '最近 1 小时' },
-  { value: '24h', label: '最近 24 小时' },
-  { value: '7d', label: '最近 7 天' },
-  { value: 'all', label: '全部记录' },
-]
-const logStatusOptions = [
-  { value: '', label: '全部状态' },
-  { value: 'direct_success', label: '直接成功' },
-  { value: 'failover_success', label: '切换后成功' },
-  { value: 'failed', label: '失败' },
-  { value: 'partial', label: '流中断' },
-  { value: 'canceled', label: '客户端取消' },
-  { value: 'client_error', label: '请求错误' },
-]
-const logStreamOptions = [
-  { value: '', label: '全部模式' },
-  { value: 'stream', label: '流式请求' },
-  { value: 'nonstream', label: '非流式请求' },
-]
-const logSlowOptions = [
-  { value: '', label: '全部耗时' },
-  { value: 5000, label: '耗时 ≥ 5 秒' },
-  { value: 30000, label: '耗时 ≥ 30 秒' },
-  { value: 120000, label: '耗时 ≥ 2 分钟' },
-]
-
-function logFilterParams() {
-  const now = Math.floor(Date.now() / 1000)
-  const since = ({ '1h': now - 3600, '24h': now - 86400, '7d': now - 7 * 86400 })[logFTime.value] || ''
-  return {
-    q: logSearch.value.trim(), since, group: logFGroup.value, model: logFModel.value,
-    status: logFStatus.value, upstream_id: logFUpstream.value, key: logFKey.value,
-    endpoint: logFEndpoint.value, error_kind: logFErrorKind.value, stream: logFStream.value,
-    slow_ms: logFSlow.value, retried: logFRetried.value,
-  }
-}
-
-let logLoadEpoch = 0
-// epoch 保证快速翻页或筛选时，较慢的旧请求不能覆盖最新结果。
-async function fetchLogPage(targetPage, refreshStats) {
-  const epoch = ++logLoadEpoch
-  logLoading.value = true
-  try {
-    const pageSize = Number(logPageSize.value)
-    const params = { ...logFilterParams(), offset: (targetPage - 1) * pageSize, limit: pageSize }
-    const [page, stats] = refreshStats
-      ? await Promise.all([api.logs(params), api.logStats(params)])
-      : [await api.logs(params), null]
-    if (epoch !== logLoadEpoch) return false
-    const rows = (page && page.entries) || []
-    logs.value = rows
-    logCurrentPage.value = targetPage
-    if (stats) logStats.value = stats
-    return true
-  } finally {
-    if (epoch === logLoadEpoch) logLoading.value = false
-  }
-}
-async function loadLogs(resetPagination = false) {
-  return fetchLogPage(resetPagination ? 1 : logCurrentPage.value, true)
-}
-async function goLogPage(targetPage) {
-  if (logLoading.value) return
-  const normalized = Math.max(1, Math.min(Number(targetPage) || 1, logTotalPages.value))
-  if (normalized === logCurrentPage.value) return
-  await fetchLogPage(normalized, false)
-}
-function onLogPageSizeChange() { guard(() => loadLogs(true)) }
-async function loadLogOptions() {
-  const o = await api.logOptions()
-  logModelOpts.value = (o && o.models) || []
-  logGroupOpts.value = (o && o.groups) || []
-  logKeyOpts.value = (o && o.keys) || []
-  logEndpointOpts.value = (o && o.endpoints) || []
-  logErrorKindOpts.value = (o && o.error_kinds) || []
-  logUpstreamOpts.value = (o && o.upstreams) || []
-}
-function onLogFilterChange() { guard(() => loadLogs(true)) }
-function resetLogFilters() {
-  logSearch.value = ''; logFTime.value = '24h'; logFGroup.value = ''; logFModel.value = ''
-  logFStatus.value = ''; logFUpstream.value = ''; logFKey.value = ''; logFEndpoint.value = ''
-  logFErrorKind.value = ''; logFStream.value = ''; logFSlow.value = ''; logFRetried.value = false
-  logMoreFilters.value = false
-  onLogFilterChange()
-}
-let logDetailEpoch = 0
-async function openLogDetail(entry) {
-  const epoch = ++logDetailEpoch
-  logDetailLoading.value = true
-  logDetail.value = entry
-  try {
-    const detail = await api.logDetail(entry.id)
-    if (epoch === logDetailEpoch) logDetail.value = detail
-  } finally {
-    if (epoch === logDetailEpoch) logDetailLoading.value = false
-  }
-}
-function closeLogDetail() { logDetailEpoch++; logDetail.value = null; logDetailLoading.value = false }
-
-let logTimer = null
-function startLogPoll() {
-  stopLogPoll()
-  if (!logAutoRefresh.value) return
-  logTimer = setInterval(() => {
-    if (page.value === 'logs' && logCurrentPage.value === 1 && !logLoading.value && !logDetail.value) loadLogs(false).catch(() => {})
-  }, 10000)
-}
-function stopLogPoll() { if (logTimer) { clearInterval(logTimer); logTimer = null } }
-function toggleLogAutoRefresh() { startLogPoll() }
-
-const logActiveFilters = computed(() => [logSearch.value, logFGroup.value, logFModel.value, logFStatus.value,
-  logFUpstream.value, logFKey.value, logFEndpoint.value, logFErrorKind.value, logFStream.value,
-  logFSlow.value, logFRetried.value].filter(Boolean).length)
-const logAdvancedFilters = computed(() => [logFGroup.value, logFModel.value, logFKey.value, logFEndpoint.value,
-  logFErrorKind.value, logFStream.value, logFSlow.value, logFRetried.value].filter(Boolean).length)
-const requestShort = id => id ? id.slice(0, 8) : '—'
-const fmtMs = ms => {
-  const value = Number(ms) || 0
-  if (!value) return '—'
-  return value >= 1000 ? (value / 1000).toFixed(1) + 's' : value + 'ms'
-}
-const fmtBytes = bytes => {
-  const value = Number(bytes) || 0
-  if (!value) return '—'
-  if (value >= 1048576) return (value / 1048576).toFixed(1) + ' MB'
-  if (value >= 1024) return (value / 1024).toFixed(1) + ' KB'
-  return value + ' B'
-}
-const fmtNum = value => new Intl.NumberFormat('zh-CN').format(Number(value) || 0)
-const outcomeText = outcome => ({
-  success: '成功', failed: '失败', canceled: '已取消', partial: '流中断',
-  client_error: '请求错误', unsupported: '不支持', unavailable: '无可用渠道',
-}[outcome] || outcome || '未知')
-const requestOutcomeText = entry => entry.outcome === 'success' && entry.attempt_count > 1 ? '切换后成功' : outcomeText(entry.outcome)
-const requestOutcomeClass = entry => entry.outcome === 'success' ? (entry.attempt_count > 1 ? 'warn' : 'ok')
-  : entry.outcome === 'canceled' || entry.outcome === 'client_error' ? 'muted' : 'fail'
-const errorKindText = kind => ({
-  request_build: '请求构建失败', upstream_network: '上游网络失败', first_response_timeout: '首字节超时',
-  upstream_read: '上游读取失败', model_unsupported: '模型不支持', client_request: '客户端请求错误',
-  upstream_http: '上游 HTTP 错误', downstream_write: '下游写入失败', client_canceled: '客户端取消',
-  empty_response: '上游空响应', error_payload: '成功状态错误体', upstream_disconnect: '上游断流',
-  no_upstream: '无可用渠道', upstream_error: '上游失败', auth: '接入鉴权失败',
-  request_too_large: '请求体过大', request_read: '请求体读取失败',
-}[kind] || kind || '—')
-const errorSourceText = source => ({ upstream: '上游', client: '客户端', gateway: 'MuxAPI' }[source] || source || '—')
-const selectionText = reason => ({ initial: '首次选择', failover: '故障切换', recovery_trial: '恢复验证' }[reason] || reason || '—')
-const streamStateText = entry => {
-  if (!entry.stream) return '非流式'
-  if (entry.stream_completed) return entry.last_event ? `完整 · ${entry.last_event}` : '完整结束'
-  return entry.last_event ? `EOF · ${entry.last_event}` : '未见完成事件'
-}
-// 绝对时间 MM-DD HH:MM:SS（请求记录看具体时刻，不用相对）
-const fmtTime = ts => {
-  if (!ts) return '—'
-  const d = new Date(ts * 1000), p = n => String(n).padStart(2, '0')
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
-}
-// 完整时间(含年份)，供请求记录 hover 查看
-const fmtTimeFull = ts => {
-  if (!ts) return '—'
-  const d = new Date(ts * 1000), p = n => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
-}
-// 状态展示文案：0=网络失败，否则状态码
-const statusText = s => s === 0 ? '网络失败' : s === 499 ? '客户端取消' : String(s)
-// 端点路径简化展示：去掉 /v1/ 前缀，空则 —
-const fmtEndpoint = p => !p ? '—' : p.replace(/^\/v1\//, '')
-
+const {
+  logs, logPageSize, logCurrentPage, logLoading, logDetail, logDetailLoading, logStats,
+  logSearch, logFTime, logFGroup, logFModel, logFStatus, logFUpstream, logFKey,
+  logFEndpoint, logFErrorKind, logFStream, logFSlow, logFRetried, logAutoRefresh,
+  logMoreFilters, logPageSizeOptions, logTotalPages, logPageItems,
+  logGroupSelectOptions, logModelSelectOptions, logKeySelectOptions,
+  logEndpointSelectOptions, logErrorSelectOptions, logUpstreamSelectOptions,
+  logTimeOptions, logStatusOptions, logStreamOptions, logSlowOptions,
+  loadLogs, goLogPage, onLogPageSizeChange, loadLogOptions, onLogFilterChange,
+  resetLogFilters, openLogDetail, closeLogDetail, startLogPoll, stopLogPoll,
+  toggleLogAutoRefresh, logActiveFilters, logAdvancedFilters, requestShort, fmtMs,
+  fmtBytes, fmtNum, requestOutcomeText, requestOutcomeClass, errorKindText,
+  errorSourceText, selectionText, streamStateText, outcomeText, fmtTime, fmtTimeFull, statusText,
+  fmtEndpoint,
+} = useLogs({ page, guard })
 // 监控项 CRUD
 const monModels = ref([])  // 当前对话框选中渠道的可选模型（datalist）
 const testModelOptions = computed(() => {
@@ -1040,7 +688,7 @@ function logout() {
 </script>
 
 <template>
-  <div v-if="!loggedIn" class="login-page">
+<div v-if="!loggedIn" class="login-page">
     <div class="login-card">
       <div class="logo login-logo"><Icon name="bolt" :size="22" /><span class="logo-text">MuxAPI</span></div>
       <h1>管理后台登录</h1>
