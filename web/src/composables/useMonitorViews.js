@@ -154,7 +154,8 @@ export function useMonitorViews({ monitors, upstreams, tags, probeOne }) {
     await probeOne(m)
   }
   return {
-    primaryTagFor, auxiliaryTagsFor, monitorItems, monitorSearch, monitorStatusFilter,
+    primaryTagFor, auxiliaryTagsFor, tagGroupKey, tagGroupName,
+    monitorItems, monitorSearch, monitorStatusFilter,
     monitorTagFilter, collapsedMonitorTags, monitorStatusOptions, monitorTagOptions,
     monitorSections, monitorVisibleCount, summary, toggleMonitorTag, matrix, ovSummary,
     cellDrawerId, cellDrawer, openCell, closeCell, probeCell,
