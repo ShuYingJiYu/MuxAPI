@@ -211,10 +211,11 @@ export function useLogs({ page, guard }) {
     return value + ' B'
   }
   const fmtNum = value => new Intl.NumberFormat('zh-CN').format(Number(value) || 0)
-  const cacheRateText = entry => Number(entry?.cache_input_tokens) > 0
+  const cacheInputTokens = entry => Number(entry?.cache_input_tokens ?? entry?.input_tokens) || 0
+  const cacheRateText = entry => cacheInputTokens(entry) > 0
     ? ((Number(entry.cache_rate) || 0) * 100).toFixed(1) + '%'
     : '—'
-  const cacheSummary = entry => Number(entry?.cache_input_tokens) > 0
+  const cacheSummary = entry => cacheInputTokens(entry) > 0
     ? `缓存 ${cacheRateText(entry)} · ${fmtNum(entry.cached_tokens)}`
     : '缓存 —'
   const cacheRateWidth = entry => Math.min(100, Math.max(0, (Number(entry?.cache_rate) || 0) * 100)).toFixed(1) + '%'
