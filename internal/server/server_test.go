@@ -29,6 +29,7 @@ func TestEndToEndForward(t *testing.T) {
 	upB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		gotKey = r.Header.Get("x-api-key")
+		w.Header().Set("X-Request-ID", "upstream-request-id")
 		w.Write([]byte(`{"ok":true}`))
 	}))
 	defer upB.Close()
@@ -60,7 +61,8 @@ func TestEndToEndForward(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.Header.Get("X-Request-ID") == "" {
+	requestIDs := resp.Header.Values("X-Request-ID")
+	if len(requestIDs) != 1 || requestIDs[0] == "" || requestIDs[0] == "upstream-request-id" {
 		t.Fatal("forward response should expose its request id")
 	}
 	body, _ := io.ReadAll(resp.Body)

@@ -805,7 +805,8 @@ func relayBody(w http.ResponseWriter, resp *http.Response, start time.Time, onFi
 // copyResponseHeaders 仅复制端到端响应头，逐跳头由当前 HTTP 连接重新生成。
 func copyResponseHeaders(dst, src http.Header) {
 	for key, values := range src {
-		if isHopByHopHeader(key) {
+		// X-Request-ID 由网关生成；上游链路 ID 已单独写入审计记录。
+		if isHopByHopHeader(key) || strings.EqualFold(key, "X-Request-ID") {
 			continue
 		}
 		for _, value := range values {
