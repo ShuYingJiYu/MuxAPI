@@ -17,20 +17,21 @@ var errBadMonitor = errors.New("monitor requires upstream_id and model")
 
 // registerAdmin 集中注册管理接口，并统一套用管理员鉴权。
 func (s *Server) registerAdmin(mux *http.ServeMux) {
-	mux.HandleFunc("/admin/upstreams", s.auth(s.adminUpstreams))     // GET 全局池 / POST 新增
-	mux.HandleFunc("/admin/upstreams/", s.auth(s.adminUpstreamItem)) // PUT 改 / DELETE 删
-	mux.HandleFunc("/admin/tags", s.auth(s.adminTags))               // GET 列表 / POST 新增
-	mux.HandleFunc("/admin/tags/", s.auth(s.adminTagItem))           // PUT 改 / DELETE 删
-	mux.HandleFunc("/admin/monitors", s.auth(s.adminMonitors))       // GET 监控列表 / POST 新增
-	mux.HandleFunc("/admin/monitors/", s.auth(s.adminMonitorItem))   // PUT 改 / DELETE 删 / {id}/probe 立即探测
-	mux.HandleFunc("/admin/groups", s.auth(s.adminGroups))           // GET 列表 / POST 新增
-	mux.HandleFunc("/admin/groups/", s.auth(s.adminGroupSub))        // /{id} 改/删 ; /{id}/upstreams 成员 ; /{id}/keys 密钥
-	mux.HandleFunc("/admin/keys/", s.auth(s.adminKeyItem))           // PUT 启停 / DELETE 删
-	mux.HandleFunc("/admin/logs", s.auth(s.adminLogs))               // GET 调用日志(游标分页+筛选)
-	mux.HandleFunc("/admin/logs/stats", s.auth(s.adminLogStats))     // GET 当前筛选范围统计
-	mux.HandleFunc("/admin/logs/options", s.auth(s.adminLogOptions)) // GET 筛选下拉选项(全量去重)
-	mux.HandleFunc("/admin/logs/", s.auth(s.adminLogItem))           // GET 单条请求完整尝试链
-	mux.HandleFunc("/admin/settings", s.auth(s.adminSettings))       // GET/PUT 运行时设置
+	mux.HandleFunc("/admin/upstreams", s.auth(s.adminUpstreams))            // GET 全局池 / POST 新增
+	mux.HandleFunc("/admin/upstreams/", s.auth(s.adminUpstreamItem))        // PUT 改 / DELETE 删
+	mux.HandleFunc("/admin/tags", s.auth(s.adminTags))                      // GET 列表 / POST 新增
+	mux.HandleFunc("/admin/tags/", s.auth(s.adminTagItem))                  // PUT 改 / DELETE 删
+	mux.HandleFunc("/admin/monitors", s.auth(s.adminMonitors))              // GET 监控列表 / POST 新增
+	mux.HandleFunc("/admin/monitors/", s.auth(s.adminMonitorItem))          // PUT 改 / DELETE 删 / {id}/probe 立即探测
+	mux.HandleFunc("/admin/groups", s.auth(s.adminGroups))                  // GET 列表 / POST 新增
+	mux.HandleFunc("/admin/groups/", s.auth(s.adminGroupSub))               // /{id} 改/删 ; /{id}/upstreams 成员 ; /{id}/keys 密钥
+	mux.HandleFunc("/admin/keys/", s.auth(s.adminKeyItem))                  // PUT 启停 / DELETE 删
+	mux.HandleFunc("/admin/logs", s.auth(s.adminLogs))                      // GET 调用日志(游标分页+筛选)
+	mux.HandleFunc("/admin/logs/stats", s.auth(s.adminLogStats))            // GET 当前筛选范围统计
+	mux.HandleFunc("/admin/logs/cache-stats", s.auth(s.adminLogCacheStats)) // GET 按渠道汇总缓存命中率
+	mux.HandleFunc("/admin/logs/options", s.auth(s.adminLogOptions))        // GET 筛选下拉选项(全量去重)
+	mux.HandleFunc("/admin/logs/", s.auth(s.adminLogItem))                  // GET 单条请求完整尝试链
+	mux.HandleFunc("/admin/settings", s.auth(s.adminSettings))              // GET/PUT 运行时设置
 }
 
 // adminLogs 返回调用日志，兼容游标和偏移量分页。
@@ -76,6 +77,15 @@ func (s *Server) adminLogStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.store.RequestStats(parseLogFilter(r.URL.Query()))
 	if err != nil {
 		http.Error(w, err.Error(), 500)
+		return
+	}
+	writeJSON(w, stats)
+}
+
+func (s *Server) adminLogCacheStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.store.RequestCacheStats(parseLogFilter(r.URL.Query()))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, stats)

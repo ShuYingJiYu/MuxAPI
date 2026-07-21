@@ -14,7 +14,7 @@ func TestResponseAuditParsesSplitResponsesEvent(t *testing.T) {
 	parts := []string{
 		"event: response.comp",
 		"leted\r\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{",
-		"\"input_tokens\":12,\"output_tokens\":7,\"input_tokens_details\":{\"cached_tokens\":3}}}}\r\n\r\n",
+		"\"input_tokens\":12,\"output_tokens\":7,\"cache_creation_input_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":3}}}}\r\n\r\n",
 	}
 	for _, part := range parts {
 		audit.feed([]byte(part))
@@ -23,8 +23,15 @@ func TestResponseAuditParsesSplitResponsesEvent(t *testing.T) {
 	if !audit.streamCompleted || audit.lastEvent != "response.completed" {
 		t.Fatalf("completion audit mismatch: completed=%v event=%q", audit.streamCompleted, audit.lastEvent)
 	}
-	if audit.usage.input != 12 || audit.usage.output != 7 || audit.usage.cached != 3 {
+	if audit.usage.input != 12 || audit.usage.output != 7 || audit.usage.cached != 3 || audit.usage.cacheCreation != 5 {
 		t.Fatalf("usage audit mismatch: %+v", audit.usage)
+	}
+}
+
+func TestUsageAuditParsesAnthropicCacheTokens(t *testing.T) {
+	usage := usageFromJSON([]byte(`{"usage":{"input_tokens":10,"output_tokens":4,"cache_read_input_tokens":30,"cache_creation_input_tokens":6}}`))
+	if usage.input != 10 || usage.output != 4 || usage.cached != 30 || usage.cacheCreation != 6 {
+		t.Fatalf("anthropic usage mismatch: %+v", usage)
 	}
 }
 

@@ -192,8 +192,9 @@ func (s *Server) recordRequest(requestID string, started time.Time, groupID int6
 			Status: attempt.Status, Outcome: attempt.Outcome, TTFTMs: attempt.TTFTMs, DurationMs: attempt.DurationMs,
 			ResponseBytes: attempt.ResponseBytes, Stream: attempt.Stream, StreamCompleted: attempt.StreamCompleted,
 			LastEvent: attempt.LastEvent, InputTokens: attempt.InputTokens, OutputTokens: attempt.OutputTokens,
-			CachedTokens: attempt.CachedTokens, UpstreamRequestID: attempt.UpstreamRequestID,
-			ErrorKind: attempt.ErrorKind, ErrorSource: attempt.ErrorSource,
+			CachedTokens: attempt.CachedTokens, CacheCreationTokens: attempt.CacheCreationTokens,
+			UpstreamRequestID: attempt.UpstreamRequestID,
+			ErrorKind:         attempt.ErrorKind, ErrorSource: attempt.ErrorSource,
 			CreatedAt: attempt.CreatedAt, CompletedAt: attempt.CompletedAt, Error: attempt.Error,
 		}
 	}
@@ -202,7 +203,8 @@ func (s *Server) recordRequest(requestID string, started time.Time, groupID int6
 		Model: model, Endpoint: endpoint, KeyName: keyName, ClientIP: clientIP, UserAgent: userAgent,
 		Stream: stream, RequestBytes: requestBytes,
 		ResponseBytes: result.ResponseBytes, InputTokens: result.InputTokens, OutputTokens: result.OutputTokens,
-		CachedTokens: result.CachedTokens, StreamCompleted: result.StreamCompleted, LastEvent: result.LastEvent,
+		CachedTokens: result.CachedTokens, CacheCreationTokens: result.CacheCreationTokens,
+		StreamCompleted: result.StreamCompleted, LastEvent: result.LastEvent,
 		UpstreamRequestID: result.UpstreamRequestID, ErrorKind: result.ErrorKind, ErrorSource: result.ErrorSource,
 		Status:  result.Status,
 		Outcome: result.Outcome, TTFTMs: result.TTFTMs, DurationMs: completed.Sub(started).Milliseconds(),

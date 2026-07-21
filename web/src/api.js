@@ -115,6 +115,16 @@ export const api = {
     const qs = p.toString()
     return req('GET', '/logs/stats' + (qs ? '?' + qs : ''))
   },
+  logCacheStats: (opts = {}) => {
+    const p = new URLSearchParams()
+    for (const key of ['model', 'group', 'status', 'key', 'endpoint', 'error_kind', 'q', 'stream',
+      'upstream_id', 'since', 'until', 'slow_ms']) {
+      if (opts[key] !== undefined && opts[key] !== null && opts[key] !== '') p.set(key, opts[key])
+    }
+    if (opts.retried) p.set('retried', 'true')
+    const qs = p.toString()
+    return req('GET', '/logs/cache-stats' + (qs ? '?' + qs : ''))
+  },
   logDetail: id => req('GET', '/logs/' + id),
   logOptions: () => req('GET', '/logs/options'),
 }

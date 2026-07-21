@@ -515,6 +515,7 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .log-stat.success b { color: #087f5b; }
 .log-stat.warn b { color: #a16207; }
 .log-stat.danger b { color: #b4233c; }
+.log-stat.cache b { color: #176b5b; }
 .log-filter-band { padding: 12px; margin-bottom: 12px; border: 1px solid var(--g200); border-radius: 8px; background: rgba(255,255,255,.76); }
 .log-filter-primary, .log-filter-secondary { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .log-filter-secondary { padding-top: 9px; margin-top: 9px; border-top: 1px solid var(--g100); }
@@ -534,6 +535,21 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .log-refresh { width: 34px; height: 34px; margin-left: auto; }
 .log-reset { margin: 0; }
 .log-count { margin-left: auto; color: var(--g500); font-size: 12px; white-space: nowrap; }
+.log-cache-panel { margin: 0 0 14px; padding: 10px 0 12px; border-block: 1px solid var(--g200); }
+.log-cache-panel > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 4px 9px; }
+.log-cache-panel > header > div { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.log-cache-panel h3 { margin: 0; color: var(--g900); font-size: 13px; }
+.log-cache-panel header span { color: var(--g500); font-size: 11px; }
+.log-cache-table-wrap { max-height: 278px; overflow: auto; border-radius: 6px; }
+.log-cache-table { width: 100%; min-width: 620px; }
+.log-cache-table th, .log-cache-table td { padding: 8px 12px; }
+.log-cache-table th { position: sticky; top: 0; z-index: 1; letter-spacing: 0; }
+.log-cache-table th:first-child { width: 34%; }
+.log-cache-table td:not(:first-child) { color: var(--g700); font-size: 12px; font-variant-numeric: tabular-nums; }
+.cache-rate-cell { display: grid; grid-template-columns: 50px minmax(70px, 1fr); align-items: center; gap: 9px; }
+.cache-rate-cell b { color: var(--g800); font-size: 12px; font-variant-numeric: tabular-nums; }
+.cache-rate-cell > span { height: 6px; overflow: hidden; border-radius: 999px; background: var(--g200); }
+.cache-rate-cell i { display: block; height: 100%; border-radius: inherit; background: #2f8f79; }
 .log-pager { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 14px; }
 .log-page-size, .log-page-controls { display: flex; align-items: center; gap: 5px; }
 .log-page-size { color: var(--g600); font-size: 12px; white-space: nowrap; }

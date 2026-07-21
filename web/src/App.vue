@@ -660,6 +660,7 @@ const sinceText = ts => {
 
 const {
   logs, logPageSize, logCurrentPage, logLoading, logDetail, logDetailLoading, logStats,
+  logCacheStats, logCacheExpanded, logCacheVisible,
   logSearch, logFTime, logFGroup, logFModel, logFStatus, logFUpstream, logFKey,
   logFEndpoint, logFErrorKind, logFStream, logFSlow, logFRetried, logAutoRefresh,
   logMoreFilters, logPageSizeOptions, logTotalPages, logPageItems,
@@ -671,7 +672,7 @@ const {
   toggleLogAutoRefresh, logActiveFilters, logAdvancedFilters, requestShort, fmtMs,
   fmtBytes, fmtNum, requestOutcomeText, requestOutcomeClass, errorKindText,
   errorSourceText, selectionText, streamStateText, outcomeText, fmtTime, fmtTimeFull, statusText,
-  fmtEndpoint, clientName,
+  fmtEndpoint, clientName, cacheRateText, cacheSummary, cacheRateWidth,
 } = useLogs({ page, guard })
 // 监控项 CRUD
 const monModels = ref([])  // 当前对话框选中渠道的可选模型（datalist）
@@ -1184,6 +1185,7 @@ function logout() {
             <div class="log-stat danger"><span>异常</span><b>{{ fmtNum((logStats.failed || 0) + (logStats.partial || 0)) }}</b><em>{{ fmtNum(logStats.partial) }} 次流中断</em></div>
             <div class="log-stat"><span>P95 TTFT</span><b>{{ fmtMs(logStats.p95_ttft_ms) }}</b><em>P50 {{ fmtMs(logStats.p50_ttft_ms) }}</em></div>
             <div class="log-stat"><span>P95 总耗时</span><b>{{ fmtMs(logStats.p95_duration_ms) }}</b><em>所选时间范围</em></div>
+            <div class="log-stat cache"><span>缓存命中率</span><b>{{ cacheRateText(logStats) }}</b><em>{{ fmtNum(logStats.cached_tokens) }} / {{ fmtNum(logStats.cache_input_tokens) }} 输入</em></div>
             <div class="log-stat tokens"><span>Token</span><b>{{ fmtNum((logStats.input_tokens || 0) + (logStats.output_tokens || 0)) }}</b><em>入 {{ fmtNum(logStats.input_tokens) }} · 出 {{ fmtNum(logStats.output_tokens) }} · 缓存 {{ fmtNum(logStats.cached_tokens) }}</em></div>
           </div>
 
@@ -1214,6 +1216,24 @@ function logout() {
             </div>
           </div>
 
+          <section v-if="logCacheStats.length" class="log-cache-panel">
+            <header><div><h3>渠道缓存</h3><span>{{ logCacheStats.length }} 个渠道</span></div><button v-if="logCacheStats.length > 6" class="btn-link sm" @click="logCacheExpanded = !logCacheExpanded">{{ logCacheExpanded ? '收起' : `展开全部 ${logCacheStats.length} 个` }}</button></header>
+            <div class="table-wrap log-cache-table-wrap">
+              <table class="log-cache-table">
+                <thead><tr><th>渠道</th><th>有效请求</th><th>输入 Token</th><th>缓存 Token</th><th>缓存率</th></tr></thead>
+                <tbody>
+                  <tr v-for="channel in logCacheVisible" :key="channel.upstream_id">
+                    <td><b class="log-main">{{ channel.upstream_name || ('#' + channel.upstream_id) }}</b></td>
+                    <td>{{ fmtNum(channel.usage_requests) }}</td>
+                    <td>{{ fmtNum(channel.input_tokens) }}</td>
+                    <td>{{ fmtNum(channel.cached_tokens) }}</td>
+                    <td><div class="cache-rate-cell"><b>{{ cacheRateText(channel) }}</b><span><i :style="{ width: cacheRateWidth(channel) }"></i></span></div></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
           <div class="table-wrap log-table-wrap">
             <table class="log-table">
               <thead><tr><th>时间 / 请求</th><th>接入</th><th>客户端 / IP</th><th>端点 / 模型</th><th>路由链</th><th>结果</th><th>性能</th><th>Token</th><th>流量</th></tr></thead>
@@ -1237,7 +1257,7 @@ function logout() {
                   </td>
                   <td><span class="log-status" :class="requestOutcomeClass(l)">{{ requestOutcomeText(l) }} · {{ statusText(l.status) }}</span><span v-if="l.error_kind" class="log-sub error-kind">{{ errorKindText(l.error_kind) }}</span></td>
                   <td><b class="log-metric">{{ fmtMs(l.ttft_ms) }}</b><span class="log-sub">总计 {{ fmtMs(l.duration_ms) }}</span></td>
-                  <td><b class="log-metric">{{ fmtNum(l.input_tokens) }} / {{ fmtNum(l.output_tokens) }}</b><span class="log-sub">缓存 {{ fmtNum(l.cached_tokens) }}</span></td>
+                  <td><b class="log-metric">{{ fmtNum(l.input_tokens) }} / {{ fmtNum(l.output_tokens) }}</b><span class="log-sub">{{ cacheSummary(l) }}</span></td>
                   <td><b class="log-metric">{{ fmtBytes(l.response_bytes) }}</b><span class="log-sub">{{ streamStateText(l) }}</span></td>
                 </tr>
                 <tr v-if="!logs.length"><td colspan="9" class="empty-cell">{{ logLoading ? '加载中…' : '没有符合条件的请求记录。' }}</td></tr>
@@ -1407,7 +1427,7 @@ function logout() {
               <div><span>响应体</span><b>{{ fmtBytes(logDetail.response_bytes) }}</b></div>
               <div><span>输入 Token</span><b>{{ fmtNum(logDetail.input_tokens) }}</b></div>
               <div><span>输出 Token</span><b>{{ fmtNum(logDetail.output_tokens) }}</b></div>
-              <div><span>缓存 Token</span><b>{{ fmtNum(logDetail.cached_tokens) }}</b></div>
+              <div><span>缓存 Token / 命中率</span><b>{{ fmtNum(logDetail.cached_tokens) }} / {{ cacheRateText(logDetail) }}</b></div>
               <div><span>流结束</span><b>{{ streamStateText(logDetail) }}</b></div>
             </div>
           </section>
@@ -1428,6 +1448,7 @@ function logout() {
                     <span>耗时 {{ fmtMs(attempt.duration_ms) }}</span>
                     <span>响应 {{ fmtBytes(attempt.response_bytes) }}</span>
                     <span>Token {{ fmtNum(attempt.input_tokens) }} / {{ fmtNum(attempt.output_tokens) }}</span>
+                    <span>{{ cacheSummary(attempt) }}</span>
                     <span v-if="attempt.stream">{{ attempt.stream_completed ? '流完成' : '未见完成事件' }} · {{ attempt.last_event || 'EOF' }}</span>
                   </div>
                   <div v-if="attempt.error_kind" class="attempt-error-meta"><b>{{ errorKindText(attempt.error_kind) }}</b><span>来源：{{ errorSourceText(attempt.error_source) }}</span></div>

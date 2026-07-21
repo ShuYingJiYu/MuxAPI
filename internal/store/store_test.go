@@ -362,8 +362,8 @@ func TestRequestAuditDetailFiltersAndStats(t *testing.T) {
 	defer st.Close()
 
 	groupID, _ := st.CreateGroup("codex", "")
-	_ = st.Create(&upstream.Upstream{Name: "primary", BaseURL: "http://primary", APIKey: "k", Enabled: true})
-	_ = st.Create(&upstream.Upstream{Name: "backup", BaseURL: "http://backup", APIKey: "k", Enabled: true})
+	_ = st.Create(&upstream.Upstream{Name: "primary", BaseURL: "http://primary", APIKey: "k", Protocol: "claude", Enabled: true})
+	_ = st.Create(&upstream.Upstream{Name: "backup", BaseURL: "http://backup", APIKey: "k", Protocol: "codex", Enabled: true})
 	upstreams, _ := st.List()
 	primary, backup := upstreams[0].ID, upstreams[1].ID
 	now := time.Now()
@@ -374,19 +374,20 @@ func TestRequestAuditDetailFiltersAndStats(t *testing.T) {
 			FinalUpstreamID: primary, Model: "gpt-a", Endpoint: "/v1/responses", KeyName: "key-a",
 			ClientIP: "203.0.113.8", UserAgent: "claude-cli/2.1.0",
 			Stream: true, RequestBytes: 120, ResponseBytes: 800, InputTokens: 10, OutputTokens: 20,
-			CachedTokens: 3, StreamCompleted: true, LastEvent: "response.completed",
+			CachedTokens: 3, CacheCreationTokens: 2, StreamCompleted: true, LastEvent: "response.completed",
 			Status: 200, Outcome: "success", TTFTMs: 100, DurationMs: 500,
 			CreatedAt: now, CompletedAt: now,
 			Attempts: []RequestAttemptRecord{{AttemptNo: 1, UpstreamID: primary, Priority: 1,
 				SelectionReason: "initial", HealthBefore: "CLOSED", HealthAfter: "CLOSED",
 				Status: 200, Outcome: "success", TTFTMs: 100, DurationMs: 500, ResponseBytes: 800,
 				Stream: true, StreamCompleted: true, LastEvent: "response.completed",
-				InputTokens: 10, OutputTokens: 20, CachedTokens: 3, CreatedAt: now, CompletedAt: now}},
+				InputTokens: 10, OutputTokens: 20, CachedTokens: 3, CacheCreationTokens: 2,
+				CreatedAt: now, CompletedAt: now}},
 		},
 		{
 			RequestID: "20000000-0000-0000-0000-000000000002", GroupID: groupID,
 			FinalUpstreamID: backup, Model: "gpt-a", Endpoint: "/v1/responses", KeyName: "key-a",
-			Stream: true, ResponseBytes: 900, InputTokens: 12, OutputTokens: 22,
+			Stream: true, ResponseBytes: 900, InputTokens: 12, OutputTokens: 22, CachedTokens: 6,
 			Status: 200, Outcome: "success", TTFTMs: 150, DurationMs: 900,
 			CreatedAt: now, CompletedAt: now,
 			Attempts: []RequestAttemptRecord{
@@ -395,7 +396,7 @@ func TestRequestAuditDetailFiltersAndStats(t *testing.T) {
 					ErrorKind: "upstream_http", ErrorSource: "upstream", Error: "bad gateway", CreatedAt: now, CompletedAt: now},
 				{AttemptNo: 2, UpstreamID: backup, Priority: 2, SelectionReason: "failover",
 					Status: 200, Outcome: "success", TTFTMs: 150, DurationMs: 800, ResponseBytes: 900,
-					InputTokens: 12, OutputTokens: 22, CreatedAt: now, CompletedAt: now},
+					InputTokens: 12, OutputTokens: 22, CachedTokens: 6, CreatedAt: now, CompletedAt: now},
 			},
 		},
 		{
@@ -451,12 +452,28 @@ func TestRequestAuditDetailFiltersAndStats(t *testing.T) {
 	if err != nil || len(detail.Attempts) != 2 || detail.Attempts[0].ErrorKind != "upstream_http" {
 		t.Fatalf("request detail mismatch: detail=%+v err=%v", detail, err)
 	}
+	if detail.CacheInputTokens != 12 || detail.CacheRate != 0.5 || detail.Attempts[1].CacheRate != 0.5 {
+		t.Fatalf("request cache metrics mismatch: detail=%+v", detail)
+	}
 	stats, err := st.RequestStats(RequestFilter{})
 	if err != nil || stats.Total != 3 || stats.DirectSuccess != 1 || stats.FailoverSuccess != 1 || stats.Partial != 1 {
 		t.Fatalf("request stats mismatch: stats=%+v err=%v", stats, err)
 	}
-	if stats.InputTokens != 22 || stats.OutputTokens != 42 || stats.CachedTokens != 3 {
+	if stats.InputTokens != 22 || stats.OutputTokens != 42 || stats.CachedTokens != 9 ||
+		stats.CacheCreationTokens != 2 || stats.CacheInputTokens != 27 || stats.CacheRate != float64(9)/27 {
 		t.Fatalf("token stats mismatch: %+v", stats)
+	}
+	cacheStats, err := st.RequestCacheStats(RequestFilter{})
+	if err != nil || len(cacheStats) != 2 {
+		t.Fatalf("channel cache stats mismatch: stats=%+v err=%v", cacheStats, err)
+	}
+	if cacheStats[0].UpstreamID != primary || cacheStats[0].InputTokens != 15 ||
+		cacheStats[0].CachedTokens != 3 || cacheStats[0].CacheCreationTokens != 2 || cacheStats[0].CacheRate != 0.2 {
+		t.Fatalf("primary cache stats mismatch: %+v", cacheStats[0])
+	}
+	if cacheStats[1].UpstreamID != backup || cacheStats[1].InputTokens != 12 ||
+		cacheStats[1].CachedTokens != 6 || cacheStats[1].CacheRate != 0.5 {
+		t.Fatalf("backup cache stats mismatch: %+v", cacheStats[1])
 	}
 }
 

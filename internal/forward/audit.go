@@ -12,9 +12,10 @@ const maxAuditPayload = 2 << 20
 
 // tokenUsage 保存跨协议统一后的 Token 用量。
 type tokenUsage struct {
-	input  int64
-	output int64
-	cached int64
+	input         int64
+	output        int64
+	cached        int64
+	cacheCreation int64
 }
 
 func (u *tokenUsage) merge(other tokenUsage) {
@@ -27,6 +28,9 @@ func (u *tokenUsage) merge(other tokenUsage) {
 	}
 	if other.cached > u.cached {
 		u.cached = other.cached
+	}
+	if other.cacheCreation > u.cacheCreation {
+		u.cacheCreation = other.cacheCreation
 	}
 }
 
@@ -210,12 +214,13 @@ func parseUsageObject(usage map[string]any) tokenUsage {
 	input := maxInt64(number(usage["input_tokens"]), number(usage["prompt_tokens"]))
 	output := maxInt64(number(usage["output_tokens"]), number(usage["completion_tokens"]))
 	cached := maxInt64(number(usage["cached_tokens"]), number(usage["cache_read_input_tokens"]))
+	cacheCreation := maxInt64(number(usage["cache_creation_tokens"]), number(usage["cache_creation_input_tokens"]))
 	for _, key := range []string{"input_tokens_details", "prompt_tokens_details"} {
 		if details, ok := usage[key].(map[string]any); ok {
 			cached = maxInt64(cached, number(details["cached_tokens"]))
 		}
 	}
-	return tokenUsage{input: input, output: output, cached: cached}
+	return tokenUsage{input: input, output: output, cached: cached, cacheCreation: cacheCreation}
 }
 
 func number(value any) int64 {

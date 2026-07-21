@@ -83,21 +83,24 @@ func (s *Store) LogFilterOptions() (*LogFilterOptions, error) {
 }
 
 type RequestStats struct {
-	Total           int64   `json:"total"`
-	DirectSuccess   int64   `json:"direct_success"`
-	FailoverSuccess int64   `json:"failover_success"`
-	Failed          int64   `json:"failed"`
-	Partial         int64   `json:"partial"`
-	Canceled        int64   `json:"canceled"`
-	ClientError     int64   `json:"client_error"`
-	Retried         int64   `json:"retried"`
-	SuccessRate     float64 `json:"success_rate"`
-	P50TTFTMs       int64   `json:"p50_ttft_ms"`
-	P95TTFTMs       int64   `json:"p95_ttft_ms"`
-	P95DurationMs   int64   `json:"p95_duration_ms"`
-	InputTokens     int64   `json:"input_tokens"`
-	OutputTokens    int64   `json:"output_tokens"`
-	CachedTokens    int64   `json:"cached_tokens"`
+	Total               int64   `json:"total"`
+	DirectSuccess       int64   `json:"direct_success"`
+	FailoverSuccess     int64   `json:"failover_success"`
+	Failed              int64   `json:"failed"`
+	Partial             int64   `json:"partial"`
+	Canceled            int64   `json:"canceled"`
+	ClientError         int64   `json:"client_error"`
+	Retried             int64   `json:"retried"`
+	SuccessRate         float64 `json:"success_rate"`
+	P50TTFTMs           int64   `json:"p50_ttft_ms"`
+	P95TTFTMs           int64   `json:"p95_ttft_ms"`
+	P95DurationMs       int64   `json:"p95_duration_ms"`
+	InputTokens         int64   `json:"input_tokens"`
+	OutputTokens        int64   `json:"output_tokens"`
+	CachedTokens        int64   `json:"cached_tokens"`
+	CacheCreationTokens int64   `json:"cache_creation_tokens"`
+	CacheInputTokens    int64   `json:"cache_input_tokens"`
+	CacheRate           float64 `json:"cache_rate"`
 }
 
 func (s *Store) RequestStats(filter RequestFilter) (*RequestStats, error) {
@@ -118,12 +121,17 @@ func (s *Store) RequestStats(filter RequestFilter) (*RequestStats, error) {
 				FILTER (WHERE r.ttft_ms>0) AS BIGINT),0),
 			COALESCE(CAST(percentile_cont(0.95) WITHIN GROUP (ORDER BY r.duration_ms)
 				FILTER (WHERE r.duration_ms>0) AS BIGINT),0),
-			COALESCE(SUM(r.input_tokens),0),COALESCE(SUM(r.output_tokens),0),COALESCE(SUM(r.cached_tokens),0)
-			FROM requests r LEFT JOIN groups g ON g.id=r.group_id`+where, args...).Scan(
+			COALESCE(SUM(r.input_tokens),0),COALESCE(SUM(r.output_tokens),0),COALESCE(SUM(r.cached_tokens),0),
+			COALESCE(SUM(r.cache_creation_tokens),0),
+			COALESCE(SUM(CASE WHEN COALESCE(u.protocol,'')='claude'
+				THEN r.input_tokens+r.cached_tokens+r.cache_creation_tokens ELSE r.input_tokens END),0)
+			FROM requests r LEFT JOIN groups g ON g.id=r.group_id
+			LEFT JOIN upstreams u ON u.id=r.final_upstream_id`+where, args...).Scan(
 			&stats.Total, &stats.DirectSuccess, &stats.FailoverSuccess, &stats.Failed,
 			&stats.Partial, &stats.Canceled, &stats.ClientError, &stats.Retried,
 			&stats.P50TTFTMs, &stats.P95TTFTMs, &stats.P95DurationMs,
 			&stats.InputTokens, &stats.OutputTokens, &stats.CachedTokens,
+			&stats.CacheCreationTokens, &stats.CacheInputTokens,
 		)
 		if err != nil {
 			return nil, err
@@ -131,11 +139,13 @@ func (s *Store) RequestStats(filter RequestFilter) (*RequestStats, error) {
 		if stats.Total > 0 {
 			stats.SuccessRate = float64(stats.DirectSuccess+stats.FailoverSuccess) / float64(stats.Total)
 		}
+		stats.CacheRate = tokenCacheRate(stats.CachedTokens, stats.CacheInputTokens)
 		return stats, nil
 	}
 	rows, err := s.db.Query(`SELECT r.outcome,r.attempt_count,r.ttft_ms,r.duration_ms,
-		r.input_tokens,r.output_tokens,r.cached_tokens
-		FROM requests r LEFT JOIN groups g ON g.id=r.group_id`+where, args...)
+		r.input_tokens,r.output_tokens,r.cached_tokens,r.cache_creation_tokens,COALESCE(u.protocol,'')
+		FROM requests r LEFT JOIN groups g ON g.id=r.group_id
+		LEFT JOIN upstreams u ON u.id=r.final_upstream_id`+where, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -145,8 +155,9 @@ func (s *Store) RequestStats(filter RequestFilter) (*RequestStats, error) {
 	for rows.Next() {
 		var outcome string
 		var attempts int
-		var ttft, duration, input, output, cached int64
-		if err := rows.Scan(&outcome, &attempts, &ttft, &duration, &input, &output, &cached); err != nil {
+		var ttft, duration, input, output, cached, cacheCreation int64
+		var protocol string
+		if err := rows.Scan(&outcome, &attempts, &ttft, &duration, &input, &output, &cached, &cacheCreation, &protocol); err != nil {
 			return nil, err
 		}
 		stats.Total++
@@ -178,6 +189,12 @@ func (s *Store) RequestStats(filter RequestFilter) (*RequestStats, error) {
 		stats.InputTokens += input
 		stats.OutputTokens += output
 		stats.CachedTokens += cached
+		stats.CacheCreationTokens += cacheCreation
+		if protocol == "claude" {
+			stats.CacheInputTokens += input + cached + cacheCreation
+		} else {
+			stats.CacheInputTokens += input
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -188,7 +205,64 @@ func (s *Store) RequestStats(filter RequestFilter) (*RequestStats, error) {
 	stats.P50TTFTMs = percentile(ttfts, 0.50)
 	stats.P95TTFTMs = percentile(ttfts, 0.95)
 	stats.P95DurationMs = percentile(durations, 0.95)
+	stats.CacheRate = tokenCacheRate(stats.CachedTokens, stats.CacheInputTokens)
 	return stats, nil
+}
+
+type ChannelCacheStats struct {
+	UpstreamID          int64   `json:"upstream_id"`
+	UpstreamName        string  `json:"upstream_name"`
+	UsageRequests       int64   `json:"usage_requests"`
+	InputTokens         int64   `json:"input_tokens"`
+	CachedTokens        int64   `json:"cached_tokens"`
+	CacheCreationTokens int64   `json:"cache_creation_tokens"`
+	CacheRate           float64 `json:"cache_rate"`
+}
+
+// RequestCacheStats 按实际尝试的渠道汇总缓存 Token，重试会归属到对应渠道。
+func (s *Store) RequestCacheStats(filter RequestFilter) ([]ChannelCacheStats, error) {
+	where, args := s.requestWhere(filter, false)
+	if filter.UpstreamID > 0 {
+		where += " AND a.upstream_id=?"
+		args = append(args, filter.UpstreamID)
+	}
+	rows, err := s.db.Query(`SELECT a.upstream_id,COALESCE(u.name,''),
+		COALESCE(SUM(CASE WHEN a.input_tokens>0 OR a.cached_tokens>0 OR a.cache_creation_tokens>0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN COALESCE(u.protocol,'')='claude'
+			THEN a.input_tokens+a.cached_tokens+a.cache_creation_tokens ELSE a.input_tokens END),0),
+		COALESCE(SUM(a.cached_tokens),0),COALESCE(SUM(a.cache_creation_tokens),0)
+		FROM request_attempts a
+		JOIN requests r ON r.request_id=a.request_id
+		LEFT JOIN upstreams u ON u.id=a.upstream_id
+		LEFT JOIN groups g ON g.id=r.group_id`+where+`
+		GROUP BY a.upstream_id,u.name
+		ORDER BY 4 DESC,2 ASC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ChannelCacheStats{}
+	for rows.Next() {
+		var item ChannelCacheStats
+		if err := rows.Scan(&item.UpstreamID, &item.UpstreamName, &item.UsageRequests,
+			&item.InputTokens, &item.CachedTokens, &item.CacheCreationTokens); err != nil {
+			return nil, err
+		}
+		item.CacheRate = tokenCacheRate(item.CachedTokens, item.InputTokens)
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func tokenCacheRate(cached, input int64) float64 {
+	if input <= 0 {
+		return 0
+	}
+	rate := float64(cached) / float64(input)
+	if rate > 1 {
+		return 1
+	}
+	return rate
 }
 
 func percentile(values []int64, quantile float64) int64 {

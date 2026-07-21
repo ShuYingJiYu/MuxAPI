@@ -43,6 +43,22 @@ func adminReq(t *testing.T, method, url, tok, body string) *http.Response {
 	return resp
 }
 
+func TestLogCacheStatsAPI(t *testing.T) {
+	ts, _, tok := newAdminTestServer(t)
+	resp := adminReq(t, http.MethodGet, ts.URL+"/admin/logs/cache-stats", tok, "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("cache stats returned %d", resp.StatusCode)
+	}
+	var stats []store.ChannelCacheStats
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		t.Fatal(err)
+	}
+	if len(stats) != 0 {
+		t.Fatalf("new store should have no cache stats: %+v", stats)
+	}
+}
+
 func TestReorderGroupsAPI(t *testing.T) {
 	ts, st, tok := newAdminTestServer(t)
 	id1, _ := st.CreateGroup("g1", "")

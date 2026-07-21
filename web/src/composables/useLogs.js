@@ -11,6 +11,8 @@ export function useLogs({ page, guard }) {
   const logDetail = ref(null)
   const logDetailLoading = ref(false)
   const logStats = ref({})
+  const logCacheStats = ref([])
+  const logCacheExpanded = ref(false)
   const logSearch = ref('')
   const logFTime = ref('24h')
   const logFGroup = ref('')
@@ -104,14 +106,15 @@ export function useLogs({ page, guard }) {
     try {
       const pageSize = Number(logPageSize.value)
       const params = { ...logFilterParams(), offset: (targetPage - 1) * pageSize, limit: pageSize }
-      const [page, stats] = refreshStats
-        ? await Promise.all([api.logs(params), api.logStats(params)])
-        : [await api.logs(params), null]
+      const [page, stats, cacheStats] = refreshStats
+        ? await Promise.all([api.logs(params), api.logStats(params), api.logCacheStats(params)])
+        : [await api.logs(params), null, null]
       if (epoch !== logLoadEpoch) return false
       const rows = (page && page.entries) || []
       logs.value = rows
       logCurrentPage.value = targetPage
       if (stats) logStats.value = stats
+      if (cacheStats) logCacheStats.value = cacheStats
       return true
     } finally {
       if (epoch === logLoadEpoch) logLoading.value = false
@@ -174,6 +177,7 @@ export function useLogs({ page, guard }) {
     logFSlow.value, logFRetried.value].filter(Boolean).length)
   const logAdvancedFilters = computed(() => [logFGroup.value, logFModel.value, logFKey.value, logFEndpoint.value,
     logFErrorKind.value, logFStream.value, logFSlow.value, logFRetried.value].filter(Boolean).length)
+  const logCacheVisible = computed(() => logCacheExpanded.value ? logCacheStats.value : logCacheStats.value.slice(0, 6))
   const clientName = userAgent => {
     const value = String(userAgent || '').trim()
     if (!value) return '未知客户端'
@@ -207,6 +211,13 @@ export function useLogs({ page, guard }) {
     return value + ' B'
   }
   const fmtNum = value => new Intl.NumberFormat('zh-CN').format(Number(value) || 0)
+  const cacheRateText = entry => Number(entry?.cache_input_tokens) > 0
+    ? ((Number(entry.cache_rate) || 0) * 100).toFixed(1) + '%'
+    : '—'
+  const cacheSummary = entry => Number(entry?.cache_input_tokens) > 0
+    ? `缓存 ${cacheRateText(entry)} · ${fmtNum(entry.cached_tokens)}`
+    : '缓存 —'
+  const cacheRateWidth = entry => Math.min(100, Math.max(0, (Number(entry?.cache_rate) || 0) * 100)).toFixed(1) + '%'
   const outcomeText = outcome => ({
     success: '成功', failed: '失败', canceled: '已取消', partial: '流中断',
     client_error: '请求错误', unsupported: '不支持', unavailable: '无可用渠道',
@@ -247,6 +258,7 @@ export function useLogs({ page, guard }) {
   const fmtEndpoint = p => !p ? '—' : p.replace(/^\/v1\//, '')
   return {
     logs, logPageSize, logCurrentPage, logLoading, logDetail, logDetailLoading, logStats,
+    logCacheStats, logCacheExpanded, logCacheVisible,
     logSearch, logFTime, logFGroup, logFModel, logFStatus, logFUpstream, logFKey,
     logFEndpoint, logFErrorKind, logFStream, logFSlow, logFRetried, logAutoRefresh,
     logMoreFilters, logPageSizeOptions, logTotalPages, logPageItems,
@@ -258,6 +270,6 @@ export function useLogs({ page, guard }) {
     toggleLogAutoRefresh, logActiveFilters, logAdvancedFilters, requestShort, fmtMs,
     fmtBytes, fmtNum, requestOutcomeText, requestOutcomeClass, errorKindText,
     errorSourceText, selectionText, streamStateText, outcomeText, fmtTime, fmtTimeFull, statusText,
-    fmtEndpoint, clientName,
+    fmtEndpoint, clientName, cacheRateText, cacheSummary, cacheRateWidth,
   }
 }

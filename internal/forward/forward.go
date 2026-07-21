@@ -79,48 +79,50 @@ const (
 
 // AttemptResult 记录一次上游尝试，完整请求可能包含多次尝试。
 type AttemptResult struct {
-	AttemptNo         int
-	UpstreamID        int64
-	Priority          int
-	SelectionReason   string
-	HealthBefore      string
-	HealthAfter       string
-	Status            int
-	Outcome           string
-	TTFTMs            int64
-	DurationMs        int64
-	ResponseBytes     int64
-	Stream            bool
-	StreamCompleted   bool
-	LastEvent         string
-	InputTokens       int64
-	OutputTokens      int64
-	CachedTokens      int64
-	UpstreamRequestID string
-	ErrorKind         string
-	ErrorSource       string
-	CreatedAt         time.Time
-	CompletedAt       time.Time
-	Error             string
+	AttemptNo           int
+	UpstreamID          int64
+	Priority            int
+	SelectionReason     string
+	HealthBefore        string
+	HealthAfter         string
+	Status              int
+	Outcome             string
+	TTFTMs              int64
+	DurationMs          int64
+	ResponseBytes       int64
+	Stream              bool
+	StreamCompleted     bool
+	LastEvent           string
+	InputTokens         int64
+	OutputTokens        int64
+	CachedTokens        int64
+	CacheCreationTokens int64
+	UpstreamRequestID   string
+	ErrorKind           string
+	ErrorSource         string
+	CreatedAt           time.Time
+	CompletedAt         time.Time
+	Error               string
 }
 
 // Result 汇总最终响应及按时间排列的全部上游尝试。
 type Result struct {
-	Status            int
-	Outcome           string
-	FinalUpstreamID   int64
-	TTFTMs            int64
-	ResponseBytes     int64
-	StreamCompleted   bool
-	LastEvent         string
-	InputTokens       int64
-	OutputTokens      int64
-	CachedTokens      int64
-	UpstreamRequestID string
-	ErrorKind         string
-	ErrorSource       string
-	Error             string
-	Attempts          []AttemptResult
+	Status              int
+	Outcome             string
+	FinalUpstreamID     int64
+	TTFTMs              int64
+	ResponseBytes       int64
+	StreamCompleted     bool
+	LastEvent           string
+	InputTokens         int64
+	OutputTokens        int64
+	CachedTokens        int64
+	CacheCreationTokens int64
+	UpstreamRequestID   string
+	ErrorKind           string
+	ErrorSource         string
+	Error               string
+	Attempts            []AttemptResult
 }
 
 type attemptContext struct {
@@ -151,8 +153,9 @@ func (a attemptContext) finish(h Health, status int, outcome string, relay relay
 		Status: status, Outcome: outcome, TTFTMs: relay.ttftMs, DurationMs: completed.Sub(a.started).Milliseconds(),
 		ResponseBytes: relay.bytesSent, Stream: relay.stream, StreamCompleted: relay.streamCompleted,
 		LastEvent: relay.lastEvent, InputTokens: relay.usage.input, OutputTokens: relay.usage.output,
-		CachedTokens: relay.usage.cached, UpstreamRequestID: relay.upstreamRequestID,
-		ErrorKind: errorKind, ErrorSource: errorSource,
+		CachedTokens: relay.usage.cached, CacheCreationTokens: relay.usage.cacheCreation,
+		UpstreamRequestID: relay.upstreamRequestID,
+		ErrorKind:         errorKind, ErrorSource: errorSource,
 		CreatedAt: a.started, CompletedAt: completed, Error: clipErr(errText),
 	}
 }
@@ -163,7 +166,8 @@ func resultFromAttempt(attempt AttemptResult, attempts []AttemptResult) Result {
 		TTFTMs: attempt.TTFTMs, ResponseBytes: attempt.ResponseBytes,
 		StreamCompleted: attempt.StreamCompleted, LastEvent: attempt.LastEvent,
 		InputTokens: attempt.InputTokens, OutputTokens: attempt.OutputTokens, CachedTokens: attempt.CachedTokens,
-		UpstreamRequestID: attempt.UpstreamRequestID, ErrorKind: attempt.ErrorKind,
+		CacheCreationTokens: attempt.CacheCreationTokens,
+		UpstreamRequestID:   attempt.UpstreamRequestID, ErrorKind: attempt.ErrorKind,
 		ErrorSource: attempt.ErrorSource, Error: attempt.Error, Attempts: attempts,
 	}
 }

@@ -108,7 +108,10 @@ func (s *Store) requestSelect(where string) string {
 	return fmt.Sprintf(`SELECT r.id,r.request_id,r.group_id,COALESCE(g.name,''),
 		r.final_upstream_id,COALESCE(u.name,''),r.model,r.endpoint,r.key_name,r.client_ip,r.user_agent,r.status,r.outcome,
 		r.ttft_ms,r.duration_ms,r.attempt_count,%s,%s,r.error_text,r.stream,r.request_bytes,
-		r.response_bytes,r.input_tokens,r.output_tokens,r.cached_tokens,r.stream_completed,r.last_event,
+		r.response_bytes,r.input_tokens,r.output_tokens,r.cached_tokens,r.cache_creation_tokens,
+		CASE WHEN COALESCE(u.protocol,'')='claude'
+			THEN r.input_tokens+r.cached_tokens+r.cache_creation_tokens ELSE r.input_tokens END,
+		r.stream_completed,r.last_event,
 		r.upstream_request_id,r.error_kind,r.error_source
 		FROM requests r
 		LEFT JOIN upstreams u ON u.id=r.final_upstream_id
@@ -127,9 +130,11 @@ func scanRequestEntry(row rowScanner) (*RequestEntry, error) {
 		&e.FinalUpstreamName, &e.Model, &e.Endpoint, &e.KeyName, &e.ClientIP, &e.UserAgent, &e.Status, &e.Outcome,
 		&e.TTFTMs, &e.DurationMs, &e.AttemptCount, &e.CreatedAt, &e.CompletedAt, &e.Error,
 		&e.Stream, &e.RequestBytes, &e.ResponseBytes, &e.InputTokens, &e.OutputTokens,
-		&e.CachedTokens, &e.StreamCompleted, &e.LastEvent, &e.UpstreamRequestID,
+		&e.CachedTokens, &e.CacheCreationTokens, &e.CacheInputTokens,
+		&e.StreamCompleted, &e.LastEvent, &e.UpstreamRequestID,
 		&e.ErrorKind, &e.ErrorSource,
 	)
+	e.CacheRate = tokenCacheRate(e.CachedTokens, e.CacheInputTokens)
 	return e, err
 }
 
@@ -223,7 +228,10 @@ func (s *Store) listRequestAttempts(requestID string) ([]*RequestAttemptEntry, e
 	q := fmt.Sprintf(`SELECT a.id,a.attempt_no,a.upstream_id,COALESCE(u.name,''),a.status,a.outcome,
 		a.ttft_ms,a.duration_ms,%s,%s,a.error_text,a.priority,a.selection_reason,a.health_before,
 		a.health_after,a.response_bytes,a.stream,a.stream_completed,a.last_event,a.input_tokens,
-		a.output_tokens,a.cached_tokens,a.upstream_request_id,a.error_kind,a.error_source
+		a.output_tokens,a.cached_tokens,a.cache_creation_tokens,
+		CASE WHEN COALESCE(u.protocol,'')='claude'
+			THEN a.input_tokens+a.cached_tokens+a.cache_creation_tokens ELSE a.input_tokens END,
+		a.upstream_request_id,a.error_kind,a.error_source
 		FROM request_attempts a LEFT JOIN upstreams u ON u.id=a.upstream_id
 		WHERE a.request_id=? ORDER BY a.attempt_no`,
 		s.unixExpr("a.created_at"), s.unixExpr("a.completed_at"))
@@ -239,9 +247,11 @@ func (s *Store) listRequestAttempts(requestID string) ([]*RequestAttemptEntry, e
 			&e.Outcome, &e.TTFTMs, &e.DurationMs, &e.CreatedAt, &e.CompletedAt, &e.Error,
 			&e.Priority, &e.SelectionReason, &e.HealthBefore, &e.HealthAfter, &e.ResponseBytes,
 			&e.Stream, &e.StreamCompleted, &e.LastEvent, &e.InputTokens, &e.OutputTokens,
-			&e.CachedTokens, &e.UpstreamRequestID, &e.ErrorKind, &e.ErrorSource); err != nil {
+			&e.CachedTokens, &e.CacheCreationTokens, &e.CacheInputTokens,
+			&e.UpstreamRequestID, &e.ErrorKind, &e.ErrorSource); err != nil {
 			return nil, err
 		}
+		e.CacheRate = tokenCacheRate(e.CachedTokens, e.CacheInputTokens)
 		out = append(out, e)
 	}
 	return out, rows.Err()
