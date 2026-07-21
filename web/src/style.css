@@ -443,7 +443,10 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 
 /* 新增 */
 .count { font-size: 13px; color: var(--g500); font-weight: 500; }
-.group-card { cursor: pointer; display: flex; flex-direction: column; }
+.group-card { cursor: pointer; display: flex; flex-direction: column; transition: box-shadow .15s, transform .15s, opacity .15s; }
+.group-card.dragging { opacity: .45; }
+.group-card.dragover { box-shadow: 0 0 0 2px var(--p400, #d9a8d0); transform: translateY(-2px); }
+.group-grip { margin: 0 4px 0 0; padding: 8px 4px; }
 .group-cards { grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 20px; }
 .card-desc { font-size: 13px; color: var(--g500); margin: 0 0 16px; min-height: 18px; }
 .card-actions { display: inline-flex; align-items: center; gap: 2px; }

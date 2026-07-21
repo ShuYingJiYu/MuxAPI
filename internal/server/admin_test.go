@@ -43,6 +43,28 @@ func adminReq(t *testing.T, method, url, tok, body string) *http.Response {
 	return resp
 }
 
+func TestReorderGroupsAPI(t *testing.T) {
+	ts, st, tok := newAdminTestServer(t)
+	id1, _ := st.CreateGroup("g1", "")
+	id2, _ := st.CreateGroup("g2", "")
+	id3, _ := st.CreateGroup("g3", "")
+
+	resp := adminReq(t, http.MethodPost, ts.URL+"/admin/groups/reorder", tok,
+		`{"ids":[`+itoa(id3)+`,`+itoa(id1)+`,`+itoa(id2)+`]}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("reorder groups returned %d", resp.StatusCode)
+	}
+
+	groups, err := st.ListGroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 3 || groups[0].ID != id3 || groups[1].ID != id1 || groups[2].ID != id2 {
+		t.Fatalf("unexpected group order: %+v", groups)
+	}
+}
+
 func TestSettingsFirstResponseTimeout(t *testing.T) {
 	ts, st, tok := newAdminTestServer(t)
 	url := ts.URL + "/admin/settings"

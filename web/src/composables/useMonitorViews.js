@@ -41,7 +41,6 @@ export function useMonitorViews({ monitors, upstreams, tags, probeOne }) {
     { value: 'untagged', label: '未分类' },
     ...tags.value.map(tag => ({ value: `tag-${tag.id}`, label: tag.name })),
   ])
-  const monitorStateRank = { DOWN: 0, DEGRADED: 1, NODATA: 2, OK: 3, DISABLED: 4 }
   const monitorSections = computed(() => {
     const query = monitorSearch.value.trim().toLowerCase()
     const tagOrder = new Map(tags.value.map((tag, index) => [tag.id, index]))
@@ -58,7 +57,7 @@ export function useMonitorViews({ monitors, upstreams, tags, probeOne }) {
       sections.get(item.groupKey).items.push(item)
     }
     return [...sections.entries()].map(([key, section]) => {
-      const items = section.items.sort((a, b) => monitorStateRank[a.state] - monitorStateRank[b.state] || a.upstream.name.localeCompare(b.upstream.name) || a.model.localeCompare(b.model))
+      const items = section.items
       const down = items.filter(item => item.state === 'DOWN').length
       const degraded = items.filter(item => item.state === 'DEGRADED').length
       const nodata = items.filter(item => item.state === 'NODATA').length

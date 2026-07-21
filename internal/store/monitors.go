@@ -75,8 +75,8 @@ func (s *Store) GetMonitor(id int64) (*Monitor, error) {
 
 func (s *Store) CreateMonitor(m *Monitor) (int64, error) {
 	var id int64
-	err := s.db.QueryRow(`INSERT INTO monitors(upstream_id,model,name,enabled,stream,probe_text,max_tokens,interval_sec,path)
-		VALUES(?,?,?,?,?,?,?,?,?) RETURNING id`,
+	err := s.db.QueryRow(`INSERT INTO monitors(upstream_id,model,name,enabled,stream,probe_text,max_tokens,interval_sec,path,sort)
+		VALUES(?,?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM monitors)) RETURNING id`,
 		m.UpstreamID, m.Model, m.Name, m.Enabled, m.Stream, m.ProbeText, m.MaxTokens, m.IntervalSec, m.Path).Scan(&id)
 	return id, err
 }

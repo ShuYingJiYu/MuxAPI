@@ -72,6 +72,7 @@ export const api = {
   createGroup: g => req('POST', '/groups', g),
   updateGroup: (id, g) => req('PUT', '/groups/' + id, g),
   deleteGroup: id => req('DELETE', '/groups/' + id),
+  reorderGroups: ids => req('POST', '/groups/reorder', { ids }),
   // 组成员
   members: gid => req('GET', `/groups/${gid}/upstreams`),
   addMember: (gid, m) => req('POST', `/groups/${gid}/upstreams`, m),

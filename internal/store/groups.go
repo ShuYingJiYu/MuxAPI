@@ -57,8 +57,8 @@ func (s *Store) ListGroups() ([]*Group, error) {
 		LEFT JOIN group_upstreams gu ON gu.group_id=g.id
 		LEFT JOIN upstreams u ON u.id=gu.upstream_id
 		LEFT JOIN access_keys ak ON ak.group_id=g.id
-		GROUP BY g.id,g.name,g.description
-		ORDER BY g.id`, since, since, since)
+		GROUP BY g.id,g.name,g.description,g.sort_order
+		ORDER BY g.sort_order,g.id`, since, since, since)
 	if err != nil {
 		return nil, err
 	}
@@ -229,8 +229,24 @@ func (s *Store) ForgetProbes(monitorID int64) error {
 
 func (s *Store) CreateGroup(name, desc string) (int64, error) {
 	var id int64
-	err := s.db.QueryRow(`INSERT INTO groups(name,description) VALUES(?,?) RETURNING id`, name, desc).Scan(&id)
+	err := s.db.QueryRow(`INSERT INTO groups(name,description,sort_order)
+		VALUES(?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM groups)) RETURNING id`, name, desc).Scan(&id)
 	return id, err
+}
+
+// ReorderGroups 按给定 id 顺序持久化分组在管理页中的位置。
+func (s *Store) ReorderGroups(ids []int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for i, id := range ids {
+		if _, err := tx.Exec(`UPDATE groups SET sort_order=? WHERE id=?`, i+1, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) UpdateGroup(id int64, name, desc string) error {

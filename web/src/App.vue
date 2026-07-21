@@ -377,6 +377,31 @@ function saveTag() {
     resetTagDraft()
   })
 }
+
+const groupDragId = ref(null)
+const groupDragOverId = ref(null)
+function onGroupDragStart(g, e) {
+  groupDragId.value = g.id
+  e.dataTransfer.effectAllowed = 'move'
+  e.dataTransfer.setData('text/plain', String(g.id))
+}
+function onGroupDragOver(g, e) {
+  if (g.id === groupDragId.value) return
+  e.preventDefault()
+  groupDragOverId.value = g.id
+}
+function onGroupDrop(target) {
+  const from = groups.value.findIndex(g => g.id === groupDragId.value)
+  const to = groups.value.findIndex(g => g.id === target.id)
+  if (from < 0 || to < 0 || from === to) { onGroupDragEnd(); return }
+  const arr = groups.value.slice()
+  const [moved] = arr.splice(from, 1)
+  arr.splice(to, 0, moved)
+  groups.value = arr
+  onGroupDragEnd()
+  guard(() => api.reorderGroups(arr.map(g => g.id)).catch(e => { loadGroups().catch(() => {}); throw e }))
+}
+function onGroupDragEnd() { groupDragId.value = groupDragOverId.value = null }
 function delTag(tag) {
   closeDlg()
   ask(`删除标签「${tag.name}」？上游不会被删除。`, () => guard(async () => {
@@ -700,6 +725,43 @@ function saveBatchMonitors() {
     flash(`已为「${f.upstream_name}」创建 ${r.created} 个监控${r.skipped ? `，跳过 ${r.skipped} 个已存在` : ''}`)
   })
 }
+
+const monitorDragId = ref(null)
+const monitorDragOverId = ref(null)
+const monitorDragGroupKey = ref('')
+function onMonitorDragStart(m, e) {
+  monitorDragId.value = m.id
+  monitorDragGroupKey.value = m.groupKey
+  e.dataTransfer.effectAllowed = 'move'
+  e.dataTransfer.setData('text/plain', String(m.id))
+}
+function onMonitorDragOver(m, e) {
+  if (m.groupKey !== monitorDragGroupKey.value || m.id === monitorDragId.value) return
+  e.preventDefault()
+  monitorDragOverId.value = m.id
+}
+function onMonitorDrop(target) {
+  if (target.groupKey !== monitorDragGroupKey.value) { onMonitorDragEnd(); return }
+  const section = monitorSections.value.find(item => item.key === target.groupKey)
+  const visible = section?.items || []
+  const from = visible.findIndex(m => m.id === monitorDragId.value)
+  const to = visible.findIndex(m => m.id === target.id)
+  if (from < 0 || to < 0 || from === to) { onMonitorDragEnd(); return }
+  const reorderedVisible = visible.slice()
+  const [moved] = reorderedVisible.splice(from, 1)
+  reorderedVisible.splice(to, 0, moved)
+  const visibleIDs = new Set(visible.map(m => m.id))
+  const rawByID = new Map(monitors.value.map(m => [m.id, m]))
+  let visibleIndex = 0
+  const arr = monitors.value.map(m => visibleIDs.has(m.id) ? rawByID.get(reorderedVisible[visibleIndex++].id) : m)
+  monitors.value = arr
+  onMonitorDragEnd()
+  guard(() => api.reorderMonitors(arr.map(m => m.id)).catch(e => { loadMonitors().catch(() => {}); throw e }))
+}
+function onMonitorDragEnd() {
+  monitorDragId.value = monitorDragOverId.value = null
+  monitorDragGroupKey.value = ''
+}
 function newMonitor() {
   const uid = upstreams.value[0]?.id || 0
   dlg.type = 'monitor'; dlg.form = { upstream_id: uid, model: '', name: '', enabled: true, stream: false, probe_text: '', max_tokens: 0, interval_sec: 0, path: '' }
@@ -824,7 +886,9 @@ function logout() {
             <button class="btn" @click="newGroup"><Icon name="plus" :size="16" />新建分组</button>
           </div>
           <div class="cards group-cards">
-            <div class="card group-card" v-for="g in groups" :key="g.id" @click="openDetail(g)">
+            <div class="card group-card" v-for="g in groups" :key="g.id" @click="openDetail(g)"
+              :class="{ dragging: groupDragId === g.id, dragover: groupDragOverId === g.id }"
+              @dragover="onGroupDragOver(g, $event)" @drop="onGroupDrop(g)">
               <div class="card-head">
                 <div class="gc-id">
                   <span class="gc-avatar">{{ (g.name || '?').slice(0,1) }}</span>
@@ -834,6 +898,7 @@ function logout() {
                   </div>
                 </div>
                 <div class="card-actions">
+                  <span class="mon-grip group-grip" draggable="true" title="拖拽调整顺序" @dragstart="onGroupDragStart(g, $event)" @dragend="onGroupDragEnd" @click.stop><Icon name="grip" :size="16" /></span>
                   <button class="icon-btn" @click.stop="editGroup(g)"><Icon name="edit" :size="16" /></button>
                   <button class="icon-btn danger" @click.stop="delGroup(g)"><Icon name="trash" :size="16" /></button>
                 </div>
@@ -1075,8 +1140,11 @@ function logout() {
                 <em>{{ section.reqs ? (section.rate * 100).toFixed(1) + '% 探测成功' : '暂无探测数据' }}</em>
               </button>
               <div v-if="!collapsedMonitorTags.has(section.key)" class="channel-card-grid monitor-model-grid">
-                <article v-for="m in section.items" :key="m.id" class="card mon-card model-monitor-card" :class="[dotClass(m.state), { disabled: m.state === 'DISABLED' }]">
+                <article v-for="m in section.items" :key="m.id" class="card mon-card model-monitor-card"
+                  :class="[dotClass(m.state), { disabled: m.state === 'DISABLED', dragging: monitorDragId === m.id, dragover: monitorDragOverId === m.id }]"
+                  @dragover="onMonitorDragOver(m, $event)" @drop="onMonitorDrop(m)">
                   <div class="mon-head">
+                    <span class="mon-grip" draggable="true" title="拖拽调整顺序" @dragstart="onMonitorDragStart(m, $event)" @dragend="onMonitorDragEnd"><Icon name="grip" :size="16" /></span>
                     <span class="mon-avatar" :class="dotClass(m.state)">{{ initial(m) }}</span>
                     <div class="mon-id">
                       <span class="mon-name">{{ m.model }}</span>

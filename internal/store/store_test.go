@@ -257,6 +257,42 @@ func TestReorderMonitors(t *testing.T) {
 	}
 }
 
+func TestReorderGroups(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	var ids []int64
+	for _, name := range []string{"g1", "g2", "g3"} {
+		id, err := st.CreateGroup(name, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := st.ReorderGroups([]int64{ids[2], ids[0], ids[1]}); err != nil {
+		t.Fatal(err)
+	}
+	groups, err := st.ListGroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 3 || groups[0].ID != ids[2] || groups[1].ID != ids[0] || groups[2].ID != ids[1] {
+		t.Fatalf("unexpected group order: %+v", groups)
+	}
+
+	lastID, err := st.CreateGroup("g4", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups, _ = st.ListGroups()
+	if groups[len(groups)-1].ID != lastID {
+		t.Fatalf("new group should be appended, got %+v", groups)
+	}
+}
+
 func modelOrder(ms []*Monitor) []string {
 	out := make([]string, len(ms))
 	for i, m := range ms {

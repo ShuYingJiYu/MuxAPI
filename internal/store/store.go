@@ -254,6 +254,8 @@ func openSQLite(path string) (*Store, error) {
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN channel_probe INTEGER NOT NULL DEFAULT 1`)
 	// 迁移：旧库 upstreams 补 sort_order 列（拖拽排序权重，0=未排过按 id）
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`)
+	// 迁移：旧库 groups 表补 sort_order 列（拖拽排序权重，0=未排序按 id）。
+	db.Exec(`ALTER TABLE groups ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`)
 	// 迁移：旧库 group_upstreams 补 enabled 列（组内成员开关，默认启用）
 	db.Exec(`ALTER TABLE group_upstreams ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`)
 	// 迁移：旧库 monitors 补可配探测列（空/0 表示沿用全局默认）
@@ -309,7 +311,8 @@ const schema = `
 CREATE TABLE IF NOT EXISTS groups (
 	id          INTEGER PRIMARY KEY AUTOINCREMENT,
 	name        TEXT NOT NULL,
-	description TEXT NOT NULL DEFAULT ''
+	description TEXT NOT NULL DEFAULT '',
+	sort_order  INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS upstreams (
 	id       INTEGER PRIMARY KEY AUTOINCREMENT,

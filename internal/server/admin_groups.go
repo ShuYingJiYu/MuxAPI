@@ -45,7 +45,15 @@ func (s *Server) adminGroups(w http.ResponseWriter, r *http.Request) {
 
 // adminGroupSub 路由 /admin/groups/{id}、/{id}/upstreams、/{id}/upstreams/{uid}、/{id}/keys。
 func (s *Server) adminGroupSub(w http.ResponseWriter, r *http.Request) {
-	rest := strings.TrimPrefix(r.URL.Path, "/admin/groups/")
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/admin/groups/"), "/")
+	if rest == "reorder" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.reorderGroups(w, r)
+		return
+	}
 	parts := strings.Split(rest, "/")
 	gid, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
@@ -86,6 +94,22 @@ func (s *Server) adminGroupSub(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "not found", 404)
 	}
+}
+
+// reorderGroups 持久化分组卡片顺序。body: {ids:[3,1,2,...]}
+func (s *Server) reorderGroups(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.store.ReorderGroups(in.IDs); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // adminGroupUpstreams 组成员：GET 列表 / POST 加入(带组内prio/weight) /
