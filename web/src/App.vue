@@ -524,12 +524,10 @@ function delGroup(g) {
 }
 
 const groupTestState = reactive({
-  show: false, groupName: '', keyId: 0, protocol: 'responses',
+  show: false, groupName: '', keyId: 0, keyName: '', protocol: 'responses',
   modelsLoading: false, models: [], model: '', modelsError: '',
   running: false, output: '', error: '', status: 0, requestId: '', result: null,
 })
-const enabledGroupKeys = computed(() => keys.value.filter(key => key.enabled))
-const groupTestKeyOptions = computed(() => enabledGroupKeys.value.map(key => ({ value: key.id, label: key.name || key.masked || ('#' + key.id) })))
 const groupTestProtocolOptions = [
   { value: 'responses', label: 'OpenAI Responses' },
   { value: 'chat', label: 'Chat Completions' },
@@ -541,7 +539,7 @@ const groupTestModelOptions = computed(() => {
   if (!options.length && groupTestState.model) options.push({ value: groupTestState.model, label: groupTestState.model })
   return options
 })
-function selectedGroupTestKey() { return enabledGroupKeys.value.find(key => key.id === Number(groupTestState.keyId)) }
+function selectedGroupTestKey() { return keys.value.find(key => key.enabled && key.id === Number(groupTestState.keyId)) }
 async function loadGroupTestModels() {
   const key = selectedGroupTestKey()
   groupTestState.modelsLoading = true
@@ -557,10 +555,10 @@ async function loadGroupTestModels() {
     groupTestState.modelsLoading = false
   }
 }
-function openGroupTest() {
-  const key = enabledGroupKeys.value[0]
+function openGroupTest(key) {
+  if (!key?.enabled) return
   Object.assign(groupTestState, {
-    show: true, groupName: detailGroup.value?.name || '', keyId: key?.id || 0, protocol: 'responses',
+    show: true, groupName: detailGroup.value?.name || '', keyId: key.id, keyName: key.name || key.masked || ('#' + key.id), protocol: 'responses',
     modelsLoading: false, models: [], model: '', modelsError: '',
     running: false, output: '', error: '', status: 0, requestId: '', result: null,
   })
@@ -628,11 +626,6 @@ const firstResponseTimeoutSec = ref('')    // 首字节超时(秒，后端存毫
 const effectiveFirstResponseTimeoutMs = ref('')
 const firstResponseTimeoutSource = ref('')
 const apiBase = location.origin    // 当前访问地址，用于展示客户端接入端点
-const groupEndpoints = [
-  { name: 'OpenAI Responses', url: apiBase + '/v1/responses' },
-  { name: 'Chat Completions', url: apiBase + '/v1/chat/completions' },
-  { name: 'Anthropic Messages', url: apiBase + '/v1/messages' },
-]
 const settingsSaved = ref(false)
 const settingsSection = ref('logs')  // 设置页左锚点：logs | alert | endpoint
 function createKey() { dlg.type = 'keygen'; dlg.form = { name: '' } }
@@ -1011,19 +1004,6 @@ function logout() {
         <template v-else-if="detailGroup">
           <button class="btn-link" @click="backToGroups">← 返回分组列表</button>
 
-          <section class="group-access-band">
-            <div class="section-head">
-              <h3 class="section-title">接入地址</h3>
-              <button class="btn btn-sm" :disabled="!enabledGroupKeys.length" :title="enabledGroupKeys.length ? '测试分组' : '请先启用一个分组密钥'" @click="openGroupTest"><Icon name="play" :size="14" />测试分组</button>
-            </div>
-            <div class="group-endpoints">
-              <div v-for="endpoint in groupEndpoints" :key="endpoint.url">
-                <span>{{ endpoint.name }}</span><code>{{ endpoint.url }}</code>
-                <button class="icon-btn" :title="`复制 ${endpoint.name} 地址`" @click="copyText(endpoint.url, endpoint.url)"><Icon :name="copied === endpoint.url ? 'check' : 'copy'" :size="15" /></button>
-              </div>
-            </div>
-          </section>
-
           <div class="section-head">
             <h3 class="section-title">上游成员</h3>
             <button class="btn btn-sm" @click="addMember" :disabled="!addable.length"><Icon name="plus" :size="14" />从池中添加</button>
@@ -1105,6 +1085,7 @@ function logout() {
                   <td><code class="key-cell" title="点击复制" @click="copyText(k.key, k.id)">{{ k.key }}</code><span v-if="copied === k.id" style="color:#16a34a;font-size:12px;margin-left:6px">已复制 ✓</span></td>
                   <td><span class="tag" :class="k.enabled ? 'on' : 'off'">{{ k.enabled ? '启用' : '停用' }}</span></td>
                   <td>
+                    <button class="icon-btn" :disabled="!k.enabled" :title="k.enabled ? '使用此密钥测试分组' : '启用密钥后可测试'" aria-label="测试分组" @click="openGroupTest(k)"><Icon name="play" :size="16" /></button>
                     <button class="btn-link sm" @click="toggleKey(k)">{{ k.enabled ? '停用' : '启用' }}</button>
                     <button class="icon-btn danger" @click="delKey(k)"><Icon name="trash" :size="16" /></button>
                   </td>
@@ -1583,22 +1564,35 @@ function logout() {
 
     <div class="mask" v-if="groupTestState.show" @click.self="groupTestState.show = false">
       <div class="dialog group-test-dialog">
-        <h3>测试分组 · {{ groupTestState.groupName }}</h3>
-        <div class="group-test-controls">
-          <FancySelect v-model="groupTestState.keyId" :options="groupTestKeyOptions" :disabled="groupTestState.running" @change="loadGroupTestModels" />
-          <FancySelect v-model="groupTestState.protocol" :options="groupTestProtocolOptions" :disabled="groupTestState.running" />
-          <FancySelect v-model="groupTestState.model" :options="groupTestModelOptions" :disabled="groupTestState.modelsLoading || groupTestState.running" />
-          <button class="btn" :disabled="groupTestState.running || !groupTestState.model || !groupTestState.keyId" @click="runGroupTest"><Icon :name="groupTestState.running ? 'loader' : 'play'" :size="16" />{{ groupTestState.running ? '测试中…' : '开始测试' }}</button>
+        <div class="group-test-heading">
+          <h3>测试分组 · {{ groupTestState.groupName }}</h3>
+          <span class="group-test-key"><small>测试密钥</small><b>{{ groupTestState.keyName }}</b></span>
         </div>
-        <p v-if="groupTestState.modelsError" class="test-err">{{ groupTestState.modelsError }}</p>
-        <div v-if="groupTestState.running || groupTestState.output" class="test-output group-test-output"><span>{{ groupTestState.output }}</span><span v-if="groupTestState.running" class="cursor">▋</span></div>
-        <div v-if="groupTestState.status || groupTestState.error" class="test-status" :class="groupTestState.error ? 'fail' : 'ok'"><Icon :name="groupTestState.error ? 'x' : 'check'" :size="16" /><span>{{ groupTestState.error ? '测试失败' : '测试通过' }}</span><small v-if="groupTestState.status">HTTP {{ groupTestState.status }}</small></div>
-        <p v-if="groupTestState.error" class="test-err">{{ groupTestState.error }}</p>
-        <div v-if="groupTestState.result" class="group-test-result">
-          <div class="group-test-metrics"><div><span>最终渠道</span><b>{{ groupTestState.result.final_upstream_name || '—' }}</b></div><div><span>TTFT</span><b>{{ fmtMs(groupTestState.result.ttft_ms) }}</b></div><div><span>总耗时</span><b>{{ fmtMs(groupTestState.result.duration_ms) }}</b></div></div>
-          <div v-if="groupTestState.result.attempts?.length" class="group-test-route"><span v-for="attempt in groupTestState.result.attempts" :key="attempt.id" :class="attempt.outcome === 'success' ? 'ok' : 'fail'">{{ attempt.attempt_no }} · {{ attempt.upstream_name || ('#' + attempt.upstream_id) }} · {{ statusText(attempt.status) }}</span></div>
-        </div>
-        <div v-if="groupTestState.requestId" class="group-test-request-id"><span>请求 ID</span><code>{{ groupTestState.requestId }}</code><button class="icon-btn" title="复制请求 ID" @click="copyText(groupTestState.requestId, 'group-test-request')"><Icon :name="copied === 'group-test-request' ? 'check' : 'copy'" :size="14" /></button></div>
+        <section class="group-test-card">
+          <div class="group-test-card-head"><span>请求配置</span><small>{{ groupTestState.models.length }} 个可用模型</small></div>
+          <div class="group-test-controls">
+            <label><span>客户端协议</span><FancySelect v-model="groupTestState.protocol" :options="groupTestProtocolOptions" :disabled="groupTestState.running" /></label>
+            <label><span>模型</span><FancySelect v-model="groupTestState.model" :options="groupTestModelOptions" :disabled="groupTestState.modelsLoading || groupTestState.running" /></label>
+          </div>
+          <p v-if="groupTestState.modelsError" class="test-err">{{ groupTestState.modelsError }}</p>
+          <button class="btn group-test-run" :disabled="groupTestState.running || !groupTestState.model || !groupTestState.keyId" @click="runGroupTest"><Icon :name="groupTestState.running ? 'loader' : 'play'" :size="16" />{{ groupTestState.running ? '测试中…' : '开始测试' }}</button>
+        </section>
+        <section v-if="groupTestState.running || groupTestState.output || groupTestState.status || groupTestState.error" class="group-test-card">
+          <div class="group-test-card-head">
+            <span>模型响应</span>
+            <div v-if="groupTestState.status || groupTestState.error" class="test-status" :class="groupTestState.error ? 'fail' : 'ok'"><Icon :name="groupTestState.error ? 'x' : 'check'" :size="16" /><span>{{ groupTestState.error ? '测试失败' : '测试通过' }}</span><small v-if="groupTestState.status">HTTP {{ groupTestState.status }}</small></div>
+          </div>
+          <div v-if="groupTestState.running || groupTestState.output" class="test-output group-test-output"><span>{{ groupTestState.output }}</span><span v-if="groupTestState.running" class="cursor">▋</span></div>
+          <p v-if="groupTestState.error" class="test-err">{{ groupTestState.error }}</p>
+        </section>
+        <section v-if="groupTestState.result || groupTestState.requestId" class="group-test-card">
+          <div class="group-test-card-head"><span>路由结果</span></div>
+          <div v-if="groupTestState.result" class="group-test-result">
+            <div class="group-test-metrics"><div><span>最终渠道</span><b>{{ groupTestState.result.final_upstream_name || '—' }}</b></div><div><span>TTFT</span><b>{{ fmtMs(groupTestState.result.ttft_ms) }}</b></div><div><span>总耗时</span><b>{{ fmtMs(groupTestState.result.duration_ms) }}</b></div></div>
+            <div v-if="groupTestState.result.attempts?.length" class="group-test-route"><span v-for="attempt in groupTestState.result.attempts" :key="attempt.id" :class="attempt.outcome === 'success' ? 'ok' : 'fail'">{{ attempt.attempt_no }} · {{ attempt.upstream_name || ('#' + attempt.upstream_id) }} · {{ statusText(attempt.status) }}</span></div>
+          </div>
+          <div v-if="groupTestState.requestId" class="group-test-request-id"><span>请求 ID</span><code>{{ groupTestState.requestId }}</code><button class="icon-btn" title="复制请求 ID" @click="copyText(groupTestState.requestId, 'group-test-request')"><Icon :name="copied === 'group-test-request' ? 'check' : 'copy'" :size="14" /></button></div>
+        </section>
         <div class="dialog-foot"><button class="btn btn-ghost" :disabled="groupTestState.running" @click="groupTestState.show = false">关闭</button></div>
       </div>
     </div>
