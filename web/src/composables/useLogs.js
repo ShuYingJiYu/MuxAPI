@@ -177,7 +177,20 @@ export function useLogs({ page, guard }) {
     logFSlow.value, logFRetried.value].filter(Boolean).length)
   const logAdvancedFilters = computed(() => [logFGroup.value, logFModel.value, logFKey.value, logFEndpoint.value,
     logFErrorKind.value, logFStream.value, logFSlow.value, logFRetried.value].filter(Boolean).length)
-  const logCacheVisible = computed(() => logCacheExpanded.value ? logCacheStats.value : logCacheStats.value.slice(0, 6))
+  const logCacheSummary = computed(() => {
+    const valid = logCacheStats.value.filter(item => Number(item.input_tokens) > 0)
+    if (!valid.length) return { cache_input_tokens: 0, cached_tokens: 0, cache_rate: 0, lowest: null, highest: null }
+    const cacheInputTokens = valid.reduce((sum, item) => sum + (Number(item.input_tokens) || 0), 0)
+    const cachedTokens = valid.reduce((sum, item) => sum + (Number(item.cached_tokens) || 0), 0)
+    const byRate = valid.slice().sort((a, b) => Number(a.cache_rate) - Number(b.cache_rate))
+    return {
+      cache_input_tokens: cacheInputTokens,
+      cached_tokens: cachedTokens,
+      cache_rate: cacheInputTokens ? cachedTokens / cacheInputTokens : 0,
+      lowest: byRate[0],
+      highest: byRate[byRate.length - 1],
+    }
+  })
   const clientName = userAgent => {
     const value = String(userAgent || '').trim()
     if (!value) return '未知客户端'
@@ -259,7 +272,7 @@ export function useLogs({ page, guard }) {
   const fmtEndpoint = p => !p ? '—' : p.replace(/^\/v1\//, '')
   return {
     logs, logPageSize, logCurrentPage, logLoading, logDetail, logDetailLoading, logStats,
-    logCacheStats, logCacheExpanded, logCacheVisible,
+    logCacheStats, logCacheExpanded, logCacheSummary,
     logSearch, logFTime, logFGroup, logFModel, logFStatus, logFUpstream, logFKey,
     logFEndpoint, logFErrorKind, logFStream, logFSlow, logFRetried, logAutoRefresh,
     logMoreFilters, logPageSizeOptions, logTotalPages, logPageItems,

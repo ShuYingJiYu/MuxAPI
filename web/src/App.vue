@@ -660,7 +660,7 @@ const sinceText = ts => {
 
 const {
   logs, logPageSize, logCurrentPage, logLoading, logDetail, logDetailLoading, logStats,
-  logCacheStats, logCacheExpanded, logCacheVisible,
+  logCacheStats, logCacheExpanded, logCacheSummary,
   logSearch, logFTime, logFGroup, logFModel, logFStatus, logFUpstream, logFKey,
   logFEndpoint, logFErrorKind, logFStream, logFSlow, logFRetried, logAutoRefresh,
   logMoreFilters, logPageSizeOptions, logTotalPages, logPageItems,
@@ -1217,12 +1217,20 @@ function logout() {
           </div>
 
           <section v-if="logCacheStats.length" class="log-cache-panel">
-            <header><div><h3>渠道缓存</h3><span>{{ logCacheStats.length }} 个渠道</span></div><button v-if="logCacheStats.length > 6" class="btn-link sm" @click="logCacheExpanded = !logCacheExpanded">{{ logCacheExpanded ? '收起' : `展开全部 ${logCacheStats.length} 个` }}</button></header>
-            <div class="table-wrap log-cache-table-wrap">
+            <button class="log-cache-toggle" :aria-expanded="logCacheExpanded" @click="logCacheExpanded = !logCacheExpanded">
+              <span class="log-cache-title"><b>渠道缓存</b><small>{{ logCacheStats.length }} 个渠道</small></span>
+              <span class="log-cache-summary">
+                <span>平均 <b>{{ cacheRateText(logCacheSummary) }}</b></span>
+                <span v-if="logCacheSummary.lowest" :title="logCacheSummary.lowest.upstream_name">最低 <em>{{ logCacheSummary.lowest.upstream_name }}</em> <b>{{ cacheRateText(logCacheSummary.lowest) }}</b></span>
+                <span v-if="logCacheSummary.highest" :title="logCacheSummary.highest.upstream_name">最高 <em>{{ logCacheSummary.highest.upstream_name }}</em> <b>{{ cacheRateText(logCacheSummary.highest) }}</b></span>
+              </span>
+              <Icon class="log-cache-chevron" :class="{ expanded: logCacheExpanded }" name="chevron-right" :size="17" />
+            </button>
+            <div v-if="logCacheExpanded" class="table-wrap log-cache-table-wrap">
               <table class="log-cache-table">
                 <thead><tr><th>渠道</th><th>有效请求</th><th>输入 Token</th><th>缓存 Token</th><th>缓存率</th></tr></thead>
                 <tbody>
-                  <tr v-for="channel in logCacheVisible" :key="channel.upstream_id">
+                  <tr v-for="channel in logCacheStats" :key="channel.upstream_id">
                     <td><b class="log-main">{{ channel.upstream_name || ('#' + channel.upstream_id) }}</b></td>
                     <td>{{ fmtNum(channel.usage_requests) }}</td>
                     <td>{{ fmtNum(channel.input_tokens) }}</td>
