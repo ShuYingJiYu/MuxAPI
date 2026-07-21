@@ -60,6 +60,9 @@ func TestEndToEndForward(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+	if resp.Header.Get("X-Request-ID") == "" {
+		t.Fatal("forward response should expose its request id")
+	}
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), `"ok":true`) {
 		t.Fatalf("A 挂应切到 B 返回 ok，实际 status=%d body=%s", resp.StatusCode, body)

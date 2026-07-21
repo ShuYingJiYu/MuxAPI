@@ -22,6 +22,75 @@ async function req(method, path, body) {
   return ct.includes('json') ? res.json() : null
 }
 
+function groupTestRequest(protocol, model) {
+  if (protocol === 'claude') {
+    return { path: '/v1/messages', body: { model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 32, stream: true } }
+  }
+  if (protocol === 'chat') {
+    return { path: '/v1/chat/completions', body: { model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 32, stream: true } }
+  }
+  return { path: '/v1/responses', body: { model, input: 'hi', max_output_tokens: 32, stream: true } }
+}
+
+function groupTestText(protocol, payload) {
+  if (protocol === 'claude') return payload?.delta?.text || ''
+  if (protocol === 'chat') return payload?.choices?.[0]?.delta?.content || ''
+  return payload?.type === 'response.output_text.delta' ? (payload.delta || '') : ''
+}
+
+function groupTestBodyText(protocol, payload) {
+  if (protocol === 'claude') return (payload?.content || []).filter(item => item.type === 'text').map(item => item.text || '').join('')
+  if (protocol === 'chat') return payload?.choices?.[0]?.message?.content || ''
+  return (payload?.output || []).flatMap(item => item.content || []).filter(item => item.type === 'output_text').map(item => item.text || '').join('')
+}
+
+async function testGroupStream({ key, protocol, model }, onText) {
+  const request = groupTestRequest(protocol, model)
+  const response = await fetch(request.path, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body: JSON.stringify(request.body),
+  })
+  const requestId = response.headers.get('x-request-id') || ''
+  if (!response.ok) {
+    const error = new Error((await response.text()) || `HTTP ${response.status}`)
+    error.status = response.status
+    error.requestId = requestId
+    throw error
+  }
+  const contentType = response.headers.get('content-type') || ''
+  if (!contentType.includes('text/event-stream')) {
+    const payload = await response.json()
+    const text = groupTestBodyText(protocol, payload)
+    if (text) onText(text)
+    return { requestId, status: response.status }
+  }
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  const consume = block => {
+    const data = block.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n')
+    if (!data || data === '[DONE]') return
+    let payload
+    try { payload = JSON.parse(data) } catch { return }
+    const message = payload?.error?.message || (payload?.type === 'error' ? payload?.error?.message : '')
+    if (message) throw new Error(message)
+    const text = groupTestText(protocol, payload)
+    if (text) onText(text)
+  }
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const blocks = buffer.split(/\r?\n\r?\n/)
+    buffer = blocks.pop()
+    blocks.forEach(consume)
+  }
+  buffer += decoder.decode()
+  if (buffer.trim()) consume(buffer)
+  return { requestId, status: response.status }
+}
+
 export const api = {
   getToken: token,
   setToken: t => localStorage.setItem('muxapi_token', t),
@@ -73,6 +142,13 @@ export const api = {
   updateGroup: (id, g) => req('PUT', '/groups/' + id, g),
   deleteGroup: id => req('DELETE', '/groups/' + id),
   reorderGroups: ids => req('POST', '/groups/reorder', { ids }),
+  groupModels: async key => {
+    const response = await fetch('/v1/models', { headers: { Authorization: 'Bearer ' + key } })
+    if (!response.ok) throw new Error((await response.text()) || String(response.status))
+    const payload = await response.json()
+    return (payload.data || []).map(item => item.id).filter(Boolean)
+  },
+  testGroupStream,
   // 组成员
   members: gid => req('GET', `/groups/${gid}/upstreams`),
   addMember: (gid, m) => req('POST', `/groups/${gid}/upstreams`, m),
