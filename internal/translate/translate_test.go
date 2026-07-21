@@ -23,6 +23,24 @@ func TestSourceFromPath(t *testing.T) {
 	}
 }
 
+func TestSourceFromRequestDetectsNativeCodex(t *testing.T) {
+	header := http.Header{"X-Codex-Turn-Metadata": []string{`{"turn_id":"turn_1"}`}}
+	got, ok := SourceFromRequest("/v1/responses", header)
+	if !ok || got != Codex {
+		t.Fatalf("SourceFromRequest() = %q, %v; want %q, true", got, ok, Codex)
+	}
+
+	got, ok = SourceFromRequest("/v1/responses", http.Header{})
+	if !ok || got != OpenAIResponses {
+		t.Fatalf("generic Responses source = %q, %v; want %q, true", got, ok, OpenAIResponses)
+	}
+
+	got, ok = SourceFromRequest("/v1/messages", header)
+	if !ok || got != Claude {
+		t.Fatalf("Claude source = %q, %v; want %q, true", got, ok, Claude)
+	}
+}
+
 func TestNewExchangeTranslatesResponsesRequestToClaude(t *testing.T) {
 	original := []byte(`{"model":"gpt-test","input":"hello","stream":false}`)
 	exchange, err := NewExchange(OpenAIResponses, Claude, "gpt-test", false, original)

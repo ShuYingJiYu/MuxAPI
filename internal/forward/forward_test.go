@@ -680,6 +680,31 @@ func TestForwardTranslatesResponsesToClaude(t *testing.T) {
 	}
 }
 
+func TestForwardPreservesNativeCodexRequest(t *testing.T) {
+	body := []byte(`{"model":"gpt-test","input":[{"type":"additional_tools","tools":[]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"parallel_tool_calls":false,"client_metadata":{"source":"desktop"},"stream":true,"store":false}`)
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestBody, _ := io.ReadAll(r.Body)
+		if !bytes.Equal(requestBody, body) {
+			t.Fatalf("native Codex request was changed:\n got: %s\nwant: %s", requestBody, body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1},\"output\":[]}}\n\n")
+	}))
+	defer upstreamServer.Close()
+
+	upstreams := []*upstream.Upstream{{ID: 1, BaseURL: upstreamServer.URL, APIKey: "k", Protocol: "codex", Priority: 1, Weight: 1}}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 1)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	request.Header.Set("X-Codex-Turn-Metadata", `{"turn_id":"turn_1"}`)
+	result := fwd.Forward(recorder, request, body, 1, "")
+
+	if recorder.Code != http.StatusOK || result.Outcome != OutcomeSuccess {
+		t.Fatalf("status=%d result=%+v body=%s", recorder.Code, result, recorder.Body.String())
+	}
+}
+
 func TestForwardTranslatesClaudeToOpenAI(t *testing.T) {
 	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {

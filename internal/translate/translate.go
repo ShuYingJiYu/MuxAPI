@@ -55,6 +55,29 @@ func SourceFromPath(path string) (Format, bool) {
 	}
 }
 
+// SourceFromRequest distinguishes native Codex clients from generic Responses
+// clients. Both use /v1/responses, but native Codex payloads must not be
+// normalized a second time before reaching a Codex upstream.
+func SourceFromRequest(path string, header http.Header) (Format, bool) {
+	format, ok := SourceFromPath(path)
+	if !ok || format != OpenAIResponses {
+		return format, ok
+	}
+	for _, key := range []string{
+		"X-Codex-Turn-Metadata",
+		"X-Codex-Beta-Features",
+		"X-OpenAI-Internal-Codex-Responses-Lite",
+	} {
+		if strings.TrimSpace(header.Get(key)) != "" {
+			return Codex, true
+		}
+	}
+	if strings.Contains(strings.ToLower(header.Get("Originator")), "codex") {
+		return Codex, true
+	}
+	return format, true
+}
+
 // TargetPath 返回目标协议的标准端点；透传模式保留原路径。
 func TargetPath(format Format, originalPath string) (string, error) {
 	switch format {

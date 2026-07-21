@@ -172,7 +172,7 @@ func resultFromAttempt(attempt AttemptResult, attempts []AttemptResult) Result {
 func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte, groupID int64, keyName string) Result {
 	model := parseModel(body)
 	streamRequested := parseStream(body)
-	sourceFormat, sourceKnown := translate.SourceFromPath(r.URL.Path)
+	sourceFormat, sourceKnown := translate.SourceFromRequest(r.URL.Path, r.Header)
 	if !sourceKnown {
 		sourceFormat = translate.Passthrough
 	}
