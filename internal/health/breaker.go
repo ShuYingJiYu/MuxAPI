@@ -301,6 +301,26 @@ func (m *Manager) ObserveProbe(id int64, model string, ok bool, latencyMs int64)
 	}
 }
 
+// ResetCircuit manually returns one channel to CLOSED without changing its
+// traffic statistics or model capability cache.
+func (m *Manager) ResetCircuit(id int64) {
+	m.mu.Lock()
+	b := m.get(id)
+	from := b.state
+	b.state = Closed
+	b.fails = 0
+	b.openUntil = time.Time{}
+	b.halfOpenInFlight = false
+	b.halfOpenClaimAt = time.Time{}
+	b.recoverySuccesses = 0
+	b.reopenCount = 0
+	ev, flipped := transitionEvent(id, "", from, Closed, 0)
+	m.mu.Unlock()
+	if flipped {
+		m.dispatch(ev)
+	}
+}
+
 // drive 是业务请求与主动探测共用的熔断状态机。
 func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) (from, to State) {
 	from = b.state

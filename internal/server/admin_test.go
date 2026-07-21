@@ -201,6 +201,48 @@ func TestUpstreamSourceAndBatchAPI(t *testing.T) {
 	}
 }
 
+func TestRecoverUpstreamAPI(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	hm := health.New(1, time.Hour)
+	sched := scheduler.New(func(int64) []*upstream.Upstream { return nil }, hm)
+	const token = "admin-tok"
+	ts := httptest.NewServer(New(forward.New(sched, hm, 1), token, st, hm, monitor.New(st), nil, 32<<20).Handler())
+	defer ts.Close()
+
+	if err := st.Create(&upstream.Upstream{Name: "relay", BaseURL: "https://api.example.com", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	list, _ := st.List()
+	id := list[0].ID
+	hm.Report(id, "gpt", false, 0)
+	if got := hm.EffectiveState(id); got != "OPEN" {
+		t.Fatalf("precondition state = %s, want OPEN", got)
+	}
+
+	resp := adminReq(t, http.MethodPost, ts.URL+"/admin/upstreams/"+itoa(id)+"/recover", token, "")
+	defer resp.Body.Close()
+	var recovered healthView
+	if err := json.NewDecoder(resp.Body).Decode(&recovered); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || recovered.State != "CLOSED" || recovered.Fails != 0 {
+		t.Fatalf("recover returned status=%d body=%+v", resp.StatusCode, recovered)
+	}
+	if !hm.IsAvailable(id, "gpt") {
+		t.Fatal("recovered upstream should be available")
+	}
+
+	missing := adminReq(t, http.MethodPost, ts.URL+"/admin/upstreams/999/recover", token, "")
+	missing.Body.Close()
+	if missing.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing upstream returned %d", missing.StatusCode)
+	}
+}
+
 func TestTagAPIValidatesAndUpdates(t *testing.T) {
 	ts, st, tok := newAdminTestServer(t)
 	bad := adminReq(t, http.MethodPost, ts.URL+"/admin/tags", tok, `{"name":"","color":"orange"}`)

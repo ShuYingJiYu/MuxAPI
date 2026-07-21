@@ -99,6 +99,10 @@ func (s *Server) adminUpstreamItem(w http.ResponseWriter, r *http.Request) {
 		s.testUpstreamChat(w, r, id)
 		return
 	}
+	if len(parts) == 2 && parts[1] == "recover" {
+		s.recoverUpstream(w, r, id)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "monitors" && r.Method == http.MethodPost { // 批量建监控
 		s.batchCreateMonitors(w, r, id)
 		return
@@ -125,6 +129,24 @@ func (s *Server) adminUpstreamItem(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", 405)
 	}
+}
+
+// recoverUpstream clears only the in-memory channel breaker. Historical
+// routing statistics and model capability exclusions remain intact.
+func (s *Server) recoverUpstream(w http.ResponseWriter, r *http.Request, id int64) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, err := s.store.Get(id); errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "upstream not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.health.ResetCircuit(id)
+	writeJSON(w, toHealthView(s.health.Snapshot(id), s.health.EffectiveState(id)))
 }
 
 func (s *Server) batchUpdateUpstreams(w http.ResponseWriter, r *http.Request) {

@@ -58,6 +58,29 @@ func TestRecoveryFailureReopens(t *testing.T) {
 	}
 }
 
+func TestResetCircuitPreservesStatisticsAndModelCache(t *testing.T) {
+	m := New(1, time.Hour)
+	m.Report(1, "gpt", false, 0)
+	m.MarkModelUnsupported(1, "unsupported")
+	before := m.Snapshot(1)
+
+	m.ResetCircuit(1)
+
+	after := m.Snapshot(1)
+	if after.State != "CLOSED" || after.Fails != 0 || !after.OpenUntil.IsZero() {
+		t.Fatalf("circuit was not reset: %+v", after)
+	}
+	if after.Reqs != before.Reqs || after.FailReqs != before.FailReqs {
+		t.Fatalf("traffic statistics changed: before=%+v after=%+v", before, after)
+	}
+	if !m.IsModelUnsupported(1, "unsupported") {
+		t.Fatal("manual circuit reset must not clear model capability cache")
+	}
+	if !m.IsAvailable(1, "gpt") {
+		t.Fatal("reset channel should be immediately available")
+	}
+}
+
 func TestHalfOpenAllowsOneClaim(t *testing.T) {
 	m := New(1, 10*time.Millisecond)
 	m.Report(1, "gpt", false, 0)

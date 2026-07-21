@@ -32,6 +32,7 @@ async function loadTags() { tags.value = (await api.tags()) || [] }
 // 单项「立即探测」：探完用返回的快照原地更新该卡片
 // 用 Set 记录正在探测的卡片 id，支持多卡并发互不串台
 const probing = reactive(new Set())
+const recoveringUpstreams = reactive(new Set())
 async function probeOne(m) {
   probing.add(m.id)
   try {
@@ -238,6 +239,20 @@ function saveUpstream() {
 function delUpstream(u) {
   ask(`删除上游「${u.name}」？将同时从所有分组移除。`, () =>
     guard(async () => { await api.deleteUpstream(u.id); await loadUpstreams() }))
+}
+
+async function recoverUpstream(item) {
+  const id = Number(item.id || item.upstream_id)
+  if (!id || recoveringUpstreams.has(id)) return
+  recoveringUpstreams.add(id)
+  try {
+    await api.recoverUpstream(id)
+    await loadUpstreams()
+    if (detailGroup.value) await loadMembers(detailGroup.value.id)
+    flash(`已恢复「${item.name || item.upstream_name || ('#' + id)}」`)
+  } finally {
+    recoveringUpstreams.delete(id)
+  }
 }
 
 const upstreamRunFilter = ref('')
@@ -884,6 +899,7 @@ function logout() {
                     <span v-else class="tag" :class="m.group_enabled ? 'on' : 'off'">{{ m.group_enabled ? '启用' : '停用' }}</span>
                   </td>
                   <td>
+                    <button v-if="m.health?.state === 'OPEN' || m.health?.state === 'HALF_OPEN'" class="icon-btn" title="手动恢复渠道" :disabled="recoveringUpstreams.has(m.upstream_id)" @click="guard(() => recoverUpstream(m))"><Icon name="refresh" :size="16" /></button>
                     <button v-if="m.enabled" class="btn-link sm" @click="toggleMember(m)">{{ m.group_enabled ? '停用' : '启用' }}</button>
                     <button class="icon-btn" @click="editMember(m)"><Icon name="edit" :size="16" /></button>
                     <button class="icon-btn danger" @click="removeMember(m)"><Icon name="trash" :size="16" /></button>
@@ -1002,6 +1018,7 @@ function logout() {
                       <td><span class="state-badge" :class="rtClass(u.health)">{{ u.enabled ? rtLabel(u.health) : '已停用' }}</span></td>
                       <td>{{ rtRate(u.health) }}</td>
                       <td>
+                        <button v-if="u.health?.state === 'OPEN' || u.health?.state === 'HALF_OPEN'" class="icon-btn" title="手动恢复渠道" :disabled="recoveringUpstreams.has(u.id)" @click="guard(() => recoverUpstream(u))"><Icon name="refresh" :size="16" /></button>
                         <button class="btn-link sm" @click="testUpstream(u)">测试</button><button class="btn-link sm" @click="openBatchMonitors(u)">建监控</button>
                         <button class="icon-btn" title="编辑上游" @click="editUpstream(u)"><Icon name="edit" :size="16" /></button><button class="icon-btn danger" title="删除上游" @click="delUpstream(u)"><Icon name="trash" :size="16" /></button>
                       </td>
