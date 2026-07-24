@@ -1,7 +1,6 @@
 package scheduler
 
 import (
-	"math"
 	"sync"
 	"testing"
 	"time"
@@ -165,22 +164,6 @@ func TestP2CIncludesInFlightLoad(t *testing.T) {
 	}
 	if counts[2] <= counts[1] {
 		t.Fatalf("idle candidate should win load-adjusted comparisons: %+v", counts)
-	}
-}
-
-func TestPreviewSharesMatchesStandardP2C(t *testing.T) {
-	tier := []*upstream.Upstream{
-		{ID: 1, Weight: 1},
-		{ID: 2, Weight: 1},
-	}
-	shares := PreviewShares(tier, func(id int64) (float64, float64) {
-		if id == 1 {
-			return 50, 1
-		}
-		return 500, 1
-	}, 30000)
-	if math.Abs(shares[1].Share-0.75) > 0.0001 || math.Abs(shares[2].Share-0.25) > 0.0001 {
-		t.Fatalf("unexpected P2C preview: %+v", shares)
 	}
 }
 

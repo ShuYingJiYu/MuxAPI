@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/mirainya/muxapi/internal/health"
-	"github.com/mirainya/muxapi/internal/store"
 )
 
 // --- 分组 ---
@@ -164,23 +163,14 @@ func (s *Server) adminGroupUpstreams(w http.ResponseWriter, r *http.Request, gid
 		}
 		state := func(id int64) string { return effSt[id] }
 		best, hasEff := effectivePriority(ms, state)
-		// 生效层成员集合 → 算标准 P2C 流量占比预估
-		eff := make([]*store.Member, 0)
-		for _, m := range ms {
-			if hasEff && m.Enabled && m.GroupEnabled && m.Priority == best && effSt[m.UpstreamID] != "OPEN" {
-				eff = append(eff, m)
-			}
-		}
-		previews := s.computeRoutePreviews(eff)
 		out := make([]memberOut, 0, len(ms))
 		for _, m := range ms {
 			isEff := hasEff && m.Enabled && m.GroupEnabled && m.Priority == best && effSt[m.UpstreamID] != "OPEN"
 			out = append(out, memberOut{
-				Member:       m,
-				Health:       toHealthView(snaps[m.UpstreamID], effSt[m.UpstreamID]),
-				ModelHealth:  toModelHealthViews(s.health.ModelStates(m.UpstreamID)),
-				Effective:    isEff,
-				RoutePreview: previews[m.UpstreamID],
+				Member:      m,
+				Health:      toHealthView(snaps[m.UpstreamID], effSt[m.UpstreamID]),
+				ModelHealth: toModelHealthViews(s.health.ModelStates(m.UpstreamID)),
+				Effective:   isEff,
 			})
 		}
 		writeJSON(w, out)

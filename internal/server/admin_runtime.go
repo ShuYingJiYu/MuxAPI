@@ -2,9 +2,7 @@ package server
 
 import (
 	"github.com/mirainya/muxapi/internal/health"
-	"github.com/mirainya/muxapi/internal/scheduler"
 	"github.com/mirainya/muxapi/internal/store"
-	"github.com/mirainya/muxapi/internal/upstream"
 )
 
 // healthView 运行时健康精简视图（成员/上游列表用，不含趋势数组，省带宽）。
@@ -79,17 +77,6 @@ type memberOut struct {
 	Health      healthView        `json:"health"`
 	ModelHealth []modelHealthView `json:"model_health,omitempty"` // 该上游模型级健康（仅 GET 填充，无则省略）
 	Effective   bool              `json:"effective"`
-	// 标准 P2C 的渠道级流量分配预估。
-	RoutePreview []routeShareView `json:"route_preview,omitempty"`
-}
-
-// routeShareView is a channel-level P2C share preview.
-type routeShareView struct {
-	Model        string  `json:"model"`
-	LatEWMAMs    float64 `json:"lat_ewma_ms"`    // 选路用成功延迟 EWMA(ms)
-	SuccRate     float64 `json:"succ_rate"`      // 选路用成功率(0..1)
-	EffLatencyMs float64 `json:"eff_latency_ms"` // P2C 比较延迟(ms)
-	SharePct     float64 `json:"share_pct"`      // 预估流量占比 0..100
 }
 
 // groupRuntime 分组运行时概览：生效渠道名 + 各健康档计数（只统计 enabled 成员）。
@@ -139,28 +126,4 @@ func (s *Server) computeGroupRuntime(gid int64) groupRuntime {
 		}
 	}
 	return rt
-}
-
-// computeRoutePreviews calculates channel-level standard P2C shares for the
-// active priority tier. Model capability exclusions do not create breakers.
-func (s *Server) computeRoutePreviews(eff []*store.Member) map[int64][]routeShareView {
-	out := map[int64][]routeShareView{}
-	if len(eff) < 1 {
-		return out
-	}
-	tier := make([]*upstream.Upstream, 0, len(eff))
-	for _, member := range eff {
-		tier = append(tier, &upstream.Upstream{ID: member.UpstreamID, Weight: member.Weight})
-	}
-	shares := scheduler.PreviewShares(tier,
-		func(id int64) (float64, float64) { return s.health.RouteStats(id, "") }, 0)
-	for _, member := range eff {
-		ewma, sr := s.health.RouteStats(member.UpstreamID, "")
-		share := shares[member.UpstreamID]
-		out[member.UpstreamID] = []routeShareView{{
-			Model: "渠道级", LatEWMAMs: ewma, SuccRate: sr,
-			EffLatencyMs: share.EffLatencyMs, SharePct: share.Share * 100,
-		}}
-	}
-	return out
 }

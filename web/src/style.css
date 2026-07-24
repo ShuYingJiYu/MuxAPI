@@ -491,23 +491,6 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .card-foot { display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: var(--p600); padding-top: 12px; border-top: 1px solid var(--g100); margin-top: auto; }
 .btn-sm { padding: 6px 12px; font-size: 12px; border-radius: 10px; }
 
-/* 流量分配预估卡片 */
-.route-flag { font-size: 12px; font-weight: 600; padding: 2px 10px; border-radius: 999px; }
-.route-flag.on { color: var(--p700); background: var(--p50); }
-.route-flag.off { color: var(--g500); background: var(--g100); }
-.route-card { display: flex; flex-direction: column; gap: 18px; }
-.route-cap { color: var(--g500); font-size: 13px; margin: 0; }
-.route-model { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; background: var(--g50, #fafafa); border: 1px solid var(--g100); border-radius: 10px; }
-.route-model-name { display: flex; align-items: baseline; gap: 8px; font-size: 13px; font-weight: 700; color: var(--g700); }
-.route-model-cnt { font-size: 11px; font-weight: 500; color: var(--g500); }
-.route-row { display: flex; flex-direction: column; gap: 4px; }
-.route-row-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
-.route-up { font-weight: 600; color: var(--g700); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.route-pct { flex: none; font-weight: 700; font-size: 13px; color: var(--p700); font-variant-numeric: tabular-nums; }
-.route-bar { height: 10px; background: var(--g100); border-radius: 999px; overflow: hidden; }
-.route-bar > i { display: block; height: 100%; background: linear-gradient(90deg, var(--p400, #7c9cf5), var(--p500)); border-radius: 999px; transition: width .35s ease; }
-.route-metrics { color: var(--g500); font-size: 11px; font-variant-numeric: tabular-nums; }
-
 /* 请求记录页 */
 .log-summary { display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); border-block: 1px solid var(--g200); margin-bottom: 16px; background: rgba(255,255,255,.5); }
 .log-stat { min-width: 0; padding: 12px 14px; border-left: 1px solid var(--g200); }

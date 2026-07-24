@@ -150,61 +150,6 @@ func weightedPick(tier []*upstream.Upstream) *upstream.Upstream {
 	return tier[0]
 }
 
-// Share is the deterministic expected selection share for a P2C tier.
-type Share struct {
-	EffLatencyMs float64 `json:"eff_latency_ms"`
-	Share        float64 `json:"share"`
-}
-
-// PreviewShares calculates the exact pairwise probability for two independent
-// weighted draws. In-flight load is intentionally omitted from this snapshot.
-func PreviewShares(tier []*upstream.Upstream, stats func(id int64) (ewmaMs, succRate float64), toleranceMs float64) map[int64]Share {
-	out := make(map[int64]Share, len(tier))
-	if len(tier) == 0 {
-		return out
-	}
-
-	known := make([]float64, 0, len(tier))
-	scores := make(map[int64]float64, len(tier))
-	totalWeight := 0.0
-	for _, candidate := range tier {
-		latency, _ := stats(candidate.ID)
-		if latency > 0 {
-			known = append(known, latency)
-			scores[candidate.ID] = latency
-		}
-		totalWeight += float64(weightOf(candidate))
-	}
-	baseline := 1.0
-	if len(known) > 0 {
-		sort.Float64s(known)
-		baseline = known[len(known)/2]
-	} else if toleranceMs > 0 {
-		baseline = toleranceMs
-	}
-	for _, candidate := range tier {
-		if scores[candidate.ID] <= 0 {
-			scores[candidate.ID] = baseline
-		}
-		out[candidate.ID] = Share{EffLatencyMs: scores[candidate.ID]}
-	}
-
-	for _, first := range tier {
-		pFirst := float64(weightOf(first)) / totalWeight
-		for _, second := range tier {
-			p := pFirst * float64(weightOf(second)) / totalWeight
-			winner := first
-			if scores[second.ID] < scores[first.ID] {
-				winner = second
-			}
-			share := out[winner.ID]
-			share.Share += p
-			out[winner.ID] = share
-		}
-	}
-	return out
-}
-
 // EffLatency is kept for callers that display the legacy metric.
 func EffLatency(ewmaMs, succRate, toleranceMs float64) float64 {
 	if ewmaMs > 0 {

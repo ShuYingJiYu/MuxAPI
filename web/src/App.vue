@@ -56,20 +56,6 @@ async function loadMembers(gid) {
   const data = (await api.members(gid)) || []
   if (ep === loadEpoch) members.value = data
 }
-// 流量分配预估：把生效层成员的 route_preview 按模型重组（同模型各成员占比加和≈100）。
-const routeDist = computed(() => {
-  const byModel = new Map()
-  for (const m of members.value) {
-    if (!m.effective || !m.route_preview) continue
-    for (const rp of m.route_preview) {
-      if (!byModel.has(rp.model)) byModel.set(rp.model, [])
-      byModel.get(rp.model).push({ name: m.name, ...rp })
-    }
-  }
-  return [...byModel.entries()]
-    .map(([model, rows]) => ({ model, rows: rows.sort((a, b) => b.share_pct - a.share_pct) }))
-    .sort((a, b) => a.model.localeCompare(b.model))
-})
 const mhTitle = mh => mh.model + ' · 当前渠道暂不支持，5 分钟后重新尝试'
 async function loadDetail(gid) {
   const ep = loadEpoch
@@ -1044,31 +1030,6 @@ function logout() {
                 <tr v-if="!members.length"><td colspan="9" class="empty-cell">暂无上游，从全局池添加。</td></tr>
               </tbody>
             </table>
-          </div>
-
-          <div class="section-head" style="margin-top:28px">
-            <h3 class="section-title">流量分配预估</h3>
-            <span class="route-flag on">标准 P2C</span>
-          </div>
-          <div class="card route-card">
-            <template>
-              <p class="route-cap">同优先级层内独立抽取两个渠道，按 TTFT 与当前并发选择更优者。</p>
-              <div v-if="!routeDist.length" class="empty">生效层暂无路由数据</div>
-              <div v-for="md in routeDist" :key="md.model" class="route-model">
-                <div class="route-model-name">{{ md.model }}<span class="route-model-cnt">{{ md.rows.length }} 个渠道</span></div>
-                <div v-for="r in md.rows" :key="r.name" class="route-row">
-                  <div class="route-row-head">
-                    <span class="route-up">{{ r.name }}</span>
-                    <span class="route-pct">{{ r.share_pct.toFixed(0) }}%</span>
-                  </div>
-                  <span class="route-bar"><i :style="{ width: Math.max(r.share_pct, 2) + '%' }"></i></span>
-                  <span class="route-metrics">
-                    <template v-if="r.lat_ewma_ms > 0">TTFT {{ Math.round(r.lat_ewma_ms) }}ms</template>
-                    <template v-else>待数据</template>
-                  </span>
-                </div>
-              </div>
-            </template>
           </div>
 
           <div class="section-head" style="margin-top:28px">
