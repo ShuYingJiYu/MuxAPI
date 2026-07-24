@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mirainya/muxapi/internal/billing"
 	"github.com/mirainya/muxapi/internal/forward"
 	"github.com/mirainya/muxapi/internal/health"
 	"github.com/mirainya/muxapi/internal/monitor"
@@ -26,9 +27,58 @@ func newAdminTestServer(t *testing.T) (*httptest.Server, *store.Store, string) {
 	fwd := forward.New(sched, hm, 3)
 	const tok = "admin-tok"
 	srv := New(fwd, tok, st, hm, monitor.New(st), nil, 32<<20)
+	srv.SetBillingManager(billing.NewManager(st))
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, st, tok
+}
+
+func TestUpstreamBillingRefreshAndList(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/usage":
+			w.Write([]byte(`{"remaining":8.75,"unit":"USD","usage":{"total":{"cost":30,"actual_cost":4.5}}}`))
+		case "/v1/sub2api/billing":
+			w.Write([]byte(`{"object":"sub2api.key_billing","group_rate_multiplier":0.15,"effective_rate_multiplier":0.15}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer provider.Close()
+
+	ts, st, tok := newAdminTestServer(t)
+	u := &upstream.Upstream{
+		Name: "provider", BaseURL: provider.URL, APIKey: "sk-test",
+		BillingType: upstream.BillingSub2API, Enabled: true,
+	}
+	if err := st.Create(u); err != nil {
+		t.Fatal(err)
+	}
+
+	refresh := adminReq(t, http.MethodPost,
+		ts.URL+"/admin/upstreams/"+itoa(u.ID)+"/billing/refresh", tok, "")
+	defer refresh.Body.Close()
+	if refresh.StatusCode != http.StatusOK {
+		t.Fatalf("billing refresh returned %d", refresh.StatusCode)
+	}
+	var refreshed store.BillingStatus
+	if err := json.NewDecoder(refresh.Body).Decode(&refreshed); err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.Status != "ok" || refreshed.Remaining == nil || *refreshed.Remaining != 8.75 {
+		t.Fatalf("unexpected refreshed billing state: %+v", refreshed)
+	}
+
+	list := adminReq(t, http.MethodGet, ts.URL+"/admin/upstreams", tok, "")
+	defer list.Body.Close()
+	var items []upstreamDTO
+	if err := json.NewDecoder(list.Body).Decode(&items); err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].BillingType != upstream.BillingSub2API ||
+		items[0].Billing == nil || items[0].Billing.Remaining == nil || *items[0].Billing.Remaining != 8.75 {
+		t.Fatalf("upstream list is missing billing data: %+v", items)
+	}
 }
 
 func adminReq(t *testing.T, method, url, tok, body string) *http.Response {
@@ -78,6 +128,53 @@ func TestReorderGroupsAPI(t *testing.T) {
 	}
 	if len(groups) != 3 || groups[0].ID != id3 || groups[1].ID != id1 || groups[2].ID != id2 {
 		t.Fatalf("unexpected group order: %+v", groups)
+	}
+}
+
+func TestGroupMaxMultiplierAPI(t *testing.T) {
+	ts, _, tok := newAdminTestServer(t)
+	create := adminReq(t, http.MethodPost, ts.URL+"/admin/groups", tok,
+		`{"name":"cost limited","description":"test","max_multiplier":0.2}`)
+	create.Body.Close()
+	if create.StatusCode != http.StatusCreated {
+		t.Fatalf("create group returned %d", create.StatusCode)
+	}
+
+	list := adminReq(t, http.MethodGet, ts.URL+"/admin/groups", tok, "")
+	var groups []struct {
+		ID            int64    `json:"id"`
+		MaxMultiplier *float64 `json:"max_multiplier"`
+	}
+	if err := json.NewDecoder(list.Body).Decode(&groups); err != nil {
+		t.Fatal(err)
+	}
+	list.Body.Close()
+	if len(groups) != 1 || groups[0].MaxMultiplier == nil || *groups[0].MaxMultiplier != 0.2 {
+		t.Fatalf("group list is missing multiplier limit: %+v", groups)
+	}
+
+	update := adminReq(t, http.MethodPut, ts.URL+"/admin/groups/"+itoa(groups[0].ID), tok,
+		`{"name":"cost limited","description":"updated","max_multiplier":0.15}`)
+	update.Body.Close()
+	if update.StatusCode != http.StatusNoContent {
+		t.Fatalf("update group returned %d", update.StatusCode)
+	}
+	bad := adminReq(t, http.MethodPost, ts.URL+"/admin/groups", tok,
+		`{"name":"invalid","max_multiplier":0}`)
+	bad.Body.Close()
+	if bad.StatusCode != http.StatusBadRequest {
+		t.Fatalf("zero multiplier limit returned %d", bad.StatusCode)
+	}
+}
+
+func TestEffectivePrioritySkipsMultiplierBlockedMembers(t *testing.T) {
+	members := []*store.Member{
+		{UpstreamID: 1, Priority: 1, Enabled: true, GroupEnabled: true, MultiplierBlocked: true},
+		{UpstreamID: 2, Priority: 2, Enabled: true, GroupEnabled: true},
+	}
+	priority, ok := effectivePriority(members, func(int64) string { return "CLOSED" })
+	if !ok || priority != 2 {
+		t.Fatalf("effective priority = %d, %v", priority, ok)
 	}
 }
 

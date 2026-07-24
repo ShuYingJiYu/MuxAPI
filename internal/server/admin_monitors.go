@@ -205,6 +205,7 @@ type upstreamInput struct {
 	BaseURL      string   `json:"base_url"`
 	Proxy        string   `json:"proxy"`
 	Protocol     string   `json:"protocol"`
+	BillingType  string   `json:"billing_type"`
 	APIKey       string   `json:"api_key"`
 	Enabled      bool     `json:"enabled"`
 	ChannelProbe bool     `json:"channel_probe"`
@@ -222,6 +223,7 @@ func decodeUpstream(r *http.Request) (*upstream.Upstream, error) {
 	d.Source = strings.TrimSpace(d.Source)
 	d.BaseURL = strings.TrimSpace(d.BaseURL)
 	d.Protocol = strings.TrimSpace(d.Protocol)
+	d.BillingType = strings.TrimSpace(d.BillingType)
 	if d.Name == "" {
 		return nil, errors.New("name is required")
 	}
@@ -234,9 +236,13 @@ func decodeUpstream(r *http.Request) (*upstream.Upstream, error) {
 	if !ok {
 		return nil, errors.New("unsupported upstream protocol")
 	}
+	billingType, ok := upstream.NormalizeBillingType(d.BillingType)
+	if !ok {
+		return nil, errors.New("unsupported billing type")
+	}
 	result := &upstream.Upstream{
 		Name: d.Name, Source: d.Source, BaseURL: d.BaseURL, APIKey: d.APIKey, Proxy: d.Proxy, Enabled: d.Enabled,
-		Protocol: string(protocol), ChannelProbe: d.ChannelProbe,
+		Protocol: string(protocol), BillingType: billingType, ChannelProbe: d.ChannelProbe,
 	}
 	if d.PrimaryTagID != nil || d.TagIDs != nil {
 		result.TagsSet = true

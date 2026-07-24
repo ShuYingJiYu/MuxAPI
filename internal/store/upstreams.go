@@ -129,7 +129,7 @@ func scanUps(rows *sql.Rows) ([]*upstream.Upstream, error) {
 	var list []*upstream.Upstream
 	for rows.Next() {
 		u := &upstream.Upstream{}
-		if err := rows.Scan(&u.ID, &u.Name, &u.Source, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Protocol, &u.Enabled, &u.Priority, &u.Weight, &u.ChannelProbe); err != nil {
+		if err := rows.Scan(&u.ID, &u.Name, &u.Source, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Protocol, &u.BillingType, &u.Enabled, &u.Priority, &u.Weight, &u.ChannelProbe); err != nil {
 			return nil, err
 		}
 		list = append(list, u)
@@ -140,9 +140,14 @@ func scanUps(rows *sql.Rows) ([]*upstream.Upstream, error) {
 // ListEnabledByGroup 返回某分组下启用的上游，JOIN 中间表填充组内 priority/weight，
 // 按组内优先级升序（调度用）。
 func (s *Store) ListEnabledByGroup(groupID int64) ([]*upstream.Upstream, error) {
-	rows, err := s.db.Query(`SELECT u.id,u.name,u.source,u.base_url,u.api_key,u.proxy,u.protocol,u.enabled,gu.priority,gu.weight,u.channel_probe
+	rows, err := s.db.Query(`SELECT u.id,u.name,u.source,u.base_url,u.api_key,u.proxy,u.protocol,u.billing_type,u.enabled,gu.priority,gu.weight,u.channel_probe
 		FROM upstreams u JOIN group_upstreams gu ON gu.upstream_id=u.id
-		WHERE gu.group_id=? AND u.enabled=TRUE AND gu.enabled=TRUE ORDER BY gu.priority ASC`, groupID)
+		JOIN groups g ON g.id=gu.group_id
+		LEFT JOIN upstream_billing_status bs ON bs.upstream_id=u.id
+		WHERE gu.group_id=? AND u.enabled=TRUE AND gu.enabled=TRUE
+		AND (g.max_multiplier IS NULL OR COALESCE(bs.effective_multiplier,bs.group_multiplier) IS NULL
+			OR COALESCE(bs.effective_multiplier,bs.group_multiplier)<=g.max_multiplier)
+		ORDER BY gu.priority ASC`, groupID)
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +156,7 @@ func (s *Store) ListEnabledByGroup(groupID int64) ([]*upstream.Upstream, error) 
 
 // List 返回全部上游(含停用)，priority/weight 置 0（全局池无组内语义），供探测与后台管理。
 func (s *Store) List() ([]*upstream.Upstream, error) {
-	rows, err := s.db.Query(`SELECT id,name,source,base_url,api_key,proxy,protocol,enabled,0,0,channel_probe FROM upstreams ORDER BY sort_order, id`)
+	rows, err := s.db.Query(`SELECT id,name,source,base_url,api_key,proxy,protocol,billing_type,enabled,0,0,channel_probe FROM upstreams ORDER BY sort_order, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -168,8 +173,8 @@ func (s *Store) List() ([]*upstream.Upstream, error) {
 // Get 按 id 取单个上游（含完整 api_key，供连通测试用）。
 func (s *Store) Get(id int64) (*upstream.Upstream, error) {
 	u := &upstream.Upstream{}
-	err := s.db.QueryRow(`SELECT id,name,source,base_url,api_key,proxy,protocol,enabled,channel_probe FROM upstreams WHERE id=?`, id).
-		Scan(&u.ID, &u.Name, &u.Source, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Protocol, &u.Enabled, &u.ChannelProbe)
+	err := s.db.QueryRow(`SELECT id,name,source,base_url,api_key,proxy,protocol,billing_type,enabled,channel_probe FROM upstreams WHERE id=?`, id).
+		Scan(&u.ID, &u.Name, &u.Source, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Protocol, &u.BillingType, &u.Enabled, &u.ChannelProbe)
 	if err == nil {
 		err = s.loadUpstreamTags([]*upstream.Upstream{u})
 	}
@@ -177,14 +182,19 @@ func (s *Store) Get(id int64) (*upstream.Upstream, error) {
 }
 
 func (s *Store) Create(u *upstream.Upstream) error {
+	billingType, ok := upstream.NormalizeBillingType(u.BillingType)
+	if !ok {
+		return errors.New("unsupported billing type")
+	}
+	u.BillingType = billingType
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err := tx.QueryRow(`INSERT INTO upstreams(name,source,base_url,api_key,proxy,protocol,enabled,channel_probe,sort_order)
-		VALUES(?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM upstreams)) RETURNING id`,
-		u.Name, u.Source, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe).Scan(&u.ID); err != nil {
+	if err := tx.QueryRow(`INSERT INTO upstreams(name,source,base_url,api_key,proxy,protocol,billing_type,enabled,channel_probe,sort_order)
+		VALUES(?,?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM upstreams)) RETURNING id`,
+		u.Name, u.Source, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.BillingType, u.Enabled, u.ChannelProbe).Scan(&u.ID); err != nil {
 		return err
 	}
 	if u.TagsSet {
@@ -211,20 +221,40 @@ func (s *Store) ReorderUpstreams(ids []int64) error {
 }
 
 func (s *Store) Update(u *upstream.Upstream) error {
+	billingType, ok := upstream.NormalizeBillingType(u.BillingType)
+	if !ok {
+		return errors.New("unsupported billing type")
+	}
+	u.BillingType = billingType
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	var oldBillingType, oldBaseURL, oldAPIKey string
+	if err := tx.QueryRow(`SELECT billing_type,base_url,api_key FROM upstreams WHERE id=?`, u.ID).
+		Scan(&oldBillingType, &oldBaseURL, &oldAPIKey); err != nil {
+		return err
+	}
 	if u.APIKey == "" { // 留空则不改凭证（对齐后台「留空则不修改」语义）
-		_, err = tx.Exec(`UPDATE upstreams SET name=?,source=?,base_url=?,proxy=?,protocol=?,enabled=?,channel_probe=? WHERE id=?`,
-			u.Name, u.Source, u.BaseURL, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe, u.ID)
+		_, err = tx.Exec(`UPDATE upstreams SET name=?,source=?,base_url=?,proxy=?,protocol=?,billing_type=?,enabled=?,channel_probe=? WHERE id=?`,
+			u.Name, u.Source, u.BaseURL, u.Proxy, u.Protocol, u.BillingType, u.Enabled, u.ChannelProbe, u.ID)
 	} else {
-		_, err = tx.Exec(`UPDATE upstreams SET name=?,source=?,base_url=?,api_key=?,proxy=?,protocol=?,enabled=?,channel_probe=? WHERE id=?`,
-			u.Name, u.Source, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.Enabled, u.ChannelProbe, u.ID)
+		_, err = tx.Exec(`UPDATE upstreams SET name=?,source=?,base_url=?,api_key=?,proxy=?,protocol=?,billing_type=?,enabled=?,channel_probe=? WHERE id=?`,
+			u.Name, u.Source, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.BillingType, u.Enabled, u.ChannelProbe, u.ID)
 	}
 	if err != nil {
 		return err
+	}
+	credentialChanged := oldBillingType != u.BillingType || oldBaseURL != u.BaseURL ||
+		(u.APIKey != "" && oldAPIKey != u.APIKey)
+	if credentialChanged {
+		if _, err := tx.Exec(`DELETE FROM upstream_billing_snapshots WHERE upstream_id=?`, u.ID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM upstream_billing_status WHERE upstream_id=?`, u.ID); err != nil {
+			return err
+		}
 	}
 	if u.TagsSet {
 		if err := replaceUpstreamTags(tx, u.ID, u.PrimaryTagID, u.TagIDs); err != nil {

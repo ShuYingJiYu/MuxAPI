@@ -245,6 +245,7 @@ func openSQLite(path string) (*Store, error) {
 	// 迁移：旧库 upstreams 补 proxy 列（已存在则忽略报错）
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN proxy TEXT NOT NULL DEFAULT ''`)
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN protocol TEXT NOT NULL DEFAULT 'passthrough'`)
+	db.Exec(`ALTER TABLE upstreams ADD COLUMN billing_type TEXT NOT NULL DEFAULT 'none'`)
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN source TEXT NOT NULL DEFAULT ''`)
 	db.Exec(`INSERT OR IGNORE INTO tags(name,color,sort_order)
 		SELECT DISTINCT TRIM(source),'gray',0 FROM upstreams WHERE TRIM(source)<>''`)
@@ -256,6 +257,7 @@ func openSQLite(path string) (*Store, error) {
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`)
 	// 迁移：旧库 groups 表补 sort_order 列（拖拽排序权重，0=未排序按 id）。
 	db.Exec(`ALTER TABLE groups ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`)
+	db.Exec(`ALTER TABLE groups ADD COLUMN max_multiplier REAL`)
 	// 迁移：旧库 group_upstreams 补 enabled 列（组内成员开关，默认启用）
 	db.Exec(`ALTER TABLE group_upstreams ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`)
 	// 迁移：旧库 monitors 补可配探测列（空/0 表示沿用全局默认）
@@ -314,7 +316,8 @@ CREATE TABLE IF NOT EXISTS groups (
 	id          INTEGER PRIMARY KEY AUTOINCREMENT,
 	name        TEXT NOT NULL,
 	description TEXT NOT NULL DEFAULT '',
-	sort_order  INTEGER NOT NULL DEFAULT 0
+	sort_order  INTEGER NOT NULL DEFAULT 0,
+	max_multiplier REAL
 );
 CREATE TABLE IF NOT EXISTS upstreams (
 	id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -324,6 +327,7 @@ CREATE TABLE IF NOT EXISTS upstreams (
 	api_key  TEXT NOT NULL,
 	proxy    TEXT NOT NULL DEFAULT '',
 	protocol TEXT NOT NULL DEFAULT 'passthrough',
+	billing_type TEXT NOT NULL DEFAULT 'none',
 	enabled  INTEGER NOT NULL DEFAULT 1,
 	channel_probe INTEGER NOT NULL DEFAULT 1,
 	sort_order INTEGER NOT NULL DEFAULT 0
@@ -389,6 +393,53 @@ CREATE TABLE IF NOT EXISTS logs (
 CREATE TABLE IF NOT EXISTS settings (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS upstream_billing_status (
+	upstream_id INTEGER PRIMARY KEY,
+	currency TEXT NOT NULL DEFAULT 'USD',
+	remaining REAL,
+	unlimited INTEGER NOT NULL DEFAULT 0,
+	billing_group TEXT NOT NULL DEFAULT '',
+	group_multiplier REAL,
+	effective_multiplier REAL,
+	reported_list_cost REAL,
+	reported_actual_cost REAL,
+	status TEXT NOT NULL DEFAULT 'pending',
+	error_text TEXT NOT NULL DEFAULT '',
+	observed_at INTEGER,
+	last_success_at INTEGER,
+	refreshed_at INTEGER NOT NULL,
+	FOREIGN KEY (upstream_id) REFERENCES upstreams(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS upstream_billing_snapshots (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	upstream_id INTEGER NOT NULL,
+	currency TEXT NOT NULL DEFAULT 'USD',
+	remaining REAL,
+	unlimited INTEGER NOT NULL DEFAULT 0,
+	billing_group TEXT NOT NULL DEFAULT '',
+	group_multiplier REAL,
+	effective_multiplier REAL,
+	reported_list_cost REAL,
+	reported_actual_cost REAL,
+	observed_at INTEGER NOT NULL,
+	FOREIGN KEY (upstream_id) REFERENCES upstreams(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS model_pricing (
+	model TEXT PRIMARY KEY,
+	input_cost_per_token REAL,
+	output_cost_per_token REAL,
+	cache_read_input_token_cost REAL,
+	cache_creation_input_token_cost REAL
+);
+CREATE TABLE IF NOT EXISTS pricing_catalog_status (
+	id INTEGER PRIMARY KEY CHECK (id=1),
+	source TEXT NOT NULL DEFAULT '',
+	version TEXT NOT NULL DEFAULT '',
+	model_count INTEGER NOT NULL DEFAULT 0,
+	last_checked_at INTEGER,
+	last_success_at INTEGER,
+	error_text TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS probe_results (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -467,4 +518,6 @@ CREATE INDEX IF NOT EXISTS idx_requests_outcome_time ON requests(outcome, create
 CREATE INDEX IF NOT EXISTS idx_requests_key_time ON requests(key_name, created_at);
 CREATE INDEX IF NOT EXISTS idx_requests_error_time ON requests(error_kind, created_at);
 CREATE INDEX IF NOT EXISTS idx_attempts_request ON request_attempts(request_id, attempt_no);
-CREATE INDEX IF NOT EXISTS idx_attempts_upstream_time ON request_attempts(upstream_id, created_at);`
+CREATE INDEX IF NOT EXISTS idx_attempts_upstream_time ON request_attempts(upstream_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_attempts_upstream_completed ON request_attempts(upstream_id, completed_at);
+CREATE INDEX IF NOT EXISTS idx_upstream_billing_snapshots_time ON upstream_billing_snapshots(upstream_id, observed_at DESC);`

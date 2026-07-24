@@ -33,6 +33,7 @@ async function loadTags() { tags.value = (await api.tags()) || [] }
 // 用 Set 记录正在探测的卡片 id，支持多卡并发互不串台
 const probing = reactive(new Set())
 const recoveringUpstreams = reactive(new Set())
+const refreshingBilling = reactive(new Set())
 async function probeOne(m) {
   probing.add(m.id)
   try {
@@ -150,11 +151,14 @@ const confirmState = reactive({ show: false, msg: '', onOk: null })
 function ask(msg, onOk) { confirmState.show = true; confirmState.msg = msg; confirmState.onOk = onOk }
 function confirmOk() { confirmState.show = false; confirmState.onOk?.() }
 
-function newGroup() { dlg.type = 'group'; dlg.form = { name: '', description: '' } }
-function editGroup(g) { dlg.type = 'group'; dlg.form = { id: g.id, name: g.name, description: g.description } }
+function newGroup() { dlg.type = 'group'; dlg.form = { name: '', description: '', max_multiplier: '' } }
+function editGroup(g) { dlg.type = 'group'; dlg.form = { id: g.id, name: g.name, description: g.description, max_multiplier: g.max_multiplier ?? '' } }
 function saveGroup() {
   guard(async () => {
-    const f = { ...dlg.form }
+    const rawMultiplier = String(dlg.form.max_multiplier ?? '').trim()
+    const maxMultiplier = rawMultiplier === '' ? null : Number(rawMultiplier)
+    if (maxMultiplier !== null && (!Number.isFinite(maxMultiplier) || maxMultiplier <= 0)) throw new Error('最大计费倍率必须大于 0')
+    const f = { ...dlg.form, max_multiplier: maxMultiplier }
     if (f.id) await api.updateGroup(f.id, f)
     else await api.createGroup(f)
     closeDlg(); await loadGroups()
@@ -170,6 +174,98 @@ const protocolOptions = [
 ]
 const protocolLabels = Object.fromEntries(protocolOptions.map(option => [option.value, option.label]))
 function protocolLabel(protocol) { return protocolLabels[protocol || 'passthrough'] || protocol }
+const billingTypeOptions = [
+  { value: 'none', label: '不采集' },
+  { value: 'sub2api', label: 'Sub2API' },
+  { value: 'newapi', label: 'New API' },
+]
+const billingTypeLabels = Object.fromEntries(billingTypeOptions.map(option => [option.value, option.label]))
+function billingTypeLabel(value) { return billingTypeLabels[value || 'none'] || value }
+function billingAmount(item) {
+  const state = item.billing
+  if (state?.unlimited) return '无限额度'
+  if (state?.remaining == null) return '余额 —'
+  const currency = state.currency || 'USD'
+  try {
+    return new Intl.NumberFormat('zh-CN', {
+      style: 'currency', currency, currencyDisplay: 'narrowSymbol',
+      minimumFractionDigits: 2, maximumFractionDigits: 4,
+    }).format(Number(state.remaining))
+  } catch {
+    return `${Number(state.remaining).toFixed(4)} ${currency}`
+  }
+}
+function billingMultiplier(item) {
+  const value = item.billing?.effective_multiplier ?? item.billing?.group_multiplier
+  if (value == null) return '倍率 —'
+  return formatMultiplier(value)
+}
+function formatMultiplier(value) { return `${Number(value).toFixed(4).replace(/0+$/, '').replace(/\.$/, '')}x` }
+function billingStatusText(item) {
+  return ({ ok: '正常', partial: '部分数据', error: '失败', pending: '待采集' }[item.billing?.status] || '待采集')
+}
+function billingStatusClass(item) { return item.billing?.status || 'pending' }
+const billingAuditReasons = {
+  insufficient_snapshots: '至少需要两次成功采集',
+  counter_reset: '累计计费值已重置，等待下一采集窗口',
+  multiplier_changed: '本窗口内倍率发生变化，等待稳定窗口',
+  multiplier_unavailable: '平台未提供有效计费倍率',
+  pricing_catalog_unavailable: 'LiteLLM 价格目录尚不可用',
+  pricing_query_failed: '本地价格查询失败',
+  request_usage_incomplete: '成功请求缺少 Usage，费用数据不足',
+  model_price_unavailable: '部分模型缺少 LiteLLM 价格',
+  actual_cost_unavailable: '平台未提供实际费用累计值或余额变化',
+  actual_cost_exceeded: '实际费用超出本地理论费用容差',
+}
+function billingCost(item, value) {
+  if (value == null) return '—'
+  const currency = item.billing?.currency || 'USD'
+  try {
+    return new Intl.NumberFormat('zh-CN', {
+      style: 'currency', currency, currencyDisplay: 'narrowSymbol',
+      minimumFractionDigits: 2, maximumFractionDigits: 4,
+    }).format(Number(value))
+  } catch {
+    return `${Number(value).toFixed(4)} ${currency}`
+  }
+}
+function billingAuditText(item) {
+  const audit = item.billing?.audit
+  if (!audit) return ''
+  if (audit.status === 'pending') return '费用比对 · 待采集'
+  if (audit.theoretical_cost == null) return `本地理论 — · 实际 ${billingCost(item, audit.actual_cost)}`
+  const prefix = audit.status === 'warning' ? '异常 · ' : ''
+  return `${prefix}本地 ${billingCost(item, audit.theoretical_cost)} · 实际 ${billingCost(item, audit.actual_cost)}`
+}
+function billingPricingText(item) {
+  const audit = item.billing?.audit
+  if (!audit) return ''
+  const parts = []
+  if (audit.pricing_source) parts.push(audit.pricing_source)
+  if (audit.price_coverage != null) parts.push(`覆盖 ${(Number(audit.price_coverage) * 100).toFixed(0)}%`)
+  if (audit.status === 'unavailable' && audit.reason) parts.push(billingAuditReasons[audit.reason] || audit.reason)
+  return parts.join(' · ')
+}
+function billingAuditTitle(item) {
+  const audit = item.billing?.audit
+  if (!audit) return ''
+  const lines = []
+  if (audit.reason) lines.push(billingAuditReasons[audit.reason] || audit.reason)
+  if (audit.pricing_source) lines.push(`价格来源 ${audit.pricing_source}${audit.pricing_version ? ` (${audit.pricing_version.slice(0, 12)})` : ''}`)
+  if (audit.price_coverage != null) lines.push(`价格覆盖 ${audit.priced_request_count || 0}/${audit.request_count || 0} (${(Number(audit.price_coverage) * 100).toFixed(1)}%)`)
+  if (audit.missing_usage_count) lines.push(`缺少 Usage 的成功请求 ${audit.missing_usage_count} 条`)
+  if (audit.missing_models?.length) lines.push(`缺少价格 ${audit.missing_models.join('、')}`)
+  if (audit.deviation_rate != null) lines.push(`费用偏差 ${(Number(audit.deviation_rate) * 100).toFixed(1)}%`)
+  if (audit.reported_list_cost != null) lines.push(`平台自报原价增量 ${billingCost(item, audit.reported_list_cost)}`)
+  if (audit.balance_spent != null) lines.push(`余额减少 ${billingCost(item, audit.balance_spent)}`)
+  return lines.join('\n')
+}
+function billingMeta(item) {
+  return [billingTypeLabel(item.billing_type), item.billing?.billing_group, billingStatusText(item)].filter(Boolean).join(' · ')
+}
+function billingTitle(item) {
+  return [billingMeta(item), billingAuditTitle(item), item.billing?.error, item.billing?.refreshed_at ? `更新于 ${sinceText(item.billing.refreshed_at)}` : '尚未采集'].filter(Boolean).join('\n')
+}
 function upstreamHref(value) {
   try {
     const url = new URL(String(value || '').trim())
@@ -205,12 +301,12 @@ const upstreamFormAvailableTags = computed(() => {
 function newUpstream() {
   upstreamFormTagSearch.value = ''
   dlg.type = 'upstream'
-  dlg.form = { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] }
+  dlg.form = { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', billing_type: 'none', enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] }
 }
 function editUpstream(u) {
   upstreamFormTagSearch.value = ''
   dlg.type = 'upstream'
-  dlg.form = { ...u, protocol: u.protocol || 'passthrough', api_key: '', primary_tag_id: u.primary_tag_id || 0, tag_ids: [...(u.tag_ids || [])] }
+  dlg.form = { ...u, protocol: u.protocol || 'passthrough', billing_type: u.billing_type || 'none', api_key: '', primary_tag_id: u.primary_tag_id || 0, tag_ids: [...(u.tag_ids || [])] }
 }
 function saveUpstream() {
   guard(async () => {
@@ -238,6 +334,19 @@ async function recoverUpstream(item) {
     flash(`已恢复「${item.name || item.upstream_name || ('#' + id)}」`)
   } finally {
     recoveringUpstreams.delete(id)
+  }
+}
+
+async function refreshUpstreamBilling(item) {
+  if (!item.id || item.billing_type === 'none' || refreshingBilling.has(item.id)) return
+  refreshingBilling.add(item.id)
+  try {
+    const state = await api.refreshUpstreamBilling(item.id)
+    item.billing = state
+    if (state.status === 'error') throw new Error(state.error || '计费数据采集失败')
+    flash(`已刷新「${item.name}」的计费数据`)
+  } finally {
+    refreshingBilling.delete(item.id)
   }
 }
 
@@ -977,6 +1086,7 @@ function logout() {
                 <span class="gc-pill mint"><i></i>{{ healthSummary(g.runtime) }}</span>
                 <span class="gc-pill blue">上游 {{ g.enabled_upstream_count || 0 }}/{{ g.upstream_count || 0 }}</span>
                 <span class="gc-pill violet">密钥 {{ g.enabled_key_count || 0 }}/{{ g.key_count || 0 }}</span>
+                <span v-if="g.max_multiplier" class="gc-pill amber">倍率 ≤ {{ formatMultiplier(g.max_multiplier) }}<template v-if="g.runtime?.multiplier_blocked"> · 拦截 {{ g.runtime.multiplier_blocked }}</template></span>
                 <span class="gc-pill" :class="g.runtime?.effective?.length ? 'amber' : 'gray'">生效 {{ effText(g.runtime) }}</span>
               </div>
 
@@ -996,7 +1106,7 @@ function logout() {
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>名称</th><th>地址</th><th>组内优先级</th><th>权重</th><th>运行时</th><th>成功率</th><th>延迟</th><th>组内开关</th><th>操作</th></tr></thead>
+              <thead><tr><th>名称</th><th>地址</th><th>组内优先级</th><th>权重</th><th>计费倍率</th><th>运行时</th><th>成功率</th><th>延迟</th><th>组内开关</th><th>操作</th></tr></thead>
               <tbody>
                 <tr v-for="m in members" :key="m.upstream_id" :class="{ 'row-eff': m.effective }">
                   <td class="cell-name">{{ m.name }}<span v-if="m.effective" class="eff-badge">生效中</span></td>
@@ -1008,6 +1118,7 @@ function logout() {
                   </td>
                   <td>{{ m.priority }}</td>
                   <td>{{ m.weight }}</td>
+                  <td class="member-multiplier"><span>{{ m.effective_multiplier == null ? '—' : formatMultiplier(m.effective_multiplier) }}</span><small v-if="m.multiplier_blocked">超限</small></td>
                   <td>
                     <span class="state-badge" :class="rtClass(m.health)">{{ m.enabled && m.group_enabled ? rtLabel(m.health) : '已停用' }}</span>
                     <div v-if="visibleDots(m).length" class="model-dots">
@@ -1027,7 +1138,7 @@ function logout() {
                     <button class="icon-btn danger" @click="removeMember(m)"><Icon name="trash" :size="16" /></button>
                   </td>
                 </tr>
-                <tr v-if="!members.length"><td colspan="9" class="empty-cell">暂无上游，从全局池添加。</td></tr>
+                <tr v-if="!members.length"><td colspan="10" class="empty-cell">暂无上游，从全局池添加。</td></tr>
               </tbody>
             </table>
           </div>
@@ -1098,7 +1209,7 @@ function logout() {
               </button>
               <div v-if="!collapsedUpstreamTags.has(section.key)" class="table-wrap upstream-table-wrap">
                 <table class="upstream-table">
-                  <thead><tr><th class="select-cell"><input type="checkbox" :checked="section.rows.every(u => upstreamSelected.has(u.id))" :aria-label="`选择 ${section.name}`" @change="toggleUpstreamSectionSelection(section.rows)" /></th><th></th><th>名称</th><th>标签</th><th>地址</th><th>协议</th><th>运行时</th><th>成功率</th><th>操作</th></tr></thead>
+                  <thead><tr><th class="select-cell"><input type="checkbox" :checked="section.rows.every(u => upstreamSelected.has(u.id))" :aria-label="`选择 ${section.name}`" @change="toggleUpstreamSectionSelection(section.rows)" /></th><th></th><th>名称</th><th>标签</th><th>地址</th><th>协议</th><th>计费</th><th>运行时</th><th>成功率</th><th>操作</th></tr></thead>
                   <tbody>
                     <tr v-for="u in section.rows" :key="u.id" :class="{ disabled: !u.enabled, dragging: upstreamDragId === u.id, dragover: upstreamDragOverId === u.id }"
                       draggable="true" @dragstart="onUpstreamDragStart(u, $event)" @dragover="onUpstreamDragOver(u, $event)" @drop="onUpstreamDrop(u)" @dragend="onUpstreamDragEnd">
@@ -1113,6 +1224,15 @@ function logout() {
                         <span v-else>{{ u.base_url }}</span>
                       </td>
                       <td><span class="tag">{{ protocolLabel(u.protocol) }}</span></td>
+                      <td class="billing-cell">
+                        <span v-if="!u.billing_type || u.billing_type === 'none'" class="tag-empty">未采集</span>
+                        <div v-else class="billing-summary" :class="`billing-${billingStatusClass(u)}`" :title="billingTitle(u)">
+                          <div class="billing-values"><strong>{{ billingAmount(u) }}</strong><span>{{ billingMultiplier(u) }}</span><button class="icon-btn billing-refresh" title="刷新计费数据" :disabled="refreshingBilling.has(u.id)" @click="guard(() => refreshUpstreamBilling(u))"><Icon name="refresh" :size="14" /></button></div>
+                          <small><i></i>{{ billingMeta(u) }}</small>
+                          <div v-if="u.billing?.audit" class="billing-audit" :class="`billing-audit-${u.billing.audit.status}`">{{ billingAuditText(u) }}</div>
+                          <div v-if="billingPricingText(u)" class="billing-pricing">{{ billingPricingText(u) }}</div>
+                        </div>
+                      </td>
                       <td><span class="state-badge" :class="rtClass(u.health)">{{ u.enabled ? rtLabel(u.health) : '已停用' }}</span></td>
                       <td>{{ rtRate(u.health) }}</td>
                       <td>
@@ -1609,6 +1729,7 @@ function logout() {
           <h3>{{ dlg.form.id ? '编辑分组' : '新建分组' }}</h3>
           <div class="field"><label>名称</label><input v-model="dlg.form.name" placeholder="如 Claude 池" /></div>
           <div class="field"><label>描述</label><input v-model="dlg.form.description" placeholder="可选" /></div>
+          <div class="field"><label>最大计费倍率</label><input v-model="dlg.form.max_multiplier" type="number" min="0.0001" step="0.01" placeholder="不限" /></div>
           <div class="dialog-foot"><button class="btn btn-ghost" @click="closeDlg">取消</button><button class="btn" @click="saveGroup">保存</button></div>
         </template>
 
@@ -1643,6 +1764,7 @@ function logout() {
           </div>
           <div class="field"><label>base_url</label><input v-model="dlg.form.base_url" placeholder="https://..." /></div>
           <div class="field"><label>协议</label><FancySelect v-model="dlg.form.protocol" :options="protocolOptions" /></div>
+          <div class="field"><label>计费平台</label><FancySelect v-model="dlg.form.billing_type" :options="billingTypeOptions" /></div>
           <div class="field"><label>api_key</label><input v-model="dlg.form.api_key" :placeholder="dlg.form.id ? '留空则不修改' : 'sk-...'" /></div>
           <div class="field"><label>代理</label><input v-model="dlg.form.proxy" placeholder="留空=直连/环境变量；如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></div>
           <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>

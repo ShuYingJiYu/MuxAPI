@@ -26,10 +26,31 @@ type Upstream struct {
 	APIKey       string // 透传凭证
 	Proxy        string // 转发/探测走的代理出口(空=按环境变量或直连)
 	Protocol     string // 上游协议；passthrough 保持客户端请求格式
+	BillingType  string // 计费接口类型：none/sub2api/newapi
 	Priority     int    // 组内视图：越小越优先
 	Weight       int    // 组内视图：同优先级层分流权重
 	Enabled      bool
 	ChannelProbe bool // 兼容旧数据；熔断固定为渠道级
+}
+
+const (
+	BillingNone    = "none"
+	BillingSub2API = "sub2api"
+	BillingNewAPI  = "newapi"
+)
+
+// NormalizeBillingType validates the management-facing billing adapter name.
+func NormalizeBillingType(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", BillingNone:
+		return BillingNone, true
+	case BillingSub2API:
+		return BillingSub2API, true
+	case BillingNewAPI:
+		return BillingNewAPI, true
+	default:
+		return "", false
+	}
 }
 
 // Tag is user-managed upstream metadata. IsPrimary controls visual grouping;

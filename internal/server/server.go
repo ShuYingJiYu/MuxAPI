@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/mirainya/muxapi/internal/billing"
 	"github.com/mirainya/muxapi/internal/forward"
 	"github.com/mirainya/muxapi/internal/health"
 	"github.com/mirainya/muxapi/internal/monitor"
@@ -39,11 +40,15 @@ type Server struct {
 	health     *health.Manager
 	mon        *monitor.Manager
 	monProber  *monitor.Prober
+	billingMgr *billing.Manager
 	maxBody    int64 // 请求体字节上限（<=0 表示不限制）
 
 	modelMu    sync.Mutex                // 保护 modelCache
 	modelCache map[int64]modelCacheEntry // 按 upstream_id 缓存其 /v1/models 结果，TTL=modelsTTL
 }
+
+// SetBillingManager enables background and manual provider billing refreshes.
+func (s *Server) SetBillingManager(manager *billing.Manager) { s.billingMgr = manager }
 
 // New 创建 HTTP 服务；maxBody 控制客户端请求正文上限。
 func New(fwd *forward.Forwarder, adminToken string, st *store.Store, hm *health.Manager, mon *monitor.Manager, mp *monitor.Prober, maxBody int64) *Server {

@@ -57,11 +57,11 @@ func toModelHealthViews(ms []health.ModelHealth) []modelHealthView {
 }
 
 // effectivePriority 返回分组「生效层」的优先级值。
-// 生效层 = enabled 且未熔断(CLOSED/HALF_OPEN 都算可用，与调度 IsAvailable 一致)中优先级最小的那层。
+// 生效层 = enabled、未被倍率限制且未熔断渠道中优先级最小的那层。
 func effectivePriority(ms []*store.Member, state func(int64) string) (int, bool) {
 	best, ok := 0, false
 	for _, m := range ms {
-		if !m.Enabled || !m.GroupEnabled || state(m.UpstreamID) == "OPEN" {
+		if !m.Enabled || !m.GroupEnabled || m.MultiplierBlocked || state(m.UpstreamID) == "OPEN" {
 			continue
 		}
 		if !ok || m.Priority < best {
@@ -81,11 +81,12 @@ type memberOut struct {
 
 // groupRuntime 分组运行时概览：生效渠道名 + 各健康档计数（只统计 enabled 成员）。
 type groupRuntime struct {
-	Effective []string `json:"effective"` // 生效层渠道名（同层多个全列）
-	Normal    int      `json:"normal"`    // CLOSED
-	HalfOpen  int      `json:"half_open"` // HALF_OPEN
-	Open      int      `json:"open"`      // OPEN 熔断
-	Total     int      `json:"total"`     // enabled 成员总数
+	Effective         []string `json:"effective"`          // 生效层渠道名（同层多个全列）
+	Normal            int      `json:"normal"`             // CLOSED
+	HalfOpen          int      `json:"half_open"`          // HALF_OPEN
+	Open              int      `json:"open"`               // OPEN 熔断
+	Total             int      `json:"total"`              // enabled 成员总数
+	MultiplierBlocked int      `json:"multiplier_blocked"` // 被倍率上限排除
 }
 
 // groupOut 分组 + 运行时概览。
@@ -108,6 +109,9 @@ func (s *Server) computeGroupRuntime(gid int64) groupRuntime {
 			continue
 		}
 		rt.Total++
+		if m.MultiplierBlocked {
+			rt.MultiplierBlocked++
+		}
 		switch eff[m.UpstreamID] {
 		case "OPEN":
 			rt.Open++
@@ -120,7 +124,7 @@ func (s *Server) computeGroupRuntime(gid int64) groupRuntime {
 	best, hasEff := effectivePriority(ms, func(id int64) string { return eff[id] })
 	if hasEff {
 		for _, m := range ms {
-			if m.Enabled && m.GroupEnabled && m.Priority == best && eff[m.UpstreamID] != "OPEN" {
+			if m.Enabled && m.GroupEnabled && !m.MultiplierBlocked && m.Priority == best && eff[m.UpstreamID] != "OPEN" {
 				rt.Effective = append(rt.Effective, m.Name)
 			}
 		}

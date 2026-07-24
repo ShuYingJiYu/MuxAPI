@@ -2,12 +2,35 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/mirainya/muxapi/internal/health"
 )
+
+type groupInput struct {
+	Name          string   `json:"name"`
+	Description   string   `json:"description"`
+	MaxMultiplier *float64 `json:"max_multiplier"`
+}
+
+func decodeGroupInput(r *http.Request) (groupInput, error) {
+	var input groupInput
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		return input, err
+	}
+	input.Name = strings.TrimSpace(input.Name)
+	input.Description = strings.TrimSpace(input.Description)
+	if input.Name == "" {
+		return input, errors.New("name is required")
+	}
+	if input.MaxMultiplier != nil && *input.MaxMultiplier <= 0 {
+		return input, errors.New("max_multiplier must be greater than zero")
+	}
+	return input, nil
+}
 
 // --- 分组 ---
 func (s *Server) adminGroups(w http.ResponseWriter, r *http.Request) {
@@ -24,15 +47,12 @@ func (s *Server) adminGroups(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, out)
 	case http.MethodPost:
-		var d struct {
-			Name        string `json:"name"`
-			Description string `json:"description"`
-		}
-		if json.NewDecoder(r.Body).Decode(&d) != nil || d.Name == "" {
-			http.Error(w, "bad name", 400)
+		d, err := decodeGroupInput(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if _, err := s.store.CreateGroup(d.Name, d.Description); err != nil {
+		if _, err := s.store.CreateGroupWithMaxMultiplier(d.Name, d.Description, d.MaxMultiplier); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
@@ -63,15 +83,12 @@ func (s *Server) adminGroupSub(w http.ResponseWriter, r *http.Request) {
 	case len(parts) == 1: // /{id}
 		switch r.Method {
 		case http.MethodPut:
-			var d struct {
-				Name        string `json:"name"`
-				Description string `json:"description"`
-			}
-			if json.NewDecoder(r.Body).Decode(&d) != nil || d.Name == "" {
-				http.Error(w, "bad name", 400)
+			d, err := decodeGroupInput(r)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			if err := s.store.UpdateGroup(gid, d.Name, d.Description); err != nil {
+			if err := s.store.UpdateGroupWithMaxMultiplier(gid, d.Name, d.Description, d.MaxMultiplier); err != nil {
 				http.Error(w, err.Error(), 500)
 				return
 			}
@@ -165,7 +182,7 @@ func (s *Server) adminGroupUpstreams(w http.ResponseWriter, r *http.Request, gid
 		best, hasEff := effectivePriority(ms, state)
 		out := make([]memberOut, 0, len(ms))
 		for _, m := range ms {
-			isEff := hasEff && m.Enabled && m.GroupEnabled && m.Priority == best && effSt[m.UpstreamID] != "OPEN"
+			isEff := hasEff && m.Enabled && m.GroupEnabled && !m.MultiplierBlocked && m.Priority == best && effSt[m.UpstreamID] != "OPEN"
 			out = append(out, memberOut{
 				Member:      m,
 				Health:      toHealthView(snaps[m.UpstreamID], effSt[m.UpstreamID]),

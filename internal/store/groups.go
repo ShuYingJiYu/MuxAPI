@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -12,6 +13,7 @@ type Group struct {
 	ID                   int64       `json:"id"`
 	Name                 string      `json:"name"`
 	Description          string      `json:"description"`
+	MaxMultiplier        *float64    `json:"max_multiplier,omitempty"`
 	UpstreamCount        int         `json:"upstream_count"`
 	EnabledUpstreamCount int         `json:"enabled_upstream_count"`
 	KeyCount             int         `json:"key_count"`
@@ -45,7 +47,7 @@ type AccessKey struct {
 func (s *Store) ListGroups() ([]*Group, error) {
 	since := s.timeValue(time.Now().Add(-24 * time.Hour))
 	rows, err := s.db.Query(`SELECT
-		g.id,g.name,g.description,
+		g.id,g.name,g.description,g.max_multiplier,
 		COUNT(DISTINCT gu.upstream_id),
 		COUNT(DISTINCT CASE WHEN u.enabled=TRUE AND gu.enabled=TRUE THEN u.id END),
 		COUNT(DISTINCT ak.id),
@@ -57,7 +59,7 @@ func (s *Store) ListGroups() ([]*Group, error) {
 		LEFT JOIN group_upstreams gu ON gu.group_id=g.id
 		LEFT JOIN upstreams u ON u.id=gu.upstream_id
 		LEFT JOIN access_keys ak ON ak.group_id=g.id
-		GROUP BY g.id,g.name,g.description,g.sort_order
+		GROUP BY g.id,g.name,g.description,g.max_multiplier,g.sort_order
 		ORDER BY g.sort_order,g.id`, since, since, since)
 	if err != nil {
 		return nil, err
@@ -67,7 +69,7 @@ func (s *Store) ListGroups() ([]*Group, error) {
 	for rows.Next() {
 		g := &Group{}
 		if err := rows.Scan(
-			&g.ID, &g.Name, &g.Description,
+			&g.ID, &g.Name, &g.Description, &g.MaxMultiplier,
 			&g.UpstreamCount, &g.EnabledUpstreamCount,
 			&g.KeyCount, &g.EnabledKeyCount,
 			&g.RecentTotal, &g.SuccessRate, &g.AvgLatencyMs,
@@ -228,9 +230,21 @@ func (s *Store) ForgetProbes(monitorID int64) error {
 }
 
 func (s *Store) CreateGroup(name, desc string) (int64, error) {
+	return s.CreateGroupWithMaxMultiplier(name, desc, nil)
+}
+
+func validMaxMultiplier(value *float64) bool {
+	return value == nil || (*value > 0 && !math.IsNaN(*value) && !math.IsInf(*value, 0))
+}
+
+func (s *Store) CreateGroupWithMaxMultiplier(name, desc string, maxMultiplier *float64) (int64, error) {
+	if !validMaxMultiplier(maxMultiplier) {
+		return 0, fmt.Errorf("max multiplier must be greater than zero")
+	}
 	var id int64
-	err := s.db.QueryRow(`INSERT INTO groups(name,description,sort_order)
-		VALUES(?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM groups)) RETURNING id`, name, desc).Scan(&id)
+	err := s.db.QueryRow(`INSERT INTO groups(name,description,max_multiplier,sort_order)
+		VALUES(?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM groups)) RETURNING id`,
+		name, desc, maxMultiplier).Scan(&id)
 	return id, err
 }
 
@@ -251,6 +265,15 @@ func (s *Store) ReorderGroups(ids []int64) error {
 
 func (s *Store) UpdateGroup(id int64, name, desc string) error {
 	_, err := s.db.Exec(`UPDATE groups SET name=?, description=? WHERE id=?`, name, desc, id)
+	return err
+}
+
+func (s *Store) UpdateGroupWithMaxMultiplier(id int64, name, desc string, maxMultiplier *float64) error {
+	if !validMaxMultiplier(maxMultiplier) {
+		return fmt.Errorf("max multiplier must be greater than zero")
+	}
+	_, err := s.db.Exec(`UPDATE groups SET name=?,description=?,max_multiplier=? WHERE id=?`,
+		name, desc, maxMultiplier, id)
 	return err
 }
 
@@ -278,20 +301,29 @@ func (s *Store) DeleteGroup(id int64) error {
 // GroupEnabled 是该上游在本分组内的开关（group_upstreams.enabled）。
 // 两者皆为真才参与本组调度，见 ListEnabledByGroup。
 type Member struct {
-	UpstreamID   int64  `json:"upstream_id"`
-	Name         string `json:"name"`
-	BaseURL      string `json:"base_url"`
-	Protocol     string `json:"protocol"`
-	Enabled      bool   `json:"enabled"`       // 全局开关
-	GroupEnabled bool   `json:"group_enabled"` // 组内开关
-	Priority     int    `json:"priority"`
-	Weight       int    `json:"weight"`
-	ChannelProbe bool   `json:"channel_probe"` // 兼容旧数据
+	UpstreamID          int64    `json:"upstream_id"`
+	Name                string   `json:"name"`
+	BaseURL             string   `json:"base_url"`
+	Protocol            string   `json:"protocol"`
+	BillingType         string   `json:"billing_type"`
+	EffectiveMultiplier *float64 `json:"effective_multiplier,omitempty"`
+	MultiplierBlocked   bool     `json:"multiplier_blocked"`
+	Enabled             bool     `json:"enabled"`       // 全局开关
+	GroupEnabled        bool     `json:"group_enabled"` // 组内开关
+	Priority            int      `json:"priority"`
+	Weight              int      `json:"weight"`
+	ChannelProbe        bool     `json:"channel_probe"` // 兼容旧数据
 }
 
 func (s *Store) ListGroupMembers(groupID int64) ([]*Member, error) {
-	rows, err := s.db.Query(`SELECT u.id,u.name,u.base_url,u.protocol,u.enabled,gu.enabled,gu.priority,gu.weight,u.channel_probe
+	rows, err := s.db.Query(`SELECT u.id,u.name,u.base_url,u.protocol,u.billing_type,
+		COALESCE(bs.effective_multiplier,bs.group_multiplier),
+		CASE WHEN g.max_multiplier IS NOT NULL
+			AND COALESCE(bs.effective_multiplier,bs.group_multiplier)>g.max_multiplier THEN TRUE ELSE FALSE END,
+		u.enabled,gu.enabled,gu.priority,gu.weight,u.channel_probe
 		FROM upstreams u JOIN group_upstreams gu ON gu.upstream_id=u.id
+		JOIN groups g ON g.id=gu.group_id
+		LEFT JOIN upstream_billing_status bs ON bs.upstream_id=u.id
 		WHERE gu.group_id=? ORDER BY gu.priority ASC`, groupID)
 	if err != nil {
 		return nil, err
@@ -300,7 +332,9 @@ func (s *Store) ListGroupMembers(groupID int64) ([]*Member, error) {
 	var ms []*Member
 	for rows.Next() {
 		m := &Member{}
-		if err := rows.Scan(&m.UpstreamID, &m.Name, &m.BaseURL, &m.Protocol, &m.Enabled, &m.GroupEnabled, &m.Priority, &m.Weight, &m.ChannelProbe); err != nil {
+		if err := rows.Scan(&m.UpstreamID, &m.Name, &m.BaseURL, &m.Protocol, &m.BillingType,
+			&m.EffectiveMultiplier, &m.MultiplierBlocked, &m.Enabled, &m.GroupEnabled,
+			&m.Priority, &m.Weight, &m.ChannelProbe); err != nil {
 			return nil, err
 		}
 		ms = append(ms, m)

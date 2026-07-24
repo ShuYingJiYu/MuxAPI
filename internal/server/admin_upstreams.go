@@ -9,27 +9,30 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mirainya/muxapi/internal/billing"
 	"github.com/mirainya/muxapi/internal/store"
 	"github.com/mirainya/muxapi/internal/upstream"
 )
 
 // upstreamDTO 对外视图：api_key 脱敏，不回显完整凭证。
 type upstreamDTO struct {
-	ID           int64             `json:"id"`
-	Name         string            `json:"name"`
-	Source       string            `json:"source"`
-	PrimaryTagID int64             `json:"primary_tag_id"`
-	TagIDs       []int64           `json:"tag_ids"`
-	Tags         []upstream.Tag    `json:"tags"`
-	BaseURL      string            `json:"base_url"`
-	Proxy        string            `json:"proxy"`
-	Protocol     string            `json:"protocol"`
-	APIKey       string            `json:"api_key,omitempty"` // 输入用；输出时脱敏到 masked
-	Masked       string            `json:"masked,omitempty"`
-	Enabled      bool              `json:"enabled"`
-	ChannelProbe bool              `json:"channel_probe"`          // 兼容旧数据；熔断固定为渠道级
-	Health       healthView        `json:"health"`                 // 运行时健康（仅 GET 列表填充）
-	ModelHealth  []modelHealthView `json:"model_health,omitempty"` // 模型级健康（仅 GET 列表填充，无则省略）
+	ID           int64                `json:"id"`
+	Name         string               `json:"name"`
+	Source       string               `json:"source"`
+	PrimaryTagID int64                `json:"primary_tag_id"`
+	TagIDs       []int64              `json:"tag_ids"`
+	Tags         []upstream.Tag       `json:"tags"`
+	BaseURL      string               `json:"base_url"`
+	Proxy        string               `json:"proxy"`
+	Protocol     string               `json:"protocol"`
+	BillingType  string               `json:"billing_type"`
+	APIKey       string               `json:"api_key,omitempty"` // 输入用；输出时脱敏到 masked
+	Masked       string               `json:"masked,omitempty"`
+	Enabled      bool                 `json:"enabled"`
+	ChannelProbe bool                 `json:"channel_probe"`          // 兼容旧数据；熔断固定为渠道级
+	Health       healthView           `json:"health"`                 // 运行时健康（仅 GET 列表填充）
+	ModelHealth  []modelHealthView    `json:"model_health,omitempty"` // 模型级健康（仅 GET 列表填充，无则省略）
+	Billing      *store.BillingStatus `json:"billing,omitempty"`
 }
 
 func mask(key string) string {
@@ -48,15 +51,28 @@ func (s *Server) adminUpstreams(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		billingStates, err := s.store.ListBillingStatuses()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
 		out := make([]upstreamDTO, 0, len(list))
 		for _, u := range list {
-			out = append(out, upstreamDTO{
-				ID: u.ID, Name: u.Name, Source: u.Source, BaseURL: u.BaseURL, Proxy: u.Proxy, Protocol: u.Protocol,
+			item := upstreamDTO{
+				ID: u.ID, Name: u.Name, Source: u.Source, BaseURL: u.BaseURL, Proxy: u.Proxy, Protocol: u.Protocol, BillingType: u.BillingType,
 				PrimaryTagID: u.PrimaryTagID, TagIDs: u.TagIDs, Tags: u.Tags,
 				Masked: mask(u.APIKey), Enabled: u.Enabled, ChannelProbe: u.ChannelProbe,
 				Health:      toHealthView(s.health.Snapshot(u.ID), s.health.EffectiveState(u.ID)),
 				ModelHealth: toModelHealthViews(s.health.ModelStates(u.ID)),
-			})
+			}
+			if u.BillingType != upstream.BillingNone {
+				state, ok := billingStates[u.ID]
+				if !ok {
+					state = store.BillingStatus{UpstreamID: u.ID, Currency: "USD", Status: "pending"}
+				}
+				item.Billing = &state
+			}
+			out = append(out, item)
 		}
 		writeJSON(w, out)
 	case http.MethodPost:
@@ -103,6 +119,10 @@ func (s *Server) adminUpstreamItem(w http.ResponseWriter, r *http.Request) {
 		s.recoverUpstream(w, r, id)
 		return
 	}
+	if len(parts) == 3 && parts[1] == "billing" && parts[2] == "refresh" {
+		s.refreshUpstreamBilling(w, r, id)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "monitors" && r.Method == http.MethodPost { // 批量建监控
 		s.batchCreateMonitors(w, r, id)
 		return
@@ -129,6 +149,31 @@ func (s *Server) adminUpstreamItem(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", 405)
 	}
+}
+
+func (s *Server) refreshUpstreamBilling(w http.ResponseWriter, r *http.Request, id int64) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.billingMgr == nil {
+		http.Error(w, "billing manager is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	state, err := s.billingMgr.Refresh(r.Context(), id)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "upstream not found", http.StatusNotFound)
+		return
+	}
+	if errors.Is(err, billing.ErrBillingDisabled) {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err != nil && state.UpstreamID == 0 {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, state)
 }
 
 // recoverUpstream clears only the in-memory channel breaker. Historical
