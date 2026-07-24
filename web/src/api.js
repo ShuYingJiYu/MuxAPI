@@ -104,6 +104,7 @@ export const api = {
   reorderUpstreams: ids => req('POST', '/upstreams/reorder', { ids }),
   testUpstream: id => req('GET', `/upstreams/${id}/models`),
   recoverUpstream: id => req('POST', `/upstreams/${id}/recover`),
+  recoverUpstreamModel: (id, model) => req('POST', `/upstreams/${id}/models/recover`, { model }),
   refreshUpstreamBilling: id => req('POST', `/upstreams/${id}/billing/refresh`),
   createMonitorsBatch: (id, payload) => req('POST', `/upstreams/${id}/monitors`, payload),
   // 管理标签

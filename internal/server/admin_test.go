@@ -378,6 +378,50 @@ func TestRecoverUpstreamAPI(t *testing.T) {
 	}
 }
 
+func TestRecoverUpstreamModelAPI(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	hm := health.New(1, time.Hour)
+	sched := scheduler.New(func(int64) []*upstream.Upstream { return nil }, hm)
+	const token = "admin-tok"
+	ts := httptest.NewServer(New(forward.New(sched, hm, 1), token, st, hm, monitor.New(st), nil, 32<<20).Handler())
+	defer ts.Close()
+
+	item := &upstream.Upstream{Name: "relay", BaseURL: "https://api.example.com", Enabled: true}
+	if err := st.Create(item); err != nil {
+		t.Fatal(err)
+	}
+	hm.MarkModelUnsupported(item.ID, "codex-auto-review")
+	if hm.IsAvailable(item.ID, "codex-auto-review") {
+		t.Fatal("precondition model should be temporarily excluded")
+	}
+
+	resp := adminReq(t, http.MethodPost,
+		ts.URL+"/admin/upstreams/"+itoa(item.ID)+"/models/recover", token,
+		`{"model":"codex-auto-review"}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent || !hm.IsAvailable(item.ID, "codex-auto-review") {
+		t.Fatalf("model recover returned %d, available=%v", resp.StatusCode,
+			hm.IsAvailable(item.ID, "codex-auto-review"))
+	}
+
+	bad := adminReq(t, http.MethodPost,
+		ts.URL+"/admin/upstreams/"+itoa(item.ID)+"/models/recover", token, `{"model":""}`)
+	bad.Body.Close()
+	if bad.StatusCode != http.StatusBadRequest {
+		t.Fatalf("empty model returned %d", bad.StatusCode)
+	}
+	missing := adminReq(t, http.MethodPost,
+		ts.URL+"/admin/upstreams/999/models/recover", token, `{"model":"gpt"}`)
+	missing.Body.Close()
+	if missing.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing upstream returned %d", missing.StatusCode)
+	}
+}
+
 func TestTagAPIValidatesAndUpdates(t *testing.T) {
 	ts, st, tok := newAdminTestServer(t)
 	bad := adminReq(t, http.MethodPost, ts.URL+"/admin/tags", tok, `{"name":"","color":"orange"}`)

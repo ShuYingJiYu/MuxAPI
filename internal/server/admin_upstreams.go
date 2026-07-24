@@ -111,6 +111,10 @@ func (s *Server) adminUpstreamItem(w http.ResponseWriter, r *http.Request) {
 		s.testUpstream(w, r, id)
 		return
 	}
+	if len(parts) == 3 && parts[1] == "models" && parts[2] == "recover" {
+		s.recoverUpstreamModel(w, r, id)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "test" { // 真实对话测试(SSE流式回显)
 		s.testUpstreamChat(w, r, id)
 		return
@@ -192,6 +196,35 @@ func (s *Server) recoverUpstream(w http.ResponseWriter, r *http.Request, id int6
 	}
 	s.health.ResetCircuit(id)
 	writeJSON(w, toHealthView(s.health.Snapshot(id), s.health.EffectiveState(id)))
+}
+
+// recoverUpstreamModel clears one temporary model capability exclusion.
+func (s *Server) recoverUpstreamModel(w http.ResponseWriter, r *http.Request, id int64) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, err := s.store.Get(id); errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "upstream not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var input struct {
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, "bad request body", http.StatusBadRequest)
+		return
+	}
+	input.Model = strings.TrimSpace(input.Model)
+	if input.Model == "" || len([]rune(input.Model)) > 256 {
+		http.Error(w, "model must be 1-256 characters", http.StatusBadRequest)
+		return
+	}
+	s.health.MarkModelSupported(id, input.Model)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) batchUpdateUpstreams(w http.ResponseWriter, r *http.Request) {

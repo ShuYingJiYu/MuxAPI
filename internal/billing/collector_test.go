@@ -41,6 +41,30 @@ func TestFetchSub2API(t *testing.T) {
 	}
 }
 
+func TestFetchSub2APIPreservesNegativeBalance(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/usage":
+			w.Write([]byte(`{"balance":-1.25,"remaining":-1.25,"unit":"USD","isValid":false}`))
+		case "/v1/sub2api/billing":
+			w.Write([]byte(`{"object":"sub2api.key_billing","group_rate_multiplier":0.2,"effective_rate_multiplier":0.2}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	result, err := Fetch(context.Background(), &upstream.Upstream{
+		BaseURL: server.URL, APIKey: "sk-test", BillingType: upstream.BillingSub2API,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Unlimited || result.Remaining == nil || *result.Remaining != -1.25 {
+		t.Fatalf("negative Sub2API balance must remain visible: %+v", result)
+	}
+}
+
 func TestFetchNewAPI(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

@@ -33,6 +33,7 @@ async function loadTags() { tags.value = (await api.tags()) || [] }
 // 用 Set 记录正在探测的卡片 id，支持多卡并发互不串台
 const probing = reactive(new Set())
 const recoveringUpstreams = reactive(new Set())
+const recoveringModels = reactive(new Set())
 const refreshingBilling = reactive(new Set())
 async function probeOne(m) {
   probing.add(m.id)
@@ -57,7 +58,7 @@ async function loadMembers(gid) {
   const data = (await api.members(gid)) || []
   if (ep === loadEpoch) members.value = data
 }
-const mhTitle = mh => mh.model + ' · 当前渠道暂不支持，5 分钟后重新尝试'
+const mhTitle = mh => mh.model + ' · 当前渠道暂不支持；点击立即恢复'
 async function loadDetail(gid) {
   const ep = loadEpoch
   await loadMembers(gid)
@@ -186,13 +187,16 @@ function billingAmount(item) {
   if (state?.unlimited) return '无限额度'
   if (state?.remaining == null) return '余额 —'
   const currency = state.currency || 'USD'
+  const amount = Number(state.remaining)
   try {
-    return new Intl.NumberFormat('zh-CN', {
+    const formatted = new Intl.NumberFormat('zh-CN', {
       style: 'currency', currency, currencyDisplay: 'narrowSymbol',
       minimumFractionDigits: 2, maximumFractionDigits: 4,
-    }).format(Number(state.remaining))
+    }).format(Math.abs(amount))
+    return amount < 0 ? `欠费 ${formatted}` : formatted
   } catch {
-    return `${Number(state.remaining).toFixed(4)} ${currency}`
+    const formatted = `${Math.abs(amount).toFixed(4)} ${currency}`
+    return amount < 0 ? `欠费 ${formatted}` : formatted
   }
 }
 function billingMultiplier(item) {
@@ -334,6 +338,21 @@ async function recoverUpstream(item) {
     flash(`已恢复「${item.name || item.upstream_name || ('#' + id)}」`)
   } finally {
     recoveringUpstreams.delete(id)
+  }
+}
+
+async function recoverUpstreamModel(item, modelHealth) {
+  const id = Number(item.id || item.upstream_id)
+  const model = String(modelHealth?.model || '').trim()
+  const key = `${id}:${model}`
+  if (!id || !model || recoveringModels.has(key)) return
+  recoveringModels.add(key)
+  try {
+    await api.recoverUpstreamModel(id, model)
+    item.model_health = (item.model_health || []).filter(entry => entry.model !== model)
+    flash(`已恢复「${model}」`)
+  } finally {
+    recoveringModels.delete(key)
   }
 }
 
@@ -1122,7 +1141,7 @@ function logout() {
                   <td>
                     <span class="state-badge" :class="rtClass(m.health)">{{ m.enabled && m.group_enabled ? rtLabel(m.health) : '已停用' }}</span>
                     <div v-if="visibleDots(m).length" class="model-dots">
-                      <span v-for="mh in visibleDots(m)" :key="mh.model" class="model-dot" :class="mhClass(mh)" :title="mhTitle(mh)">{{ mh.model }}</span>
+                      <button v-for="mh in visibleDots(m)" :key="mh.model" type="button" class="model-dot model-dot-action" :class="mhClass(mh)" :title="mhTitle(mh)" :disabled="recoveringModels.has(`${m.upstream_id}:${mh.model}`)" @click="guard(() => recoverUpstreamModel(m, mh))">{{ mh.model }}</button>
                     </div>
                   </td>
                   <td>{{ rtRate(m.health) }}</td>
@@ -1227,7 +1246,7 @@ function logout() {
                       <td class="billing-cell">
                         <span v-if="!u.billing_type || u.billing_type === 'none'" class="tag-empty">未采集</span>
                         <div v-else class="billing-summary" :class="`billing-${billingStatusClass(u)}`" :title="billingTitle(u)">
-                          <div class="billing-values"><strong>{{ billingAmount(u) }}</strong><span>{{ billingMultiplier(u) }}</span><button class="icon-btn billing-refresh" title="刷新计费数据" :disabled="refreshingBilling.has(u.id)" @click="guard(() => refreshUpstreamBilling(u))"><Icon name="refresh" :size="14" /></button></div>
+                          <div class="billing-values"><strong :class="{ 'billing-debt': Number(u.billing?.remaining) < 0 }">{{ billingAmount(u) }}</strong><span>{{ billingMultiplier(u) }}</span><button class="icon-btn billing-refresh" title="刷新计费数据" :disabled="refreshingBilling.has(u.id)" @click="guard(() => refreshUpstreamBilling(u))"><Icon name="refresh" :size="14" /></button></div>
                           <small><i></i>{{ billingMeta(u) }}</small>
                           <div v-if="u.billing?.audit" class="billing-audit" :class="`billing-audit-${u.billing.audit.status}`">{{ billingAuditText(u) }}</div>
                           <div v-if="billingPricingText(u)" class="billing-pricing">{{ billingPricingText(u) }}</div>

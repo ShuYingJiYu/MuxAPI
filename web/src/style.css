@@ -153,6 +153,7 @@ svg { display: block; flex-shrink: 0; }
 .billing-summary { min-width: 0; }
 .billing-values { height: 23px; display: flex; align-items: center; gap: 7px; white-space: nowrap; }
 .billing-values strong { color: var(--g900); font-size: 12px; font-variant-numeric: tabular-nums; }
+.billing-values strong.billing-debt { color: var(--red); }
 .billing-values > span { color: var(--p700); font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .billing-values .billing-refresh { width: 24px; height: 24px; margin-left: auto; }
 .billing-values .billing-refresh:disabled svg { animation: spin 1s linear infinite; }
@@ -414,6 +415,9 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .model-dot.half::before { background: var(--amber); }
 .model-dot.open::before { background: var(--red); }
 .model-dot.nodata::before { background: var(--g300); }
+.model-dot-action { border: 0; font-family: inherit; cursor: pointer; }
+.model-dot-action:hover, .model-dot-action:focus-visible { color: var(--red); background: #fff0f2; outline: 1px solid #ffc4ce; }
+.model-dot-action:disabled { opacity: .55; cursor: wait; }
 
 .hint { color: var(--g500); font-size: 13px; margin: 14px 0; }
 

@@ -116,10 +116,6 @@ func fetchSub2API(ctx context.Context, item *upstream.Upstream) (Result, error) 
 	if remaining == nil {
 		remaining = usage.Balance
 	}
-	unlimited := remaining != nil && *remaining < 0
-	if unlimited {
-		remaining = nil
-	}
 	observed := time.Now()
 	if parsed, err := time.Parse(time.RFC3339Nano, provider.ObservedAt); err == nil {
 		observed = parsed
@@ -129,7 +125,7 @@ func fetchSub2API(ctx context.Context, item *upstream.Upstream) (Result, error) 
 		currency = "USD"
 	}
 	return Result{
-		Currency: currency, Remaining: remaining, Unlimited: unlimited,
+		Currency: currency, Remaining: remaining,
 		GroupMultiplier:     floatPtr(provider.GroupRateMultiplier),
 		EffectiveMultiplier: floatPtr(provider.EffectiveRateMultiplier),
 		ReportedListCost:    usage.Usage.Total.Cost, ReportedActualCost: usage.Usage.Total.ActualCost,
