@@ -150,6 +150,7 @@ func IsErrorPayload(body []byte) bool {
 }
 
 // BuildRequest 构建发往上游的请求：黑名单透传客户端请求头（保留 User-Agent/x-stainless-* 等），
+// 由 Go Transport 管理响应压缩，确保转发层能审计解压后的 SSE。
 // 仅覆盖凭证为上游 key、重算 Content-Length。URL = TrimSuffix(base_url,"/") + 客户端原始路径(path)。
 func (u *Upstream) BuildRequest(method, path string, body io.Reader, clientHeader http.Header) (*http.Request, error) {
 	url := strings.TrimSuffix(u.BaseURL, "/") + path
@@ -158,7 +159,7 @@ func (u *Upstream) BuildRequest(method, path string, body io.Reader, clientHeade
 		return nil, err
 	}
 	for k, vs := range clientHeader { // 全量透传客户端请求头
-		if isHopByHopHeader(k) {
+		if isHopByHopHeader(k) || strings.EqualFold(k, "Accept-Encoding") {
 			continue
 		}
 		req.Header[k] = vs

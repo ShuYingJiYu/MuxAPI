@@ -3,6 +3,7 @@ package forward
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,39 @@ import (
 	"github.com/mirainya/muxapi/internal/scheduler"
 	"github.com/mirainya/muxapi/internal/upstream"
 )
+
+func TestForwardAuditsCompressedCodexSSE(t *testing.T) {
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept-Encoding"); got != "gzip" {
+			t.Errorf("transport should negotiate gzip itself, got %q", got)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Encoding", "gzip")
+		compressed := gzip.NewWriter(w)
+		_, _ = io.WriteString(compressed, "event: response.completed\n")
+		_, _ = io.WriteString(compressed, `data: {"type":"response.completed","response":{"usage":{"input_tokens":4391,"output_tokens":5,"input_tokens_details":{"cached_tokens":3385}}}}`+"\n\n")
+		_ = compressed.Close()
+	}))
+	defer upstreamServer.Close()
+
+	ups := []*upstream.Upstream{{ID: 1, BaseURL: upstreamServer.URL, APIKey: "key", Protocol: "codex", Priority: 1, Weight: 1}}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 1)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
+	request.Header.Set("Accept-Encoding", "gzip, deflate, br")
+
+	result := fwd.Forward(recorder, request, []byte(`{"model":"gpt-5.6-sol","stream":true}`), 1, "")
+	if result.InputTokens != 4391 || result.OutputTokens != 5 || result.CachedTokens != 3385 {
+		t.Fatalf("compressed SSE usage was not audited: %+v", result)
+	}
+	if !result.StreamCompleted || result.LastEvent != "response.completed" {
+		t.Fatalf("compressed SSE completion was not audited: %+v", result)
+	}
+	if encoding := recorder.Header().Get("Content-Encoding"); encoding != "" {
+		t.Fatalf("decoded response must not retain Content-Encoding: %q", encoding)
+	}
+}
 
 // 验证 SSE 流式逐行透传不丢事件、不破坏格式。
 func TestForwardSSEStreaming(t *testing.T) {

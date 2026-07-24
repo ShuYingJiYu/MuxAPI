@@ -2,8 +2,27 @@ package upstream
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 )
+
+func TestBuildRequestLetsTransportManageCompression(t *testing.T) {
+	u := &Upstream{BaseURL: "https://example.com", APIKey: "upstream-key"}
+	headers := http.Header{
+		"Accept-Encoding": []string{"gzip, deflate, br"},
+		"User-Agent":      []string{"Codex Desktop"},
+	}
+	req, err := u.BuildRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`), headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := req.Header.Get("Accept-Encoding"); got != "" {
+		t.Fatalf("client compression header must not reach upstream request: %q", got)
+	}
+	if got := req.Header.Get("User-Agent"); got != "Codex Desktop" {
+		t.Fatalf("ordinary client headers must remain forwarded: %q", got)
+	}
+}
 
 func TestIsFailureStatus(t *testing.T) {
 	// 应触发故障切换/熔断的状态码
