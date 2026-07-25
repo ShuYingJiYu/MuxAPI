@@ -228,6 +228,9 @@ type Exchange struct {
 
 	registry *sdktranslator.Registry
 	state    any
+	// sdkSource 是查 SDK 转换表时使用的来源协议，可能与 Source 不同（见 resolveSDKSource）。
+	// Source 始终保留真实客户端协议，透传判定和错误回写都依赖它。
+	sdkSource Format
 }
 
 // NewExchange 校验双向转换能力，并从原始客户端正文生成上游请求。
@@ -259,6 +262,7 @@ func NewExchange(source, target Format, model string, stream bool, original []by
 		exchange.UpstreamRequest = append([]byte(nil), original...)
 		return exchange, nil
 	}
+	exchange.sdkSource = resolveSDKSource(exchange.registry, source, target)
 	from, to := exchange.sdkFormats()
 	if !exchange.registry.HasRequestTransformer(from, to) {
 		return nil, fmt.Errorf("%w: %s -> %s", ErrUnsupported, source, target)
@@ -270,12 +274,33 @@ func NewExchange(source, target Format, model string, stream bool, original []by
 	} else if !exchange.registry.HasNonStreamResponseTransformer(from, to) {
 		return nil, fmt.Errorf("%w: response %s <- %s", ErrUnsupported, source, target)
 	}
-	translated := exchange.registry.TranslateRequest(from, to, model, normalizeResponsesInput(source, original), exchange.UpstreamStream)
+	translated := exchange.registry.TranslateRequest(from, to, model, normalizeResponsesInput(exchange.sdkSource, original), exchange.UpstreamStream)
 	if !json.Valid(translated) {
 		return nil, fmt.Errorf("translate request %s -> %s: invalid JSON", source, target)
 	}
 	exchange.UpstreamRequest = translated
 	return exchange, nil
+}
+
+// resolveSDKSource 选出查 SDK 转换表时该用的来源协议。
+// SDK 只把 codex 注册为目标协议，从未注册为来源，所以 Codex CLI 的请求发往
+// Claude/OpenAI 渠道时查表必然落空。但 Codex 的请求体本身就是合法的 Responses
+// 形状（codex 专有字段只是额外键），而目标端翻译器都是从零构造上游请求、只读取
+// 自己认识的字段，多出来的键会被自然忽略，因此降级成 openai-response 是安全的。
+// 仅在「codex 直连不可用而降级后可用」时才降级，其余情况原样返回，
+// 避免把 codex -> codex 这类透传误变成翻译。
+func resolveSDKSource(registry *sdktranslator.Registry, source, target Format) Format {
+	if source != Codex {
+		return source
+	}
+	to := sdktranslator.FromString(string(target))
+	if registry.HasRequestTransformer(sdktranslator.FromString(string(Codex)), to) {
+		return source
+	}
+	if registry.HasRequestTransformer(sdktranslator.FromString(string(OpenAIResponses)), to) {
+		return OpenAIResponses
+	}
+	return source
 }
 
 // normalizeResponsesInput 把 Responses 协议的 input 字符串简写展开成标准数组形式。
@@ -355,5 +380,9 @@ func (e *Exchange) TranslateStream(ctx context.Context, line []byte) (outputs []
 }
 
 func (e *Exchange) sdkFormats() (sdktranslator.Format, sdktranslator.Format) {
-	return sdktranslator.FromString(string(e.Source)), sdktranslator.FromString(string(e.Target))
+	source := e.sdkSource
+	if source == "" {
+		source = e.Source
+	}
+	return sdktranslator.FromString(string(source)), sdktranslator.FromString(string(e.Target))
 }

@@ -80,6 +80,80 @@ func TestNewExchangeNormalizesStringInputForEveryTarget(t *testing.T) {
 	}
 }
 
+// codexRequest 是 Codex CLI 真实请求体的最小形状：数组 input 加 codex 专有字段。
+const codexRequest = `{"model":"m","input":[{"type":"message","role":"user",` +
+	`"content":[{"type":"input_text","text":"hello"}]}],"stream":true,` +
+	`"store":false,"parallel_tool_calls":true,"include":["reasoning.encrypted_content"]}`
+
+// SDK 没有注册 codex 作为来源，但 Codex CLI 的请求体本身就是合法 Responses 形状，
+// 因此查表时降级成 openai-response，让 Codex 客户端也能落到 Claude/OpenAI 渠道。
+func TestNewExchangeDegradesCodexSourceToResponses(t *testing.T) {
+	for _, target := range []Format{Claude, OpenAI} {
+		exchange, err := NewExchange(Codex, target, "m", true, []byte(codexRequest))
+		if err != nil {
+			t.Fatalf("target %s: %v", target, err)
+		}
+		if !strings.Contains(string(exchange.UpstreamRequest), "hello") {
+			t.Fatalf("target %s dropped the prompt: %s", target, exchange.UpstreamRequest)
+		}
+		// codex 专有字段不应泄漏到上游请求里。
+		// 注意 parallel_tool_calls 不在此列：它是 OpenAI Chat Completions 的合法参数，
+		// 目标翻译器会有意映射它，透传过去反映的是客户端真实意图。
+		for _, leaked := range []string{"reasoning.encrypted_content", `"store"`} {
+			if strings.Contains(string(exchange.UpstreamRequest), leaked) {
+				t.Fatalf("target %s leaked codex field %s: %s", target, leaked, exchange.UpstreamRequest)
+			}
+		}
+		// Source 必须保持真实客户端协议，响应方向才能回到 Responses 形状。
+		if exchange.Source != Codex {
+			t.Fatalf("target %s mutated Source to %s", target, exchange.Source)
+		}
+	}
+}
+
+// Codex 客户端消费的是 Responses 形状的 SSE，所以响应方向必须把 Claude 事件
+// 还原成 response.* 事件，否则请求通了客户端也读不懂。
+func TestExchangeTranslatesClaudeStreamBackForCodexSource(t *testing.T) {
+	exchange, err := NewExchange(Codex, Claude, "m", true, []byte(codexRequest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, err := exchange.TranslateStream(context.Background(),
+		[]byte(`data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":2}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stringJoin(start), "response.created") {
+		t.Fatalf("expected Responses-shaped start events, got %q", stringJoin(start))
+	}
+	delta, err := exchange.TranslateStream(context.Background(),
+		[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"OK"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := stringJoin(delta)
+	if !strings.Contains(joined, "OK") {
+		t.Fatalf("delta lost the text: %q", joined)
+	}
+	if !strings.Contains(joined, "response.output_text.delta") {
+		t.Fatalf("delta is not Responses-shaped: %q", joined)
+	}
+}
+
+// 降级只用于查表，绝不能把 codex -> codex 从透传变成翻译。
+func TestNewExchangeKeepsCodexToCodexPassthrough(t *testing.T) {
+	exchange, err := NewExchange(Codex, Codex, "m", true, []byte(codexRequest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exchange.Translated() {
+		t.Fatal("codex -> codex must stay passthrough")
+	}
+	if string(exchange.UpstreamRequest) != codexRequest {
+		t.Fatalf("codex -> codex altered the body: %s", exchange.UpstreamRequest)
+	}
+}
+
 func TestNewExchangeRejectsMissingPair(t *testing.T) {
 	_, err := NewExchange(Claude, OpenAIResponses, "model", false, []byte(`{"model":"model","messages":[]}`))
 	if !errors.Is(err, ErrUnsupported) {
