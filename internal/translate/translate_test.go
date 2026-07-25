@@ -154,6 +154,57 @@ func TestNewExchangeKeepsCodexToCodexPassthrough(t *testing.T) {
 	}
 }
 
+// Codex Desktop 通过 additional_tools input 项传工具定义，而不是顶层 tools 字段。
+// Claude 方向的翻译器只读顶层 tools，不归一化的话工具会被静默丢弃，
+// 模型收不到任何工具，只能自述意图后放弃。
+const codexToolsViaAdditional = `{"model":"m","input":[` +
+	`{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"read_file",` +
+	`"description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]},` +
+	`{"type":"message","role":"user","content":[{"type":"input_text","text":"list my desktop"}]}` +
+	`],"stream":true}`
+
+func TestNewExchangeKeepsAdditionalToolsForEveryTarget(t *testing.T) {
+	for _, source := range []Format{Codex, OpenAIResponses} {
+		for _, target := range []Format{Claude, OpenAI} {
+			exchange, err := NewExchange(source, target, "m", true, []byte(codexToolsViaAdditional))
+			if err != nil {
+				t.Fatalf("%s -> %s: %v", source, target, err)
+			}
+			got := string(exchange.UpstreamRequest)
+			if !strings.Contains(got, "read_file") {
+				t.Fatalf("%s -> %s dropped the tool: %s", source, target, got)
+			}
+			// additional_tools 项必须移出 input，否则会被当成一条普通消息发给模型。
+			if strings.Contains(got, "additional_tools") {
+				t.Fatalf("%s -> %s leaked the additional_tools item: %s", source, target, got)
+			}
+			if !strings.Contains(got, "list my desktop") {
+				t.Fatalf("%s -> %s lost the user message: %s", source, target, got)
+			}
+		}
+	}
+}
+
+// 两个来源同时有工具时必须合并，不能相互覆盖。
+func TestNewExchangeMergesBothToolSources(t *testing.T) {
+	body := `{"model":"m","input":[` +
+		`{"type":"additional_tools","tools":[{"type":"function","name":"from_additional",` +
+		`"parameters":{"type":"object","properties":{}}}]},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}` +
+		`],"tools":[{"type":"function","name":"from_toplevel",` +
+		`"parameters":{"type":"object","properties":{}}}],"stream":true}`
+	exchange, err := NewExchange(Codex, Claude, "m", true, []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(exchange.UpstreamRequest)
+	for _, want := range []string{"from_toplevel", "from_additional"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("merged tools missing %q: %s", want, got)
+		}
+	}
+}
+
 func TestNewExchangeRejectsMissingPair(t *testing.T) {
 	_, err := NewExchange(Claude, OpenAIResponses, "model", false, []byte(`{"model":"model","messages":[]}`))
 	if !errors.Is(err, ErrUnsupported) {

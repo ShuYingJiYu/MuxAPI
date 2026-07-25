@@ -274,7 +274,11 @@ func NewExchange(source, target Format, model string, stream bool, original []by
 	} else if !exchange.registry.HasNonStreamResponseTransformer(from, to) {
 		return nil, fmt.Errorf("%w: response %s <- %s", ErrUnsupported, source, target)
 	}
-	translated := exchange.registry.TranslateRequest(from, to, model, normalizeResponsesInput(exchange.sdkSource, original), exchange.UpstreamStream)
+	// 归一化顺序：先展开 input 字符串简写，再把 additional_tools 搬到顶层 tools。
+	// 后者依赖 input 已是数组形式。
+	upstreamBody := normalizeResponsesInput(exchange.sdkSource, original)
+	upstreamBody = hoistAdditionalTools(exchange.sdkSource, upstreamBody)
+	translated := exchange.registry.TranslateRequest(from, to, model, upstreamBody, exchange.UpstreamStream)
 	if !json.Valid(translated) {
 		return nil, fmt.Errorf("translate request %s -> %s: invalid JSON", source, target)
 	}
@@ -301,6 +305,74 @@ func resolveSDKSource(registry *sdktranslator.Registry, source, target Format) F
 		return OpenAIResponses
 	}
 	return source
+}
+
+// hoistAdditionalTools 把 Codex Desktop 的 additional_tools input 项搬到顶层 tools。
+// Codex Desktop（Responses Lite）用 input 里的 additional_tools 项携带工具定义，
+// 而 Claude 方向的翻译器只读顶层 tools，不搬运工具就会被静默丢弃 —— 模型收到一个
+// 没有工具的请求，只能自述意图后放弃。openai 方向自己合并了两个来源，搬运后结果
+// 等价（同一个转换函数、同一份扁平列表），所以这里对两个目标统一处理。
+// 顶层已有的工具排在前面，两个来源合并而非覆盖；搬空后的 additional_tools 项
+// 必须从 input 移除，否则会被当成一条普通消息发给模型。
+func hoistAdditionalTools(source Format, original []byte) []byte {
+	if source != OpenAIResponses && source != Codex {
+		return original
+	}
+	var body map[string]json.RawMessage
+	if json.Unmarshal(original, &body) != nil {
+		return original
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(body["input"], &items) != nil {
+		return original
+	}
+	var hoisted []json.RawMessage
+	kept := make([]json.RawMessage, 0, len(items))
+	for _, item := range items {
+		var probe struct {
+			Type  string            `json:"type"`
+			Tools []json.RawMessage `json:"tools"`
+		}
+		if json.Unmarshal(item, &probe) != nil || strings.TrimSpace(probe.Type) != "additional_tools" {
+			kept = append(kept, item)
+			continue
+		}
+		hoisted = append(hoisted, probe.Tools...)
+	}
+	if len(hoisted) == 0 {
+		return original
+	}
+	merged := make([]json.RawMessage, 0, len(hoisted))
+	if raw, ok := body["tools"]; ok {
+		var existing []json.RawMessage
+		if json.Unmarshal(raw, &existing) == nil {
+			merged = append(merged, existing...)
+		}
+	}
+	merged = append(merged, hoisted...)
+	rewritten, err := setJSONField(original, "tools", merged)
+	if err != nil {
+		return original
+	}
+	rewritten, err = setJSONField(rewritten, "input", kept)
+	if err != nil {
+		return original
+	}
+	return rewritten
+}
+
+// setJSONField 用 value 替换 body 顶层的 field，其余字段保持原始字节不变。
+func setJSONField(body []byte, field string, value any) ([]byte, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(body, &object); err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	object[field] = encoded
+	return json.Marshal(object)
 }
 
 // normalizeResponsesInput 把 Responses 协议的 input 字符串简写展开成标准数组形式。
