@@ -226,7 +226,15 @@ const billingAuditReasons = {
   model_price_unavailable: '部分模型缺少 LiteLLM 价格',
   actual_cost_unavailable: '平台未提供实际费用累计值或余额变化',
   actual_cost_exceeded: '实际扣费超出「平台自报原价 × 倍率」容差',
+  actual_cost_exceeded_local_basis: '实际扣费高于本地价目估算，但平台未提供自报原价，无法据此判定多收',
+  multiplier_changed: '窗口内倍率有调整，偏差含调整时点落差，不作超收判定',
   catalog_cost_exceeded: '平台自报原价明显高于公共价目表估算',
+}
+// 本地价目估算为何不可信。只影响价目核对轨道，不阻塞计费核对。
+const billingLocalPricingReasons = {
+  pricing_catalog_unavailable: 'LiteLLM 价格目录尚不可用',
+  request_usage_incomplete: '部分请求缺少 Usage',
+  model_price_unavailable: '部分模型缺少 LiteLLM 价格',
 }
 // 计费核对基准：reported 用平台自报原价(不受本地价表漂移影响)；
 // local 是平台未提供原价时的降级，结论会被价表差异污染。
@@ -247,9 +255,11 @@ function billingAuditText(item) {
   const audit = item.billing?.audit
   if (!audit) return ''
   if (audit.status === 'pending') return '费用比对 · 待采集'
-  if (audit.theoretical_cost == null) return `本地理论 — · 实际 ${billingCost(item, audit.actual_cost)}`
+  if (audit.theoretical_cost == null) return `理论 — · 实际 ${billingCost(item, audit.actual_cost)}`
   const prefix = audit.status === 'warning' ? '异常 · ' : ''
-  return `${prefix}本地 ${billingCost(item, audit.theoretical_cost)} · 实际 ${billingCost(item, audit.actual_cost)}`
+  // 标签跟随实际基准：reported=平台自报原价，local=本地价目表（降级）
+  const label = audit.billing_basis === 'local' ? '理论(本地)' : '理论'
+  return `${prefix}${label} ${billingCost(item, audit.theoretical_cost)} · 实际 ${billingCost(item, audit.actual_cost)}`
 }
 function billingPricingText(item) {
   const audit = item.billing?.audit
@@ -257,7 +267,8 @@ function billingPricingText(item) {
   const parts = []
   if (audit.pricing_source) parts.push(audit.pricing_source)
   if (audit.price_coverage != null) parts.push(`覆盖 ${(Number(audit.price_coverage) * 100).toFixed(0)}%`)
-  if (audit.status === 'unavailable' && audit.reason) parts.push(billingAuditReasons[audit.reason] || audit.reason)
+  // 有 reason 就显示：unavailable 是阻塞原因，ok 也可能带保留说明
+  if (audit.reason) parts.push(billingAuditReasons[audit.reason] || audit.reason)
   return parts.join(' · ')
 }
 // 区间比对：默认 24h。单个采集间隔的结论会被下一轮覆盖，且样本量太小，
@@ -317,6 +328,7 @@ function billingDetailRows(item) {
     ? `${audit.expected_multiplier}${audit.multiplier_changed ? '（区间内有调整）' : ''}` : '')
   push('实测倍率', audit.observed_multiplier != null ? Number(audit.observed_multiplier).toFixed(4) : '')
   push('比对基准', billingBasisLabels[audit.billing_basis] || '')
+  push('本地估算受限', billingLocalPricingReasons[audit.local_pricing_reason] || audit.local_pricing_reason || '')
   push('价格覆盖', audit.price_coverage != null
     ? `${audit.priced_request_count || 0}/${audit.request_count || 0}（${(Number(audit.price_coverage) * 100).toFixed(1)}%）` : '')
   push('缺少 Usage', audit.missing_usage_count ? `${audit.missing_usage_count} 条成功请求` : '')

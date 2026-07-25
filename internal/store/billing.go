@@ -35,6 +35,7 @@ type BillingAudit struct {
 	ListCost           *float64 `json:"list_cost,omitempty"`
 	ReportedListCost   *float64 `json:"reported_list_cost,omitempty"`
 	BillingBasis       string   `json:"billing_basis,omitempty"`
+	LocalPricingReason string   `json:"local_pricing_reason,omitempty"`
 	CatalogDeviation   *float64 `json:"catalog_deviation,omitempty"`
 	CatalogRate        *float64 `json:"catalog_deviation_rate,omitempty"`
 	TheoreticalCost    *float64 `json:"theoretical_cost,omitempty"`
@@ -52,6 +53,10 @@ type BillingAudit struct {
 	PricedRequestCount int64    `json:"priced_request_count,omitempty"`
 	MissingUsageCount  int64    `json:"missing_usage_count,omitempty"`
 	MissingModels      []string `json:"missing_models,omitempty"`
+
+	// theoreticalPerPair 标记 TheoreticalCost 是否由逐对倍率累加而来。
+	// 仅在此情况下，倍率变动过的窗口其偏差才可用于判定超收。
+	theoreticalPerPair bool
 }
 
 // BillingStatus is the latest provider-reported billing state for one upstream.
@@ -280,6 +285,11 @@ func usageListCost(usage BillingWindowUsage, price ModelPricing) (float64, bool)
 		inputOK && outputOK && cacheReadOK && cacheWriteOK
 }
 
+// applyLocalPricing 用本地价目表估算窗口用量成本。
+//
+// 它只负责「算出能算的」并记录降级原因，不设置最终 Status —— 本地价目不完整
+// 只影响价目核对轨道，计费核对（实际扣费 vs 上游自报原价×倍率）完全不依赖它。
+// 早期版本在这里直接判 unavailable，导致上游账目明明精确吻合却什么结论都不给。
 func (s *Store) applyLocalPricing(audit *BillingAudit, upstreamID int64) error {
 	status, err := s.GetPricingCatalogStatus()
 	if err == nil {
@@ -317,22 +327,17 @@ func (s *Store) applyLocalPricing(audit *BillingAudit, upstreamID int64) error {
 		coverage := float64(audit.PricedRequestCount) / float64(audit.RequestCount)
 		audit.PriceCoverage = &coverage
 	}
-	if audit.RequestCount > 0 && (status.ModelCount == 0 || audit.PricingSource == "") {
-		audit.Status = "unavailable"
-		audit.Reason = "pricing_catalog_unavailable"
-		return nil
+	// 记录本地估算为何不可信；ListCost 保持 nil 让价目核对自动跳过。
+	switch {
+	case audit.RequestCount > 0 && (status.ModelCount == 0 || audit.PricingSource == ""):
+		audit.LocalPricingReason = "pricing_catalog_unavailable"
+	case audit.MissingUsageCount > 0:
+		audit.LocalPricingReason = "request_usage_incomplete"
+	case len(audit.MissingModels) > 0:
+		audit.LocalPricingReason = "model_price_unavailable"
+	default:
+		audit.ListCost = &listCost
 	}
-	if audit.MissingUsageCount > 0 {
-		audit.Status = "unavailable"
-		audit.Reason = "request_usage_incomplete"
-		return nil
-	}
-	if len(audit.MissingModels) > 0 {
-		audit.Status = "unavailable"
-		audit.Reason = "model_price_unavailable"
-		return nil
-	}
-	audit.ListCost = &listCost
 	return nil
 }
 
@@ -348,9 +353,6 @@ func (s *Store) billingAuditFromSnapshots(snapshots []BillingSnapshot) BillingAu
 	if err := s.applyLocalPricing(&audit, snapshots[0].UpstreamID); err != nil {
 		audit.Status = "unavailable"
 		audit.Reason = "pricing_query_failed"
-		return audit
-	}
-	if audit.Status == "unavailable" {
 		return audit
 	}
 	latestMultiplier := snapshotMultiplier(snapshots[0])

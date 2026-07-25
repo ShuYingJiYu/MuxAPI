@@ -100,9 +100,13 @@ type billingRangeTotals struct {
 	actualPairs   int
 	reported      float64
 	reportedPairs int
-	balanceSpent  float64
-	balancePairs  int
-	resetPairs    int
+	// theoretical 用**每对自己的倍率**累加。拿窗口末端单一倍率乘整窗累计原价，
+	// 会把窗口内的倍率调整整段计入偏差，产生纯粹的误报。
+	theoretical      float64
+	theoreticalPairs int
+	balanceSpent     float64
+	balancePairs     int
+	resetPairs       int
 }
 
 func accumulateBillingRange(snapshots []BillingSnapshot) billingRangeTotals {
@@ -120,6 +124,11 @@ func accumulateBillingRange(snapshots []BillingSnapshot) billingRangeTotals {
 		if delta, ok := billingCounterDelta(current.ReportedListCost, previous.ReportedListCost); ok && delta != nil {
 			totals.reported += *delta
 			totals.reportedPairs++
+			// 该区间生效的倍率取本对末端快照的值，与增量归属方式一致。
+			if rate := snapshotMultiplier(current); rate != nil {
+				totals.theoretical += *delta * *rate
+				totals.theoreticalPairs++
+			}
 		}
 
 		// 余额只累加下降部分；上升说明中途充值，跳过该对而不是记成负支出。
@@ -197,13 +206,17 @@ func (s *Store) BillingAuditRange(upstreamID int64, window BillingWindow, now ti
 		reported := totals.reported
 		audit.ReportedListCost = &reported
 	}
+	// 逐对倍率累加出的理论值优先于「单一倍率×整窗原价」，
+	// 否则窗口内的倍率调整会整段计入偏差。
+	if totals.theoreticalPairs > 0 && totals.theoreticalPairs == totals.reportedPairs {
+		theoretical := totals.theoretical
+		audit.TheoreticalCost = &theoretical
+		audit.theoreticalPerPair = true
+	}
 
 	if err := s.applyLocalPricing(&audit, upstreamID); err != nil {
 		audit.Status = "unavailable"
 		audit.Reason = "pricing_query_failed"
-		return audit, nil
-	}
-	if audit.Status == "unavailable" {
 		return audit, nil
 	}
 	evaluateBillingAudit(&audit, multiplier)
@@ -212,13 +225,17 @@ func (s *Store) BillingAuditRange(upstreamID int64, window BillingWindow, now ti
 
 // evaluateBillingAudit 执行双轨判定，是即时窗口与区间聚合共用的收尾。
 //
-// 轨道一（价目核对）：本地 ListCost 与上游自报原价的差距。这一项只说明两张
-// 价目表不一致，不代表上游多收，故只填数值、不触发告警。
+// 轨道一（价目核对）：本地 ListCost 与上游自报原价的差距。上游自报明显高于公共
+// 行情说明它挂牌价虚标——余额按虚标价扣，同样是真金白银的损失，故超阈值告警。
+// 仅在两侧都有非零估算时才判，否则无意义。
 //
 // 轨道二（计费核对）：ActualCost 与「基准×倍率」的差距。基准优先取上游自报原价
 // ——用上游自己的挂牌价算，结论不受本地价表漂移污染，这才是真正查倍率有没有被
-// 正确应用。上游不提供原价时（如 newAPI）降级用本地 ListCost，并把 BillingBasis
-// 标为 "local" 让调用方降低可信度。
+// 正确应用。上游不提供原价时（如 newAPI）降级用本地 ListCost，BillingBasis 标为
+// "local"：此时偏差可能只反映本地价表低估，故不升级为 warning，仅作提示。
+//
+// 关键约束：本地价目不完整（LocalPricingReason 非空）只影响轨道一，绝不能阻塞
+// 轨道二——上游自报原价与实际扣费都在手上时，账目对不对是能算清的。
 func evaluateBillingAudit(audit *BillingAudit, multiplier *float64) {
 	if multiplier == nil {
 		audit.Status = "unavailable"
@@ -226,20 +243,19 @@ func evaluateBillingAudit(audit *BillingAudit, multiplier *float64) {
 		return
 	}
 
-	// 轨道一：价目核对。上游自报原价与本地独立估算差太多，说明上游价目表与
-	// 公共价目表严重偏离——余额是按上游原价扣的，虚标同样是真金白银的损失，
-	// 故超过阈值必须告警，而非只填数值。
+	// 轨道一：价目核对。仅在两侧都有**非零**估算时才有意义 ——
+	// 本地为 0 通常是窗口内无请求或模型别名查不到价，不是上游虚标；
+	// 拿 0 去比会把任何上游消费都判成虚标。
 	catalogMismatch := false
-	if audit.ListCost != nil && audit.ReportedListCost != nil {
+	if audit.ListCost != nil && audit.ReportedListCost != nil &&
+		*audit.ListCost > 1e-9 && *audit.ReportedListCost > 1e-9 {
 		catalogDeviation := *audit.ReportedListCost - *audit.ListCost
 		audit.CatalogDeviation = &catalogDeviation
 		reference := math.Max(*audit.ListCost, *audit.ReportedListCost)
-		if reference > 1e-9 {
-			rate := catalogDeviation / reference
-			audit.CatalogRate = &rate
-			// 只在上游自报「高于」本地估算时告警；低于说明上游给了折扣价，不是问题。
-			catalogMismatch = rate > billingCatalogTolerance
-		}
+		rate := catalogDeviation / reference
+		audit.CatalogRate = &rate
+		// 只在上游自报「高于」本地估算时告警；低于说明上游给了折扣价，不是问题。
+		catalogMismatch = rate > billingCatalogTolerance
 	}
 
 	// 轨道二：选定计费基准。
@@ -252,13 +268,24 @@ func evaluateBillingAudit(audit *BillingAudit, multiplier *float64) {
 		basis = audit.ListCost
 		audit.BillingBasis = "local"
 	default:
+		// 两个基准都没有才真的无从比对。优先报本地价目的具体降级原因，
+		// 它比笼统的 pricing_catalog_unavailable 更能指向要修的东西。
 		audit.Status = "unavailable"
-		audit.Reason = "pricing_catalog_unavailable"
+		audit.Reason = audit.LocalPricingReason
+		if audit.Reason == "" {
+			audit.Reason = "pricing_catalog_unavailable"
+		}
 		return
 	}
 
 	theoretical := *basis * *multiplier
-	audit.TheoreticalCost = &theoretical
+	// 区间聚合已用逐对倍率算好理论值时以它为准：倍率在窗口内变动过的话，
+	// 单一倍率×整窗原价会把调整时点的落差整段计入偏差。
+	if audit.TheoreticalCost != nil {
+		theoretical = *audit.TheoreticalCost
+	} else {
+		audit.TheoreticalCost = &theoretical
+	}
 	if *basis > 1e-9 && audit.ActualCost != nil {
 		observed := *audit.ActualCost / *basis
 		audit.ObservedMultiplier = &observed
@@ -277,9 +304,22 @@ func evaluateBillingAudit(audit *BillingAudit, multiplier *float64) {
 	}
 	tolerance := math.Max(billingAuditAbsoluteTolerance, theoretical*billingAuditRelativeTolerance)
 	// 计费核对优先：它是「上游按自己的规则多收了」，比价表偏离更直接。
+	// 两种情况不升级为 warning，只保留说明：
+	//   basis=local —— 偏差可能只反映本地价表低估，不足以指控上游多收；
+	//   倍率变动过且理论值不是逐对算出的 —— 偏差来自倍率调整时点，不是超收。
 	if deviation > tolerance {
-		audit.Status = "warning"
-		audit.Reason = "actual_cost_exceeded"
+		trustworthy := audit.BillingBasis == "reported" && !perPairUnavailableWithChange(audit)
+		if trustworthy {
+			audit.Status = "warning"
+			audit.Reason = "actual_cost_exceeded"
+			return
+		}
+		audit.Status = "ok"
+		if audit.BillingBasis == "reported" {
+			audit.Reason = "multiplier_changed"
+		} else {
+			audit.Reason = "actual_cost_exceeded_local_basis"
+		}
 		return
 	}
 	if catalogMismatch {
@@ -289,4 +329,10 @@ func evaluateBillingAudit(audit *BillingAudit, multiplier *float64) {
 	}
 	audit.Status = "ok"
 	audit.Reason = ""
+}
+
+// perPairUnavailableWithChange 报告「倍率在窗口内变动过，但理论值只能用单一倍率
+// 估算」的情形——此时聚合比对不成立，偏差不可用于判定超收。
+func perPairUnavailableWithChange(audit *BillingAudit) bool {
+	return audit.MultiplierChanged && !audit.theoreticalPerPair
 }
