@@ -278,6 +278,10 @@ func NewExchange(source, target Format, model string, stream bool, original []by
 	// 后者依赖 input 已是数组形式。
 	upstreamBody := normalizeResponsesInput(exchange.sdkSource, original)
 	upstreamBody = hoistAdditionalTools(exchange.sdkSource, upstreamBody)
+	// Response translators also inspect the source request to restore tool kinds
+	// and namespaces. Keep the normalized source shape so definitions delivered
+	// through Codex Desktop's additional_tools remain visible on the way back.
+	exchange.OriginalRequest = append([]byte(nil), upstreamBody...)
 	translated := exchange.registry.TranslateRequest(from, to, model, upstreamBody, exchange.UpstreamStream)
 	if !json.Valid(translated) {
 		return nil, fmt.Errorf("translate request %s -> %s: invalid JSON", source, target)

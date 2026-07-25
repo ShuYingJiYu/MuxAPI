@@ -127,47 +127,42 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	// Stream
 	out, _ = sjson.SetBytes(out, "stream", stream)
 
-	// instructions -> as a leading message (use role user for Claude API compatibility)
-	instructionsText := ""
-	extractedFromSystem := false
+	// Responses instructions and developer/system input items belong in
+	// Claude's top-level system field. Treating them as user messages weakens
+	// their priority and makes tool-use constraints unreliable.
+	var systemParts []string
 	if instr := root.Get("instructions"); instr.Exists() && instr.Type == gjson.String {
-		instructionsText = instr.String()
-		if instructionsText != "" {
-			sysMsg := []byte(`{"role":"user","content":""}`)
-			sysMsg, _ = sjson.SetBytes(sysMsg, "content", instructionsText)
-			out, _ = sjson.SetRawBytes(out, "messages.-1", sysMsg)
+		if text := strings.TrimSpace(instr.String()); text != "" {
+			systemParts = append(systemParts, text)
 		}
 	}
-
-	if instructionsText == "" {
-		if input := root.Get("input"); input.Exists() && input.IsArray() {
-			input.ForEach(func(_, item gjson.Result) bool {
-				if strings.EqualFold(item.Get("role").String(), "system") {
-					var builder strings.Builder
-					if parts := item.Get("content"); parts.Exists() && parts.IsArray() {
-						parts.ForEach(func(_, part gjson.Result) bool {
-							textResult := part.Get("text")
-							text := textResult.String()
-							if builder.Len() > 0 && text != "" {
-								builder.WriteByte('\n')
-							}
-							builder.WriteString(text)
-							return true
-						})
-					} else if parts.Type == gjson.String {
-						builder.WriteString(parts.String())
+	if input := root.Get("input"); input.Exists() && input.IsArray() {
+		input.ForEach(func(_, item gjson.Result) bool {
+			role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
+			if role != "system" && role != "developer" {
+				return true
+			}
+			var builder strings.Builder
+			if parts := item.Get("content"); parts.Exists() && parts.IsArray() {
+				parts.ForEach(func(_, part gjson.Result) bool {
+					text := part.Get("text").String()
+					if builder.Len() > 0 && text != "" {
+						builder.WriteByte('\n')
 					}
-					instructionsText = builder.String()
-					if instructionsText != "" {
-						sysMsg := []byte(`{"role":"user","content":""}`)
-						sysMsg, _ = sjson.SetBytes(sysMsg, "content", instructionsText)
-						out, _ = sjson.SetRawBytes(out, "messages.-1", sysMsg)
-						extractedFromSystem = true
-					}
-				}
-				return instructionsText == ""
-			})
-		}
+					builder.WriteString(text)
+					return true
+				})
+			} else if parts.Type == gjson.String {
+				builder.WriteString(parts.String())
+			}
+			if text := strings.TrimSpace(builder.String()); text != "" {
+				systemParts = append(systemParts, text)
+			}
+			return true
+		})
+	}
+	if len(systemParts) > 0 {
+		out, _ = sjson.SetBytes(out, "system", strings.Join(systemParts, "\n\n"))
 	}
 
 	// input array processing
@@ -213,7 +208,8 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
 		input.ForEach(func(_, item gjson.Result) bool {
-			if extractedFromSystem && strings.EqualFold(item.Get("role").String(), "system") {
+			role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
+			if role == "system" || role == "developer" {
 				return true
 			}
 			typ := item.Get("type").String()
@@ -418,6 +414,40 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				usr := []byte(`{"role":"user","content":[]}`)
 				usr, _ = sjson.SetRawBytes(usr, "content.-1", toolResult)
 				appendMessage(usr)
+
+			case "custom_tool_call":
+				callID := item.Get("call_id").String()
+				if callID == "" {
+					callID = genToolCallID()
+				}
+				callID = util.SanitizeClaudeToolID(callID)
+				toolUse := []byte(`{"type":"tool_use","id":"","name":"","input":{"input":""}}`)
+				toolUse, _ = sjson.SetBytes(toolUse, "id", callID)
+				toolUse, _ = sjson.SetBytes(toolUse, "name", item.Get("name").String())
+				toolUse, _ = sjson.SetBytes(toolUse, "input.input", item.Get("input").String())
+
+				asst := []byte(`{"role":"assistant","content":[]}`)
+				for _, partJSON := range pendingReasoningParts {
+					asst, _ = sjson.SetRawBytes(asst, "content.-1", []byte(partJSON))
+				}
+				pendingReasoningParts = nil
+				asst, _ = sjson.SetRawBytes(asst, "content.-1", toolUse)
+				pendingToolUseMessages = append(pendingToolUseMessages, pendingToolUseMessage{
+					callID: callID,
+					raw:    asst,
+				})
+
+			case "custom_tool_call_output":
+				flushPendingReasoning()
+				callID := util.SanitizeClaudeToolID(item.Get("call_id").String())
+				flushPendingToolUseFor(callID)
+				toolResult := []byte(`{"type":"tool_result","tool_use_id":"","content":""}`)
+				toolResult, _ = sjson.SetBytes(toolResult, "tool_use_id", callID)
+				toolResult = applyResponsesToolResultContent(toolResult, item.Get("output"))
+
+				usr := []byte(`{"role":"user","content":[]}`)
+				usr, _ = sjson.SetRawBytes(usr, "content.-1", toolResult)
+				appendMessage(usr)
 			}
 			return true
 		})
@@ -462,7 +492,8 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				}
 			}
 		case gjson.JSON:
-			if toolChoice.Get("type").String() == "function" {
+			switch toolChoice.Get("type").String() {
+			case "function", "custom":
 				fn := toolChoice.Get("function.name").String()
 				if fn == "" {
 					fn = toolChoice.Get("name").String()
@@ -479,6 +510,12 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		default:
 
 		}
+	}
+	if parallel := root.Get("parallel_tool_calls"); parallel.Exists() && !parallel.Bool() && len(includedToolNames) > 0 {
+		if !gjson.GetBytes(out, "tool_choice").Exists() {
+			out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"auto"}`))
+		}
+		out, _ = sjson.SetBytes(out, "tool_choice.disable_parallel_tool_use", true)
 	}
 
 	return out
@@ -626,6 +663,13 @@ func convertResponsesToolToClaudeTools(tool gjson.Result, toolNameMap map[string
 		}
 	case "namespace":
 		return convertResponsesNamespaceToolToClaude(tool, toolNameMap)
+	case "custom":
+		if tJSON, ok := convertResponsesCustomToolToClaude(tool, ""); ok {
+			if name := gjson.GetBytes(tJSON, "name").String(); name != "" {
+				toolNameMap[name] = name
+			}
+			return [][]byte{tJSON}
+		}
 	case "web_search":
 		if tJSON, ok := convertResponsesWebSearchToolToClaude(tool); ok {
 			if name := gjson.GetBytes(tJSON, "name").String(); name != "" {
@@ -634,9 +678,6 @@ func convertResponsesToolToClaudeTools(tool gjson.Result, toolNameMap map[string
 			return [][]byte{tJSON}
 		}
 	default:
-		if isOpenAIResponsesApplyPatchCustomTool(toolType, tool) {
-			return nil
-		}
 		if isUnsupportedOpenAIBuiltinToolType(toolType) {
 			return nil
 		}
@@ -645,10 +686,6 @@ func convertResponsesToolToClaudeTools(tool gjson.Result, toolNameMap map[string
 		}
 	}
 	return nil
-}
-
-func isOpenAIResponsesApplyPatchCustomTool(toolType string, tool gjson.Result) bool {
-	return toolType == "custom" && strings.TrimSpace(tool.Get("name").String()) == "apply_patch"
 }
 
 func convertResponsesNamespaceToolToClaude(tool gjson.Result, toolNameMap map[string]string) [][]byte {
@@ -662,7 +699,15 @@ func convertResponsesNamespaceToolToClaude(tool gjson.Result, toolNameMap map[st
 	children.ForEach(func(_, child gjson.Result) bool {
 		childName := responsesToolName(child)
 		qualifiedName := qualifyResponsesNamespaceToolName(namespaceName, childName)
-		if tJSON, ok := convertResponsesFunctionToolToClaude(child, qualifiedName); ok {
+		var tJSON []byte
+		var ok bool
+		switch strings.TrimSpace(child.Get("type").String()) {
+		case "", "function":
+			tJSON, ok = convertResponsesFunctionToolToClaude(child, qualifiedName)
+		case "custom":
+			tJSON, ok = convertResponsesCustomToolToClaude(child, qualifiedName)
+		}
+		if ok {
 			out = append(out, tJSON)
 			toolNameMap[qualifiedName] = qualifiedName
 			if childName != "" {
@@ -694,6 +739,26 @@ func convertResponsesFunctionToolToClaude(tool gjson.Result, overrideName string
 		tJSON = common.AttachCacheControl(tJSON, tool.Get("function"))
 	}
 	return tJSON, true
+}
+
+// Claude has no freeform tool type. Represent Responses custom tools as a
+// normal tool with one string field, then unwrap that field on the response
+// path before returning a custom_tool_call to the Codex client.
+func convertResponsesCustomToolToClaude(tool gjson.Result, overrideName string) ([]byte, bool) {
+	name := strings.TrimSpace(overrideName)
+	if name == "" {
+		name = responsesToolName(tool)
+	}
+	if name == "" {
+		return nil, false
+	}
+
+	tJSON := []byte(`{"name":"","description":"","input_schema":{"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false}}`)
+	tJSON, _ = sjson.SetBytes(tJSON, "name", name)
+	if description := responsesToolDescription(tool); description != "" {
+		tJSON, _ = sjson.SetBytes(tJSON, "description", description)
+	}
+	return common.AttachCacheControl(tJSON, tool), true
 }
 
 func convertResponsesWebSearchToolToClaude(tool gjson.Result) ([]byte, bool) {

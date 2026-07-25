@@ -205,6 +205,97 @@ func TestNewExchangeMergesBothToolSources(t *testing.T) {
 	}
 }
 
+func TestNewExchangeConvertsCodexCustomToolHistoryToClaude(t *testing.T) {
+	body := `{"model":"m","input":[` +
+		`{"type":"additional_tools","tools":[{"type":"custom","name":"apply_patch",` +
+		`"description":"Apply a patch","format":{"type":"grammar","syntax":"lark","definition":"start: patch"}}]},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"edit the file"}]},` +
+		`{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch"},` +
+		`{"type":"custom_tool_call_output","call_id":"call_patch","output":"Done"}` +
+		`],"stream":true}`
+
+	exchange, err := NewExchange(Codex, Claude, "m", true, []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(exchange.UpstreamRequest)
+	for _, want := range []string{`"name":"apply_patch"`, `"input_schema":{"type":"object"`,
+		`"type":"tool_use"`, `"input":{"input":"*** Begin Patch"}`, `"type":"tool_result"`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("translated custom tool request missing %s: %s", want, got)
+		}
+	}
+	if strings.Contains(got, "custom_tool_call") {
+		t.Fatalf("Codex custom item leaked to Claude: %s", got)
+	}
+}
+
+func TestExchangeRestoresClaudeCustomToolCallForCodex(t *testing.T) {
+	body := `{"model":"m","input":[` +
+		`{"type":"additional_tools","tools":[{"type":"custom","name":"apply_patch",` +
+		`"description":"Apply a patch","format":{"type":"grammar","syntax":"lark","definition":"start: patch"}}]},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"edit"}]}` +
+		`],"stream":true}`
+	exchange, err := NewExchange(Codex, Claude, "m", true, []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lines := [][]byte{
+		[]byte(`data: {"type":"message_start","message":{"id":"msg_custom","usage":{"input_tokens":2}}}`),
+		[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_patch","name":"apply_patch","input":{}}}`),
+		[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"input\":\"*** Begin Patch\"}"}}`),
+		[]byte(`data: {"type":"content_block_stop","index":0}`),
+		[]byte(`data: {"type":"message_stop"}`),
+	}
+	var all [][]byte
+	for _, line := range lines {
+		chunks, translateErr := exchange.TranslateStream(context.Background(), line)
+		if translateErr != nil {
+			t.Fatal(translateErr)
+		}
+		all = append(all, chunks...)
+	}
+	got := stringJoin(all)
+	for _, want := range []string{"response.custom_tool_call_input.done", `"type":"custom_tool_call"`,
+		`"id":"ctc_call_patch"`, `"input":"*** Begin Patch"`, "response.completed"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("custom tool response missing %s: %s", want, got)
+		}
+	}
+	if strings.Contains(got, "response.function_call_arguments") {
+		t.Fatalf("custom tool was emitted as a function call: %s", got)
+	}
+}
+
+func TestExchangeRestoresAdditionalToolNamespaceForCodex(t *testing.T) {
+	body := `{"model":"m","input":[` +
+		`{"type":"additional_tools","tools":[{"type":"namespace","name":"collaboration","tools":[` +
+		`{"type":"function","name":"send_message","parameters":{"type":"object","properties":{}}}]}]},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"send"}]}` +
+		`],"stream":true}`
+	exchange, err := NewExchange(Codex, Claude, "m", true, []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = exchange.TranslateStream(context.Background(),
+		[]byte(`data: {"type":"message_start","message":{"id":"msg_namespace","usage":{"input_tokens":2}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks, err := exchange.TranslateStream(context.Background(),
+		[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_send","name":"collaboration__send_message","input":{}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := stringJoin(chunks)
+	for _, want := range []string{`"name":"send_message"`, `"namespace":"collaboration"`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("namespace response missing %s: %s", want, got)
+		}
+	}
+}
+
 func TestNewExchangeRejectsMissingPair(t *testing.T) {
 	_, err := NewExchange(Claude, OpenAIResponses, "model", false, []byte(`{"model":"model","messages":[]}`))
 	if !errors.Is(err, ErrUnsupported) {
