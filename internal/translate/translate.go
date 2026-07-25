@@ -270,12 +270,48 @@ func NewExchange(source, target Format, model string, stream bool, original []by
 	} else if !exchange.registry.HasNonStreamResponseTransformer(from, to) {
 		return nil, fmt.Errorf("%w: response %s <- %s", ErrUnsupported, source, target)
 	}
-	translated := exchange.registry.TranslateRequest(from, to, model, original, exchange.UpstreamStream)
+	translated := exchange.registry.TranslateRequest(from, to, model, normalizeResponsesInput(source, original), exchange.UpstreamStream)
 	if !json.Valid(translated) {
 		return nil, fmt.Errorf("translate request %s -> %s: invalid JSON", source, target)
 	}
 	exchange.UpstreamRequest = translated
 	return exchange, nil
+}
+
+// normalizeResponsesInput 把 Responses 协议的 input 字符串简写展开成标准数组形式。
+// 官方 Responses API 两种都合法，但 SDK 的翻译器只解析数组，收到字符串会静默产出
+// 空 messages —— 上游（如 New API）随即报「field messages is required」。
+// 只在源协议是 Responses 且 input 确为字符串时改写，其余情况原样返回。
+func normalizeResponsesInput(source Format, original []byte) []byte {
+	if source != OpenAIResponses {
+		return original
+	}
+	var body map[string]json.RawMessage
+	if json.Unmarshal(original, &body) != nil {
+		return original
+	}
+	raw, ok := body["input"]
+	if !ok {
+		return original
+	}
+	var text string
+	if json.Unmarshal(raw, &text) != nil { // 已是数组或其他结构，交给翻译器
+		return original
+	}
+	expanded, err := json.Marshal([]any{map[string]any{
+		"type":    "message",
+		"role":    "user",
+		"content": []any{map[string]any{"type": "input_text", "text": text}},
+	}})
+	if err != nil {
+		return original
+	}
+	body["input"] = expanded
+	rewritten, err := json.Marshal(body)
+	if err != nil {
+		return original
+	}
+	return rewritten
 }
 
 // Translated 判断本次交换是否需要跨协议转换。

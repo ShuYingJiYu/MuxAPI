@@ -54,11 +54,29 @@ func TestNewExchangeTranslatesResponsesRequestToClaude(t *testing.T) {
 	if body["model"] != "gpt-test" {
 		t.Fatalf("translated model = %v", body["model"])
 	}
-	if _, ok := body["messages"]; !ok {
+	messages, ok := body["messages"].([]any)
+	if !ok {
 		t.Fatalf("translated request has no messages: %s", exchange.UpstreamRequest)
+	}
+	// 上游（如 New API）会校验 messages 非空，空数组等于请求缺字段。
+	if len(messages) == 0 {
+		t.Fatalf("translated request dropped the prompt: %s", exchange.UpstreamRequest)
 	}
 	if !exchange.UpstreamStream {
 		t.Fatal("translated Claude non-stream response should be aggregated from upstream SSE")
+	}
+}
+
+// Responses 的 input 允许字符串简写，SDK 翻译器只认数组，必须在边界归一化。
+func TestNewExchangeNormalizesStringInputForEveryTarget(t *testing.T) {
+	for _, target := range []Format{Claude, OpenAI, Codex} {
+		exchange, err := NewExchange(OpenAIResponses, target, "gpt-test", true, []byte(`{"model":"gpt-test","input":"hello","stream":true}`))
+		if err != nil {
+			t.Fatalf("target %s: %v", target, err)
+		}
+		if !strings.Contains(string(exchange.UpstreamRequest), "hello") {
+			t.Fatalf("target %s dropped the prompt: %s", target, exchange.UpstreamRequest)
+		}
 	}
 }
 
