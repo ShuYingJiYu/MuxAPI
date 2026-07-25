@@ -199,6 +199,13 @@ func runLogJanitor(ctx context.Context, st *store.Store, keepDays func() int) {
 		} else if deleted > 0 {
 			slog.Info("probe janitor pruned", "deleted", deleted, "keepHours", probeKeepHours)
 		}
+		// 计费快照：每上游每刷新间隔一行，无清理会无限增长；保底留最近 2 条。
+		if deleted, err := st.PruneBillingSnapshots(store.BillingSnapshotKeepDays); err != nil {
+			slog.Error("billing snapshot janitor prune failed", "err", err)
+		} else if deleted > 0 {
+			slog.Info("billing snapshot janitor pruned", "deleted", deleted,
+				"keepDays", store.BillingSnapshotKeepDays)
+		}
 	}
 	prune() // 启动即清一次，立刻收敛历史堆积
 	ticker := time.NewTicker(10 * time.Minute)

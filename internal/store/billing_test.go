@@ -139,9 +139,11 @@ func TestBillingAuditComparesSnapshotDeltas(t *testing.T) {
 	saveTestBillingRequest(t, st, "billing-window", u.ID, "openai/gpt-test",
 		1_700_000_300, 2000, 0, 0, 0)
 
+	// 上游自报原价 2.02 与本地估算 2.0 基本一致（价目核对通过），
+	// 但实际扣费 0.35 高于 2.02×0.15=0.303 —— 上游按自己的规则多收了。
 	second := BillingStatus{
 		UpstreamID: u.ID, Remaining: billingFloat(9.65),
-		EffectiveMultiplier: billingFloat(0.15), ReportedListCost: billingFloat(199),
+		EffectiveMultiplier: billingFloat(0.15), ReportedListCost: billingFloat(102.02),
 		ReportedActualCost: billingFloat(15.35), ObservedAt: 1_700_000_600,
 	}
 	if err := st.SaveBillingSuccess(second); err != nil {
@@ -153,18 +155,71 @@ func TestBillingAuditComparesSnapshotDeltas(t *testing.T) {
 	}
 	audit := state.Audit
 	if audit == nil || audit.Status != "warning" || audit.Reason != "actual_cost_exceeded" ||
+		audit.BillingBasis != "reported" ||
 		audit.ListCost == nil || math.Abs(*audit.ListCost-2) > 1e-9 ||
-		audit.ReportedListCost == nil || math.Abs(*audit.ReportedListCost-99) > 1e-9 ||
-		audit.TheoreticalCost == nil || math.Abs(*audit.TheoreticalCost-0.30) > 1e-9 ||
+		audit.ReportedListCost == nil || math.Abs(*audit.ReportedListCost-2.02) > 1e-9 ||
+		audit.TheoreticalCost == nil || math.Abs(*audit.TheoreticalCost-0.303) > 1e-9 ||
 		audit.ActualCost == nil || math.Abs(*audit.ActualCost-0.35) > 1e-9 ||
 		audit.BalanceSpent == nil || math.Abs(*audit.BalanceSpent-0.35) > 1e-9 ||
-		audit.ObservedMultiplier == nil || math.Abs(*audit.ObservedMultiplier-0.175) > 1e-9 ||
 		audit.PriceCoverage == nil || *audit.PriceCoverage != 1 || audit.RequestCount != 1 {
 		t.Fatalf("unexpected billing audit: %+v", audit)
 	}
 	statuses, err := st.ListBillingStatuses()
 	if err != nil || statuses[u.ID].Audit == nil || statuses[u.ID].Audit.Status != "warning" {
 		t.Fatalf("billing status list omitted audit: %+v, err=%v", statuses, err)
+	}
+}
+
+// 上游自报原价远高于本地独立估算时，即使它按自己的原价正确应用了倍率，
+// 也必须告警——余额是按虚标的原价扣的。这条是双轨判定的核心价值。
+func TestBillingAuditFlagsInflatedProviderCatalog(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "billing-catalog.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	u := &upstream.Upstream{
+		Name: "provider", BaseURL: "https://example.com", APIKey: "sk-test",
+		Protocol: "codex", BillingType: upstream.BillingSub2API, Enabled: true,
+	}
+	if err := st.Create(u); err != nil {
+		t.Fatal(err)
+	}
+	installTestPricing(t, st, ModelPricing{
+		Model: "gpt-test", InputCostPerToken: billingFloat(0.001),
+	})
+	if err := st.SaveBillingSuccess(BillingStatus{
+		UpstreamID: u.ID, Remaining: billingFloat(100),
+		EffectiveMultiplier: billingFloat(0.15), ReportedListCost: billingFloat(0),
+		ReportedActualCost: billingFloat(0), ObservedAt: 1_700_000_000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	saveTestBillingRequest(t, st, "catalog-window", u.ID, "gpt-test",
+		1_700_000_300, 2000, 0, 0, 0)
+	// 本地估算 2.0，上游自报 20（虚标 10 倍）；实际扣费 3.0 = 20×0.15，
+	// 倍率应用「正确」，所以计费核对通过，必须靠价目核对抓出来。
+	if err := st.SaveBillingSuccess(BillingStatus{
+		UpstreamID: u.ID, Remaining: billingFloat(97),
+		EffectiveMultiplier: billingFloat(0.15), ReportedListCost: billingFloat(20),
+		ReportedActualCost: billingFloat(3), ObservedAt: 1_700_000_600,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := st.GetBillingStatus(u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	audit := state.Audit
+	if audit == nil || audit.Status != "warning" || audit.Reason != "catalog_cost_exceeded" {
+		t.Fatalf("inflated provider catalog must warn: %+v", audit)
+	}
+	if audit.CatalogDeviation == nil || math.Abs(*audit.CatalogDeviation-18) > 1e-9 {
+		t.Fatalf("catalog deviation should be 20-2=18: %+v", audit.CatalogDeviation)
+	}
+	if audit.Deviation == nil || math.Abs(*audit.Deviation) > 1e-9 {
+		t.Fatalf("billing track should agree with the provider's own basis: %+v", audit.Deviation)
 	}
 }
 

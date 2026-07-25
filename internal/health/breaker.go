@@ -290,6 +290,19 @@ func (m *Manager) ObserveProbe(id int64, model string, ok bool, latencyMs int64)
 	}
 }
 
+// Forget 丢弃某渠道的全部内存状态，供上游被删除时调用。
+// 不调用则 breakers/unsupported 会随删除累积，Sample() 还会继续为其追加趋势点。
+func (m *Manager) Forget(id int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.breakers, id)
+	for key := range m.unsupported {
+		if key.upstreamID == id {
+			delete(m.unsupported, key)
+		}
+	}
+}
+
 // ResetCircuit manually returns one channel to CLOSED without changing its
 // traffic statistics or model capability cache.
 func (m *Manager) ResetCircuit(id int64) {

@@ -127,6 +127,10 @@ func (s *Server) adminUpstreamItem(w http.ResponseWriter, r *http.Request) {
 		s.refreshUpstreamBilling(w, r, id)
 		return
 	}
+	if len(parts) == 3 && parts[1] == "billing" && parts[2] == "audit" {
+		s.upstreamBillingAudit(w, r, id)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "monitors" && r.Method == http.MethodPost { // 批量建监控
 		s.batchCreateMonitors(w, r, id)
 		return
@@ -149,6 +153,9 @@ func (s *Server) adminUpstreamItem(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		// 删库后同步丢弃内存态，否则熔断器与模型缓存会随删除累积。
+		s.health.Forget(id)
+		s.forgetUpstreamModels(id)
 		w.WriteHeader(204)
 	default:
 		http.Error(w, "method not allowed", 405)
@@ -178,6 +185,41 @@ func (s *Server) refreshUpstreamBilling(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	writeJSON(w, state)
+}
+
+// upstreamBillingAudit 返回指定时间窗口的费用比对。单个刷新间隔的样本量太小、
+// 且结论会被下一轮采集覆盖，故聚合到小时以上再判定，窗口可由调用方选择。
+func (s *Server) upstreamBillingAudit(w http.ResponseWriter, r *http.Request, id int64) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, err := s.store.Get(id); errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "upstream not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	window := store.LookupBillingWindow(r.URL.Query().Get("window"))
+	audit, err := s.store.BillingAuditRange(id, window, time.Now())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	options := make([]map[string]any, 0, len(store.BillingWindows()))
+	for _, item := range store.BillingWindows() {
+		options = append(options, map[string]any{
+			"key": item.Key, "label": item.Label,
+			"seconds": int64(item.Duration / time.Second),
+		})
+	}
+	writeJSON(w, map[string]any{
+		"window":  window.Key,
+		"label":   window.Label,
+		"windows": options,
+		"audit":   audit,
+	})
 }
 
 // recoverUpstream clears only the in-memory channel breaker. Historical
@@ -347,7 +389,7 @@ func (s *Server) testUpstream(w http.ResponseWriter, r *http.Request, id int64) 
 		Error     string   `json:"error,omitempty"`
 	}
 	start := time.Now()
-	models, status, err := u.FetchModels(10 * time.Second)
+	models, status, err := u.FetchModels(r.Context(), 10*time.Second)
 	lat := time.Since(start).Milliseconds()
 	if err != nil {
 		writeJSON(w, result{Status: status, LatencyMs: lat, Error: err.Error()})

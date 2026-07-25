@@ -45,8 +45,10 @@ func (s *Scheduler) PickExcluding(groupID int64, model string, exclude map[int64
 	for id, value := range exclude {
 		blocked[id] = value
 	}
+	// 成员清单每次调用只读一次库：重试只为处理 Claim 竞争，与成员变化无关。
+	// 转发层每次换源都会重新调用本函数，故后台增删仍是下个请求即生效。
+	all := s.list(groupID)
 	for {
-		all := s.list(groupID)
 		var healthy []*upstream.Upstream
 		for _, candidate := range all {
 			if blocked[candidate.ID] || !s.health.IsAvailable(candidate.ID, model) {

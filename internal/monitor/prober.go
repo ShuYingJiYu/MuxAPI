@@ -206,7 +206,8 @@ func (p *Prober) Probe(ctx context.Context, m *store.Monitor) {
 	if strings.HasSuffix(path, "/v1/messages") {
 		req.Header.Set("anthropic-version", "2023-06-01")
 	}
-	client := &http.Client{Timeout: 30 * time.Second, Transport: upstream.ProxyTransport(m.Proxy)}
+	// 共享 Transport：每次探测新建会各自留一份空闲连接池，长跑后耗尽 fd。
+	client := &http.Client{Timeout: 30 * time.Second, Transport: upstream.SharedTransport(m.Proxy)}
 	start := time.Now()
 	resp, err := client.Do(req)
 	ttft := time.Since(start).Milliseconds()

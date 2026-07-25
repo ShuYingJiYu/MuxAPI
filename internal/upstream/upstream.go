@@ -2,6 +2,7 @@
 package upstream
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -207,12 +208,16 @@ func isHopByHopHeader(key string) bool {
 // FetchModels 实时拉该上游的 /v1/models，解析 OpenAI 风格 {"data":[{"id":...}]}
 // 返回模型 ID 列表。既用于上游连通测试，也用于下游 /v1/models 汇总。
 // 返回 (models, status, error)：status 是上游 HTTP 状态码（网络错误为 0）。
-func (u *Upstream) FetchModels(timeout time.Duration) ([]string, int, error) {
+// ctx 让调用方在客户端断开时立即放弃；Transport 走共享池，避免每次拉取都新建连接池。
+func (u *Upstream) FetchModels(ctx context.Context, timeout time.Duration) ([]string, int, error) {
 	req, err := u.BuildRequest(http.MethodGet, "/v1/models", nil, http.Header{})
 	if err != nil {
 		return nil, 0, err
 	}
-	client := &http.Client{Timeout: timeout, Transport: ProxyTransport(u.Proxy)}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req = req.WithContext(ctx)
+	client := &http.Client{Transport: SharedTransport(u.Proxy)}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, err

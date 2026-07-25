@@ -126,7 +126,13 @@ func (s *Store) LookupModelPricing(model string) (ModelPricing, error) {
 	return ModelPricing{}, sql.ErrNoRows
 }
 
-// BillingWindowUsage groups successful request attempts for local cost calculation.
+// billingCountsCanceled 控制客户端主动断开的尝试是否计入用量。
+// 上游在客户端断连后是否继续生成、是否照收，各家实现不同：有的立刻中止只收已
+// 生成部分，有的跑完全程照收。默认不计入（偏保守，宁可低估本地理论费用也不
+// 凭猜测加账）；若确认上游照收，改为 true 可提高比对准确度。
+const billingCountsCanceled = false
+
+// BillingWindowUsage groups billed request attempts for local cost calculation.
 type BillingWindowUsage struct {
 	Model               string
 	Protocol            string
@@ -140,16 +146,33 @@ type BillingWindowUsage struct {
 
 // ListBillingWindowUsage returns successful attempts in the half-open snapshot window.
 func (s *Store) ListBillingWindowUsage(upstreamID, fromAt, toAt int64) ([]BillingWindowUsage, error) {
-	query := `SELECT r.model,COALESCE(u.protocol,''),COUNT(*),
-		COALESCE(SUM(CASE WHEN a.input_tokens=0 AND a.output_tokens=0 AND a.cached_tokens=0
-			AND a.cache_creation_tokens=0 THEN 1 ELSE 0 END),0),COALESCE(SUM(a.input_tokens),0),
+	// 协议优先取 attempt 行上的快照；历史行为空时回退到现查（与旧行为一致）。
+	protocolExpr := `COALESCE(NULLIF(a.protocol,''),u.protocol,'')`
+	// outcome 过滤：success 与 partial 都已消耗上游 token（partial=响应已提交后
+	// 流中断，上游那边照样生成并计费），只统计 success 会系统性压低理论费用，
+	// 把偏差单向推向「上游多收」的误报。canceled 是否计费取决于上游断连后是否
+	// 继续生成，无法一概而论，故由 billingCountsCanceled 控制，默认不计入。
+	outcomes := "'success','partial'"
+	if billingCountsCanceled {
+		outcomes = "'success','partial','canceled'"
+	}
+	// usage 完整性分两种形态：
+	//   四项全零 —— 完全没拿到 usage，任何 outcome 下都算不完整；
+	//   partial 且无 output —— 流在 usage 事件前断掉，按 output=0 定价会低估。
+	// success 且有 input 无 output 不算异常：部分上游只回报 prompt token。
+	incompleteExpr := `CASE WHEN (a.input_tokens=0 AND a.output_tokens=0 AND a.cached_tokens=0
+			AND a.cache_creation_tokens=0) OR (a.outcome<>'success' AND a.output_tokens=0)
+		THEN 1 ELSE 0 END`
+	query := `SELECT r.model,` + protocolExpr + `,COUNT(*),
+		COALESCE(SUM(` + incompleteExpr + `),0),COALESCE(SUM(a.input_tokens),0),
 		COALESCE(SUM(a.output_tokens),0),COALESCE(SUM(a.cached_tokens),0),
 		COALESCE(SUM(a.cache_creation_tokens),0)
 		FROM request_attempts a
 		JOIN requests r ON r.request_id=a.request_id
 		LEFT JOIN upstreams u ON u.id=a.upstream_id
-		WHERE a.upstream_id=? AND a.outcome='success' AND a.completed_at>? AND a.completed_at<=?
-		GROUP BY r.model,u.protocol ORDER BY r.model`
+		WHERE a.upstream_id=? AND a.outcome IN (` + outcomes + `)
+			AND a.completed_at>? AND a.completed_at<=?
+		GROUP BY r.model,` + protocolExpr + ` ORDER BY r.model`
 	rows, err := s.db.Query(query, upstreamID, s.timeValue(time.Unix(fromAt, 0)),
 		s.timeValue(time.Unix(toAt, 0)))
 	if err != nil {

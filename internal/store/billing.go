@@ -10,17 +10,33 @@ import (
 const (
 	billingAuditAbsoluteTolerance = 0.01
 	billingAuditRelativeTolerance = 0.10
+	// billingCatalogTolerance 价目核对阈值。本地价目表(LiteLLM)与上游自报原价
+	// 天然有差异，容忍度比计费核对宽；超出说明上游挂牌价明显偏离公共行情。
+	billingCatalogTolerance = 0.25
 )
 
-// BillingAudit compares provider counters between the two latest successful
-// snapshots. It avoids treating cumulative provider values as per-window cost.
+// BillingAudit compares provider counters across snapshots in one window.
+// It avoids treating cumulative provider values as per-window cost.
+//
+// 比对分两条独立轨道，避免把「价目表不一致」误报成「上游多收」：
+//   - 价目核对：本地 ListCost vs 上游自报 ReportedListCost，差异说明两张价目表不一致
+//   - 计费核对：ActualCost vs 计费基准×倍率，基准优先用上游自报原价（不受价表漂移影响）
+//
+// BillingBasis 标明计费核对用的是哪种基准："reported"（可信）或 "local"（上游未提供
+// 原价时降级，结论受价目表差异污染）。
 type BillingAudit struct {
 	Status             string   `json:"status"`
 	Reason             string   `json:"reason,omitempty"`
 	FromAt             int64    `json:"from_at,omitempty"`
 	ToAt               int64    `json:"to_at,omitempty"`
+	WindowSeconds      int64    `json:"window_seconds,omitempty"`
+	SnapshotCount      int      `json:"snapshot_count,omitempty"`
+	MultiplierChanged  bool     `json:"multiplier_changed,omitempty"`
 	ListCost           *float64 `json:"list_cost,omitempty"`
 	ReportedListCost   *float64 `json:"reported_list_cost,omitempty"`
+	BillingBasis       string   `json:"billing_basis,omitempty"`
+	CatalogDeviation   *float64 `json:"catalog_deviation,omitempty"`
+	CatalogRate        *float64 `json:"catalog_deviation_rate,omitempty"`
 	TheoreticalCost    *float64 `json:"theoretical_cost,omitempty"`
 	ActualCost         *float64 `json:"actual_cost,omitempty"`
 	ActualSource       string   `json:"actual_source,omitempty"`
@@ -339,47 +355,12 @@ func (s *Store) billingAuditFromSnapshots(snapshots []BillingSnapshot) BillingAu
 	}
 	latestMultiplier := snapshotMultiplier(snapshots[0])
 	previousMultiplier := snapshotMultiplier(snapshots[1])
-	if latestMultiplier == nil {
-		audit.Status = "unavailable"
-		audit.Reason = "multiplier_unavailable"
-		return audit
+	if latestMultiplier != nil && previousMultiplier != nil &&
+		math.Abs(*previousMultiplier-*latestMultiplier) > 1e-9 {
+		audit.MultiplierChanged = true
 	}
-	if previousMultiplier == nil || math.Abs(*previousMultiplier-*latestMultiplier) > 1e-9 {
-		audit.Status = "unavailable"
-		audit.Reason = "multiplier_changed"
-		return audit
-	}
-	if audit.ListCost == nil {
-		audit.Status = "unavailable"
-		audit.Reason = "pricing_catalog_unavailable"
-		return audit
-	}
-	theoretical := *audit.ListCost * *latestMultiplier
-	audit.TheoreticalCost = &theoretical
-	if *audit.ListCost > 1e-9 && audit.ActualCost != nil {
-		observed := *audit.ActualCost / *audit.ListCost
-		audit.ObservedMultiplier = &observed
-	}
-	if audit.ActualCost == nil {
-		audit.Status = "unavailable"
-		audit.Reason = "actual_cost_unavailable"
-		return audit
-	}
-	deviation := *audit.ActualCost - theoretical
-	audit.Deviation = &deviation
-	if theoretical > 1e-9 {
-		rate := deviation / theoretical
-		audit.DeviationRate = &rate
-	}
-	tolerance := math.Max(billingAuditAbsoluteTolerance,
-		theoretical*billingAuditRelativeTolerance)
-	if deviation > tolerance {
-		audit.Status = "warning"
-		audit.Reason = "actual_cost_exceeded"
-		return audit
-	}
-	audit.Status = "ok"
-	audit.Reason = ""
+	audit.SnapshotCount = len(snapshots)
+	evaluateBillingAudit(&audit, latestMultiplier)
 	return audit
 }
 

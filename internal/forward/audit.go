@@ -172,12 +172,9 @@ func isCompletionEvent(value string) bool {
 	}
 }
 
+// clipLabel 截断 SSE 事件名。同 clipErr，结果会入库，必须是合法 UTF-8。
 func clipLabel(value string) string {
-	value = strings.TrimSpace(value)
-	if len(value) > 80 {
-		return value[:80]
-	}
-	return value
+	return clipUTF8(strings.TrimSpace(value), 80)
 }
 
 func usageFromJSON(data []byte) tokenUsage {

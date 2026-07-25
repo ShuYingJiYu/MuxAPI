@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mirainya/muxapi/internal/translate"
 	"github.com/mirainya/muxapi/internal/upstream"
@@ -79,10 +80,13 @@ const (
 
 // AttemptResult 记录一次上游尝试，完整请求可能包含多次尝试。
 type AttemptResult struct {
-	AttemptNo           int
-	UpstreamID          int64
-	Priority            int
-	SelectionReason     string
+	AttemptNo int
+	// Protocol 快照本次尝试实际使用的渠道协议。费用比对靠它决定 cached_tokens
+	// 的口径，事后现查会用改动后的协议解释历史用量。
+	Protocol        string
+	UpstreamID      int64
+	Priority        int
+	SelectionReason string
 	HealthBefore        string
 	HealthAfter         string
 	Status              int
@@ -127,6 +131,7 @@ type Result struct {
 
 type attemptContext struct {
 	number          int
+	protocol        string
 	upstreamID      int64
 	priority        int
 	selectionReason string
@@ -148,7 +153,7 @@ func healthState(h Health, id int64) string {
 func (a attemptContext) finish(h Health, status int, outcome string, relay relayResult, errorKind, errorSource, errText string) AttemptResult {
 	completed := time.Now()
 	return AttemptResult{
-		AttemptNo: a.number, UpstreamID: a.upstreamID, Priority: a.priority,
+		AttemptNo: a.number, Protocol: a.protocol, UpstreamID: a.upstreamID, Priority: a.priority,
 		SelectionReason: a.selectionReason, HealthBefore: a.healthBefore, HealthAfter: healthState(h, a.upstreamID),
 		Status: status, Outcome: outcome, TTFTMs: relay.ttftMs, DurationMs: completed.Sub(a.started).Milliseconds(),
 		ResponseBytes: relay.bytesSent, Stream: relay.stream, StreamCompleted: relay.streamCompleted,
@@ -203,7 +208,8 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			selectionReason = "recovery_trial"
 		}
 		attemptCtx := attemptContext{
-			number: attemptNo, upstreamID: candidate.ID, priority: candidate.Priority,
+			number: attemptNo, protocol: candidate.Protocol, upstreamID: candidate.ID,
+			priority: candidate.Priority,
 			selectionReason: selectionReason, healthBefore: beforeState, started: attemptStarted,
 		}
 
@@ -403,7 +409,8 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			ErrorKind: "no_upstream", ErrorSource: "gateway", Error: "no upstream available", Attempts: attempts}
 	}
 	if lastErr != nil {
-		http.Error(w, "upstream error: "+lastErr.Error(), http.StatusBadGateway)
+		// 只回笼统信息：上游原文可能含渠道地址等内部细节，完整错误留在审计里。
+		http.Error(w, "all upstreams failed", http.StatusBadGateway)
 		if len(attempts) > 0 {
 			final := attempts[len(attempts)-1]
 			result := resultFromAttempt(final, attempts)
@@ -433,12 +440,24 @@ func relayErrorKind(err error, cause error) string {
 	}
 }
 
+// clipErr 截断上游错误文本。必须按 rune 边界切并清洗非法字节：审计文本会写入
+// Postgres 的 text 列，非法 UTF-8 会让整条 INSERT 失败、连带丢掉这次请求的审计。
 func clipErr(value string) string {
-	value = strings.TrimSpace(value)
-	if len(value) > 500 {
-		return value[:500]
+	return clipUTF8(strings.TrimSpace(value), 500)
+}
+
+// clipUTF8 把字符串限制到 maxBytes 字节以内，且保证结果是合法 UTF-8。
+// 先替换非法字节（上游可能返回二进制或截断的响应体），再按 rune 边界回退。
+func clipUTF8(value string, maxBytes int) string {
+	value = strings.ToValidUTF8(value, "")
+	if len(value) <= maxBytes {
+		return value
 	}
-	return value
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut]
 }
 
 func readLimitedBody(reader io.Reader, limit int64) ([]byte, error) {

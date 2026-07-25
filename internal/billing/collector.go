@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mirainya/muxapi/internal/upstream"
 )
@@ -65,16 +66,27 @@ func getJSON(ctx context.Context, item *upstream.Upstream, path string, target a
 		return errors.New("billing response is too large")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		message := strings.TrimSpace(string(body))
-		if len(message) > 512 {
-			message = message[:512]
-		}
-		return fmt.Errorf("billing endpoint %s returned %d: %s", path, resp.StatusCode, message)
+		return fmt.Errorf("billing endpoint %s returned %d: %s", path, resp.StatusCode, clipMessage(string(body)))
 	}
 	if err := json.Unmarshal(body, target); err != nil {
 		return fmt.Errorf("decode billing endpoint %s: %w", path, err)
 	}
 	return nil
+}
+
+// clipMessage 截断上游计费错误体。错误文本会写入 upstream_billing_status.error，
+// 按字节硬切会产生非法 UTF-8 并让 Postgres 拒收整条状态更新，故按 rune 边界回退。
+func clipMessage(value string) string {
+	const maxBytes = 512
+	value = strings.ToValidUTF8(strings.TrimSpace(value), "")
+	if len(value) <= maxBytes {
+		return value
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut]
 }
 
 func floatPtr(value float64) *float64 { return &value }
@@ -97,7 +109,6 @@ type sub2BillingResponse struct {
 	GroupRateMultiplier     float64 `json:"group_rate_multiplier"`
 	ResolvedRateMultiplier  float64 `json:"resolved_rate_multiplier"`
 	EffectiveRateMultiplier float64 `json:"effective_rate_multiplier"`
-	ObservedAt              string  `json:"observed_at"`
 }
 
 func fetchSub2API(ctx context.Context, item *upstream.Upstream) (Result, error) {
@@ -116,10 +127,10 @@ func fetchSub2API(ctx context.Context, item *upstream.Upstream) (Result, error) 
 	if remaining == nil {
 		remaining = usage.Balance
 	}
+	// ObservedAt 必须用本地时钟：它同时是比对窗口的边界，而窗口内的请求是按
+	// 本地写入的 completed_at 过滤的。混用上游时钟会让两侧时钟差直接变成窗口
+	// 漏算/重算。上游自报的 observed_at 只作参考，不参与窗口计算。
 	observed := time.Now()
-	if parsed, err := time.Parse(time.RFC3339Nano, provider.ObservedAt); err == nil {
-		observed = parsed
-	}
 	currency := strings.TrimSpace(usage.Unit)
 	if currency == "" {
 		currency = "USD"

@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -43,8 +44,16 @@ type Server struct {
 	billingMgr *billing.Manager
 	maxBody    int64 // 请求体字节上限（<=0 表示不限制）
 
-	modelMu    sync.Mutex                // 保护 modelCache
-	modelCache map[int64]modelCacheEntry // 按 upstream_id 缓存其 /v1/models 结果，TTL=modelsTTL
+	modelMu     sync.Mutex                // 保护 modelCache 与 modelFlight
+	modelCache  map[int64]modelCacheEntry // 按 upstream_id 缓存其 /v1/models 结果，TTL=modelsTTL
+	modelFlight map[int64]*modelFetch     // 同一上游正在进行的拉取，用于并发去重
+}
+
+// modelFetch 表示一次正在进行的上游模型拉取。缓存过期瞬间的并发请求共享同一次
+// 拉取结果，避免 N 个客户端 × M 个上游的连接风暴。
+type modelFetch struct {
+	done   chan struct{}
+	models []string
 }
 
 // SetBillingManager enables background and manual provider billing refreshes.
@@ -53,7 +62,7 @@ func (s *Server) SetBillingManager(manager *billing.Manager) { s.billingMgr = ma
 // New 创建 HTTP 服务；maxBody 控制客户端请求正文上限。
 func New(fwd *forward.Forwarder, adminToken string, st *store.Store, hm *health.Manager, mon *monitor.Manager, mp *monitor.Prober, maxBody int64) *Server {
 	return &Server{fwd: fwd, adminToken: adminToken, store: st, health: hm, mon: mon, monProber: mp, maxBody: maxBody,
-		modelCache: make(map[int64]modelCacheEntry)}
+		modelCache: make(map[int64]modelCacheEntry), modelFlight: make(map[int64]*modelFetch)}
 }
 
 // Handler 注册客户端、管理、健康检查和静态前端路由。
@@ -192,7 +201,8 @@ func (s *Server) recordRequest(requestID string, started time.Time, groupID int6
 	attempts := make([]store.RequestAttemptRecord, len(result.Attempts))
 	for i, attempt := range result.Attempts {
 		attempts[i] = store.RequestAttemptRecord{
-			AttemptNo: attempt.AttemptNo, UpstreamID: attempt.UpstreamID, Priority: attempt.Priority,
+			AttemptNo: attempt.AttemptNo, Protocol: attempt.Protocol,
+			UpstreamID: attempt.UpstreamID, Priority: attempt.Priority,
 			SelectionReason: attempt.SelectionReason, HealthBefore: attempt.HealthBefore, HealthAfter: attempt.HealthAfter,
 			Status: attempt.Status, Outcome: attempt.Outcome, TTFTMs: attempt.TTFTMs, DurationMs: attempt.DurationMs,
 			ResponseBytes: attempt.ResponseBytes, Stream: attempt.Stream, StreamCompleted: attempt.StreamCompleted,
@@ -245,10 +255,21 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// 并发拉取各上游：串行时任一上游超时都会线性累加到客户端等待时间。
+	perUpstream := make([][]string, len(ups))
+	var wg sync.WaitGroup
+	for i, u := range ups {
+		wg.Add(1)
+		go func(index int, item *upstream.Upstream) {
+			defer wg.Done()
+			perUpstream[index] = s.upstreamModels(r.Context(), item)
+		}(i, u)
+	}
+	wg.Wait()
 	seen := make(map[string]bool)
 	var ids []string
-	for _, u := range ups {
-		for _, m := range s.upstreamModels(u) {
+	for _, models := range perUpstream {
+		for _, m := range models {
 			if !seen[m] {
 				seen[m] = true
 				ids = append(ids, m)
@@ -271,22 +292,50 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
 }
 
+// forgetUpstreamModels 丢弃某上游的模型清单缓存，供上游删除后调用。
+func (s *Server) forgetUpstreamModels(id int64) {
+	s.modelMu.Lock()
+	delete(s.modelCache, id)
+	s.modelMu.Unlock()
+}
+
 // upstreamModels 取单个上游的模型列表，命中缓存(TTL 内)则直接返回，
 // 否则实时拉取并写缓存；拉取失败时回退到上次缓存（可能过期），仍无则空。
-func (s *Server) upstreamModels(u *upstream.Upstream) []string {
+// 同一上游同时只允许一次在途拉取，其余调用者等待并复用结果——否则缓存过期瞬间
+// 的并发请求会各自打满上游连接。
+func (s *Server) upstreamModels(ctx context.Context, u *upstream.Upstream) []string {
 	s.modelMu.Lock()
-	ent, ok := s.modelCache[u.ID]
-	s.modelMu.Unlock()
-	if ok && time.Since(ent.ts) < modelsTTL {
+	ent, cached := s.modelCache[u.ID]
+	if cached && time.Since(ent.ts) < modelsTTL {
+		s.modelMu.Unlock()
 		return ent.models
 	}
-	models, _, err := u.FetchModels(10 * time.Second)
-	if err != nil {
-		return ent.models // 失败回退到旧缓存（无则 nil）
+	if flight, ok := s.modelFlight[u.ID]; ok {
+		s.modelMu.Unlock()
+		select {
+		case <-flight.done:
+			return flight.models
+		case <-ctx.Done():
+			return ent.models
+		}
 	}
-	s.health.MarkModelsSupported(u.ID, models)
-	s.modelMu.Lock()
-	s.modelCache[u.ID] = modelCacheEntry{models: models, ts: time.Now()}
+	flight := &modelFetch{done: make(chan struct{})}
+	s.modelFlight[u.ID] = flight
 	s.modelMu.Unlock()
+
+	models, _, err := u.FetchModels(ctx, 10*time.Second)
+	if err != nil {
+		models = ent.models // 失败回退到旧缓存（无则 nil）
+	} else {
+		s.health.MarkModelsSupported(u.ID, models)
+	}
+	s.modelMu.Lock()
+	if err == nil {
+		s.modelCache[u.ID] = modelCacheEntry{models: models, ts: time.Now()}
+	}
+	delete(s.modelFlight, u.ID)
+	s.modelMu.Unlock()
+	flight.models = models
+	close(flight.done)
 	return models
 }

@@ -35,6 +35,13 @@ const probing = reactive(new Set())
 const recoveringUpstreams = reactive(new Set())
 const recoveringModels = reactive(new Set())
 const refreshingBilling = reactive(new Set())
+// 计费比对明细：展开的上游 id、各上游选中的窗口、已取回的区间比对结果。
+// 明细放内联面板而非原生 title——余额、缺价模型、价目版本这些要能选中复制、
+// 触屏可看，原生 tooltip 做不到。
+const billingDetailOpen = reactive(new Set())
+const billingWindowFor = reactive({})
+const billingRangeAudit = reactive({})
+const billingRangeLoading = reactive(new Set())
 async function probeOne(m) {
   probing.add(m.id)
   try {
@@ -210,17 +217,20 @@ function billingStatusText(item) {
 }
 function billingStatusClass(item) { return item.billing?.status || 'pending' }
 const billingAuditReasons = {
-  insufficient_snapshots: '至少需要两次成功采集',
+  insufficient_snapshots: '本窗口内不足两次成功采集',
   counter_reset: '累计计费值已重置，等待下一采集窗口',
-  multiplier_changed: '本窗口内倍率发生变化，等待稳定窗口',
   multiplier_unavailable: '平台未提供有效计费倍率',
   pricing_catalog_unavailable: 'LiteLLM 价格目录尚不可用',
   pricing_query_failed: '本地价格查询失败',
   request_usage_incomplete: '成功请求缺少 Usage，费用数据不足',
   model_price_unavailable: '部分模型缺少 LiteLLM 价格',
   actual_cost_unavailable: '平台未提供实际费用累计值或余额变化',
-  actual_cost_exceeded: '实际费用超出本地理论费用容差',
+  actual_cost_exceeded: '实际扣费超出「平台自报原价 × 倍率」容差',
+  catalog_cost_exceeded: '平台自报原价明显高于公共价目表估算',
 }
+// 计费核对基准：reported 用平台自报原价(不受本地价表漂移影响)；
+// local 是平台未提供原价时的降级，结论会被价表差异污染。
+const billingBasisLabels = { reported: '基准：平台自报原价', local: '基准：本地价目表（降级）' }
 function billingCost(item, value) {
   if (value == null) return '—'
   const currency = item.billing?.currency || 'USD'
@@ -250,25 +260,76 @@ function billingPricingText(item) {
   if (audit.status === 'unavailable' && audit.reason) parts.push(billingAuditReasons[audit.reason] || audit.reason)
   return parts.join(' · ')
 }
-function billingAuditTitle(item) {
-  const audit = item.billing?.audit
-  if (!audit) return ''
-  const lines = []
-  if (audit.reason) lines.push(billingAuditReasons[audit.reason] || audit.reason)
-  if (audit.pricing_source) lines.push(`价格来源 ${audit.pricing_source}${audit.pricing_version ? ` (${audit.pricing_version.slice(0, 12)})` : ''}`)
-  if (audit.price_coverage != null) lines.push(`价格覆盖 ${audit.priced_request_count || 0}/${audit.request_count || 0} (${(Number(audit.price_coverage) * 100).toFixed(1)}%)`)
-  if (audit.missing_usage_count) lines.push(`缺少 Usage 的成功请求 ${audit.missing_usage_count} 条`)
-  if (audit.missing_models?.length) lines.push(`缺少价格 ${audit.missing_models.join('、')}`)
-  if (audit.deviation_rate != null) lines.push(`费用偏差 ${(Number(audit.deviation_rate) * 100).toFixed(1)}%`)
-  if (audit.reported_list_cost != null) lines.push(`平台自报原价增量 ${billingCost(item, audit.reported_list_cost)}`)
-  if (audit.balance_spent != null) lines.push(`余额减少 ${billingCost(item, audit.balance_spent)}`)
-  return lines.join('\n')
+// 区间比对：默认 24h。单个采集间隔的结论会被下一轮覆盖，且样本量太小，
+// 故明细面板一律展示聚合窗口，行内摘要保留即时值。
+async function loadBillingRange(item, window) {
+  const key = window || billingWindowFor[item.id] || '24h'
+  billingWindowFor[item.id] = key
+  billingRangeLoading.add(item.id)
+  try {
+    const payload = await api.upstreamBillingAudit(item.id, key)
+    if (payload) {
+      billingRangeAudit[item.id] = payload.audit || null
+      if (payload.window) billingWindowFor[item.id] = payload.window
+    }
+  } finally {
+    billingRangeLoading.delete(item.id)
+  }
+}
+function toggleBillingDetail(item) {
+  if (billingDetailOpen.has(item.id)) {
+    billingDetailOpen.delete(item.id)
+    return
+  }
+  billingDetailOpen.add(item.id)
+  if (!billingRangeAudit[item.id]) guard(() => loadBillingRange(item))
+}
+const billingWindowOptions = [
+  { key: '1h', label: '1 小时' },
+  { key: '24h', label: '24 小时' },
+  { key: '7d', label: '7 天' },
+]
+// 明细行：只保留需要留存/追溯的项，短暂状态留在行内摘要。
+function billingDetailRows(item) {
+  const audit = billingRangeAudit[item.id]
+  if (!audit) return []
+  const rows = []
+  const push = (label, value) => { if (value) rows.push({ label, value }) }
+  push('比对区间', audit.snapshot_count > 1
+    ? `${sinceText(audit.from_at)} → ${sinceText(audit.to_at)}（${audit.snapshot_count} 次采集）`
+    : '本窗口内采集次数不足')
+  push('本地价目估算', audit.list_cost != null ? billingCost(item, audit.list_cost) : '')
+  push('平台自报原价', audit.reported_list_cost != null ? billingCost(item, audit.reported_list_cost) : '')
+  if (audit.catalog_deviation != null) {
+    const rate = audit.catalog_deviation_rate != null
+      ? `（${(Number(audit.catalog_deviation_rate) * 100).toFixed(1)}%）` : ''
+    push('价目差异', `${billingCost(item, audit.catalog_deviation)}${rate}`)
+  }
+  push('理论扣费', audit.theoretical_cost != null ? billingCost(item, audit.theoretical_cost) : '')
+  push('实际扣费', audit.actual_cost != null
+    ? `${billingCost(item, audit.actual_cost)}${audit.actual_source === 'balance' ? '（按余额变化推算）' : ''}` : '')
+  if (audit.deviation != null) {
+    const rate = audit.deviation_rate != null ? `（${(Number(audit.deviation_rate) * 100).toFixed(1)}%）` : ''
+    push('计费偏差', `${billingCost(item, audit.deviation)}${rate}`)
+  }
+  push('余额减少', audit.balance_spent != null ? billingCost(item, audit.balance_spent) : '')
+  push('计费倍率', audit.expected_multiplier != null
+    ? `${audit.expected_multiplier}${audit.multiplier_changed ? '（区间内有调整）' : ''}` : '')
+  push('实测倍率', audit.observed_multiplier != null ? Number(audit.observed_multiplier).toFixed(4) : '')
+  push('比对基准', billingBasisLabels[audit.billing_basis] || '')
+  push('价格覆盖', audit.price_coverage != null
+    ? `${audit.priced_request_count || 0}/${audit.request_count || 0}（${(Number(audit.price_coverage) * 100).toFixed(1)}%）` : '')
+  push('缺少 Usage', audit.missing_usage_count ? `${audit.missing_usage_count} 条成功请求` : '')
+  push('缺少价格', audit.missing_models?.length ? audit.missing_models.join('、') : '')
+  push('价目来源', audit.pricing_source
+    ? `${audit.pricing_source}${audit.pricing_version ? ` (${audit.pricing_version.slice(0, 12)})` : ''}` : '')
+  return rows
 }
 function billingMeta(item) {
   return [billingTypeLabel(item.billing_type), item.billing?.billing_group, billingStatusText(item)].filter(Boolean).join(' · ')
 }
 function billingTitle(item) {
-  return [billingMeta(item), billingAuditTitle(item), item.billing?.error, item.billing?.refreshed_at ? `更新于 ${sinceText(item.billing.refreshed_at)}` : '尚未采集'].filter(Boolean).join('\n')
+  return [billingMeta(item), item.billing?.error, item.billing?.refreshed_at ? `更新于 ${sinceText(item.billing.refreshed_at)}` : '尚未采集'].filter(Boolean).join('\n')
 }
 function upstreamHref(value) {
   try {
@@ -1247,6 +1308,7 @@ function logout() {
                           <small><i></i>{{ billingMeta(u) }}</small>
                           <div v-if="u.billing?.audit" class="billing-audit" :class="`billing-audit-${u.billing.audit.status}`">{{ billingAuditText(u) }}</div>
                           <div v-if="billingPricingText(u)" class="billing-pricing">{{ billingPricingText(u) }}</div>
+                          <button class="btn-link sm billing-detail-toggle" :aria-expanded="billingDetailOpen.has(u.id)" @click="toggleBillingDetail(u)">{{ billingDetailOpen.has(u.id) ? '收起明细' : '费用明细' }}</button>
                         </div>
                       </td>
                       <td><span class="state-badge" :class="rtClass(u.health)">{{ u.enabled ? rtLabel(u.health) : '已停用' }}</span></td>
@@ -1255,6 +1317,34 @@ function logout() {
                         <button v-if="u.health?.state === 'OPEN' || u.health?.state === 'HALF_OPEN'" class="icon-btn" title="手动恢复渠道" :disabled="recoveringUpstreams.has(u.id)" @click="guard(() => recoverUpstream(u))"><Icon name="refresh" :size="16" /></button>
                         <button class="btn-link sm" @click="testUpstream(u)">测试</button><button class="btn-link sm" @click="openBatchMonitors(u)">建监控</button>
                         <button class="icon-btn" title="编辑上游" @click="editUpstream(u)"><Icon name="edit" :size="16" /></button><button class="icon-btn danger" title="删除上游" @click="delUpstream(u)"><Icon name="trash" :size="16" /></button>
+                      </td>
+                    </tr>
+                    <tr v-if="billingDetailOpen.has(u.id)" class="billing-detail-row">
+                      <td colspan="10">
+                        <div class="billing-detail">
+                          <div class="billing-detail-head">
+                            <strong>费用比对明细</strong>
+                            <div class="billing-window-tabs" role="group" aria-label="比对区间">
+                              <button v-for="opt in billingWindowOptions" :key="opt.key" type="button"
+                                class="billing-window-tab" :class="{ on: (billingWindowFor[u.id] || '24h') === opt.key }"
+                                :aria-pressed="(billingWindowFor[u.id] || '24h') === opt.key"
+                                :disabled="billingRangeLoading.has(u.id)"
+                                @click="guard(() => loadBillingRange(u, opt.key))">{{ opt.label }}</button>
+                            </div>
+                          </div>
+                          <p v-if="billingRangeLoading.has(u.id)" class="billing-detail-hint">正在汇总…</p>
+                          <template v-else-if="billingRangeAudit[u.id]">
+                            <p v-if="billingRangeAudit[u.id].reason" class="billing-detail-hint" :class="`billing-audit-${billingRangeAudit[u.id].status}`">
+                              {{ billingAuditReasons[billingRangeAudit[u.id].reason] || billingRangeAudit[u.id].reason }}
+                            </p>
+                            <dl class="billing-detail-grid">
+                              <template v-for="row in billingDetailRows(u)" :key="row.label">
+                                <dt>{{ row.label }}</dt><dd>{{ row.value }}</dd>
+                              </template>
+                            </dl>
+                          </template>
+                          <p v-else class="billing-detail-hint">暂无比对数据。</p>
+                        </div>
                       </td>
                     </tr>
                   </tbody>

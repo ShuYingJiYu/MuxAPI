@@ -106,6 +106,7 @@ export const api = {
   recoverUpstream: id => req('POST', `/upstreams/${id}/recover`),
   recoverUpstreamModel: (id, model) => req('POST', `/upstreams/${id}/models/recover`, { model }),
   refreshUpstreamBilling: id => req('POST', `/upstreams/${id}/billing/refresh`),
+  upstreamBillingAudit: (id, window) => req('GET', `/upstreams/${id}/billing/audit?window=${encodeURIComponent(window || '')}`),
   createMonitorsBatch: (id, payload) => req('POST', `/upstreams/${id}/monitors`, payload),
   // 管理标签
   tags: () => req('GET', '/tags'),

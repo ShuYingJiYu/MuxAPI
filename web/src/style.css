@@ -166,6 +166,21 @@ svg { display: block; flex-shrink: 0; }
 .billing-audit-warning { color: var(--red); font-weight: 700; }
 .billing-audit-pending, .billing-audit-unavailable { color: var(--g400); }
 .billing-pricing { max-width: 205px; margin-top: 1px; overflow: hidden; color: var(--g400); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.billing-detail-toggle { margin-top: 2px; padding: 0; font-size: 10px; }
+/* 明细内联展开：数值可选中复制，触屏可用（原生 title 两者都做不到） */
+.billing-detail-row > td { padding: 0 12px 12px; background: var(--g50); }
+.billing-detail { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--g200); border-radius: 8px; background: #fff; }
+.billing-detail-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.billing-detail-head strong { font-size: 12px; }
+.billing-window-tabs { display: flex; gap: 4px; }
+.billing-window-tab { padding: 3px 10px; border: 1px solid var(--g200); border-radius: 999px; background: var(--bg); color: var(--g500); cursor: pointer; font-size: 11px; }
+.billing-window-tab:hover:not(:disabled) { border-color: var(--g300); color: var(--g600); }
+.billing-window-tab.on { border-color: var(--p600); background: var(--p600); color: #fff; }
+.billing-window-tab:disabled { cursor: default; opacity: .6; }
+.billing-detail-hint { margin: 0; color: var(--g500); font-size: 11px; }
+.billing-detail-grid { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; margin: 0; font-size: 11px; }
+.billing-detail-grid dt { color: var(--g400); white-space: nowrap; }
+.billing-detail-grid dd { margin: 0; color: var(--g600); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .tag-color-dot { width: 9px; height: 9px; flex: none; border-radius: 50%; background: var(--g300); }
 .tag-color-dot.tag-green, .tag-green > span { background: #42b883; }
 .tag-color-dot.tag-teal, .tag-teal > span { background: #299f91; }
