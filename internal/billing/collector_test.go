@@ -93,6 +93,87 @@ func TestFetchNewAPI(t *testing.T) {
 	}
 }
 
+// 关键回归：New API 的 /api/log/token 把错误日志(type=5)和消费日志(type=2)混在
+// 一起返回，错误日志的 other 里没有 group_ratio。生产上 mosshubs 有 39% 是错误
+// 日志，取「最新一条」会让倍率随机落到分组表的公示价，与实际扣费价不符。
+func TestFetchNewAPISkipsErrorLogsWhenReadingMultiplier(t *testing.T) {
+	var groupsHit int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/usage/token/":
+			w.Write([]byte(`{"data":{"object":"token_usage","total_used":500000,"unlimited_quota":true}}`))
+		case "/api/status":
+			w.Write([]byte(`{"data":{"quota_per_unit":500000}}`))
+		case "/api/log/token":
+			// 最新两条是错误日志：带 group 但 other 里只有 error_code/status_code
+			w.Write([]byte(`{"success":true,"data":[
+				{"group":"OAI-PRO20X","other":"{\"error_code\":\"upstream_error\",\"status_code\":503}"},
+				{"group":"OAI-PRO20X","other":"{\"error_code\":\"upstream_error\",\"status_code\":429}"},
+				{"group":"OAI-PRO20X","other":"{\"group_ratio\":0.18,\"user_group_ratio\":-1}"}
+			]}`))
+		case "/api/user/groups":
+			groupsHit++
+			w.Write([]byte(`{"success":true,"data":{"OAI-PRO20X":{"ratio":0.15}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	result, err := Fetch(context.Background(), &upstream.Upstream{
+		BaseURL: server.URL, BillingType: upstream.BillingNewAPI,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BillingGroup != "OAI-PRO20X" {
+		t.Fatalf("error logs still carry the group name: %+v", result)
+	}
+	if result.EffectiveMultiplier == nil || *result.EffectiveMultiplier != 0.18 {
+		t.Fatalf("multiplier must come from the newest consumption log, got %v", result.EffectiveMultiplier)
+	}
+	if groupsHit != 0 {
+		t.Fatalf("group table must not be consulted when a consumption log exists")
+	}
+	if result.Warning != "" {
+		t.Fatalf("unexpected warning: %s", result.Warning)
+	}
+}
+
+// 只有错误日志时才回落到分组公示价，并说明该值未经实际扣费验证。
+func TestFetchNewAPIFallsBackToGroupTableWithoutConsumptionLog(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/usage/token/":
+			w.Write([]byte(`{"data":{"object":"token_usage","total_used":0,"unlimited_quota":true}}`))
+		case "/api/status":
+			w.Write([]byte(`{"data":{"quota_per_unit":500000}}`))
+		case "/api/log/token":
+			w.Write([]byte(`{"success":true,"data":[
+				{"group":"claude-kiro","other":"{\"error_code\":\"upstream_error\",\"status_code\":503}"}
+			]}`))
+		case "/api/user/groups":
+			w.Write([]byte(`{"success":true,"data":{"claude-kiro":{"ratio":0.15}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	result, err := Fetch(context.Background(), &upstream.Upstream{
+		BaseURL: server.URL, BillingType: upstream.BillingNewAPI,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.EffectiveMultiplier == nil || *result.EffectiveMultiplier != 0.15 {
+		t.Fatalf("group table must supply the fallback multiplier, got %v", result.EffectiveMultiplier)
+	}
+	if result.Warning == "" {
+		t.Fatal("a list-price multiplier must be reported as unverified")
+	}
+}
+
 func TestFetchNewAPIPartialWithoutLogs(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

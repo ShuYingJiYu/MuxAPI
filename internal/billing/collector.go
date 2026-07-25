@@ -159,6 +159,8 @@ type newAPIStatusResponse struct {
 	} `json:"data"`
 }
 
+// newAPILogResponse 是 /api/log/token 的响应，按时间倒序。它把消费日志与错误日志
+// 混在一起返回：两者都带 group，但只有消费日志的 other 里有 group_ratio。
 type newAPILogResponse struct {
 	Success bool `json:"success"`
 	Data    []struct {
@@ -218,18 +220,30 @@ func fetchNewAPI(ctx context.Context, item *upstream.Upstream) (Result, error) {
 		result.Warning = err.Error()
 		return result, nil
 	}
+	// 分组名取最新一条日志（错误日志也带 group，且反映当前分组归属）；
+	// 倍率只认最新一条**消费**日志——错误日志没有扣费，其 other 里也没有
+	// group_ratio，若不区分就会随机落到下面的分组公示价，与实际扣费价不符。
 	for _, entry := range logs.Data {
-		if strings.TrimSpace(entry.Group) == "" {
+		group := strings.TrimSpace(entry.Group)
+		if group == "" {
 			continue
 		}
-		result.BillingGroup = entry.Group
+		if result.BillingGroup == "" {
+			result.BillingGroup = group
+		}
 		var detail newAPILogBilling
-		if decodeNewAPILogBilling(entry.Other, &detail) {
-			result.GroupMultiplier = detail.GroupRatio
-			result.EffectiveMultiplier = detail.GroupRatio
-			if detail.UserGroupRatio != nil && *detail.UserGroupRatio >= 0 {
-				result.EffectiveMultiplier = detail.UserGroupRatio
-			}
+		if !decodeNewAPILogBilling(entry.Other, &detail) || detail.GroupRatio == nil {
+			continue
+		}
+		// 分组变更后，旧分组的扣费倍率不能套到当前分组上。
+		if group != result.BillingGroup {
+			break
+		}
+		result.GroupMultiplier = detail.GroupRatio
+		result.EffectiveMultiplier = detail.GroupRatio
+		// user_group_ratio 为负数表示「无个人覆盖」，不是真实倍率。
+		if detail.UserGroupRatio != nil && *detail.UserGroupRatio >= 0 {
+			result.EffectiveMultiplier = detail.UserGroupRatio
 		}
 		break
 	}
@@ -248,6 +262,9 @@ func fetchNewAPI(ctx context.Context, item *upstream.Upstream) (Result, error) {
 			if json.Unmarshal(group.Ratio, &ratio) == nil {
 				result.GroupMultiplier = &ratio
 				result.EffectiveMultiplier = &ratio
+				// 分组表是公示价，可能与该令牌实际适用的倍率不同（站点常有议价分组）。
+				// 标注出来，免得比对偏差被当成上游超收。
+				result.Warning = "New API billing multiplier came from the group list price, not from a charged request"
 			}
 		}
 	}
