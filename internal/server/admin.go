@@ -128,13 +128,11 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 		alertWebhook, alertWebhookSource := stringSettingValue(s.store.GetSetting("alert_webhook", ""), "")
 		alertDebounce, alertDebounceSource := settingValue(s.store.GetSetting("alert_debounce", ""), "60s")
 		firstResponseTimeout, firstResponseTimeoutSource := intSettingValue(s.store.GetSetting("first_response_timeout_ms", ""), 120000)
-		routeSmart := s.store.GetSetting("route_smart", "on") // 默认开
 		writeJSON(w, map[string]string{
 			"log_retention":                       s.store.GetSetting("request_retention_days", ""),
 			"alert_webhook":                       s.store.GetSetting("alert_webhook", ""),
 			"alert_debounce":                      s.store.GetSetting("alert_debounce", ""),
 			"first_response_timeout_ms":           s.store.GetSetting("first_response_timeout_ms", ""),
-			"route_smart":                         routeSmart,
 			"effective_log_retention":             logRetention,
 			"effective_alert_webhook":             alertWebhook,
 			"effective_alert_debounce":            alertDebounce,
@@ -150,7 +148,6 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 			AlertWebhook           any `json:"alert_webhook"`
 			AlertDebounce          any `json:"alert_debounce"`
 			FirstResponseTimeoutMs any `json:"first_response_timeout_ms"`
-			RouteSmart             any `json:"route_smart"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 			http.Error(w, "设置参数格式无效", 400)
@@ -161,13 +158,11 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 			AlertWebhook           string
 			AlertDebounce          string
 			FirstResponseTimeoutMs string
-			RouteSmart             string
 		}{
 			LogRetention:           settingString(raw.LogRetention),
 			AlertWebhook:           settingString(raw.AlertWebhook),
 			AlertDebounce:          settingString(raw.AlertDebounce),
 			FirstResponseTimeoutMs: settingString(raw.FirstResponseTimeoutMs),
-			RouteSmart:             settingString(raw.RouteSmart),
 		}
 		if n, err := strconv.Atoi(d.LogRetention); err != nil || n < 1 || n > 365 {
 			http.Error(w, "请求记录保留天数须为 1~365 的整数", 400)
@@ -186,15 +181,10 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "首响应超时须为 1000~600000 的毫秒数(1~600 秒)", 400)
 			return
 		}
-		if d.RouteSmart != "on" && d.RouteSmart != "off" {
-			http.Error(w, "智能路由开关须为 on 或 off", 400)
-			return
-		}
 		s.store.SetSetting("request_retention_days", d.LogRetention)
 		s.store.SetSetting("alert_webhook", d.AlertWebhook)
 		s.store.SetSetting("alert_debounce", d.AlertDebounce)
 		s.store.SetSetting("first_response_timeout_ms", d.FirstResponseTimeoutMs)
-		s.store.SetSetting("route_smart", d.RouteSmart)
 		w.WriteHeader(204)
 	default:
 		http.Error(w, "method not allowed", 405)

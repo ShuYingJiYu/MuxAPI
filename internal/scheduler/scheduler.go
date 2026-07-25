@@ -12,13 +12,14 @@ import (
 // ErrNoUpstream 表示分组中没有可声明占用的健康渠道。
 var ErrNoUpstream = errors.New("no healthy upstream available")
 
-// Health is the channel-level state required by the scheduler.
+// Health is the channel-level state required by the scheduler. Model only
+// affects availability via the capability cache; latency and load are per
+// channel.
 type Health interface {
 	IsAvailable(id int64, model string) bool
 	Claim(id int64, model string) bool
-	LatencyEWMA(id int64, model string) int64
+	LatencyEWMA(id int64) int64
 	InFlight(id int64) int64
-	RouteStats(id int64, model string) (ewmaMs float64, succRate float64)
 }
 
 // Scheduler applies strict priority first, then standard weighted P2C inside
@@ -32,10 +33,6 @@ type Scheduler struct {
 func New(list func(groupID int64) []*upstream.Upstream, h Health) *Scheduler {
 	return &Scheduler{list: list, health: h}
 }
-
-// SetRouting remains for API compatibility. Routing now always uses standard
-// P2C, so runtime smart-routing settings no longer alter the algorithm.
-func (s *Scheduler) SetRouting(tolerance func() float64, enabled func() bool) {}
 
 // Pick 选择一个上游，并在健康管理器中声明并发占用。
 func (s *Scheduler) Pick(groupID int64, model string) (*upstream.Upstream, error) {
@@ -75,7 +72,7 @@ func (s *Scheduler) PickExcluding(groupID int64, model string, exclude map[int64
 		}
 
 		// IsAvailable 与 Claim 分离，声明失败时重新选择可处理并发半开竞争。
-		chosen := s.pickP2C(tier, model)
+		chosen := s.pickP2C(tier)
 		if s.health.Claim(chosen.ID, model) {
 			return chosen, nil
 		}
@@ -85,7 +82,7 @@ func (s *Scheduler) PickExcluding(groupID int64, model string, exclude map[int64
 
 // pickP2C performs two independent weighted draws. Drawing the same upstream
 // twice is valid and returns it directly, matching standard P2C behavior.
-func (s *Scheduler) pickP2C(tier []*upstream.Upstream, model string) *upstream.Upstream {
+func (s *Scheduler) pickP2C(tier []*upstream.Upstream) *upstream.Upstream {
 	if len(tier) == 1 {
 		return tier[0]
 	}
@@ -94,16 +91,16 @@ func (s *Scheduler) pickP2C(tier []*upstream.Upstream, model string) *upstream.U
 	if a.ID == b.ID {
 		return a
 	}
-	baseline := medianKnownLatency(tier, func(id int64) int64 { return s.health.LatencyEWMA(id, model) })
-	if p2cScore(b, s.health, model, baseline) < p2cScore(a, s.health, model, baseline) {
+	baseline := medianKnownLatency(tier, s.health.LatencyEWMA)
+	if p2cScore(b, s.health, baseline) < p2cScore(a, s.health, baseline) {
 		return b
 	}
 	return a
 }
 
 // p2cScore 用延迟乘以当前并发数，使慢渠道和繁忙渠道自然降低胜率。
-func p2cScore(candidate *upstream.Upstream, health Health, model string, baseline int64) float64 {
-	latency := health.LatencyEWMA(candidate.ID, model)
+func p2cScore(candidate *upstream.Upstream, health Health, baseline int64) float64 {
+	latency := health.LatencyEWMA(candidate.ID)
 	if latency <= 0 {
 		latency = baseline
 	}
@@ -148,15 +145,4 @@ func weightedPick(tier []*upstream.Upstream) *upstream.Upstream {
 		draw -= weight
 	}
 	return tier[0]
-}
-
-// EffLatency is kept for callers that display the legacy metric.
-func EffLatency(ewmaMs, succRate, toleranceMs float64) float64 {
-	if ewmaMs > 0 {
-		return ewmaMs
-	}
-	if toleranceMs > 0 {
-		return toleranceMs
-	}
-	return 1
 }

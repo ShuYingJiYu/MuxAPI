@@ -371,7 +371,7 @@ type countingHealth struct {
 func (c *countingHealth) Report(id int64, model string, ok bool, latencyMs int64) {
 	atomic.AddInt32(&c.reports, 1)
 }
-func (c *countingHealth) ReleaseClaim(id int64, model string)         {}
+func (c *countingHealth) ReleaseClaim(id int64)                       {}
 func (c *countingHealth) MarkModelUnsupported(id int64, model string) {}
 func (c *countingHealth) MarkModelSupported(id int64, model string)   {}
 func (c *countingHealth) PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, error) {

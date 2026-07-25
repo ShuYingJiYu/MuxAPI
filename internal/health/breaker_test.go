@@ -94,11 +94,11 @@ func TestHalfOpenAllowsOneClaim(t *testing.T) {
 	if m.Claim(1, "gpt") {
 		t.Fatal("second concurrent HALF_OPEN claim should be blocked")
 	}
-	m.ReleaseClaim(1, "gpt")
+	m.ReleaseClaim(1)
 	if !m.Claim(1, "gpt") {
 		t.Fatal("released HALF_OPEN slot should be reusable")
 	}
-	m.ReleaseClaim(1, "gpt")
+	m.ReleaseClaim(1)
 }
 
 func TestHalfOpenConcurrentBurst(t *testing.T) {
@@ -120,7 +120,7 @@ func TestHalfOpenConcurrentBurst(t *testing.T) {
 	if accepted != 1 {
 		t.Fatalf("expected one HALF_OPEN claim, got %d", accepted)
 	}
-	m.ReleaseClaim(1, "gpt")
+	m.ReleaseClaim(1)
 }
 
 func TestModelUnsupportedDoesNotAffectChannel(t *testing.T) {
@@ -162,25 +162,22 @@ func TestInFlightAccounting(t *testing.T) {
 	if got := m.InFlight(1); got != 2 {
 		t.Fatalf("expected in-flight=2, got %d", got)
 	}
-	m.ReleaseClaim(1, "gpt")
-	m.ReleaseClaim(1, "gpt")
-	m.ReleaseClaim(1, "gpt")
+	m.ReleaseClaim(1)
+	m.ReleaseClaim(1)
+	m.ReleaseClaim(1)
 	if got := m.InFlight(1); got != 0 {
 		t.Fatalf("release must be idempotent at zero, got %d", got)
 	}
 }
 
-func TestRouteStatsUseChannelTTFT(t *testing.T) {
+func TestLatencyEWMAUsesChannelTTFT(t *testing.T) {
 	m := New(3, time.Hour)
 	m.Report(1, "gpt-5.6", true, 100)
 	m.Report(1, "gpt-5.5", true, 200)
-	latA, succA := m.RouteStats(1, "gpt-5.6")
-	latB, succB := m.RouteStats(1, "other")
-	if latA != latB || succA != succB {
-		t.Fatalf("all models must share channel stats: a=(%v,%v) b=(%v,%v)", latA, succA, latB, succB)
-	}
-	if latA <= 100 || latA >= 200 || succA != 1 {
-		t.Fatalf("unexpected channel EWMA: latency=%v success=%v", latA, succA)
+	// 每个模型的成功延迟都汇入同一把渠道 EWMA，两次上报后落在 100~200 之间。
+	latency := m.LatencyEWMA(1)
+	if latency <= 100 || latency >= 200 {
+		t.Fatalf("unexpected channel EWMA: latency=%v", latency)
 	}
 }
 
@@ -204,13 +201,12 @@ func TestTrafficStats(t *testing.T) {
 func TestSeedRestoresChannelStatsOnly(t *testing.T) {
 	m := New(3, time.Hour)
 	m.Seed([]RouteSample{
-		{UpstreamID: 1, Model: "a", OK: true, LatencyMs: 100},
-		{UpstreamID: 1, Model: "b", OK: false},
-		{UpstreamID: 1, Model: "c", OK: true, LatencyMs: 200},
+		{UpstreamID: 1, OK: true, LatencyMs: 100},
+		{UpstreamID: 1, OK: false},
+		{UpstreamID: 1, OK: true, LatencyMs: 200},
 	})
-	latency, success := m.RouteStats(1, "any")
-	if latency <= 0 || success <= 0 || success >= 1 {
-		t.Fatalf("unexpected restored stats: latency=%v success=%v", latency, success)
+	if latency := m.LatencyEWMA(1); latency <= 0 {
+		t.Fatalf("seed must restore channel latency EWMA, got %v", latency)
 	}
 	if got := m.EffectiveState(1); got != "CLOSED" {
 		t.Fatalf("seed must not restore OPEN state, got %s", got)

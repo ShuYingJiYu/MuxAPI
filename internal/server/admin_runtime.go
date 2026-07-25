@@ -29,15 +29,10 @@ func toHealthView(sn health.Snapshot, state string) healthView {
 	}
 }
 
-// modelHealthView 模型级健康精简视图（上游/成员列表展开模型徽章用）。
+// modelHealthView 模型能力排除的精简视图（上游/成员列表展开模型徽章用）。
 type modelHealthView struct {
-	Model     string  `json:"model"`
-	State     string  `json:"state"`
-	Fails     int     `json:"fails"`
-	LatencyMs int64   `json:"latency_ms"`
-	LastProbe int64   `json:"last_probe"`
-	LatEWMA   float64 `json:"lat_ewma"`  // 选路用成功延迟 EWMA(ms)，徽章 hover 展示
-	SuccEWMA  float64 `json:"succ_ewma"` // 选路用成功率 EWMA(0..1)
+	Model string `json:"model"`
+	State string `json:"state"`
 }
 
 // toModelHealthViews exposes temporary model capability exclusions.
@@ -47,11 +42,7 @@ func toModelHealthViews(ms []health.ModelHealth) []modelHealthView {
 	}
 	out := make([]modelHealthView, 0, len(ms))
 	for _, mh := range ms {
-		out = append(out, modelHealthView{
-			Model: mh.Model, State: mh.State, Fails: mh.Fails,
-			LatencyMs: mh.LatencyMs, LastProbe: mh.LastProbe,
-			LatEWMA: mh.LatEWMA, SuccEWMA: mh.SuccEWMA,
-		})
+		out = append(out, modelHealthView{Model: mh.Model, State: mh.State})
 	}
 	return out
 }

@@ -39,7 +39,6 @@ type breaker struct {
 
 	latencyMs   int64
 	latencyEWMA float64
-	succEWMA    float64
 	inFlight    int64
 
 	reqs       int64
@@ -124,7 +123,7 @@ func (m *Manager) SetAlerter(a Alerter) { m.alerter = a }
 func (m *Manager) get(id int64) *breaker {
 	b := m.breakers[id]
 	if b == nil {
-		b = &breaker{state: Closed, succEWMA: -1}
+		b = &breaker{state: Closed}
 		m.breakers[id] = b
 	}
 	return b
@@ -194,7 +193,7 @@ func (m *Manager) Claim(id int64, model string) bool {
 }
 
 // ReleaseClaim releases the generic load counter and the HALF_OPEN gate.
-func (m *Manager) ReleaseClaim(id int64, model string) {
+func (m *Manager) ReleaseClaim(id int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	b := m.get(id)
@@ -246,21 +245,11 @@ func (m *Manager) IsModelUnsupported(id int64, model string) bool {
 	return m.modelUnsupportedLocked(id, model)
 }
 
-func (m *Manager) LatencyEWMA(id int64, model string) int64 {
+// LatencyEWMA 返回渠道的成功请求 TTFT EWMA(ms)，供 P2C 比较；0 表示冷启动。
+func (m *Manager) LatencyEWMA(id int64) int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return int64(m.get(id).latencyEWMA)
-}
-
-func (m *Manager) RouteStats(id int64, model string) (ewmaMs float64, succRate float64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	b := m.get(id)
-	succ := b.succEWMA
-	if succ < 0 {
-		succ = 1
-	}
-	return b.latencyEWMA, succ
 }
 
 // Report records one business attempt against the channel breaker.
@@ -324,7 +313,6 @@ func (m *Manager) ResetCircuit(id int64) {
 // drive 是业务请求与主动探测共用的熔断状态机。
 func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) (from, to State) {
 	from = b.state
-	b.succEWMA = mixEWMA(b.succEWMA, boolToF(ok))
 	if ok {
 		b.fails = 0
 		if latencyMs > 0 {
@@ -406,24 +394,9 @@ func transitionEvent(id int64, model string, from, to State, fails int) (AlertEv
 	}, true
 }
 
-func mixEWMA(prev, sample float64) float64 {
-	if prev < 0 {
-		return sample
-	}
-	return ewmaAlpha*sample + (1-ewmaAlpha)*prev
-}
-
-func boolToF(ok bool) float64 {
-	if ok {
-		return 1
-	}
-	return 0
-}
-
-// RouteSample 是从历史审计恢复路由 EWMA 所需的最小数据。
+// RouteSample 是从历史审计恢复渠道延迟 EWMA 所需的最小数据。
 type RouteSample struct {
 	UpstreamID int64
-	Model      string
 	OK         bool
 	LatencyMs  int64
 }
@@ -434,7 +407,6 @@ func (m *Manager) Seed(samples []RouteSample) {
 	defer m.mu.Unlock()
 	for _, sample := range samples {
 		b := m.get(sample.UpstreamID)
-		b.succEWMA = mixEWMA(b.succEWMA, boolToF(sample.OK))
 		if sample.OK && sample.LatencyMs > 0 {
 			if b.latencyEWMA == 0 {
 				b.latencyEWMA = float64(sample.LatencyMs)
@@ -480,15 +452,10 @@ func (m *Manager) Snapshot(id int64) Snapshot {
 	return sn
 }
 
-// ModelHealth now represents model capability exclusions, not breakers.
+// ModelHealth 表示一条模型能力排除记录，不是独立熔断器。
 type ModelHealth struct {
-	Model     string  `json:"model"`
-	State     string  `json:"state"`
-	Fails     int     `json:"fails"`
-	LatencyMs int64   `json:"latency_ms"`
-	LastProbe int64   `json:"last_probe"`
-	LatEWMA   float64 `json:"lat_ewma"`
-	SuccEWMA  float64 `json:"succ_ewma"`
+	Model string `json:"model"`
+	State string `json:"state"`
 }
 
 func (m *Manager) ModelStates(id int64) []ModelHealth {

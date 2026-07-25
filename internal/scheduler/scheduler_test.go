@@ -21,14 +21,14 @@ func TestStrictPriorityAndFailback(t *testing.T) {
 	if chosen.ID != 1 {
 		t.Fatalf("expected primary, got %s", chosen.Name)
 	}
-	hm.ReleaseClaim(chosen.ID, "gpt")
+	hm.ReleaseClaim(chosen.ID)
 	hm.Report(1, "gpt", false, 0)
 
 	chosen, _ = scheduler.Pick(1, "gpt")
 	if chosen.ID != 2 {
 		t.Fatalf("expected backup while primary is open, got %s", chosen.Name)
 	}
-	hm.ReleaseClaim(chosen.ID, "gpt")
+	hm.ReleaseClaim(chosen.ID)
 
 	hm.ObserveProbe(1, "gpt", true, 50)
 	hm.ObserveProbe(1, "gpt", true, 45)
@@ -36,7 +36,7 @@ func TestStrictPriorityAndFailback(t *testing.T) {
 	if chosen.ID != 1 {
 		t.Fatalf("expected immediate failback to primary, got %s", chosen.Name)
 	}
-	hm.ReleaseClaim(chosen.ID, "gpt")
+	hm.ReleaseClaim(chosen.ID)
 }
 
 func TestFailuresAcrossModelsOpenChannel(t *testing.T) {
@@ -52,7 +52,7 @@ func TestFailuresAcrossModelsOpenChannel(t *testing.T) {
 	if chosen.ID != 2 {
 		t.Fatalf("cross-model failures should open A and select B, got %s", chosen.Name)
 	}
-	hm.ReleaseClaim(chosen.ID, "claude")
+	hm.ReleaseClaim(chosen.ID)
 }
 
 func TestUnsupportedModelOnlyExcludesThatModel(t *testing.T) {
@@ -68,12 +68,12 @@ func TestUnsupportedModelOnlyExcludesThatModel(t *testing.T) {
 	if chosen.ID != 2 {
 		t.Fatalf("unsupported model should use B, got %s", chosen.Name)
 	}
-	hm.ReleaseClaim(chosen.ID, "gpt-5.6")
+	hm.ReleaseClaim(chosen.ID)
 	chosen, _ = scheduler.Pick(1, "gpt-5.5")
 	if chosen.ID != 1 {
 		t.Fatalf("other models should still use A, got %s", chosen.Name)
 	}
-	hm.ReleaseClaim(chosen.ID, "gpt-5.5")
+	hm.ReleaseClaim(chosen.ID)
 }
 
 func TestSamePriorityWeightDistribution(t *testing.T) {
@@ -90,7 +90,7 @@ func TestSamePriorityWeightDistribution(t *testing.T) {
 			t.Fatal(err)
 		}
 		counts[chosen.ID]++
-		hm.ReleaseClaim(chosen.ID, "gpt")
+		hm.ReleaseClaim(chosen.ID)
 	}
 	ratio := float64(counts[1]) / 10000
 	if ratio < 0.72 || ratio > 0.78 {
@@ -113,7 +113,7 @@ func TestStandardP2CFastCandidateGetsAboutSeventyFivePercent(t *testing.T) {
 	for i := 0; i < 10000; i++ {
 		chosen, _ := scheduler.Pick(1, "gpt")
 		counts[chosen.ID]++
-		hm.ReleaseClaim(chosen.ID, "gpt")
+		hm.ReleaseClaim(chosen.ID)
 	}
 	ratio := float64(counts[1]) / 10000
 	if ratio < 0.72 || ratio > 0.78 {
@@ -134,14 +134,11 @@ func (h *fixedHealth) Claim(id int64, model string) bool {
 	h.mu.Unlock()
 	return true
 }
-func (h *fixedHealth) LatencyEWMA(id int64, model string) int64 { return h.latency[id] }
+func (h *fixedHealth) LatencyEWMA(id int64) int64 { return h.latency[id] }
 func (h *fixedHealth) InFlight(id int64) int64 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.inflight[id]
-}
-func (h *fixedHealth) RouteStats(id int64, model string) (float64, float64) {
-	return float64(h.latency[id]), 1
 }
 
 func TestP2CIncludesInFlightLoad(t *testing.T) {

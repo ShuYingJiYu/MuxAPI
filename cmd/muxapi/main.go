@@ -48,13 +48,13 @@ func main() {
 
 	// 依赖顺序：健康状态 -> 调度 -> 转发 -> 主动监控 -> HTTP 接入。
 	hm := health.New(cfg.FailThreshold, cfg.Cooldown)
-	// 重启恢复：用最近的转发样本重建选路预估(延迟/成功率 EWMA)，不重建熔断状态
+	// 重启恢复：用最近的转发样本重建选路用的渠道延迟 EWMA，不重建熔断状态
 	if samples, err := st.RecentSamples(2000); err != nil {
 		slog.Warn("seed route stats from logs failed", "err", err)
 	} else if len(samples) > 0 {
 		hs := make([]health.RouteSample, len(samples))
 		for i, s := range samples {
-			hs[i] = health.RouteSample{UpstreamID: s.UpstreamID, Model: s.Model, OK: s.OK, LatencyMs: s.LatencyMs}
+			hs[i] = health.RouteSample{UpstreamID: s.UpstreamID, OK: s.OK, LatencyMs: s.LatencyMs}
 		}
 		hm.Seed(hs)
 		slog.Info("seeded route stats from logs", "samples", len(hs))

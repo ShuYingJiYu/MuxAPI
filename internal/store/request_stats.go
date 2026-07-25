@@ -277,7 +277,7 @@ func percentile(values []int64, quantile float64) int64 {
 	return values[index]
 }
 
-// RouteSample 一条历史路由样本，供启动时重建 (上游,模型) 的延迟/成功率 EWMA。
+// RouteSample 一条历史路由样本，供启动时重建渠道的延迟 EWMA。
 type RouteSample struct {
 	UpstreamID int64
 	Model      string

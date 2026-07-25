@@ -735,7 +735,6 @@ const effectiveAlertWebhook = ref('')
 const effectiveAlertDebounce = ref('')
 const alertWebhookSource = ref('')
 const alertDebounceSource = ref('')
-const routeSmart = ref('on')               // 兼容旧设置字段；调度固定使用标准 P2C
 const firstResponseTimeoutSec = ref('')    // 首字节超时(秒，后端存毫秒)
 const effectiveFirstResponseTimeoutMs = ref('')
 const firstResponseTimeoutSource = ref('')
@@ -775,7 +774,6 @@ async function loadSettings() {
   logRetentionSource.value = s.log_retention_source || ''
   alertWebhookSource.value = s.alert_webhook_source || ''
   alertDebounceSource.value = s.alert_debounce_source || ''
-  routeSmart.value = s.route_smart || 'on'
   effectiveFirstResponseTimeoutMs.value = s.effective_first_response_timeout_ms || ''
   // 后端存毫秒，UI 展示秒：优先取页面设置值，否则用 effective
   firstResponseTimeoutSec.value = String(Math.round((Number(s.first_response_timeout_ms || s.effective_first_response_timeout_ms) || 120000) / 1000))
@@ -793,7 +791,6 @@ function saveSettings() {
       log_retention: String(logRetention.value),
       alert_webhook: alertWebhook.value,
       alert_debounce: alertDebounce.value,
-      route_smart: routeSmart.value,
       first_response_timeout_ms: String((Number(firstResponseTimeoutSec.value) || 120) * 1000),
     })
     await loadSettings()

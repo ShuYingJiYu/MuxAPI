@@ -22,7 +22,7 @@ const defaultFirstResponseTimeout = 120 * time.Second
 // Health 汇总转发层需要的熔断反馈、并发占用和模型能力接口。
 type Health interface {
 	Report(id int64, model string, ok bool, latencyMs int64)
-	ReleaseClaim(id int64, model string)
+	ReleaseClaim(id int64)
 	MarkModelUnsupported(id int64, model string)
 	MarkModelSupported(id int64, model string)
 }
@@ -191,7 +191,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			break
 		}
 		tried[candidate.ID] = true
-		release := func() { f.health.ReleaseClaim(candidate.ID, model) }
+		release := func() { f.health.ReleaseClaim(candidate.ID) }
 		attemptStarted := time.Now()
 		attemptNo := len(attempts) + 1
 		selectionReason := "initial"

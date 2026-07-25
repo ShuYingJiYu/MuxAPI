@@ -196,8 +196,7 @@ func TestSettingsFirstResponseTimeout(t *testing.T) {
 		"log_retention":"7",
 		"alert_webhook":"",
 		"alert_debounce":"60s",
-		"first_response_timeout_ms":"180000",
-		"route_smart":"on"
+		"first_response_timeout_ms":"180000"
 	}`)
 	put.Body.Close()
 	if put.StatusCode != http.StatusNoContent {
