@@ -1300,7 +1300,9 @@ function logout() {
                 <table class="upstream-table">
                   <thead><tr><th class="select-cell"><input type="checkbox" :checked="section.rows.every(u => upstreamSelected.has(u.id))" :aria-label="`选择 ${section.name}`" @change="toggleUpstreamSectionSelection(section.rows)" /></th><th></th><th>名称</th><th>标签</th><th>地址</th><th>协议</th><th>计费</th><th>运行时</th><th>成功率</th><th>操作</th></tr></thead>
                   <tbody>
-                    <tr v-for="u in section.rows" :key="u.id" :class="{ disabled: !u.enabled, dragging: upstreamDragId === u.id, dragover: upstreamDragOverId === u.id }"
+                    <!-- template 包两行：明细行必须与主行同处 v-for 作用域内 -->
+                    <template v-for="u in section.rows" :key="u.id">
+                    <tr :class="{ disabled: !u.enabled, dragging: upstreamDragId === u.id, dragover: upstreamDragOverId === u.id }"
                       draggable="true" @dragstart="onUpstreamDragStart(u, $event)" @dragover="onUpstreamDragOver(u, $event)" @drop="onUpstreamDrop(u)" @dragend="onUpstreamDragEnd">
                       <td class="select-cell"><input type="checkbox" :checked="upstreamSelected.has(u.id)" :aria-label="`选择 ${u.name}`" @change="toggleUpstreamSelection(u.id)" /></td>
                       <td class="drag-cell"><span class="mon-grip" title="拖拽调整顺序"><Icon name="grip" :size="16" /></span></td>
@@ -1359,6 +1361,7 @@ function logout() {
                         </div>
                       </td>
                     </tr>
+                    </template>
                   </tbody>
                 </table>
               </div>
