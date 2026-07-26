@@ -39,8 +39,28 @@ type claudeToResponsesState struct {
 	ReasoningSignature string
 	ReasoningPartAdded bool
 	ReasoningIndex     int
+	// CompletedReasoning collects every finished thinking/redacted_thinking
+	// block; the final response.output must carry all of them, not just the
+	// last one, or replay loses earlier signatures.
+	CompletedReasoning []claudeReasoningItem
+	// StopReason is Claude's message_delta stop_reason; it decides whether the
+	// terminal event is response.completed or response.incomplete.
+	StopReason string
+	// ErrorSeen marks that an upstream error event arrived. response.failed is
+	// then the terminal event, so a trailing message_stop must stay silent —
+	// a Responses stream may carry exactly one terminal event.
+	ErrorSeen bool
 	// usage aggregation
 	Usage claudeResponsesUsageTokens
+}
+
+// claudeReasoningItem is one finished reasoning output item. Encrypted holds a
+// raw Claude thinking signature, or a claude_redacted#-prefixed opaque blob
+// for redacted_thinking blocks.
+type claudeReasoningItem struct {
+	ID        string
+	Summary   string
+	Encrypted string
 }
 
 type claudeResponsesUsageTokens struct {
@@ -248,6 +268,9 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			st.ReasoningSignature = ""
 			st.ReasoningIndex = 0
 			st.ReasoningPartAdded = false
+			st.CompletedReasoning = nil
+			st.StopReason = ""
+			st.ErrorSeen = false
 			st.FuncArgsBuf = make(map[int]*strings.Builder)
 			st.FuncNames = make(map[int]string)
 			st.FuncCallIDs = make(map[int]string)
@@ -342,6 +365,25 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			part, _ = sjson.SetBytes(part, "output_index", idx)
 			out = append(out, emitEvent("response.reasoning_summary_part.added", part))
 			st.ReasoningPartAdded = true
+		} else if typ == "redacted_thinking" {
+			// The block arrives complete in content_block_start. Wrap the
+			// opaque payload with our own prefix so the request translator can
+			// restore a redacted_thinking block on replay.
+			itemID := fmt.Sprintf("rs_%s_%d", st.ResponseID, idx)
+			encrypted := claudeRedactedPrefix + cb.Get("data").String()
+			added := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"reasoning","status":"in_progress","encrypted_content":"","summary":[]}}`)
+			added, _ = sjson.SetBytes(added, "sequence_number", nextSeq())
+			added, _ = sjson.SetBytes(added, "output_index", idx)
+			added, _ = sjson.SetBytes(added, "item.id", itemID)
+			added, _ = sjson.SetBytes(added, "item.encrypted_content", encrypted)
+			out = append(out, emitEvent("response.output_item.added", added))
+			itemDone := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"reasoning","encrypted_content":"","summary":[]}}`)
+			itemDone, _ = sjson.SetBytes(itemDone, "sequence_number", nextSeq())
+			itemDone, _ = sjson.SetBytes(itemDone, "output_index", idx)
+			itemDone, _ = sjson.SetBytes(itemDone, "item.id", itemID)
+			itemDone, _ = sjson.SetBytes(itemDone, "item.encrypted_content", encrypted)
+			out = append(out, emitEvent("response.output_item.done", itemDone))
+			st.CompletedReasoning = append(st.CompletedReasoning, claudeReasoningItem{ID: itemID, Encrypted: encrypted})
 		}
 	case "content_block_delta":
 		d := root.Get("delta")
@@ -475,17 +517,52 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				itemDone, _ = sjson.SetRawBytes(itemDone, "item.summary.-1", summary)
 			}
 			out = append(out, emitEvent("response.output_item.done", itemDone))
+			st.CompletedReasoning = append(st.CompletedReasoning, claudeReasoningItem{
+				ID:        st.ReasoningItemID,
+				Summary:   full,
+				Encrypted: st.ReasoningSignature,
+			})
 			st.ReasoningActive = false
 			st.ReasoningPartAdded = false
 		}
 		return noSSEOutput(out)
 	case "message_delta":
 		st.Usage.Merge(root.Get("usage"))
+		if stopReason := root.Get("delta.stop_reason"); stopReason.Exists() && stopReason.String() != "" {
+			st.StopReason = stopReason.String()
+		}
 		return [][]byte{}
+	case "error":
+		st.ErrorSeen = true
+		// Before message_start nothing was sent to the client, so staying
+		// silent lets the gateway treat the stream as empty and fail over.
+		if st.ResponseID == "" {
+			return [][]byte{}
+		}
+		failed := []byte(`{"type":"response.failed","sequence_number":0,"response":{"id":"","object":"response","created_at":0,"status":"failed","error":{"code":"","message":""}}}`)
+		failed, _ = sjson.SetBytes(failed, "sequence_number", nextSeq())
+		failed, _ = sjson.SetBytes(failed, "response.id", st.ResponseID)
+		failed, _ = sjson.SetBytes(failed, "response.created_at", st.CreatedAt)
+		failed, _ = sjson.SetBytes(failed, "response.error.code", root.Get("error.type").String())
+		failed, _ = sjson.SetBytes(failed, "response.error.message", root.Get("error.message").String())
+		out = append(out, emitEvent("response.failed", failed))
+		return noSSEOutput(out)
 	case "message_stop":
+		// After an error event the stream is already terminated (response.failed
+		// or, before message_start, silence for gateway failover). Emitting
+		// completion events here would fabricate success from a failed stream.
+		if st.ErrorSeen {
+			return noSSEOutput(out)
+		}
 		out = append(out, st.finalizeAssistantMessage(nextSeq)...)
 
+		terminalEvent, terminalStatus, incompleteReason := responsesTerminalForClaudeStopReason(st.StopReason)
 		completed := []byte(`{"type":"response.completed","sequence_number":0,"response":{"id":"","object":"response","created_at":0,"status":"completed","background":false,"error":null}}`)
+		completed, _ = sjson.SetBytes(completed, "type", terminalEvent)
+		completed, _ = sjson.SetBytes(completed, "response.status", terminalStatus)
+		if incompleteReason != "" {
+			completed, _ = sjson.SetBytes(completed, "response.incomplete_details.reason", incompleteReason)
+		}
 		completed, _ = sjson.SetBytes(completed, "sequence_number", nextSeq())
 		completed, _ = sjson.SetBytes(completed, "response.id", st.ResponseID)
 		completed, _ = sjson.SetBytes(completed, "response.created_at", st.CreatedAt)
@@ -558,14 +635,25 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 
 		// Build response.output from aggregated state
 		outputsWrapper := []byte(`{"arr":[]}`)
-		// reasoning item (if any)
-		if st.ReasoningBuf.Len() > 0 || st.ReasoningPartAdded || st.ReasoningSignature != "" {
+		// reasoning items: every completed block, plus one still open if the
+		// stream was cut before its content_block_stop.
+		reasoningItems := st.CompletedReasoning
+		if st.ReasoningActive && (st.ReasoningBuf.Len() > 0 || st.ReasoningPartAdded || st.ReasoningSignature != "") {
+			reasoningItems = append(reasoningItems, claudeReasoningItem{
+				ID:        st.ReasoningItemID,
+				Summary:   st.ReasoningBuf.String(),
+				Encrypted: st.ReasoningSignature,
+			})
+		}
+		reasoningChars := 0
+		for _, reasoning := range reasoningItems {
+			reasoningChars += len(reasoning.Summary)
 			item := []byte(`{"id":"","type":"reasoning","encrypted_content":"","summary":[]}`)
-			item, _ = sjson.SetBytes(item, "id", st.ReasoningItemID)
-			item, _ = sjson.SetBytes(item, "encrypted_content", st.ReasoningSignature)
-			if st.ReasoningBuf.Len() > 0 {
+			item, _ = sjson.SetBytes(item, "id", reasoning.ID)
+			item, _ = sjson.SetBytes(item, "encrypted_content", reasoning.Encrypted)
+			if reasoning.Summary != "" {
 				summary := []byte(`{"type":"summary_text","text":""}`)
-				summary, _ = sjson.SetBytes(summary, "text", st.ReasoningBuf.String())
+				summary, _ = sjson.SetBytes(summary, "text", reasoning.Summary)
 				item, _ = sjson.SetRawBytes(item, "summary.-1", summary)
 			}
 			outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
@@ -626,8 +714,8 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 		}
 
 		reasoningTokens := int64(0)
-		if st.ReasoningBuf.Len() > 0 {
-			reasoningTokens = int64(st.ReasoningBuf.Len() / 4)
+		if reasoningChars > 0 {
+			reasoningTokens = int64(reasoningChars / 4)
 		}
 		usagePresent := st.Usage.HasUsage || reasoningTokens > 0
 		if usagePresent {
@@ -642,10 +730,25 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				completed, _ = sjson.SetBytes(completed, "response.usage.total_tokens", totalTokens)
 			}
 		}
-		out = append(out, emitEvent("response.completed", completed))
+		out = append(out, emitEvent(terminalEvent, completed))
 	}
 
 	return noSSEOutput(out)
+}
+
+// responsesTerminalForClaudeStopReason maps Claude's stop_reason to the
+// Responses terminal event. max_tokens and refusal must surface as
+// response.incomplete — reporting them as completed hides truncation from the
+// client. The reason values mirror the codex->claude translator's mapping.
+func responsesTerminalForClaudeStopReason(stopReason string) (event, status, incompleteReason string) {
+	switch stopReason {
+	case "max_tokens":
+		return "response.incomplete", "incomplete", "max_output_tokens"
+	case "refusal":
+		return "response.incomplete", "incomplete", "content_filter"
+	default:
+		return "response.completed", "completed", ""
+	}
 }
 
 // ConvertClaudeResponseToOpenAIResponsesNonStream aggregates Claude SSE into a single OpenAI Responses JSON.
@@ -681,10 +784,12 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 		currentMsgID    string
 		currentFCID     string
 		textBuf         strings.Builder
-		reasoningBuf    strings.Builder
+		reasoningItems  []claudeReasoningItem
 		reasoningActive bool
-		reasoningItemID string
-		reasoningSig    string
+		stopReason      string
+		errorSeen       bool
+		errorType       string
+		errorMessage    string
 		annotations     []any
 		usageTokens     claudeResponsesUsageTokens
 	)
@@ -731,11 +836,17 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 				}
 			case "thinking":
 				reasoningActive = true
-				reasoningItemID = fmt.Sprintf("rs_%s_%d", responseID, idx)
-				reasoningSig = ""
+				item := claudeReasoningItem{ID: fmt.Sprintf("rs_%s_%d", responseID, idx)}
 				if signature := cb.Get("signature"); signature.Exists() && signature.String() != "" {
-					reasoningSig = signature.String()
+					item.Encrypted = signature.String()
 				}
+				reasoningItems = append(reasoningItems, item)
+			case "redacted_thinking":
+				reasoningActive = false
+				reasoningItems = append(reasoningItems, claudeReasoningItem{
+					ID:        fmt.Sprintf("rs_%s_%d", responseID, idx),
+					Encrypted: claudeRedactedPrefix + cb.Get("data").String(),
+				})
 			}
 
 		case "content_block_delta":
@@ -758,15 +869,15 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 					toolCalls[idx].args.WriteString(pj.String())
 				}
 			case "thinking_delta":
-				if reasoningActive {
+				if reasoningActive && len(reasoningItems) > 0 {
 					if t := d.Get("thinking"); t.Exists() {
-						reasoningBuf.WriteString(t.String())
+						reasoningItems[len(reasoningItems)-1].Summary += t.String()
 					}
 				}
 			case "signature_delta":
-				if reasoningActive {
+				if reasoningActive && len(reasoningItems) > 0 {
 					if signature := d.Get("signature"); signature.Exists() && signature.String() != "" {
-						reasoningSig = signature.String()
+						reasoningItems[len(reasoningItems)-1].Encrypted = signature.String()
 					}
 				}
 			case "citations_delta":
@@ -781,12 +892,34 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 
 		case "message_delta":
 			usageTokens.Merge(root.Get("usage"))
+			if sr := root.Get("delta.stop_reason"); sr.Exists() && sr.String() != "" {
+				stopReason = sr.String()
+			}
+
+		case "error":
+			errorSeen = true
+			errorType = root.Get("error.type").String()
+			errorMessage = root.Get("error.message").String()
 		}
+	}
+
+	// A mid-stream error means the aggregate is truncated. Return an error
+	// envelope so the gateway detects it (IsErrorPayload) and can fail over
+	// instead of shipping a silently incomplete response.
+	if errorSeen {
+		errEnvelope := []byte(`{"error":{"type":"","message":""}}`)
+		errEnvelope, _ = sjson.SetBytes(errEnvelope, "error.type", errorType)
+		errEnvelope, _ = sjson.SetBytes(errEnvelope, "error.message", errorMessage)
+		return errEnvelope
 	}
 
 	// Populate base fields
 	out, _ = sjson.SetBytes(out, "id", responseID)
 	out, _ = sjson.SetBytes(out, "created_at", createdAt)
+	if _, status, incompleteReason := responsesTerminalForClaudeStopReason(stopReason); incompleteReason != "" {
+		out, _ = sjson.SetBytes(out, "status", status)
+		out, _ = sjson.SetBytes(out, "incomplete_details.reason", incompleteReason)
+	}
 
 	// Inject request echo fields as top-level (similar to streaming variant)
 	reqBytes := pickRequestJSON(originalRequestRawJSON, requestRawJSON)
@@ -856,13 +989,18 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 
 	// Build output array
 	outputsWrapper := []byte(`{"arr":[]}`)
-	if reasoningBuf.Len() > 0 || reasoningSig != "" {
+	reasoningChars := 0
+	for _, reasoning := range reasoningItems {
+		if reasoning.Summary == "" && reasoning.Encrypted == "" {
+			continue
+		}
+		reasoningChars += len(reasoning.Summary)
 		item := []byte(`{"id":"","type":"reasoning","encrypted_content":"","summary":[]}`)
-		item, _ = sjson.SetBytes(item, "id", reasoningItemID)
-		item, _ = sjson.SetBytes(item, "encrypted_content", reasoningSig)
-		if reasoningBuf.Len() > 0 {
+		item, _ = sjson.SetBytes(item, "id", reasoning.ID)
+		item, _ = sjson.SetBytes(item, "encrypted_content", reasoning.Encrypted)
+		if reasoning.Summary != "" {
 			summary := []byte(`{"type":"summary_text","text":""}`)
-			summary, _ = sjson.SetBytes(summary, "text", reasoningBuf.String())
+			summary, _ = sjson.SetBytes(summary, "text", reasoning.Summary)
 			item, _ = sjson.SetRawBytes(item, "summary.-1", summary)
 		}
 		outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
@@ -922,9 +1060,9 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	out, _ = sjson.SetBytes(out, "usage.input_tokens_details.cached_tokens", cachedTokens)
 	out, _ = sjson.SetBytes(out, "usage.output_tokens", outputTokens)
 	out, _ = sjson.SetBytes(out, "usage.total_tokens", totalTokens)
-	if reasoningBuf.Len() > 0 {
+	if reasoningChars > 0 {
 		// Rough estimate similar to chat completions
-		reasoningTokens := int64(len(reasoningBuf.String()) / 4)
+		reasoningTokens := int64(reasoningChars / 4)
 		if reasoningTokens > 0 {
 			out, _ = sjson.SetBytes(out, "usage.output_tokens_details.reasoning_tokens", reasoningTokens)
 		}

@@ -1039,3 +1039,147 @@ func TestForwardFailoverToTranslatedClaudeUpstream(t *testing.T) {
 		t.Fatalf("backup hits = %d", backupHits.Load())
 	}
 }
+
+// recordingHealth 记录每次 Report 的 ok 值，用于断言「流未跑完不得报成功」。
+type recordingHealth struct {
+	mu    sync.Mutex
+	oks   []bool
+	inner *health.Manager
+}
+
+func (r *recordingHealth) Report(id int64, model string, ok bool, latencyMs int64) {
+	r.mu.Lock()
+	r.oks = append(r.oks, ok)
+	r.mu.Unlock()
+	r.inner.Report(id, model, ok, latencyMs)
+}
+func (r *recordingHealth) ReleaseClaim(id int64) { r.inner.ReleaseClaim(id) }
+func (r *recordingHealth) MarkModelUnsupported(id int64, model string) {
+	r.inner.MarkModelUnsupported(id, model)
+}
+func (r *recordingHealth) MarkModelSupported(id int64, model string) {
+	r.inner.MarkModelSupported(id, model)
+}
+func (r *recordingHealth) EffectiveState(id int64) string { return r.inner.EffectiveState(id) }
+func (r *recordingHealth) reported() []bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]bool(nil), r.oks...)
+}
+
+// 上游以 200 开流后在流中投递 error 事件时，不得向熔断器报成功——
+// 否则一个总在半路报错的渠道会被当成健康渠道，熔断永不触发。
+// 注意：单纯「没有终止事件」不算失败（见 TestForwardSSECleanEOFAfterFirstByteIsTransparent），
+// 这里依据的是上游明确的 error 事件。
+func TestForwardErroredStreamIsNotReportedHealthy(t *testing.T) {
+	upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\"}\n\n")
+		flusher.Flush()
+		io.WriteString(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\n")
+		flusher.Flush()
+		io.WriteString(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n")
+		flusher.Flush()
+	}))
+	defer upSrv.Close()
+
+	ups := []*upstream.Upstream{{ID: 1, BaseURL: upSrv.URL, APIKey: "k", Protocol: "passthrough", Priority: 1, Weight: 1, Enabled: true}}
+	hm := &recordingHealth{inner: health.New(3, time.Hour)}
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm.inner), hm, 1)
+
+	recorder := httptest.NewRecorder()
+	body := []byte(`{"model":"claude-test","stream":true}`)
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	result := fwd.Forward(recorder, request, body, 1, "")
+
+	if result.Outcome != OutcomePartial {
+		t.Fatalf("outcome = %q, want %q for a stream that errored mid-flight", result.Outcome, OutcomePartial)
+	}
+	if result.ErrorKind != "stream_error" {
+		t.Fatalf("error kind = %q, want stream_error. Result: %+v", result.ErrorKind, result)
+	}
+	for _, ok := range hm.reported() {
+		if ok {
+			t.Fatalf("errored stream must not report success to the breaker, got reports %v", hm.reported())
+		}
+	}
+}
+
+// 完整流（有 message_stop）仍必须报成功，避免上一条修复把健康渠道全判失败。
+func TestForwardCompletedStreamStillReportsHealthy(t *testing.T) {
+	upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\"}\n\n")
+		io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer upSrv.Close()
+
+	ups := []*upstream.Upstream{{ID: 1, BaseURL: upSrv.URL, APIKey: "k", Protocol: "passthrough", Priority: 1, Weight: 1, Enabled: true}}
+	hm := &recordingHealth{inner: health.New(3, time.Hour)}
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm.inner), hm, 1)
+
+	recorder := httptest.NewRecorder()
+	body := []byte(`{"model":"claude-test","stream":true}`)
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	result := fwd.Forward(recorder, request, body, 1, "")
+
+	if !result.StreamCompleted || result.Outcome != OutcomeSuccess {
+		t.Fatalf("completed stream should stay success: %+v", result)
+	}
+	reports := hm.reported()
+	if len(reports) != 1 || !reports[0] {
+		t.Fatalf("completed stream must report success once, got %v", reports)
+	}
+}
+
+// 非流式客户端 + 流式上游：翻译结果是错误信封时必须换源，
+// 不能把 {"error":...} 当成正常响应回给客户端。
+func TestForwardSSEToBodyErrorPayloadFailsOver(t *testing.T) {
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_bad\",\"usage\":{\"input_tokens\":1}}}\n\n")
+		io.WriteString(w, "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n")
+	}))
+	defer failing.Close()
+	var backupHits atomic.Int32
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ok\",\"usage\":{\"input_tokens\":1}}}\n\n")
+		io.WriteString(w, "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
+		io.WriteString(w, "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"recovered\"}}\n\n")
+		io.WriteString(w, "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+		io.WriteString(w, "data: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer backup.Close()
+
+	ups := []*upstream.Upstream{
+		{ID: 1, BaseURL: failing.URL, APIKey: "k", Protocol: "claude", Priority: 1, Weight: 1, Enabled: true},
+		{ID: 2, BaseURL: backup.URL, APIKey: "k", Protocol: "claude", Priority: 2, Weight: 1, Enabled: true},
+	}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 2)
+
+	recorder := httptest.NewRecorder()
+	body := []byte(`{"model":"claude-test","input":"hi","stream":false}`)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	result := fwd.Forward(recorder, request, body, 1, "")
+
+	if backupHits.Load() != 1 {
+		t.Fatalf("error envelope should have triggered failover, backup hits = %d", backupHits.Load())
+	}
+	if result.FinalUpstreamID != 2 {
+		t.Fatalf("final upstream = %d, want 2. Result: %+v", result.FinalUpstreamID, result)
+	}
+	if !strings.Contains(recorder.Body.String(), "recovered") {
+		t.Fatalf("client should receive the backup response, got: %s", recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "Overloaded") {
+		t.Fatalf("error envelope must not reach the client: %s", recorder.Body.String())
+	}
+}

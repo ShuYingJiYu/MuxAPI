@@ -123,6 +123,16 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	if mot := root.Get("max_output_tokens"); mot.Exists() {
 		out, _ = sjson.SetBytes(out, "max_tokens", mot.Int())
 	}
+	// Claude rejects requests whose thinking budget reaches max_tokens, and
+	// Codex clients rarely send max_output_tokens, so reconcile the two here.
+	thinkingRequested := gjson.GetBytes(out, "thinking").Exists()
+	out = reconcileClaudeThinkingBudget(out, root.Get("max_output_tokens").Exists())
+	// Thinking was requested but forcibly turned off (budget clamped below the
+	// minimum, or effort set it to disabled). History thinking/redacted_thinking
+	// blocks must then be dropped — Claude rejects them when thinking is off.
+	// A request that never enabled thinking keeps its blocks (established behavior).
+	dropThinkingBlocks := (thinkingRequested && !gjson.GetBytes(out, "thinking").Exists()) ||
+		gjson.GetBytes(out, "thinking.type").String() == "disabled"
 
 	// Stream
 	out, _ = sjson.SetBytes(out, "stream", stream)
@@ -165,13 +175,25 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		out, _ = sjson.SetBytes(out, "system", strings.Join(systemParts, "\n\n"))
 	}
 
-	// input array processing
+	// input array processing.
+	// Tool calls are merged per round: consecutive function_call items become
+	// one assistant message (thinking blocks kept in front), and their outputs
+	// become one user message. Claude requires exactly this shape — with
+	// thinking enabled, a second assistant message that starts with a bare
+	// tool_use is rejected, and every tool_use needs a tool_result in the next
+	// user turn.
 	var pendingReasoningParts []string
-	type pendingToolUseMessage struct {
-		callID string
-		raw    []byte
-	}
-	var pendingToolUseMessages []pendingToolUseMessage
+	var pendingToolUseBlocks []string
+	var pendingToolCallIDs []string // call ids still waiting for an output
+	var pendingToolResults []string
+	// resolvedToolCallIDs holds call ids that already own a tool_result, real or
+	// synthesized. Claude rejects a second result for the same tool_use, so a
+	// late output for a call already closed out by a round boundary is dropped.
+	resolvedToolCallIDs := map[string]struct{}{}
+	// seenToolCallIDs holds every call id this input declared a tool_use for. An
+	// output whose call is absent (history compaction trimmed it) would become a
+	// tool_result with an unknown tool_use_id, which Claude rejects.
+	seenToolCallIDs := map[string]struct{}{}
 	appendMessage := func(msg []byte) {
 		out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
 	}
@@ -186,24 +208,46 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		appendMessage(asst)
 		pendingReasoningParts = nil
 	}
-	flushPendingToolUses := func() {
-		for _, pending := range pendingToolUseMessages {
-			appendMessage(pending.raw)
-		}
-		pendingToolUseMessages = nil
-	}
-	flushPendingToolUseFor := func(callID string) {
-		if len(pendingToolUseMessages) == 0 {
+	emitPendingToolUses := func() {
+		if len(pendingToolUseBlocks) == 0 {
 			return
 		}
-		for i, pending := range pendingToolUseMessages {
-			if pending.callID == callID {
-				appendMessage(pending.raw)
-				pendingToolUseMessages = append(pendingToolUseMessages[:i], pendingToolUseMessages[i+1:]...)
+		asst := []byte(`{"role":"assistant","content":[]}`)
+		for _, blockJSON := range pendingToolUseBlocks {
+			asst, _ = sjson.SetRawBytes(asst, "content.-1", []byte(blockJSON))
+		}
+		appendMessage(asst)
+		pendingToolUseBlocks = nil
+	}
+	dropPendingToolCallID := func(callID string) {
+		for i, pending := range pendingToolCallIDs {
+			if pending == callID {
+				pendingToolCallIDs = append(pendingToolCallIDs[:i], pendingToolCallIDs[i+1:]...)
 				return
 			}
 		}
-		flushPendingToolUses()
+	}
+	// closeToolRound emits the assistant tool_use message and its user
+	// tool_result message. Calls whose output never arrived get a synthetic
+	// error result — Claude hard-rejects tool_use without a following result.
+	closeToolRound := func() {
+		emitPendingToolUses()
+		for _, callID := range pendingToolCallIDs {
+			synth := []byte(`{"type":"tool_result","tool_use_id":"","content":"Tool execution was aborted before a result was produced.","is_error":true}`)
+			synth, _ = sjson.SetBytes(synth, "tool_use_id", callID)
+			pendingToolResults = append(pendingToolResults, string(synth))
+			resolvedToolCallIDs[callID] = struct{}{}
+		}
+		pendingToolCallIDs = nil
+		if len(pendingToolResults) == 0 {
+			return
+		}
+		usr := []byte(`{"role":"user","content":[]}`)
+		for _, resultJSON := range pendingToolResults {
+			usr, _ = sjson.SetRawBytes(usr, "content.-1", []byte(resultJSON))
+		}
+		appendMessage(usr)
+		pendingToolResults = nil
 	}
 
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
@@ -322,8 +366,16 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				}
 
 				hasReasoningParts := false
-				if role != "assistant" {
-					flushPendingToolUses()
+				// A non-assistant message always ends the round. An assistant
+				// message ends it only when no call is still awaiting its output:
+				// closing then flushes the buffered tool_results ahead of the text,
+				// keeping each tool_result adjacent to its tool_use. While calls
+				// are still pending, the round stays open — the text either gets
+				// hoisted ahead of the unemitted tool_use, or (mid parallel batch)
+				// joins the merged assistant turn — so outputs that arrive later
+				// are neither faked as errors nor duplicated.
+				if role != "assistant" || len(pendingToolCallIDs) == 0 {
+					closeToolRound()
 				}
 				if len(pendingReasoningParts) > 0 {
 					if role == "assistant" {
@@ -365,6 +417,9 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				}
 
 			case "reasoning":
+				if dropThinkingBlocks {
+					return true
+				}
 				if thinkingPart := convertResponsesReasoningToClaudeThinking(item); len(thinkingPart) > 0 {
 					pendingReasoningParts = append(pendingReasoningParts, string(thinkingPart))
 				}
@@ -389,31 +444,41 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 					}
 				}
 
-				asst := []byte(`{"role":"assistant","content":[]}`)
-				for _, partJSON := range pendingReasoningParts {
-					asst, _ = sjson.SetRawBytes(asst, "content.-1", []byte(partJSON))
+				// Outputs collected and no call still waiting means this call
+				// starts a new round. While outputs of a parallel batch are still
+				// pending, the call joins the current round instead — closing here
+				// would fabricate error results for calls whose outputs arrive
+				// later and then duplicate them in the next round.
+				if len(pendingToolResults) > 0 && len(pendingToolCallIDs) == 0 {
+					closeToolRound()
 				}
+				pendingToolUseBlocks = append(pendingToolUseBlocks, pendingReasoningParts...)
 				pendingReasoningParts = nil
-				asst, _ = sjson.SetRawBytes(asst, "content.-1", toolUse)
-				pendingToolUseMessages = append(pendingToolUseMessages, pendingToolUseMessage{
-					callID: callID,
-					raw:    asst,
-				})
+				pendingToolUseBlocks = append(pendingToolUseBlocks, string(toolUse))
+				pendingToolCallIDs = append(pendingToolCallIDs, callID)
+				seenToolCallIDs[callID] = struct{}{}
 
 			case "function_call_output":
-				flushPendingReasoning()
+				// Pending reasoning stays buffered: emitting it here would place a
+				// thinking block after the tool_use blocks of the same merged
+				// assistant turn, which Claude rejects when thinking is enabled.
 				// Map to user tool_result
 				callID := item.Get("call_id").String()
 				callID = util.SanitizeClaudeToolID(callID)
-				flushPendingToolUseFor(callID)
+				if _, resolved := resolvedToolCallIDs[callID]; resolved {
+					return true
+				}
+				if _, seen := seenToolCallIDs[callID]; !seen {
+					return true
+				}
+				emitPendingToolUses()
+				dropPendingToolCallID(callID)
+				resolvedToolCallIDs[callID] = struct{}{}
 				output := item.Get("output")
 				toolResult := []byte(`{"type":"tool_result","tool_use_id":"","content":""}`)
 				toolResult, _ = sjson.SetBytes(toolResult, "tool_use_id", callID)
 				toolResult = applyResponsesToolResultContent(toolResult, output)
-
-				usr := []byte(`{"role":"user","content":[]}`)
-				usr, _ = sjson.SetRawBytes(usr, "content.-1", toolResult)
-				appendMessage(usr)
+				pendingToolResults = append(pendingToolResults, string(toolResult))
 
 			case "custom_tool_call":
 				callID := item.Get("call_id").String()
@@ -426,34 +491,42 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				toolUse, _ = sjson.SetBytes(toolUse, "name", item.Get("name").String())
 				toolUse, _ = sjson.SetBytes(toolUse, "input.input", item.Get("input").String())
 
-				asst := []byte(`{"role":"assistant","content":[]}`)
-				for _, partJSON := range pendingReasoningParts {
-					asst, _ = sjson.SetRawBytes(asst, "content.-1", []byte(partJSON))
+				// Same round-boundary rule as function_call above.
+				if len(pendingToolResults) > 0 && len(pendingToolCallIDs) == 0 {
+					closeToolRound()
 				}
+				pendingToolUseBlocks = append(pendingToolUseBlocks, pendingReasoningParts...)
 				pendingReasoningParts = nil
-				asst, _ = sjson.SetRawBytes(asst, "content.-1", toolUse)
-				pendingToolUseMessages = append(pendingToolUseMessages, pendingToolUseMessage{
-					callID: callID,
-					raw:    asst,
-				})
+				pendingToolUseBlocks = append(pendingToolUseBlocks, string(toolUse))
+				pendingToolCallIDs = append(pendingToolCallIDs, callID)
+				seenToolCallIDs[callID] = struct{}{}
 
 			case "custom_tool_call_output":
-				flushPendingReasoning()
+				// Same reasoning-buffering and duplicate-result rules as
+				// function_call_output above.
 				callID := util.SanitizeClaudeToolID(item.Get("call_id").String())
-				flushPendingToolUseFor(callID)
+				if _, resolved := resolvedToolCallIDs[callID]; resolved {
+					return true
+				}
+				if _, seen := seenToolCallIDs[callID]; !seen {
+					return true
+				}
+				emitPendingToolUses()
+				dropPendingToolCallID(callID)
+				resolvedToolCallIDs[callID] = struct{}{}
 				toolResult := []byte(`{"type":"tool_result","tool_use_id":"","content":""}`)
 				toolResult, _ = sjson.SetBytes(toolResult, "tool_use_id", callID)
 				toolResult = applyResponsesToolResultContent(toolResult, item.Get("output"))
-
-				usr := []byte(`{"role":"user","content":[]}`)
-				usr, _ = sjson.SetRawBytes(usr, "content.-1", toolResult)
-				appendMessage(usr)
+				pendingToolResults = append(pendingToolResults, string(toolResult))
 			}
 			return true
 		})
 	}
+	// Close the round before flushing trailing reasoning: a reasoning item that
+	// arrives after the last tool output must land behind its tool_result, not
+	// between the tool_use and the result.
+	closeToolRound()
 	flushPendingReasoning()
-	flushPendingToolUses()
 
 	includedToolNames := map[string]struct{}{}
 	toolNameMap := map[string]string{}
@@ -485,7 +558,8 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			case "auto":
 				out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"auto"}`))
 			case "none":
-				// Leave unset; implies no tools
+				// Claude supports an explicit none; leaving it unset would mean auto.
+				out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"none"}`))
 			case "required":
 				if len(includedToolNames) > 0 {
 					out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"any"}`))
@@ -515,13 +589,58 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		if !gjson.GetBytes(out, "tool_choice").Exists() {
 			out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"auto"}`))
 		}
-		out, _ = sjson.SetBytes(out, "tool_choice.disable_parallel_tool_use", true)
+		// disable_parallel_tool_use is meaningless (and rejected) on none.
+		if gjson.GetBytes(out, "tool_choice.type").String() != "none" {
+			out, _ = sjson.SetBytes(out, "tool_choice.disable_parallel_tool_use", true)
+		}
 	}
 
 	return out
 }
 
+// claudeRedactedPrefix marks encrypted_content that carries a Claude
+// redacted_thinking block round-tripped through the Responses shape by the
+// paired response translator. It is this proxy's own convention, not an
+// upstream format.
+const claudeRedactedPrefix = "claude_redacted#"
+
+// reconcileClaudeThinkingBudget enforces Claude's budget_tokens < max_tokens
+// invariant. Without an explicit client limit the default max_tokens is our
+// own invention, so raising it is safe; an explicit limit is honored by
+// clamping the budget instead, and thinking is dropped entirely when the
+// clamped budget would fall below Claude's 1024-token minimum.
+func reconcileClaudeThinkingBudget(out []byte, explicitMaxTokens bool) []byte {
+	budget := gjson.GetBytes(out, "thinking.budget_tokens")
+	if !budget.Exists() {
+		return out
+	}
+	maxTokens := gjson.GetBytes(out, "max_tokens").Int()
+	if budget.Int() < maxTokens {
+		return out
+	}
+	if !explicitMaxTokens {
+		out, _ = sjson.SetBytes(out, "max_tokens", budget.Int()+8192)
+		return out
+	}
+	clamped := maxTokens - 1024
+	if clamped < 1024 {
+		out, _ = sjson.DeleteBytes(out, "thinking")
+		return out
+	}
+	out, _ = sjson.SetBytes(out, "thinking.budget_tokens", clamped)
+	return out
+}
+
 func convertResponsesReasoningToClaudeThinking(item gjson.Result) []byte {
+	if encrypted := item.Get("encrypted_content").String(); strings.HasPrefix(encrypted, claudeRedactedPrefix) {
+		redacted := []byte(`{"type":"redacted_thinking","data":""}`)
+		redacted, _ = sjson.SetBytes(redacted, "data", strings.TrimPrefix(encrypted, claudeRedactedPrefix))
+		return redacted
+	}
+	return convertResponsesReasoningSignatureToClaudeThinking(item)
+}
+
+func convertResponsesReasoningSignatureToClaudeThinking(item gjson.Result) []byte {
 	signature, ok := sigcompat.CompatibleSignatureForProvider(sigcompat.SignatureProviderClaude, item.Get("encrypted_content").String())
 	if !ok {
 		return nil

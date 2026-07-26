@@ -371,6 +371,508 @@ func testGPTResponsesReasoningSignature() string {
 	return base64.URLEncoding.EncodeToString(payload)
 }
 
+func TestConvertOpenAIResponsesRequestToClaude_ClampsThinkingBudgetToExplicitMaxTokens(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"max_output_tokens":4096,
+		"reasoning":{"effort":"xhigh"},
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	root := gjson.ParseBytes(out)
+
+	maxTokens := root.Get("max_tokens").Int()
+	if maxTokens != 4096 {
+		t.Fatalf("max_tokens = %d, want explicit 4096 preserved. Output: %s", maxTokens, string(out))
+	}
+	budget := root.Get("thinking.budget_tokens").Int()
+	if budget >= maxTokens {
+		t.Fatalf("budget_tokens = %d must be < max_tokens %d. Output: %s", budget, maxTokens, string(out))
+	}
+	if budget < 1024 {
+		t.Fatalf("budget_tokens = %d, want >= 1024. Output: %s", budget, string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_RaisesDefaultMaxTokensForLargeBudget(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"reasoning":{"effort":"xhigh"},
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	root := gjson.ParseBytes(out)
+
+	budget := root.Get("thinking.budget_tokens").Int()
+	maxTokens := root.Get("max_tokens").Int()
+	if budget != 32768 {
+		t.Fatalf("budget_tokens = %d, want xhigh budget 32768. Output: %s", budget, string(out))
+	}
+	if maxTokens <= budget {
+		t.Fatalf("default max_tokens = %d must be raised above budget %d. Output: %s", maxTokens, budget, string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_DisablesThinkingWhenNoBudgetRoom(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"max_output_tokens":1500,
+		"reasoning":{"effort":"medium"},
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	root := gjson.ParseBytes(out)
+
+	if root.Get("thinking").Exists() {
+		t.Fatalf("thinking should be removed when clamped budget < 1024. Output: %s", string(out))
+	}
+	if got := root.Get("max_tokens").Int(); got != 1500 {
+		t.Fatalf("max_tokens = %d, want explicit 1500 preserved. Output: %s", got, string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_MergesParallelToolCallsIntoOneAssistantMessage(t *testing.T) {
+	rawSignature, _ := testClaudeResponsesThinkingSignature(t)
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[
+			{"type":"reasoning","encrypted_content":"` + rawSignature + `","summary":[{"type":"summary_text","text":"plan"}]},
+			{"type":"function_call","call_id":"call_a","name":"read","arguments":"{\"path\":\"a\"}"},
+			{"type":"function_call","call_id":"call_b","name":"read","arguments":"{\"path\":\"b\"}"},
+			{"type":"function_call_output","call_id":"call_a","output":"content a"},
+			{"type":"function_call_output","call_id":"call_b","output":"content b"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	root := gjson.ParseBytes(out)
+
+	if got := root.Get("messages.#").Int(); got != 2 {
+		t.Fatalf("messages count = %d, want 2 (one assistant, one user). Output: %s", got, string(out))
+	}
+	assistant := root.Get("messages.0")
+	if got := assistant.Get("role").String(); got != "assistant" {
+		t.Fatalf("messages.0.role = %q, want assistant. Output: %s", got, string(out))
+	}
+	if got := assistant.Get("content.0.type").String(); got != "thinking" {
+		t.Fatalf("assistant content.0.type = %q, want thinking first. Output: %s", got, string(out))
+	}
+	if got := assistant.Get("content.1.id").String(); got != "call_a" {
+		t.Fatalf("assistant content.1.id = %q, want call_a. Output: %s", got, string(out))
+	}
+	if got := assistant.Get("content.2.id").String(); got != "call_b" {
+		t.Fatalf("assistant content.2.id = %q, want call_b. Output: %s", got, string(out))
+	}
+	user := root.Get("messages.1")
+	if got := user.Get("role").String(); got != "user" {
+		t.Fatalf("messages.1.role = %q, want user. Output: %s", got, string(out))
+	}
+	if got := user.Get("content.0.tool_use_id").String(); got != "call_a" {
+		t.Fatalf("user content.0.tool_use_id = %q, want call_a. Output: %s", got, string(out))
+	}
+	if got := user.Get("content.1.tool_use_id").String(); got != "call_b" {
+		t.Fatalf("user content.1.tool_use_id = %q, want call_b. Output: %s", got, string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_SynthesizesResultForOrphanFunctionCall(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[
+			{"type":"function_call","call_id":"call_orphan","name":"read","arguments":"{}"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"never mind"}]}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	root := gjson.ParseBytes(out)
+
+	if got := root.Get("messages.0.content.0.type").String(); got != "tool_use" {
+		t.Fatalf("messages.0 should carry the tool_use. Output: %s", string(out))
+	}
+	synth := root.Get("messages.1.content.0")
+	if got := synth.Get("type").String(); got != "tool_result" {
+		t.Fatalf("messages.1.content.0.type = %q, want synthesized tool_result. Output: %s", got, string(out))
+	}
+	if got := synth.Get("tool_use_id").String(); got != "call_orphan" {
+		t.Fatalf("synthesized tool_use_id = %q, want call_orphan. Output: %s", got, string(out))
+	}
+	if !synth.Get("is_error").Bool() {
+		t.Fatalf("synthesized tool_result should be marked is_error. Output: %s", string(out))
+	}
+	if got := root.Get("messages.2.role").String(); got != "user" {
+		t.Fatalf("messages.2.role = %q, want trailing user text. Output: %s", got, string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_FlushesResultsBeforeAssistantText(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[
+			{"type":"function_call","call_id":"call_a","name":"read","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_a","output":"content"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done reading"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"thanks"}]}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	root := gjson.ParseBytes(out)
+
+	if got := root.Get("messages.0.content.0.type").String(); got != "tool_use" {
+		t.Fatalf("messages.0 = %q, want tool_use. Output: %s", got, string(out))
+	}
+	if got := root.Get("messages.1.content.0.type").String(); got != "tool_result" {
+		t.Fatalf("tool_result must directly follow the tool_use message, messages.1 = %s. Output: %s", root.Get("messages.1").Raw, string(out))
+	}
+	if got := root.Get("messages.2.role").String(); got != "assistant" {
+		t.Fatalf("messages.2.role = %q, want assistant text after the result. Output: %s", got, string(out))
+	}
+	if got := root.Get("messages.3.role").String(); got != "user" {
+		t.Fatalf("messages.3.role = %q, want trailing user. Output: %s", got, string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_InterleavedParallelOutputsKeepOneRound(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[
+			{"type":"function_call","call_id":"call_1","name":"read","arguments":"{}"},
+			{"type":"function_call","call_id":"call_2","name":"read","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_1","output":"one"},
+			{"type":"function_call","call_id":"call_3","name":"read","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_2","output":"two"},
+			{"type":"function_call_output","call_id":"call_3","output":"three"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	root := gjson.ParseBytes(out)
+
+	if strings.Contains(string(out), "is_error") {
+		t.Fatalf("calls whose outputs arrive later must not get synthetic error results. Output: %s", string(out))
+	}
+	// Every call must yield exactly one tool_result, and all results must sit
+	// after the last tool_use message so Claude's same-role merge keeps the
+	// round shape tool_use* -> tool_result*.
+	counts := map[string]int{}
+	lastToolUseIdx, firstResultIdx := -1, -1
+	root.Get("messages").ForEach(func(key, msg gjson.Result) bool {
+		msg.Get("content").ForEach(func(_, part gjson.Result) bool {
+			switch part.Get("type").String() {
+			case "tool_use":
+				lastToolUseIdx = int(key.Int())
+			case "tool_result":
+				counts[part.Get("tool_use_id").String()]++
+				if firstResultIdx < 0 {
+					firstResultIdx = int(key.Int())
+				}
+			}
+			return true
+		})
+		return true
+	})
+	for _, id := range []string{"call_1", "call_2", "call_3"} {
+		if counts[id] != 1 {
+			t.Fatalf("tool_result for %s appears %d times, want exactly 1. Output: %s", id, counts[id], string(out))
+		}
+	}
+	if firstResultIdx <= lastToolUseIdx {
+		t.Fatalf("tool_results (first at messages.%d) must follow the last tool_use message (messages.%d). Output: %s", firstResultIdx, lastToolUseIdx, string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_UserMessageMidBatchDoesNotDuplicateToolResult(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[
+			{"type":"function_call","call_id":"call_1","name":"tool_a","arguments":"{}"},
+			{"type":"function_call","call_id":"call_2","name":"tool_b","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_1","output":"res1"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"wait"}]},
+			{"type":"function_call_output","call_id":"call_2","output":"res2"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+
+	counts := map[string]int{}
+	toolUseIDs := map[string]struct{}{}
+	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+		msg.Get("content").ForEach(func(_, part gjson.Result) bool {
+			switch part.Get("type").String() {
+			case "tool_use":
+				toolUseIDs[part.Get("id").String()] = struct{}{}
+			case "tool_result":
+				counts[part.Get("tool_use_id").String()]++
+			}
+			return true
+		})
+		return true
+	})
+	for id, n := range counts {
+		if n != 1 {
+			t.Fatalf("tool_result for %s appears %d times, want exactly 1. Output: %s", id, n, string(out))
+		}
+		if _, ok := toolUseIDs[id]; !ok {
+			t.Fatalf("tool_result references unknown tool_use_id %s. Output: %s", id, string(out))
+		}
+	}
+	for id := range toolUseIDs {
+		if counts[id] != 1 {
+			t.Fatalf("tool_use %s has %d results, want exactly 1. Output: %s", id, counts[id], string(out))
+		}
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_DropsToolResultWithoutMatchingToolUse(t *testing.T) {
+	// A compacted history can keep a function_call_output whose function_call was
+	// trimmed away. Claude rejects a tool_result whose tool_use_id it never saw.
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[
+			{"type":"function_call_output","call_id":"call_gone","output":"res"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+
+	if strings.Contains(string(out), "tool_result") {
+		t.Fatalf("orphan tool_result without a tool_use must be dropped. Output: %s", string(out))
+	}
+	if got := gjson.GetBytes(out, "messages.0.content").String(); got != "hi" {
+		t.Fatalf("remaining user message = %q, want hi. Output: %s", got, string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_MultiRoundToolLoopKeepsThinkingFirst(t *testing.T) {
+	rawSignature, _ := testClaudeResponsesThinkingSignature(t)
+	reasoning := `{"type":"reasoning","encrypted_content":"` + rawSignature + `","summary":[{"type":"summary_text","text":"plan"}]}`
+	raw := []byte(`{
+		"model":"claude-test",
+		"reasoning":{"effort":"medium"},
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},
+			` + reasoning + `,
+			{"type":"function_call","call_id":"call_1","name":"tool_a","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_1","output":"res1"},
+			` + reasoning + `,
+			{"type":"function_call","call_id":"call_2","name":"tool_b","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_2","output":"res2"},
+			` + reasoning + `,
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"thanks"}]}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+
+	for _, turn := range mergeClaudeSameRoleTurns(t, out) {
+		sawNonThinking := false
+		for _, blockType := range turn.blocks {
+			switch blockType {
+			case "thinking", "redacted_thinking":
+				if sawNonThinking {
+					t.Fatalf("thinking must lead the merged %s turn, got %v. Output: %s", turn.role, turn.blocks, string(out))
+				}
+			default:
+				sawNonThinking = true
+			}
+		}
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_AssistantTextMidParallelBatchKeepsRound(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[
+			{"type":"function_call","call_id":"call_1","name":"read","arguments":"{}"},
+			{"type":"function_call","call_id":"call_2","name":"read","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_1","output":"one"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"halfway"}]},
+			{"type":"function_call_output","call_id":"call_2","output":"two"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	root := gjson.ParseBytes(out)
+
+	if strings.Contains(string(out), "is_error") {
+		t.Fatalf("call_2's real output arrives later; no synthetic error result allowed. Output: %s", string(out))
+	}
+	counts := map[string]int{}
+	root.Get("messages").ForEach(func(_, msg gjson.Result) bool {
+		msg.Get("content").ForEach(func(_, part gjson.Result) bool {
+			if part.Get("type").String() == "tool_result" {
+				counts[part.Get("tool_use_id").String()]++
+			}
+			return true
+		})
+		return true
+	})
+	for _, id := range []string{"call_1", "call_2"} {
+		if counts[id] != 1 {
+			t.Fatalf("tool_result for %s appears %d times, want exactly 1. Output: %s", id, counts[id], string(out))
+		}
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_ReasoningBetweenParallelOutputsStaysAheadOfToolUse(t *testing.T) {
+	rawSignature, _ := testClaudeResponsesThinkingSignature(t)
+	raw := []byte(`{
+		"model":"claude-test",
+		"reasoning":{"effort":"medium"},
+		"input":[
+			{"type":"function_call","call_id":"call_1","name":"tool_a","arguments":"{}"},
+			{"type":"function_call","call_id":"call_2","name":"tool_b","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_1","output":"res1"},
+			{"type":"reasoning","encrypted_content":"` + rawSignature + `","summary":[{"type":"summary_text","text":"mid"}]},
+			{"type":"function_call_output","call_id":"call_2","output":"res2"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+
+	// Claude merges consecutive same-role messages, and with thinking enabled a
+	// thinking block may not follow a tool_use inside the merged turn.
+	for _, turn := range mergeClaudeSameRoleTurns(t, out) {
+		sawToolUse := false
+		for _, blockType := range turn.blocks {
+			switch blockType {
+			case "tool_use":
+				sawToolUse = true
+			case "thinking", "redacted_thinking":
+				if sawToolUse {
+					t.Fatalf("thinking block follows tool_use in merged %s turn %v. Output: %s", turn.role, turn.blocks, string(out))
+				}
+			}
+		}
+	}
+}
+
+type claudeMergedTurn struct {
+	role   string
+	blocks []string
+}
+
+// mergeClaudeSameRoleTurns mirrors Anthropic's merging of consecutive same-role
+// messages so tests can assert on the block order the API actually validates.
+func mergeClaudeSameRoleTurns(t *testing.T, out []byte) []claudeMergedTurn {
+	t.Helper()
+	var turns []claudeMergedTurn
+	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+		role := msg.Get("role").String()
+		var blocks []string
+		if content := msg.Get("content"); content.IsArray() {
+			content.ForEach(func(_, block gjson.Result) bool {
+				blocks = append(blocks, block.Get("type").String())
+				return true
+			})
+		} else {
+			blocks = append(blocks, "text")
+		}
+		if n := len(turns); n > 0 && turns[n-1].role == role {
+			turns[n-1].blocks = append(turns[n-1].blocks, blocks...)
+			return true
+		}
+		turns = append(turns, claudeMergedTurn{role: role, blocks: blocks})
+		return true
+	})
+	return turns
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_TrailingReasoningAfterOutputStaysBehindResults(t *testing.T) {
+	rawSignature, _ := testClaudeResponsesThinkingSignature(t)
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[
+			{"type":"function_call","call_id":"call_a","name":"read","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_a","output":"content"},
+			{"type":"reasoning","encrypted_content":"` + rawSignature + `","summary":[{"type":"summary_text","text":"tail"}]}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	root := gjson.ParseBytes(out)
+
+	if got := root.Get("messages.1.content.0.type").String(); got != "tool_result" {
+		t.Fatalf("messages.1 must be the tool_result, got %s. Output: %s", root.Get("messages.1").Raw, string(out))
+	}
+	if got := root.Get("messages.2.content.0.type").String(); got != "thinking" {
+		t.Fatalf("trailing reasoning should land after the results, messages.2 = %s. Output: %s", root.Get("messages.2").Raw, string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_DroppedThinkingAlsoDropsHistoryThinkingBlocks(t *testing.T) {
+	rawSignature, _ := testClaudeResponsesThinkingSignature(t)
+	raw := []byte(`{
+		"model":"claude-test",
+		"max_output_tokens":1500,
+		"reasoning":{"effort":"medium"},
+		"input":[
+			{"type":"reasoning","encrypted_content":"` + rawSignature + `","summary":[{"type":"summary_text","text":"plan"}]},
+			{"type":"function_call","call_id":"call_a","name":"read","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_a","output":"ok"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	root := gjson.ParseBytes(out)
+
+	if root.Get("thinking").Exists() {
+		t.Fatalf("thinking config should be removed. Output: %s", string(out))
+	}
+	if got := root.Get("messages.0.content.0.type").String(); got != "tool_use" {
+		t.Fatalf("history thinking blocks must be dropped when thinking is disabled, messages.0.content.0 = %s. Output: %s", root.Get("messages.0.content.0").Raw, string(out))
+	}
+	if strings.Contains(string(out), `"type":"thinking"`) || strings.Contains(string(out), `"redacted_thinking"`) {
+		t.Fatalf("no thinking-family blocks may remain when thinking is disabled. Output: %s", string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_MapsToolChoiceNone(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"tools":[{"type":"function","name":"read","parameters":{"type":"object","properties":{}}}],
+		"tool_choice":"none"
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	if got := gjson.GetBytes(out, "tool_choice.type").String(); got != "none" {
+		t.Fatalf("tool_choice.type = %q, want none. Output: %s", got, string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_RestoresRedactedThinking(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[
+			{"type":"reasoning","encrypted_content":"claude_redacted#OPAQUEDATA","summary":[]},
+			{"type":"function_call","call_id":"call_r","name":"read","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_r","output":"ok"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	root := gjson.ParseBytes(out)
+
+	block := root.Get("messages.0.content.0")
+	if got := block.Get("type").String(); got != "redacted_thinking" {
+		t.Fatalf("content.0.type = %q, want redacted_thinking. Output: %s", got, string(out))
+	}
+	if got := block.Get("data").String(); got != "OPAQUEDATA" {
+		t.Fatalf("redacted data = %q, want OPAQUEDATA. Output: %s", got, string(out))
+	}
+	if got := root.Get("messages.0.content.1.type").String(); got != "tool_use" {
+		t.Fatalf("content.1.type = %q, want tool_use in same message. Output: %s", got, string(out))
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToClaude_PreservesContentPartCacheControl(t *testing.T) {
 	inputJSON := `{
 		"model": "gpt-4.1",

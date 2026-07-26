@@ -83,10 +83,10 @@ type AttemptResult struct {
 	AttemptNo int
 	// Protocol 快照本次尝试实际使用的渠道协议。费用比对靠它决定 cached_tokens
 	// 的口径，事后现查会用改动后的协议解释历史用量。
-	Protocol        string
-	UpstreamID      int64
-	Priority        int
-	SelectionReason string
+	Protocol            string
+	UpstreamID          int64
+	Priority            int
+	SelectionReason     string
 	HealthBefore        string
 	HealthAfter         string
 	Status              int
@@ -209,7 +209,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		}
 		attemptCtx := attemptContext{
 			number: attemptNo, protocol: candidate.Protocol, upstreamID: candidate.ID,
-			priority: candidate.Priority,
+			priority:        candidate.Priority,
 			selectionReason: selectionReason, healthBefore: beforeState, started: attemptStarted,
 		}
 
@@ -385,17 +385,31 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			return resultFromAttempt(finished, attempts)
 		}
 
+		// 上游在流中投递了 error 事件：HTTP 状态码仍是 200，但这次调用其实失败了。
+		// 响应已提交无法换源，但必须给熔断器报失败——否则总在半路报错的渠道
+		// 会被记成健康渠道，熔断永不触发。
+		// 注意：仅「缺少终止事件」不算失败，部分上游合法地不发终止标记。
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			f.health.MarkModelSupported(candidate.ID, model)
-			f.health.Report(candidate.ID, model, true, result.ttftMs)
+			if result.streamErrored {
+				f.health.Report(candidate.ID, model, false, result.ttftMs)
+			} else {
+				f.health.MarkModelSupported(candidate.ID, model)
+				f.health.Report(candidate.ID, model, true, result.ttftMs)
+			}
 		}
 		outcome := OutcomeSuccess
+		if result.streamErrored {
+			outcome = OutcomePartial
+		}
 		if resp.StatusCode >= 400 {
 			outcome = OutcomeClientError
 		}
 		errorKind, errorSource := "", ""
-		if outcome == OutcomeClientError {
+		switch {
+		case outcome == OutcomeClientError:
 			errorKind, errorSource = "client_request", "client"
+		case result.streamErrored:
+			errorKind, errorSource = "stream_error", "upstream"
 		}
 		finished := attemptCtx.finish(f.health, resp.StatusCode, outcome, result, errorKind, errorSource, "")
 		attempts = append(attempts, finished)
@@ -501,6 +515,7 @@ type relayResult struct {
 	stream            bool
 	streamCompleted   bool
 	lastEvent         string
+	streamErrored     bool
 	usage             tokenUsage
 	upstreamRequestID string
 }
@@ -534,6 +549,7 @@ func relayTranslatedResponse(ctx context.Context, w http.ResponseWriter, resp *h
 	audited.audit.finish()
 	result.stream = stream
 	result.streamCompleted = audited.audit.streamCompleted
+	result.streamErrored = audited.audit.streamErrored
 	result.lastEvent = audited.audit.lastEvent
 	result.usage = audited.audit.usage
 	result.upstreamRequestID = upstreamRequestID(resp.Header)
@@ -633,6 +649,11 @@ func relayTranslatedSSEToBody(ctx context.Context, w http.ResponseWriter, resp *
 			err = errEmptyResponse
 		}
 		return relayResult{err: err, source: relayUpstream, ttftMs: ttft}
+	}
+	// 流中途出错时聚合结果是错误信封。响应尚未提交，仍可换源，
+	// 不能把上游的错误当成正常响应回给客户端。
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 && upstream.IsErrorPayload(translated) {
+		return relayResult{err: errErrorPayload, source: relayUpstream, ttftMs: ttft}
 	}
 	copyTranslatedResponseHeaders(w.Header(), resp.Header, false)
 	w.WriteHeader(resp.StatusCode)

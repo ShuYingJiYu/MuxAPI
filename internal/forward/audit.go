@@ -44,6 +44,8 @@ type responseAudit struct {
 	usage           tokenUsage
 	lastEvent       string
 	streamCompleted bool
+	// streamErrored 表示上游在 2xx 流里投递过明确的错误事件。
+	streamErrored bool
 }
 
 // auditReadCloser 装饰上游正文，使所有转发分支共享同一套审计解析。
@@ -140,6 +142,9 @@ func (a *responseAudit) consumeSSEBlock(block []byte) {
 		if isCompletionEvent(eventName) {
 			a.streamCompleted = true
 		}
+		if isStreamErrorEvent(eventName) {
+			a.streamErrored = true
+		}
 	}
 	data := strings.Join(dataLines, "\n")
 	if data == "" {
@@ -159,8 +164,22 @@ func (a *responseAudit) consumeSSEBlock(block []byte) {
 		if isCompletionEvent(typ) {
 			a.streamCompleted = true
 		}
+		if isStreamErrorEvent(typ) {
+			a.streamErrored = true
+		}
 	}
 	a.usage.merge(usageFromValue(payload))
+}
+
+// isStreamErrorEvent 识别各协议在 2xx 流中投递失败的终止事件：
+// Claude 的 error、Responses 的 response.failed。
+func isStreamErrorEvent(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "error", "response.failed":
+		return true
+	default:
+		return false
+	}
 }
 
 func isCompletionEvent(value string) bool {

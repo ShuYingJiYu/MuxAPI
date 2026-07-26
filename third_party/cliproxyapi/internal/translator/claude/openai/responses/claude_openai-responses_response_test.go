@@ -346,3 +346,259 @@ func TestConvertClaudeResponseToOpenAIResponsesNonStream_RestoresNamespaceFuncti
 		t.Fatalf("non-stream output namespace = %q, want mcp__node_repl", got)
 	}
 }
+
+func TestConvertClaudeResponseToOpenAIResponses_ErrorEventEmitsResponseFailed(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(`data: {"type":"message_start","message":{"id":"msg_err","usage":{"input_tokens":1,"output_tokens":0}}}`),
+		[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`),
+		[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`),
+		[]byte(`data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`),
+	}
+
+	var param any
+	var failed gjson.Result
+	for _, chunk := range chunks {
+		for _, output := range ConvertClaudeResponseToOpenAIResponses(context.Background(), "claude-test", nil, nil, chunk, &param) {
+			event, data := parseClaudeResponsesSSEEvent(t, output)
+			if event == "response.failed" {
+				failed = data
+			}
+		}
+	}
+
+	if !failed.Exists() {
+		t.Fatal("expected response.failed event after upstream error")
+	}
+	if got := failed.Get("response.status").String(); got != "failed" {
+		t.Fatalf("response.status = %q, want failed", got)
+	}
+	if got := failed.Get("response.error.message").String(); got != "Overloaded" {
+		t.Fatalf("response.error.message = %q, want Overloaded", got)
+	}
+	if got := failed.Get("response.error.code").String(); got != "overloaded_error" {
+		t.Fatalf("response.error.code = %q, want overloaded_error", got)
+	}
+}
+
+func TestConvertClaudeResponseToOpenAIResponses_ErrorBeforeMessageStartEmitsNothing(t *testing.T) {
+	var param any
+	outputs := ConvertClaudeResponseToOpenAIResponses(context.Background(), "claude-test", nil, nil,
+		[]byte(`data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`), &param)
+	if len(outputs) != 0 {
+		t.Fatalf("error before message_start should emit nothing so the gateway can fail over, got %d chunks", len(outputs))
+	}
+}
+
+func TestConvertClaudeResponseToOpenAIResponses_NoSecondTerminalAfterError(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(`data: {"type":"message_start","message":{"id":"msg_err2","usage":{"input_tokens":1,"output_tokens":0}}}`),
+		[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`),
+		[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`),
+		[]byte(`data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`),
+		[]byte(`data: {"type":"message_stop"}`),
+	}
+
+	var param any
+	var events []string
+	for _, chunk := range chunks {
+		for _, output := range ConvertClaudeResponseToOpenAIResponses(context.Background(), "claude-test", nil, nil, chunk, &param) {
+			event, _ := parseClaudeResponsesSSEEvent(t, output)
+			events = append(events, event)
+		}
+	}
+
+	sawFailed := false
+	for _, event := range events {
+		switch event {
+		case "response.failed":
+			sawFailed = true
+		case "response.completed", "response.incomplete":
+			t.Fatalf("no second terminal event may follow response.failed, got %v", events)
+		}
+	}
+	if !sawFailed {
+		t.Fatalf("expected response.failed, got %v", events)
+	}
+}
+
+func TestConvertClaudeResponseToOpenAIResponses_MaxTokensEmitsResponseIncomplete(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(`data: {"type":"message_start","message":{"id":"msg_trunc","usage":{"input_tokens":1,"output_tokens":0}}}`),
+		[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`),
+		[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"cut off"}}`),
+		[]byte(`data: {"type":"content_block_stop","index":0}`),
+		[]byte(`data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":9}}`),
+		[]byte(`data: {"type":"message_stop"}`),
+	}
+
+	var param any
+	var incomplete gjson.Result
+	sawCompleted := false
+	for _, chunk := range chunks {
+		for _, output := range ConvertClaudeResponseToOpenAIResponses(context.Background(), "claude-test", nil, nil, chunk, &param) {
+			event, data := parseClaudeResponsesSSEEvent(t, output)
+			if event == "response.incomplete" {
+				incomplete = data
+			}
+			if event == "response.completed" {
+				sawCompleted = true
+			}
+		}
+	}
+
+	if sawCompleted {
+		t.Fatal("truncated response must not be reported as response.completed")
+	}
+	if !incomplete.Exists() {
+		t.Fatal("expected response.incomplete event for stop_reason max_tokens")
+	}
+	if got := incomplete.Get("response.status").String(); got != "incomplete" {
+		t.Fatalf("response.status = %q, want incomplete", got)
+	}
+	if got := incomplete.Get("response.incomplete_details.reason").String(); got != "max_output_tokens" {
+		t.Fatalf("incomplete_details.reason = %q, want max_output_tokens", got)
+	}
+	if got := incomplete.Get("response.output.0.content.0.text").String(); got != "cut off" {
+		t.Fatalf("incomplete response should still carry aggregated output, got %q", got)
+	}
+}
+
+func TestConvertClaudeResponseToOpenAIResponses_MultipleThinkingBlocksAllInFinalOutput(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(`data: {"type":"message_start","message":{"id":"msg_multi","usage":{"input_tokens":1,"output_tokens":0}}}`),
+		[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`),
+		[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"first"}}`),
+		[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_one"}}`),
+		[]byte(`data: {"type":"content_block_stop","index":0}`),
+		[]byte(`data: {"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}`),
+		[]byte(`data: {"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"second"}}`),
+		[]byte(`data: {"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"sig_two"}}`),
+		[]byte(`data: {"type":"content_block_stop","index":1}`),
+		[]byte(`data: {"type":"message_stop"}`),
+	}
+
+	var param any
+	var completed gjson.Result
+	for _, chunk := range chunks {
+		for _, output := range ConvertClaudeResponseToOpenAIResponses(context.Background(), "claude-test", nil, nil, chunk, &param) {
+			event, data := parseClaudeResponsesSSEEvent(t, output)
+			if event == "response.completed" {
+				completed = data
+			}
+		}
+	}
+
+	if got := completed.Get("response.output.#").Int(); got != 2 {
+		t.Fatalf("completed output count = %d, want 2 reasoning items. Output: %s", got, completed.Raw)
+	}
+	if got := completed.Get("response.output.0.encrypted_content").String(); got != "sig_one" {
+		t.Fatalf("output.0 encrypted_content = %q, want sig_one", got)
+	}
+	if got := completed.Get("response.output.0.summary.0.text").String(); got != "first" {
+		t.Fatalf("output.0 summary = %q, want first", got)
+	}
+	if got := completed.Get("response.output.1.encrypted_content").String(); got != "sig_two" {
+		t.Fatalf("output.1 encrypted_content = %q, want sig_two", got)
+	}
+	if got := completed.Get("response.output.1.summary.0.text").String(); got != "second" {
+		t.Fatalf("output.1 summary = %q, want second", got)
+	}
+}
+
+func TestConvertClaudeResponseToOpenAIResponses_RedactedThinkingRoundTrips(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(`data: {"type":"message_start","message":{"id":"msg_red","usage":{"input_tokens":1,"output_tokens":0}}}`),
+		[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"OPAQUE"}}`),
+		[]byte(`data: {"type":"content_block_stop","index":0}`),
+		[]byte(`data: {"type":"message_stop"}`),
+	}
+
+	var param any
+	var done gjson.Result
+	var completed gjson.Result
+	for _, chunk := range chunks {
+		for _, output := range ConvertClaudeResponseToOpenAIResponses(context.Background(), "claude-test", nil, nil, chunk, &param) {
+			event, data := parseClaudeResponsesSSEEvent(t, output)
+			if event == "response.output_item.done" && data.Get("item.type").String() == "reasoning" {
+				done = data
+			}
+			if event == "response.completed" {
+				completed = data
+			}
+		}
+	}
+
+	if !done.Exists() {
+		t.Fatal("expected reasoning output_item.done for redacted_thinking block")
+	}
+	if got := done.Get("item.encrypted_content").String(); got != "claude_redacted#OPAQUE" {
+		t.Fatalf("item.encrypted_content = %q, want claude_redacted#OPAQUE", got)
+	}
+	if got := completed.Get("response.output.0.encrypted_content").String(); got != "claude_redacted#OPAQUE" {
+		t.Fatalf("completed encrypted_content = %q, want claude_redacted#OPAQUE", got)
+	}
+}
+
+func TestConvertClaudeResponseToOpenAIResponsesNonStream_ErrorEventProducesErrorEnvelope(t *testing.T) {
+	raw := []byte(strings.Join([]string{
+		`data: {"type":"message_start","message":{"id":"msg_err","usage":{"input_tokens":1,"output_tokens":0}}}`,
+		`data: {"type":"error","error":{"type":"api_error","message":"Internal server error"}}`,
+	}, "\n"))
+
+	out := ConvertClaudeResponseToOpenAIResponsesNonStream(context.Background(), "claude-test", nil, nil, raw, nil)
+	root := gjson.ParseBytes(out)
+
+	if got := root.Get("error.message").String(); got != "Internal server error" {
+		t.Fatalf("error.message = %q, want Internal server error. Output: %s", got, string(out))
+	}
+	if got := root.Get("error.type").String(); got != "api_error" {
+		t.Fatalf("error.type = %q, want api_error. Output: %s", got, string(out))
+	}
+}
+
+func TestConvertClaudeResponseToOpenAIResponsesNonStream_MaxTokensSetsIncomplete(t *testing.T) {
+	raw := []byte(strings.Join([]string{
+		`data: {"type":"message_start","message":{"id":"msg_trunc","usage":{"input_tokens":1,"output_tokens":0}}}`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"cut"}}`,
+		`data: {"type":"content_block_stop","index":0}`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":2}}`,
+		`data: {"type":"message_stop"}`,
+	}, "\n"))
+
+	out := ConvertClaudeResponseToOpenAIResponsesNonStream(context.Background(), "claude-test", nil, nil, raw, nil)
+	root := gjson.ParseBytes(out)
+
+	if got := root.Get("status").String(); got != "incomplete" {
+		t.Fatalf("status = %q, want incomplete. Output: %s", got, string(out))
+	}
+	if got := root.Get("incomplete_details.reason").String(); got != "max_output_tokens" {
+		t.Fatalf("incomplete_details.reason = %q, want max_output_tokens. Output: %s", got, string(out))
+	}
+}
+
+func TestConvertClaudeResponseToOpenAIResponsesNonStream_MultipleThinkingBlocksAllInOutput(t *testing.T) {
+	raw := []byte(strings.Join([]string{
+		`data: {"type":"message_start","message":{"id":"msg_multi","usage":{"input_tokens":1,"output_tokens":0}}}`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"first"}}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_one"}}`,
+		`data: {"type":"content_block_stop","index":0}`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"OPAQUE"}}`,
+		`data: {"type":"content_block_stop","index":1}`,
+		`data: {"type":"message_stop"}`,
+	}, "\n"))
+
+	out := ConvertClaudeResponseToOpenAIResponsesNonStream(context.Background(), "claude-test", nil, nil, raw, nil)
+	root := gjson.ParseBytes(out)
+
+	if got := root.Get("output.#").Int(); got != 2 {
+		t.Fatalf("output count = %d, want 2. Output: %s", got, string(out))
+	}
+	if got := root.Get("output.0.encrypted_content").String(); got != "sig_one" {
+		t.Fatalf("output.0 encrypted_content = %q, want sig_one", got)
+	}
+	if got := root.Get("output.1.encrypted_content").String(); got != "claude_redacted#OPAQUE" {
+		t.Fatalf("output.1 encrypted_content = %q, want claude_redacted#OPAQUE", got)
+	}
+}
