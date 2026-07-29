@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mirainya/muxapi/internal/backup"
 	"github.com/mirainya/muxapi/internal/billing"
 	"github.com/mirainya/muxapi/internal/config"
 	"github.com/mirainya/muxapi/internal/forward"
@@ -113,8 +114,10 @@ func main() {
 	// 传 nil 让 prober 用内置默认（5m / /v1/chat/completions），监控项可逐项覆盖。
 	monProber := monitor.NewProber(mon, st, hm, nil, nil)
 	billingMgr := billing.NewManager(st)
+	backupSvc := backup.NewService(st, cfg.DatabaseURL)
 	srv := server.New(fwd, cfg.AdminToken, st, hm, mon, monProber, cfg.MaxBody)
 	srv.SetBillingManager(billingMgr)
+	srv.SetBackupService(backupSvc)
 
 	// 收到 SIGINT/SIGTERM 时取消：停探测并触发优雅关闭
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -133,6 +136,12 @@ func main() {
 	go func() {
 		defer wg.Done()
 		billingMgr.Run(ctx)
+	}()
+	// Backup scheduler: runs cron jobs and waits for ctx cancellation.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		backupSvc.Run(ctx)
 	}()
 	// 请求审计按天保留，默认 7 天；每 10 分钟分批删除过期请求及其尝试链。
 	requestRetentionDays := settingInt("request_retention_days", 7)

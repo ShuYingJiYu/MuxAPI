@@ -206,4 +206,15 @@ export const api = {
   },
   logDetail: id => req('GET', '/logs/' + id),
   logOptions: () => req('GET', '/logs/options'),
+
+  // 数据备份
+  backupConfig: () => req('GET', '/backup/config'),
+  saveBackupConfig: cfg => req('PUT', '/backup/config', cfg),
+  testBackupConfig: cfg => req('POST', '/backup/config/test', cfg),
+  backupSchedule: () => req('GET', '/backup/schedule'),
+  saveBackupSchedule: s => req('PUT', '/backup/schedule', s),
+  triggerBackup: () => req('POST', '/backup', {}),
+  listBackups: () => req('GET', '/backup'),
+  deleteBackup: id => req('DELETE', '/backup/records/' + id),
+  backupDownloadURL: id => req('GET', '/backup/records/' + id + '/download'),
 }

@@ -32,6 +32,8 @@ func (s *Server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/logs/options", s.auth(s.adminLogOptions))        // GET 筛选下拉选项(全量去重)
 	mux.HandleFunc("/admin/logs/", s.auth(s.adminLogItem))                  // GET 单条请求完整尝试链
 	mux.HandleFunc("/admin/settings", s.auth(s.adminSettings))              // GET/PUT 运行时设置
+	mux.HandleFunc("/admin/backup", s.auth(s.adminBackup))                  // GET 列表 / POST 触发
+	mux.HandleFunc("/admin/backup/", s.auth(s.adminBackup))                 // config / schedule / records/{id}
 }
 
 // adminLogs 返回调用日志，兼容游标和偏移量分页。

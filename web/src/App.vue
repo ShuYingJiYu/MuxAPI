@@ -121,7 +121,7 @@ function go(p) {
     else if (p === 'upstreams') { await loadTags(); await loadUpstreams(); startRtPoll(loadUpstreams) }
     else if (p === 'monitors') { await loadTags(); await loadUpstreams(); await loadMonitors(); startMonPoll() }
     else if (p === 'logs') { await loadLogOptions(); await loadLogs(true); startLogPoll() }
-    else if (p === 'settings') { await loadSettings() }
+    else if (p === 'settings') { await loadSettings(); await Promise.all([loadBackupConfig(), loadBackupSchedule(), loadBackups()]) }
   })
 }
 function openDetail(g) {
@@ -872,7 +872,84 @@ const effectiveFirstResponseTimeoutMs = ref('')
 const firstResponseTimeoutSource = ref('')
 const apiBase = location.origin    // 当前访问地址，用于展示客户端接入端点
 const settingsSaved = ref(false)
-const settingsSection = ref('logs')  // 设置页左锚点：logs | alert | endpoint
+const settingsSection = ref('logs')  // 设置页左锚点：logs | alert | endpoint | backup
+
+// 备份配置
+const backupConfig = ref({ endpoint: '', region: '', bucket: '', access_key_id: '', secret_key: '', prefix: '', force_path_style: false })
+const backupSchedule = ref({ enabled: false, cron_expr: '0 3 * * *', retain_days: 14, retain_count: 30 })
+const backupRecords = ref([])
+const backupTesting = ref(false)
+const backupTriggering = ref(false)
+const backupLoading = ref(false)
+const backupTestResult = ref(null) // null | 'ok' | 'err'
+const backupTestMsg = ref('')
+let _backupPollTimer = null
+function startBackupPoll() {
+  if (_backupPollTimer) return
+  _backupPollTimer = setInterval(async () => {
+    const r = await api.listBackups().catch(() => null)
+    if (!r) return
+    backupRecords.value = r.items || []
+    if (!backupRecords.value.some(b => b.status === 'running' || b.status === 'pending')) {
+      clearInterval(_backupPollTimer); _backupPollTimer = null
+    }
+  }, 4000)
+}
+function stopBackupPoll() { clearInterval(_backupPollTimer); _backupPollTimer = null }
+
+async function loadBackupConfig() {
+  backupConfig.value = (await api.backupConfig()) || { endpoint: '', region: '', bucket: '', access_key_id: '', secret_key: '', prefix: '', force_path_style: false }
+}
+async function saveBackupConfig() {
+  await api.saveBackupConfig(backupConfig.value)
+  await loadBackupConfig()
+  settingsSaved.value = true
+  setTimeout(() => { settingsSaved.value = false }, 1500)
+}
+async function testS3() {
+  backupTesting.value = true
+  backupTestResult.value = null
+  try {
+    const r = await api.testBackupConfig(backupConfig.value)
+    backupTestResult.value = r.ok ? 'ok' : 'err'
+    if (!r.ok) backupTestMsg.value = r.message
+  } finally { backupTesting.value = false }
+}
+async function loadBackupSchedule() {
+  backupSchedule.value = (await api.backupSchedule()) || { enabled: false, cron_expr: '0 3 * * *', retain_days: 14, retain_count: 30 }
+}
+async function saveBackupSchedule() {
+  await api.saveBackupSchedule(backupSchedule.value)
+  await loadBackupSchedule()
+  settingsSaved.value = true
+  setTimeout(() => { settingsSaved.value = false }, 1500)
+}
+async function triggerBackup() {
+  backupTriggering.value = true
+  try {
+    await api.triggerBackup()
+    await loadBackups()
+    startBackupPoll()
+  } finally { backupTriggering.value = false }
+}
+async function loadBackups() {
+  backupLoading.value = true
+  try {
+    const r = await api.listBackups()
+    backupRecords.value = r.items || []
+    if (backupRecords.value.some(b => b.status === 'running' || b.status === 'pending')) startBackupPoll()
+  } finally { backupLoading.value = false }
+}
+function deleteBackup(id) {
+  ask('删除此备份？', () => guard(async () => { await api.deleteBackup(id); await loadBackups() }))
+}
+async function downloadBackup(id) {
+  const r = await api.backupDownloadURL(id)
+  window.open(r.url, '_blank')
+}
+const backupStatusClass = s => ({ pending: 'tag warn', running: 'tag on', completed: 'tag ok', failed: 'tag err' }[s] || 'tag')
+const backupStatusText = s => ({ pending: '待处理', running: '进行中', completed: '已完成', failed: '失败' }[s] || s)
+const fmtFileSize = b => b < 1024 ? b + 'B' : b < 1024 * 1024 ? (b / 1024).toFixed(1) + 'KB' : (b / 1024 / 1024).toFixed(1) + 'MB'
 function createKey() { dlg.type = 'keygen'; dlg.form = { name: '' } }
 function saveKey() {
   guard(async () => {
@@ -915,7 +992,6 @@ const sourceText = s => s === 'settings' ? '页面设置' : '默认值'
 // 设置页左锚点点击：滚动到对应 section 并高亮
 function gotoSection(id) {
   settingsSection.value = id
-  document.getElementById('set-' + id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 function saveSettings() {
   guard(async () => {
@@ -1113,6 +1189,7 @@ function logout() {
   loggedIn.value = false
   loginForm.token = ''
   groups.value = []; upstreams.value = []; members.value = []; keys.value = []; monitors.value = []; tags.value = []
+  stopBackupPoll()
   stopAllPoll()
 }
 </script>
@@ -1656,11 +1733,12 @@ function logout() {
               <div class="set-navitem" :class="{ active: settingsSection === 'route' }" @click="gotoSection('route')"><Icon name="link" :size="16" />渠道路由</div>
               <div class="set-navitem" :class="{ active: settingsSection === 'alert' }" @click="gotoSection('alert')"><Icon name="alert" :size="16" />健康告警</div>
               <div class="set-navitem" :class="{ active: settingsSection === 'endpoint' }" @click="gotoSection('endpoint')"><Icon name="link" :size="16" />接入地址</div>
+              <div class="set-navitem" :class="{ active: settingsSection === 'backup' }" @click="gotoSection('backup')"><Icon name="refresh" :size="16" />数据备份</div>
               <p class="set-navhint">探测间隔 / 路径已下放到各监控项，在「监控看板」逐项配置。</p>
             </aside>
 
             <div class="settings-body">
-              <section id="set-logs" class="card settings-card">
+              <section id="set-logs" v-show="settingsSection === 'logs'" class="card settings-card">
                 <div class="settings-title"><h3>日志清理</h3><p>按完成时间保留请求记录，过期记录与尝试链自动删除。</p></div>
                 <div class="settings-fields">
                   <div class="field"><label>保留天数</label><input v-model="logRetention" type="number" min="1" max="365" placeholder="7" /></div>
@@ -1674,7 +1752,7 @@ function logout() {
                 </div>
               </section>
 
-              <section id="set-route" class="card settings-card">
+              <section id="set-route" v-show="settingsSection === 'route'" class="card settings-card">
                 <div class="settings-title"><h3>渠道路由</h3><p>首字节前允许故障切换，流开始后保持透明传输。</p></div>
                 <div class="settings-fields">
                   <div class="field"><label>首字节超时（秒）</label><input v-model="firstResponseTimeoutSec" type="number" min="1" max="600" placeholder="120" /></div>
@@ -1690,7 +1768,7 @@ function logout() {
                 </div>
               </section>
 
-              <section id="set-alert" class="card settings-card">
+              <section id="set-alert" v-show="settingsSection === 'alert'" class="card settings-card">
                 <div class="settings-title"><h3>健康告警</h3><p>上游渠道熔断翻转时推送 Webhook，URL 留空则关闭。</p></div>
                 <div class="settings-fields">
                   <div class="field"><label>告警 Webhook</label><input v-model="alertWebhook" placeholder="https://... 留空关闭" /></div>
@@ -1706,7 +1784,7 @@ function logout() {
                 </div>
               </section>
 
-              <section id="set-endpoint" class="card settings-card">
+              <section id="set-endpoint" v-show="settingsSection === 'endpoint'" class="card settings-card">
                 <div class="settings-title"><h3>接入地址</h3><p>客户端使用接入密钥访问。</p></div>
                 <div class="endpoint-list">
                   <div><span>OpenAI</span><code>{{ apiBase }}/v1/chat/completions</code></div>
@@ -1714,6 +1792,80 @@ function logout() {
                   <div><span>Claude</span><code>{{ apiBase }}/v1/messages</code></div>
                 </div>
                 <p class="hint">请求头：<code>Authorization: Bearer &lt;密钥&gt;</code></p>
+              </section>
+
+              <!-- 数据备份 -->
+              <section id="set-backup" v-show="settingsSection === 'backup'" class="card settings-card">
+                <div class="settings-title"><h3>数据备份</h3><p>将 PostgreSQL 数据库自动备份至 S3/R2 对象存储。</p></div>
+
+                <h4 style="margin:0 0 8px;font-size:13px;color:var(--text2)">对象存储配置</h4>
+                <div class="settings-fields">
+                  <div class="field"><label>Endpoint</label><input v-model="backupConfig.endpoint" placeholder="https://xxx.r2.cloudflarestorage.com" /></div>
+                  <div class="field"><label>Region</label><input v-model="backupConfig.region" placeholder="auto" /></div>
+                  <div class="field"><label>Bucket</label><input v-model="backupConfig.bucket" placeholder="my-bucket" /></div>
+                  <div class="field"><label>Access Key ID</label><input v-model="backupConfig.access_key_id" /></div>
+                  <div class="field"><label>Secret Key</label><input v-model="backupConfig.secret_key" type="password" placeholder="已配置时显示占位符" /></div>
+                  <div class="field"><label>前缀 (Prefix)</label><input v-model="backupConfig.prefix" placeholder="muxapi/backups/" /></div>
+                  <div class="field"><label>Path Style</label>
+                    <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                      <input type="checkbox" v-model="backupConfig.force_path_style" style="width:auto" />
+                      Force Path Style（部分私有部署需要）
+                    </label>
+                  </div>
+                </div>
+                <div class="settings-actions">
+                  <button class="btn btn-ghost" :disabled="backupTesting" @click="guard(testS3)">{{ backupTesting ? '测试中…' : '测试连接' }}</button>
+                  <span v-if="backupTestResult === 'ok'" style="color:#1b8c75;font-size:13px;font-weight:500">✓ 连接成功</span>
+                  <span v-if="backupTestResult === 'err'" style="color:#d6536f;font-size:13px;font-weight:500;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" :title="backupTestMsg">✗ {{ backupTestMsg }}</span>
+                  <span class="save-status" :class="{ show: settingsSaved }">已保存 ✓</span>
+                  <button class="btn" @click="guard(saveBackupConfig)"><Icon name="check" :size="16" />保存配置</button>
+                </div>
+
+                <h4 style="margin:16px 0 8px;font-size:13px;color:var(--text2)">定时备份</h4>
+                <div class="settings-fields">
+                  <div class="field"><label>启用</label>
+                    <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                      <input type="checkbox" v-model="backupSchedule.enabled" style="width:auto" />
+                      启用定时备份
+                    </label>
+                  </div>
+                  <div class="field"><label>Cron 表达式</label><input v-model="backupSchedule.cron_expr" placeholder="0 3 * * *（每天凌晨3点）" /></div>
+                  <div class="field"><label>保留天数</label><input v-model.number="backupSchedule.retain_days" type="number" min="0" placeholder="14（0=不限）" /></div>
+                  <div class="field"><label>最多保留份数</label><input v-model.number="backupSchedule.retain_count" type="number" min="0" placeholder="30（0=不限）" /></div>
+                </div>
+                <div class="settings-actions">
+                  <span class="save-status" :class="{ show: settingsSaved }">已保存 ✓</span>
+                  <button class="btn" @click="guard(saveBackupSchedule)"><Icon name="check" :size="16" />保存计划</button>
+                </div>
+
+                <h4 style="margin:16px 0 8px;font-size:13px;color:var(--text2)">备份记录</h4>
+                <div class="settings-actions" style="margin-bottom:8px">
+                  <button class="btn" :disabled="backupTriggering" @click="guard(triggerBackup)">{{ backupTriggering ? '备份中…' : '立即备份' }}</button>
+                  <button class="btn btn-ghost" @click="guard(loadBackups)">刷新</button>
+                </div>
+                <div v-if="backupLoading" class="hint">加载中…</div>
+                <div v-else-if="backupRecords.length === 0" class="hint">暂无备份记录</div>
+                <div v-else class="backup-table-wrap">
+                  <table class="backup-table">
+                    <thead><tr><th>状态</th><th>文件</th><th>大小</th><th>触发方式</th><th>开始时间</th><th>操作</th></tr></thead>
+                    <tbody>
+                      <tr v-for="r in backupRecords" :key="r.id">
+                        <td><span :class="backupStatusClass(r.status)">{{ backupStatusText(r.status) }}</span></td>
+                        <td class="col-file" :title="r.file_name">{{ r.file_name }}</td>
+                        <td style="white-space:nowrap">{{ r.size_bytes ? fmtFileSize(r.size_bytes) : '—' }}</td>
+                        <td>{{ r.triggered_by === 'scheduled' ? '定时' : '手动' }}</td>
+                        <td style="white-space:nowrap">{{ r.started_at ? new Date(r.started_at * 1000).toLocaleString() : '—' }}</td>
+                        <td class="col-ops">
+                          <button v-if="r.status === 'completed'" class="btn btn-ghost" style="padding:2px 8px;font-size:11px" @click="guard(() => downloadBackup(r.id))">下载</button>
+                          <button class="btn btn-ghost" style="padding:2px 8px;font-size:11px;color:var(--red)" @click="deleteBackup(r.id)">删除</button>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div v-if="backupRecords.some(r => r.error)" style="margin-top:8px">
+                  <div v-for="r in backupRecords.filter(r => r.error)" :key="r.id+'e'" class="hint" style="color:var(--red)">{{ r.file_name }}：{{ r.error }}</div>
+                </div>
               </section>
             </div>
           </div>
