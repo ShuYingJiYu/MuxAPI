@@ -638,8 +638,12 @@ function clearTagFilters() { upstreamTagFilters.clear(); onUpstreamFilterChange(
 
 // 行内标签 picker
 const inlineTagPickerUpstreamId = ref(null)
-function openInlineTagPicker(id) {
-  inlineTagPickerUpstreamId.value = inlineTagPickerUpstreamId.value === id ? null : id
+const inlineTagPickerPos = ref({ top: 0, left: 0 })
+function openInlineTagPicker(id, event) {
+  if (inlineTagPickerUpstreamId.value === id) { inlineTagPickerUpstreamId.value = null; return }
+  const rect = event.currentTarget.getBoundingClientRect()
+  inlineTagPickerPos.value = { top: rect.bottom + 6, left: rect.left }
+  inlineTagPickerUpstreamId.value = id
 }
 async function toggleInlineTag(u, tagId) {
   const primaryId = Number(u.primary_tag_id) || 0
@@ -1373,13 +1377,17 @@ function logout() {
                       <td>
                         <div class="cell-tags-wrap" @click.stop>
                           <div class="tag-chip-row"><span v-for="tag in auxiliaryTagsFor(u)" :key="tag.id" class="manage-tag" :class="`tag-${tag.color}`">{{ tag.name }}</span><span v-if="!auxiliaryTagsFor(u).length" class="tag-empty">—</span></div>
-                          <button class="inline-tag-btn" title="快速打标签" @click.stop="openInlineTagPicker(u.id)"><Icon name="plus" :size="12" /></button>
-                          <div v-if="inlineTagPickerUpstreamId === u.id" class="inline-tag-picker" @click.stop>
-                            <button v-for="tag in tags" :key="tag.id"
-                              class="inline-tag-option manage-tag" :class="[`tag-${tag.color}`, { active: (u.tag_ids||[]).includes(tag.id) || u.primary_tag_id === tag.id, 'is-primary': u.primary_tag_id === tag.id }]"
-                              @click="toggleInlineTag(u, tag.id)">{{ tag.name }}</button>
-                            <div v-if="!tags.length" style="font-size:11px;color:var(--g400);padding:4px">暂无标签</div>
-                          </div>
+                          <button class="inline-tag-btn" title="快速打标签" @click.stop="openInlineTagPicker(u.id, $event)"><Icon name="plus" :size="12" /></button>
+                          <Teleport to="body">
+                            <div v-if="inlineTagPickerUpstreamId === u.id" class="inline-tag-picker"
+                              :style="{ top: inlineTagPickerPos.top + 'px', left: inlineTagPickerPos.left + 'px' }"
+                              @click.stop>
+                              <button v-for="tag in tags" :key="tag.id"
+                                class="inline-tag-option manage-tag" :class="[`tag-${tag.color}`, { active: (u.tag_ids||[]).includes(tag.id) || u.primary_tag_id === tag.id, 'is-primary': u.primary_tag_id === tag.id }]"
+                                @click="toggleInlineTag(u, tag.id)">{{ tag.name }}</button>
+                              <div v-if="!tags.length" style="font-size:11px;color:var(--g400);padding:4px">暂无标签</div>
+                            </div>
+                          </Teleport>
                         </div>
                       </td>
                       <td class="cell-url">

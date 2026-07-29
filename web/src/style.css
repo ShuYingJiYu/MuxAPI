@@ -955,7 +955,7 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .inline-tag-btn { width: 20px; height: 20px; display: grid; place-items: center; border: 1px dashed var(--g300); border-radius: 4px; background: transparent; color: var(--g400); cursor: pointer; flex: none; opacity: 0; transition: opacity .1s; }
 tr:hover .inline-tag-btn { opacity: 1; }
 .inline-tag-btn:hover { border-color: var(--g500); color: var(--g700); }
-.inline-tag-picker { position: absolute; top: calc(100% + 4px); left: 0; z-index: 200; min-width: 180px; max-width: 280px; background: #fff; border: 1px solid var(--g200); border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.12); padding: 5px; display: flex; flex-wrap: wrap; gap: 4px; }
+.inline-tag-picker { position: fixed; z-index: 200; min-width: 180px; max-width: 280px; background: #fff; border: 1px solid var(--g200); border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.12); padding: 5px; display: flex; flex-wrap: wrap; gap: 4px; }
 .inline-tag-option { min-height: 26px; display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border: 1px solid var(--g200); border-radius: 5px; background: #fff; color: var(--g600); font-size: 11.5px; cursor: pointer; white-space: nowrap; }
 .inline-tag-option:hover { filter: brightness(.96); }
 .inline-tag-option.active { box-shadow: inset 0 0 0 1.5px currentColor; font-weight: 700; }
