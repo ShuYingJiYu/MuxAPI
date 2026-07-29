@@ -297,6 +297,9 @@ var tagColors = map[string]bool{
 	"gray": true, "green": true, "amber": true, "red": true,
 	"blue": true, "purple": true, "pink": true, "teal": true,
 	"cyan": true, "indigo": true, "orange": true, "lime": true,
+	// extended palette
+	"rose": true, "emerald": true, "sky": true,
+	"violet": true, "fuchsia": true, "yellow": true,
 }
 
 func decodeTag(r *http.Request) (string, string, error) {

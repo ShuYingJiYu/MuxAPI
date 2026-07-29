@@ -444,8 +444,7 @@ async function refreshUpstreamBilling(item) {
 
 const upstreamRunFilter = ref('')
 const upstreamEnabledFilter = ref('')
-const upstreamPrimaryTagFilter = ref('')
-const upstreamAnyTagFilter = ref('')
+const upstreamTagFilters = reactive(new Set())   // 多选标签筛选（替换旧的两个下拉）
 const upstreamProtocolFilter = ref('')
 const upstreamSearch = ref('')
 const upstreamPageSize = ref(20)
@@ -483,18 +482,32 @@ const upstreamProtocolOptions = [
 ]
 
 const upstreamRunValue = u => rtUnprobed(u.health) ? 'UNPROBED' : (u.health?.state || '')
-const upstreamsFiltered = computed(() => {
-  const tagOrder = new Map(tags.value.map((tag, index) => [tag.id, index]))
-  const filtered = upstreams.value.filter(u => {
+
+// 不含标签筛选的基础过滤集合，用于算 chip bar 里各标签的命中数
+const upstreamsBaseFiltered = computed(() => {
+  return upstreams.value.filter(u => {
     const query = upstreamSearch.value.trim().toLowerCase()
-    const groupKey = tagGroupKey(primaryTagFor(u))
     if (upstreamEnabledFilter.value === 'enabled' && !u.enabled) return false
     if (upstreamEnabledFilter.value === 'disabled' && u.enabled) return false
     if (upstreamRunFilter.value && upstreamRunValue(u) !== upstreamRunFilter.value) return false
-    if (upstreamPrimaryTagFilter.value && groupKey !== upstreamPrimaryTagFilter.value) return false
-    if (upstreamAnyTagFilter.value && !auxiliaryTagsFor(u).some(tag => String(tag.id) === String(upstreamAnyTagFilter.value))) return false
     if (upstreamProtocolFilter.value && (u.protocol || 'passthrough') !== upstreamProtocolFilter.value) return false
-    if (query && ![u.name, u.base_url, u.protocol, ...(u.tags || []).map(tag => tag.name)].some(value => String(value || '').toLowerCase().includes(query))) return false
+    if (query && ![u.name, u.base_url, u.protocol, ...(u.tags || []).map(tag => tag.name)].some(v => String(v || '').toLowerCase().includes(query))) return false
+    return true
+  })
+})
+
+// chip bar：每个标签在当前基础过滤下的命中数
+const tagChipItems = computed(() => {
+  return tags.value.map(tag => ({
+    ...tag,
+    count: upstreamsBaseFiltered.value.filter(u => (u.tags || []).some(t => t.id === tag.id)).length,
+  }))
+})
+
+const upstreamsFiltered = computed(() => {
+  const tagOrder = new Map(tags.value.map((tag, index) => [tag.id, index]))
+  const filtered = upstreamsBaseFiltered.value.filter(u => {
+    if (upstreamTagFilters.size > 0 && !(u.tags || []).some(t => upstreamTagFilters.has(t.id))) return false
     return true
   })
   return filtered.sort((a, b) => {
@@ -545,11 +558,27 @@ const tagColorChoices = [
   { value: 'purple', label: '紫' }, { value: 'pink', label: '粉' },
   { value: 'red', label: '红' }, { value: 'orange', label: '橙' },
   { value: 'amber', label: '黄' }, { value: 'lime', label: '青柠' },
+  { value: 'rose', label: '玫红' }, { value: 'emerald', label: '翠绿' },
+  { value: 'sky', label: '天蓝' }, { value: 'violet', label: '深紫' },
+  { value: 'fuchsia', label: '品红' }, { value: 'yellow', label: '金黄' },
 ]
 const tagDraft = reactive({ id: 0, name: '', color: 'gray' })
+
+// 每个标签被多少个上游使用（含主标签），供标签管理和 chip bar 显示
+const tagUsageCount = computed(() => {
+  const m = new Map()
+  for (const u of upstreams.value) {
+    for (const t of (u.tags || [])) {
+      m.set(t.id, (m.get(t.id) || 0) + 1)
+    }
+  }
+  return m
+})
+
 const filteredManagedTags = computed(() => {
   const query = tagManagerSearch.value.trim().toLowerCase()
-  return query ? tags.value.filter(tag => tag.name.toLowerCase().includes(query)) : tags.value
+  const list = query ? tags.value.filter(tag => tag.name.toLowerCase().includes(query)) : tags.value
+  return list.map(tag => ({ ...tag, count: tagUsageCount.value.get(tag.id) || 0 }))
 })
 function resetTagDraft() { Object.assign(tagDraft, { id: 0, name: '', color: 'gray' }) }
 function openTagManager() { tagManagerSearch.value = ''; dlg.type = 'tags'; dlg.form = {}; resetTagDraft() }
@@ -600,6 +629,32 @@ function delTag(tag) {
 const upstreamPageItems = computed(() => buildPageItems(upstreamTotalPages.value, Math.min(upstreamCurrentPage.value, upstreamTotalPages.value)))
 const upstreamSelectedCount = computed(() => upstreamSelected.size)
 function onUpstreamFilterChange() { upstreamCurrentPage.value = 1 }
+function toggleTagFilter(tagId) {
+  if (upstreamTagFilters.has(tagId)) upstreamTagFilters.delete(tagId)
+  else upstreamTagFilters.add(tagId)
+  onUpstreamFilterChange()
+}
+function clearTagFilters() { upstreamTagFilters.clear(); onUpstreamFilterChange() }
+
+// 行内标签 picker
+const inlineTagPickerUpstreamId = ref(null)
+function openInlineTagPicker(id) {
+  inlineTagPickerUpstreamId.value = inlineTagPickerUpstreamId.value === id ? null : id
+}
+async function toggleInlineTag(u, tagId) {
+  const primaryId = Number(u.primary_tag_id) || 0
+  if (primaryId === tagId) return               // 主标签不可从 picker 里摘除
+  const current = new Set((u.tag_ids || []).map(Number))
+  if (current.has(tagId)) current.delete(tagId); else current.add(tagId)
+  const tagIDs = [...current].filter(id => id && id !== primaryId)
+  await guard(async () => {
+    await api.updateUpstream(u.id, { ...u, api_key: '', primary_tag_id: primaryId, tag_ids: tagIDs })
+    await loadUpstreams()
+  })
+}
+function closeInlineTagPicker() { inlineTagPickerUpstreamId.value = null }
+onMounted(() => document.addEventListener('click', closeInlineTagPicker))
+onUnmounted(() => document.removeEventListener('click', closeInlineTagPicker))
 function goUpstreamPage(page) { upstreamCurrentPage.value = Math.max(1, Math.min(Number(page) || 1, upstreamTotalPages.value)) }
 function toggleUpstreamSelection(id) {
   if (upstreamSelected.has(id)) upstreamSelected.delete(id)
@@ -1266,8 +1321,6 @@ function logout() {
                 <Icon class="ic" name="search" :size="16" />
                 <input v-model="upstreamSearch" class="search-input" placeholder="名称、地址或标签" @input="onUpstreamFilterChange" />
               </div>
-              <FancySelect v-model="upstreamPrimaryTagFilter" :options="upstreamPrimaryTagOptions" @change="onUpstreamFilterChange" />
-              <FancySelect v-model="upstreamAnyTagFilter" :options="tagFilterOptions" @change="onUpstreamFilterChange" />
               <FancySelect v-model="upstreamProtocolFilter" :options="upstreamProtocolOptions" @change="onUpstreamFilterChange" />
               <FancySelect v-model="upstreamRunFilter" :options="upstreamRunOptions" @change="onUpstreamFilterChange" />
               <FancySelect v-model="upstreamEnabledFilter" :options="upstreamEnabledOptions" @change="onUpstreamFilterChange" />
@@ -1276,6 +1329,15 @@ function logout() {
               <button class="btn btn-ghost" @click="openTagManager"><Icon name="filter" :size="16" />标签管理</button>
               <button class="btn" @click="newUpstream"><Icon name="plus" :size="16" />新增上游</button>
             </div>
+          </div>
+          <!-- Tag Chip Bar：多选标签筛选 -->
+          <div v-if="tags.length" class="tag-chip-bar">
+            <button class="tag-chip-bar-item" :class="{ active: !upstreamTagFilters.size }" @click="clearTagFilters">全部</button>
+            <button v-for="item in tagChipItems" :key="item.id"
+              class="tag-chip-bar-item manage-tag" :class="[`tag-${item.color}`, { 'tag-active': upstreamTagFilters.has(item.id) }]"
+              @click="toggleTagFilter(item.id)">
+              {{ item.name }}<span class="chip-count">{{ item.count }}</span>
+            </button>
           </div>
           <div v-if="upstreamSelectedCount" class="upstream-batchbar">
             <b>已选 {{ upstreamSelectedCount }} 项</b>
@@ -1307,7 +1369,18 @@ function logout() {
                       <td class="select-cell"><input type="checkbox" :checked="upstreamSelected.has(u.id)" :aria-label="`选择 ${u.name}`" @change="toggleUpstreamSelection(u.id)" /></td>
                       <td class="drag-cell"><span class="mon-grip" title="拖拽调整顺序"><Icon name="grip" :size="16" /></span></td>
                       <td class="cell-name">{{ u.name }}</td>
-                      <td><div class="tag-chip-row"><span v-for="tag in auxiliaryTagsFor(u)" :key="tag.id" class="manage-tag" :class="`tag-${tag.color}`">{{ tag.name }}</span><span v-if="!auxiliaryTagsFor(u).length" class="tag-empty">—</span></div></td>
+                      <td>
+                        <div class="cell-tags-wrap" @click.stop>
+                          <div class="tag-chip-row"><span v-for="tag in auxiliaryTagsFor(u)" :key="tag.id" class="manage-tag" :class="`tag-${tag.color}`">{{ tag.name }}</span><span v-if="!auxiliaryTagsFor(u).length" class="tag-empty">—</span></div>
+                          <button class="inline-tag-btn" title="快速打标签" @click.stop="openInlineTagPicker(u.id)"><Icon name="plus" :size="12" /></button>
+                          <div v-if="inlineTagPickerUpstreamId === u.id" class="inline-tag-picker" @click.stop>
+                            <button v-for="tag in tags" :key="tag.id"
+                              class="inline-tag-option manage-tag" :class="[`tag-${tag.color}`, { active: (u.tag_ids||[]).includes(tag.id) || u.primary_tag_id === tag.id, 'is-primary': u.primary_tag_id === tag.id }]"
+                              @click="toggleInlineTag(u, tag.id)">{{ tag.name }}</button>
+                            <div v-if="!tags.length" style="font-size:11px;color:var(--g400);padding:4px">暂无标签</div>
+                          </div>
+                        </div>
+                      </td>
                       <td class="cell-url">
                         <a v-if="upstreamHref(u.base_url)" class="upstream-url-link" :href="upstreamHref(u.base_url)" target="_blank" rel="noopener noreferrer" :title="`打开 ${u.base_url}`">
                           <span>{{ u.base_url }}</span><Icon name="external-link" :size="13" />
@@ -1900,7 +1973,8 @@ function logout() {
               <div class="tag-manager-search"><Icon name="search" :size="15" /><input v-model="tagManagerSearch" placeholder="搜索标签" /></div>
               <div class="tag-manager-list">
                 <button v-for="tag in filteredManagedTags" :key="tag.id" class="tag-manager-item" :class="{ active: tagDraft.id === tag.id }" @click="editTagDraft(tag)">
-                  <span class="tag-color-dot" :class="`tag-${tag.color}`"></span><span>{{ tag.name }}</span><Icon name="edit" :size="14" />
+                  <span class="tag-color-dot" :class="`tag-${tag.color}`"></span><span>{{ tag.name }}</span>
+                  <span class="tag-count">{{ tag.count || '' }}</span>
                 </button>
                 <div v-if="!filteredManagedTags.length" class="tag-manager-empty">没有匹配的标签</div>
               </div>

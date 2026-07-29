@@ -194,6 +194,12 @@ svg { display: block; flex-shrink: 0; }
 .tag-color-dot.tag-purple, .tag-purple > span { background: #9270d6; }
 .tag-color-dot.tag-pink, .tag-pink > span { background: #df709e; }
 .tag-color-dot.tag-gray, .tag-gray > span { background: #8c8490; }
+.tag-color-dot.tag-rose, .tag-rose > span { background: #f43f5e; }
+.tag-color-dot.tag-emerald, .tag-emerald > span { background: #059669; }
+.tag-color-dot.tag-sky, .tag-sky > span { background: #0284c7; }
+.tag-color-dot.tag-violet, .tag-violet > span { background: #7c3aed; }
+.tag-color-dot.tag-fuchsia, .tag-fuchsia > span { background: #c026d3; }
+.tag-color-dot.tag-yellow, .tag-yellow > span { background: #ca8a04; }
 .tag-chip-row { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
 .manage-tag { min-height: 23px; display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px; border: 1px solid var(--g200); border-radius: 5px; background: #fff; color: var(--g600); font-size: 10.5px; white-space: nowrap; }
 button.manage-tag { cursor: pointer; }
@@ -208,6 +214,12 @@ button.manage-tag { cursor: pointer; }
 .manage-tag.tag-indigo { border-color: #b8c1ec; background: #f1f3fd; color: #48569b; }
 .manage-tag.tag-purple { border-color: #ccbced; background: #f7f3fd; color: #6747a2; }
 .manage-tag.tag-pink { border-color: #edbdd1; background: #fff3f8; color: #98506f; }
+.manage-tag.tag-rose { border-color: #fca5b2; background: #fff1f3; color: #9f1239; }
+.manage-tag.tag-emerald { border-color: #6ee7b7; background: #ecfdf5; color: #065f46; }
+.manage-tag.tag-sky { border-color: #7dd3fc; background: #f0f9ff; color: #0c4a6e; }
+.manage-tag.tag-violet { border-color: #c4b5fd; background: #f5f3ff; color: #4c1d95; }
+.manage-tag.tag-fuchsia { border-color: #f0abfc; background: #fdf4ff; color: #701a75; }
+.manage-tag.tag-yellow { border-color: #fde68a; background: #fefce8; color: #713f12; }
 .manage-tag.selected { box-shadow: inset 0 0 0 1px currentColor; font-weight: 700; }
 .manage-tag.primary { opacity: .5; cursor: default; }
 .tag-empty { color: var(--g400); }
@@ -888,37 +900,42 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .tag-picker-option > span:nth-child(2) { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tag-picker-option > svg { flex: none; color: var(--g400); }
 .tag-picker-empty { display: block; padding: 12px 8px; color: var(--g400); font-size: 12px; text-align: center; }
-.tag-manager { display: grid; grid-template-columns: 250px minmax(0,1fr); gap: 22px; min-height: 290px; margin-top: 12px; }
-.tag-manager-browser { min-width: 0; overflow: hidden; border: 1px solid var(--g200); border-radius: 8px; background: var(--g50); }
-.tag-manager-search { border-bottom: 1px solid var(--g200); }
-.tag-manager-list { max-height: 300px; overflow-y: auto; padding: 5px; }
-.tag-manager-item { width: 100%; min-height: 36px; display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--g700); text-align: left; cursor: pointer; }
-.tag-manager-item span:nth-child(2) { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ===== 标签管理对话框重设计 ===== */
+.tag-manager { display: grid; grid-template-columns: 220px minmax(0,1fr); gap: 16px; min-height: 260px; margin-top: 10px; }
+.tag-manager-browser { min-width: 0; overflow: hidden; border-radius: 8px; background: var(--g50); }
+.tag-manager-search { border-bottom: 1px solid var(--g150,var(--g200)); }
+.tag-manager-list { max-height: 300px; overflow-y: auto; padding: 4px; }
+.tag-manager-item { width: 100%; min-height: 34px; display: flex; align-items: center; gap: 7px; padding: 5px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--g700); text-align: left; cursor: pointer; }
+.tag-manager-item span:nth-child(2) { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.tag-manager-item .tag-count { margin-left: auto; font-size: 11px; color: var(--g400); flex: none; }
 .tag-manager-item:hover, .tag-manager-item.active { background: #fff; color: var(--g900); }
-.tag-manager-empty { padding: 30px 8px; color: var(--g400); font-size: 12px; text-align: center; }
-.tag-manager-form { min-width: 0; padding: 2px 0; }
-.tag-color-picker { display: grid; grid-template-columns: repeat(6, 34px); gap: 8px; }
-.tag-color-picker button { width: 34px; height: 34px; display: grid; place-items: center; border: 2px solid transparent; border-radius: 50%; background: transparent; cursor: pointer; }
-.tag-color-picker button span { width: 22px; height: 22px; border-radius: 50%; background: var(--g300); }
-.tag-color-picker .tag-green span { background: #42b883; }
-.tag-color-picker .tag-teal span { background: #299f91; }
-.tag-color-picker .tag-cyan span { background: #2e9ec4; }
-.tag-color-picker .tag-amber span { background: #e9a23b; }
-.tag-color-picker .tag-orange span { background: #e98532; }
-.tag-color-picker .tag-lime span { background: #76a82f; }
-.tag-color-picker .tag-red span { background: #db6278; }
-.tag-color-picker .tag-blue span { background: #5598d9; }
-.tag-color-picker .tag-indigo span { background: #6174d6; }
-.tag-color-picker .tag-purple span { background: #9270d6; }
-.tag-color-picker .tag-pink span { background: #df709e; }
-.tag-color-picker .tag-gray span { background: #8c8490; }
-.tag-color-picker button.active { border-color: var(--g700); }
-.tag-manager-actions { display: flex; align-items: center; gap: 8px; margin-top: 20px; }
+.tag-manager-item.active .tag-count { color: var(--g600); }
+.tag-manager-empty { padding: 28px 8px; color: var(--g400); font-size: 12px; text-align: center; }
+.tag-manager-form { min-width: 0; padding: 0; }
+.tag-manager-actions { display: flex; align-items: center; gap: 8px; margin-top: 16px; }
 .tag-manager-actions .btn { flex: none; white-space: nowrap; }
 .tag-manager-actions .hspacer { flex: 1; }
-.tag-dialog > .dialog-foot { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--g100); }
+.tag-dialog > .dialog-foot { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--g100); }
 
-/* ===== 上游池表格拖拽 ===== */
+/* ===== Tag Chip Bar（多选标签筛选）===== */
+.tag-chip-bar { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; padding: 6px 0 2px; }
+.tag-chip-bar-item { height: 24px; display: inline-flex; align-items: center; gap: 4px; padding: 0 9px; border: 1px solid var(--g200); border-radius: 12px; background: var(--g50); color: var(--g600); font-size: 12px; white-space: nowrap; cursor: pointer; transition: background .1s, color .1s; }
+.tag-chip-bar-item:hover { background: var(--g100); color: var(--g900); }
+.tag-chip-bar-item.active { background: var(--p500,#3b7dd8); border-color: var(--p500,#3b7dd8); color: #fff; font-weight: 600; }
+.tag-chip-bar-item.tag-active { box-shadow: inset 0 0 0 1.5px currentColor; font-weight: 600; }
+.chip-count { font-size: 10.5px; opacity: .75; }
+
+/* ===== 行内标签 picker ===== */
+.cell-tags-wrap { position: relative; display: flex; align-items: center; gap: 4px; min-width: 0; }
+.inline-tag-btn { width: 20px; height: 20px; display: grid; place-items: center; border: 1px dashed var(--g300); border-radius: 4px; background: transparent; color: var(--g400); cursor: pointer; flex: none; opacity: 0; transition: opacity .1s; }
+tr:hover .inline-tag-btn { opacity: 1; }
+.inline-tag-btn:hover { border-color: var(--g500); color: var(--g700); }
+.inline-tag-picker { position: absolute; top: calc(100% + 4px); left: 0; z-index: 200; min-width: 180px; max-width: 280px; background: #fff; border: 1px solid var(--g200); border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.12); padding: 5px; display: flex; flex-wrap: wrap; gap: 4px; }
+.inline-tag-option { min-height: 26px; display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border: 1px solid var(--g200); border-radius: 5px; background: #fff; color: var(--g600); font-size: 11.5px; cursor: pointer; white-space: nowrap; }
+.inline-tag-option:hover { filter: brightness(.96); }
+.inline-tag-option.active { box-shadow: inset 0 0 0 1.5px currentColor; font-weight: 700; }
+.inline-tag-option.is-primary { opacity: .5; cursor: default; font-style: italic; }
 .drag-cell { width: 42px; color: var(--g300); }
 tr.disabled { opacity: .65; }
 tr.dragging td { opacity: .45; }
