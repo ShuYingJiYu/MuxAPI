@@ -1334,8 +1334,9 @@ function logout() {
           <div v-if="tags.length" class="tag-chip-bar">
             <button class="tag-chip-bar-item" :class="{ active: !upstreamTagFilters.size }" @click="clearTagFilters">全部</button>
             <button v-for="item in tagChipItems" :key="item.id"
-              class="tag-chip-bar-item manage-tag" :class="[`tag-${item.color}`, { 'tag-active': upstreamTagFilters.has(item.id) }]"
+              class="tag-chip-bar-item" :class="{ 'tag-active': upstreamTagFilters.has(item.id) }"
               @click="toggleTagFilter(item.id)">
+              <span class="tag-color-dot" :class="`tag-${item.color}`"></span>
               {{ item.name }}<span class="chip-count">{{ item.count }}</span>
             </button>
           </div>

@@ -920,11 +920,35 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 
 /* ===== Tag Chip Bar（多选标签筛选）===== */
 .tag-chip-bar { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; padding: 6px 0 2px; }
-.tag-chip-bar-item { height: 24px; display: inline-flex; align-items: center; gap: 4px; padding: 0 9px; border: 1px solid var(--g200); border-radius: 12px; background: var(--g50); color: var(--g600); font-size: 12px; white-space: nowrap; cursor: pointer; transition: background .1s, color .1s; }
+.tag-chip-bar-item { height: 24px; display: inline-flex; align-items: center; gap: 5px; padding: 0 10px; border: 1px solid var(--g200); border-radius: 12px; background: var(--g50); color: var(--g700); font-size: 12px; white-space: nowrap; cursor: pointer; transition: background .1s, color .1s; }
 .tag-chip-bar-item:hover { background: var(--g100); color: var(--g900); }
 .tag-chip-bar-item.active { background: var(--p500,#3b7dd8); border-color: var(--p500,#3b7dd8); color: #fff; font-weight: 600; }
-.tag-chip-bar-item.tag-active { box-shadow: inset 0 0 0 1.5px currentColor; font-weight: 600; }
-.chip-count { font-size: 10.5px; opacity: .75; }
+.tag-chip-bar-item.tag-active { border-width: 2px; font-weight: 600; }
+.chip-count { font-size: 10.5px; opacity: .65; }
+
+/* ===== 颜色选择器（tag-color-picker）===== */
+.tag-color-picker { display: grid; grid-template-columns: repeat(9, 28px); gap: 6px; }
+.tag-color-picker button { width: 28px; height: 28px; display: grid; place-items: center; border: 2px solid transparent; border-radius: 50%; background: transparent; cursor: pointer; }
+.tag-color-picker button span { width: 18px; height: 18px; border-radius: 50%; background: var(--g300); }
+.tag-color-picker .tag-green span { background: #42b883; }
+.tag-color-picker .tag-teal span { background: #299f91; }
+.tag-color-picker .tag-cyan span { background: #2e9ec4; }
+.tag-color-picker .tag-amber span { background: #e9a23b; }
+.tag-color-picker .tag-orange span { background: #e98532; }
+.tag-color-picker .tag-lime span { background: #76a82f; }
+.tag-color-picker .tag-red span { background: #db6278; }
+.tag-color-picker .tag-blue span { background: #5598d9; }
+.tag-color-picker .tag-indigo span { background: #6174d6; }
+.tag-color-picker .tag-purple span { background: #9270d6; }
+.tag-color-picker .tag-pink span { background: #df709e; }
+.tag-color-picker .tag-gray span { background: #8c8490; }
+.tag-color-picker .tag-rose span { background: #f43f5e; }
+.tag-color-picker .tag-emerald span { background: #059669; }
+.tag-color-picker .tag-sky span { background: #0284c7; }
+.tag-color-picker .tag-violet span { background: #7c3aed; }
+.tag-color-picker .tag-fuchsia span { background: #c026d3; }
+.tag-color-picker .tag-yellow span { background: #ca8a04; }
+.tag-color-picker button.active { border-color: var(--g700); }
 
 /* ===== 行内标签 picker ===== */
 .cell-tags-wrap { position: relative; display: flex; align-items: center; gap: 4px; min-width: 0; }
