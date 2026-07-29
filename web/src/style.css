@@ -608,10 +608,10 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .log-page-number:disabled { cursor: default; }
 .log-page-ellipsis { display: grid; place-items: center; color: var(--g400); font-size: 14px; }
 .log-table-wrap { overflow: auto; border-radius: 8px; }
-.log-table { min-width: 1340px; table-layout: fixed; }
+.log-table { min-width: 1400px; table-layout: fixed; }
 .log-table th { position: sticky; top: 0; z-index: 1; padding: 10px 12px; letter-spacing: 0; }
 .log-table th:nth-child(1) { width: 128px; }
-.log-table th:nth-child(2) { width: 130px; }
+.log-table th:nth-child(2) { width: 180px; }
 .log-table th:nth-child(3) { width: 160px; }
 .log-table th:nth-child(4) { width: 180px; }
 .log-table th:nth-child(5) { width: 210px; }

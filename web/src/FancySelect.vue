@@ -47,7 +47,8 @@ function positionMenu() {
   const available = Math.max(80, openAbove ? above : below)
   menuStyle.value = {
     left: `${rect.left}px`,
-    width: `${rect.width}px`,
+    minWidth: `${rect.width}px`,
+    maxWidth: `320px`,
     top: openAbove ? 'auto' : `${rect.bottom + gap}px`,
     bottom: openAbove ? `${window.innerHeight - rect.top + gap}px` : 'auto',
     maxHeight: `${Math.min(280, available)}px`,
