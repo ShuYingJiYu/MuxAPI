@@ -378,18 +378,18 @@ const upstreamFormAvailableTags = computed(() => {
 function newUpstream() {
   upstreamFormTagSearch.value = ''
   dlg.type = 'upstream'
-  dlg.form = { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', billing_type: 'none', enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] }
+  dlg.form = { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', billing_type: 'none', credit_ratio: 1, enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] }
 }
 function editUpstream(u) {
   upstreamFormTagSearch.value = ''
   dlg.type = 'upstream'
-  dlg.form = { ...u, protocol: u.protocol || 'passthrough', billing_type: u.billing_type || 'none', api_key: '', primary_tag_id: u.primary_tag_id || 0, tag_ids: [...(u.tag_ids || [])] }
+  dlg.form = { ...u, protocol: u.protocol || 'passthrough', billing_type: u.billing_type || 'none', credit_ratio: u.credit_ratio || 1, api_key: '', primary_tag_id: u.primary_tag_id || 0, tag_ids: [...(u.tag_ids || [])] }
 }
 function saveUpstream() {
   guard(async () => {
     const primaryTagID = Number(dlg.form.primary_tag_id) || 0
     const tagIDs = [...new Set((dlg.form.tag_ids || []).map(Number).filter(id => id && id !== primaryTagID))]
-    const f = { ...dlg.form, primary_tag_id: primaryTagID, tag_ids: tagIDs }
+    const f = { ...dlg.form, primary_tag_id: primaryTagID, tag_ids: tagIDs, credit_ratio: Number(dlg.form.credit_ratio) || 1 }
     if (f.id) await api.updateUpstream(f.id, f)
     else await api.createUpstream(f)
     closeDlg(); await loadUpstreams()
@@ -1886,6 +1886,7 @@ function logout() {
           <div class="field"><label>base_url</label><input v-model="dlg.form.base_url" placeholder="https://..." /></div>
           <div class="field"><label>协议</label><FancySelect v-model="dlg.form.protocol" :options="protocolOptions" /></div>
           <div class="field"><label>计费平台</label><FancySelect v-model="dlg.form.billing_type" :options="billingTypeOptions" /></div>
+          <div class="field"><label>储值倍率</label><input v-model="dlg.form.credit_ratio" type="number" step="any" min="0" placeholder="充1得N积分时填 N；默认 1" /></div>
           <div class="field"><label>api_key</label><input v-model="dlg.form.api_key" :placeholder="dlg.form.id ? '留空则不修改' : 'sk-...'" /></div>
           <div class="field"><label>代理</label><input v-model="dlg.form.proxy" placeholder="留空=直连/环境变量；如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></div>
           <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>

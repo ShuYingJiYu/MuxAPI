@@ -255,6 +255,8 @@ func openSQLite(path string) (*Store, error) {
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN channel_probe INTEGER NOT NULL DEFAULT 1`)
 	// 迁移：旧库 upstreams 补 sort_order 列（拖拽排序权重，0=未排过按 id）
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`)
+	// 迁移：储值积分倍率（1:N 储值时填 N，用于归一化 max_multiplier 比对）
+	db.Exec(`ALTER TABLE upstreams ADD COLUMN credit_ratio REAL NOT NULL DEFAULT 1`)
 	// 迁移：旧库 groups 表补 sort_order 列（拖拽排序权重，0=未排序按 id）。
 	db.Exec(`ALTER TABLE groups ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`)
 	db.Exec(`ALTER TABLE groups ADD COLUMN max_multiplier REAL`)
@@ -333,7 +335,8 @@ CREATE TABLE IF NOT EXISTS upstreams (
 	billing_type TEXT NOT NULL DEFAULT 'none',
 	enabled  INTEGER NOT NULL DEFAULT 1,
 	channel_probe INTEGER NOT NULL DEFAULT 1,
-	sort_order INTEGER NOT NULL DEFAULT 0
+	sort_order INTEGER NOT NULL DEFAULT 0,
+	credit_ratio REAL NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS tags (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,

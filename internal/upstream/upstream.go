@@ -26,10 +26,11 @@ type Upstream struct {
 	BaseURL      string // 中转站地址
 	APIKey       string // 透传凭证
 	Proxy        string // 转发/探测走的代理出口(空=按环境变量或直连)
-	Protocol     string // 上游协议；passthrough 保持客户端请求格式
-	BillingType  string // 计费接口类型：none/sub2api/newapi
-	Priority     int    // 组内视图：越小越优先
-	Weight       int    // 组内视图：同优先级层分流权重
+	Protocol     string  // 上游协议；passthrough 保持客户端请求格式
+	BillingType  string  // 计费接口类型：none/sub2api/newapi
+	CreditRatio  float64 // 储值积分倍率（默认 1）：充1元得 N 元积分时填 N；路由倍率 = 上报倍率 / CreditRatio
+	Priority     int     // 组内视图：越小越优先
+	Weight       int     // 组内视图：同优先级层分流权重
 	Enabled      bool
 	ChannelProbe bool // 兼容旧数据；熔断固定为渠道级
 }

@@ -317,9 +317,9 @@ type Member struct {
 
 func (s *Store) ListGroupMembers(groupID int64) ([]*Member, error) {
 	rows, err := s.db.Query(`SELECT u.id,u.name,u.base_url,u.protocol,u.billing_type,
-		COALESCE(bs.effective_multiplier,bs.group_multiplier),
+		COALESCE(bs.effective_multiplier,bs.group_multiplier)/u.credit_ratio,
 		CASE WHEN g.max_multiplier IS NOT NULL
-			AND COALESCE(bs.effective_multiplier,bs.group_multiplier)>g.max_multiplier THEN TRUE ELSE FALSE END,
+			AND COALESCE(bs.effective_multiplier,bs.group_multiplier)/u.credit_ratio>g.max_multiplier THEN TRUE ELSE FALSE END,
 		u.enabled,gu.enabled,gu.priority,gu.weight,u.channel_probe
 		FROM upstreams u JOIN group_upstreams gu ON gu.upstream_id=u.id
 		JOIN groups g ON g.id=gu.group_id

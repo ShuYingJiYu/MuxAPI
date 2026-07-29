@@ -207,6 +207,7 @@ type upstreamInput struct {
 	Protocol     string   `json:"protocol"`
 	BillingType  string   `json:"billing_type"`
 	APIKey       string   `json:"api_key"`
+	CreditRatio  *float64 `json:"credit_ratio"`
 	Enabled      bool     `json:"enabled"`
 	ChannelProbe bool     `json:"channel_probe"`
 	PrimaryTagID *int64   `json:"primary_tag_id"`
@@ -243,6 +244,14 @@ func decodeUpstream(r *http.Request) (*upstream.Upstream, error) {
 	result := &upstream.Upstream{
 		Name: d.Name, Source: d.Source, BaseURL: d.BaseURL, APIKey: d.APIKey, Proxy: d.Proxy, Enabled: d.Enabled,
 		Protocol: string(protocol), BillingType: billingType, ChannelProbe: d.ChannelProbe,
+	}
+	if d.CreditRatio != nil {
+		if *d.CreditRatio <= 0 {
+			return nil, errors.New("credit_ratio must be greater than zero")
+		}
+		result.CreditRatio = *d.CreditRatio
+	} else {
+		result.CreditRatio = 1
 	}
 	if d.PrimaryTagID != nil || d.TagIDs != nil {
 		result.TagsSet = true

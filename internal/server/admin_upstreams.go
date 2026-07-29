@@ -26,6 +26,7 @@ type upstreamDTO struct {
 	Proxy        string               `json:"proxy"`
 	Protocol     string               `json:"protocol"`
 	BillingType  string               `json:"billing_type"`
+	CreditRatio  float64              `json:"credit_ratio"`
 	APIKey       string               `json:"api_key,omitempty"` // 输入用；输出时脱敏到 masked
 	Masked       string               `json:"masked,omitempty"`
 	Enabled      bool                 `json:"enabled"`
@@ -61,7 +62,7 @@ func (s *Server) adminUpstreams(w http.ResponseWriter, r *http.Request) {
 			item := upstreamDTO{
 				ID: u.ID, Name: u.Name, Source: u.Source, BaseURL: u.BaseURL, Proxy: u.Proxy, Protocol: u.Protocol, BillingType: u.BillingType,
 				PrimaryTagID: u.PrimaryTagID, TagIDs: u.TagIDs, Tags: u.Tags,
-				Masked: mask(u.APIKey), Enabled: u.Enabled, ChannelProbe: u.ChannelProbe,
+				Masked: mask(u.APIKey), Enabled: u.Enabled, ChannelProbe: u.ChannelProbe, CreditRatio: u.CreditRatio,
 				Health:      toHealthView(s.health.Snapshot(u.ID), s.health.EffectiveState(u.ID)),
 				ModelHealth: toModelHealthViews(s.health.ModelStates(u.ID)),
 			}
