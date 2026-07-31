@@ -660,7 +660,7 @@ func TestResponseWatchdogReleasesStalledStreamAfterFirstByte(t *testing.T) {
 	defer stalled.Close()
 
 	upstreams := []*upstream.Upstream{{ID: 1, BaseURL: stalled.URL, APIKey: "k", Priority: 1, Weight: 1}}
-	hm := health.New(1, time.Hour)
+	hm := health.New(3, time.Hour)
 	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 1)
 	fwd.SetFirstResponseTimeout(func() time.Duration { return 20 * time.Millisecond })
 	body := []byte(`{"model":"gpt","stream":true}`)

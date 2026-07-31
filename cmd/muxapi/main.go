@@ -87,7 +87,7 @@ func main() {
 			return def
 		}
 	}
-	// 仅在收到首个响应字节前允许超时换源；流开始后保持透明转发，由客户端取消请求。
+	// 首个响应或流中连续无数据达到阈值时取消上游；每收到字节都会重置计时器。
 	firstResponseTimeoutMs := settingInt("first_response_timeout_ms", 120000)
 	fwd.SetFirstResponseTimeout(func() time.Duration {
 		return time.Duration(firstResponseTimeoutMs()) * time.Millisecond

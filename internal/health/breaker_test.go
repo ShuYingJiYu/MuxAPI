@@ -24,6 +24,21 @@ func TestChannelFailuresAccumulateAcrossModels(t *testing.T) {
 	}
 }
 
+func TestTimeoutOpensChannelImmediately(t *testing.T) {
+	m := New(3, time.Hour)
+	m.ReportTimeout(1, "gpt-5.6", 120000)
+	if m.IsAvailable(1, "gpt-5.6") {
+		t.Fatal("a response timeout must immediately remove the channel from scheduling")
+	}
+	if got := m.EffectiveState(1); got != "OPEN" {
+		t.Fatalf("expected OPEN after one timeout, got %s", got)
+	}
+	snapshot := m.Snapshot(1)
+	if snapshot.Reqs != 1 || snapshot.FailReqs != 1 {
+		t.Fatalf("timeout should count as one failed request: %+v", snapshot)
+	}
+}
+
 func TestClosedSuccessResetsConsecutiveFailures(t *testing.T) {
 	m := New(3, time.Hour)
 	m.Report(1, "a", false, 0)

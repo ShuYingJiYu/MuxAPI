@@ -272,6 +272,25 @@ func (m *Manager) Report(id int64, model string, ok bool, latencyMs int64) {
 	}
 }
 
+// ReportTimeout immediately opens a channel after a confirmed response stall.
+// A timeout can hold a request slot for minutes, so waiting for the normal
+// failure threshold would allow more requests to select the same channel.
+func (m *Manager) ReportTimeout(id int64, model string, latencyMs int64) {
+	m.mu.Lock()
+	b := m.get(id)
+	b.reqs++
+	b.failReqs++
+	if b.fails < m.failThreshold-1 {
+		b.fails = m.failThreshold - 1
+	}
+	from, to := m.drive(b, false, latencyMs)
+	ev, flipped := transitionEvent(id, model, from, to, b.fails)
+	m.mu.Unlock()
+	if flipped {
+		m.dispatch(ev)
+	}
+}
+
 // ObserveProbe uses the same channel state machine as business traffic but
 // does not affect business request counters. Two successes are required to
 // close an OPEN/HALF_OPEN channel.

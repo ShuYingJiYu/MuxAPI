@@ -29,6 +29,12 @@ type Health interface {
 	MarkModelSupported(id int64, model string)
 }
 
+// timeoutHealth lets the breaker distinguish a confirmed stalled response
+// from ordinary transient upstream failures.
+type timeoutHealth interface {
+	ReportTimeout(id int64, model string, latencyMs int64)
+}
+
 // Picker 从指定分组选择一个未尝试且可用的上游。
 type Picker interface {
 	PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, error)
@@ -273,7 +279,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			if errors.Is(cause, errFirstResponseTimeout) {
 				errorKind = "first_response_timeout"
 			}
-			f.health.Report(candidate.ID, model, false, 0)
+			f.reportFailure(candidate.ID, model, 0, cause)
 			attempts = append(attempts, attemptCtx.finish(f.health, 0, OutcomeFailed, relayResult{}, errorKind, "upstream", err.Error()))
 			lastErr = err
 			continue
@@ -298,7 +304,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 				if errors.Is(cause, errFirstResponseTimeout) {
 					errorKind = "first_response_timeout"
 				}
-				f.health.Report(candidate.ID, model, false, 0)
+				f.reportFailure(candidate.ID, model, 0, cause)
 				attempts = append(attempts, attemptCtx.finish(f.health, 0, OutcomeFailed, relayResult{}, errorKind, "upstream", readErr.Error()))
 				lastErr = readErr
 				continue
@@ -339,10 +345,11 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		if upstream.IsFailureStatus(resp.StatusCode) {
 			payload, _ := readLimitedBody(resp.Body, 64<<10)
 			watchdog.stop()
+			cause := context.Cause(ctx)
 			resp.Body.Close()
 			cancel(nil)
 			latency := time.Since(start).Milliseconds()
-			f.health.Report(candidate.ID, model, false, latency)
+			f.reportFailure(candidate.ID, model, latency, cause)
 			release()
 			responseMeta := relayResult{ttftMs: latency, upstreamRequestID: upstreamRequestID(resp.Header)}
 			attempts = append(attempts, attemptCtx.finish(f.health, resp.StatusCode, OutcomeFailed,
@@ -371,7 +378,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 				attempts = append(attempts, finished)
 				return resultFromAttempt(finished, attempts)
 			}
-			f.health.Report(candidate.ID, model, false, result.ttftMs)
+			f.reportFailure(candidate.ID, model, result.ttftMs, cause)
 			outcome := OutcomeFailed
 			status := 0
 			if result.committed {
@@ -442,6 +449,16 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 	http.Error(w, "all upstreams failed", http.StatusBadGateway)
 	return Result{Status: http.StatusBadGateway, Outcome: OutcomeFailed,
 		ErrorKind: "upstream_error", ErrorSource: "upstream", Error: "all upstreams failed", Attempts: attempts}
+}
+
+func (f *Forwarder) reportFailure(id int64, model string, latencyMs int64, cause error) {
+	if errors.Is(cause, errFirstResponseTimeout) {
+		if reporter, ok := f.health.(timeoutHealth); ok {
+			reporter.ReportTimeout(id, model, latencyMs)
+			return
+		}
+	}
+	f.health.Report(id, model, false, latencyMs)
 }
 
 func relayErrorKind(err error, cause error) string {
