@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -37,32 +38,27 @@ func main() {
 	}
 	defer st.Close()
 
-	// 调度用：某分组下启用的上游（实时查库，后台增删即时生效）
-	listByGroup := func(groupID int64) []*upstream.Upstream {
-		ups, err := st.ListEnabledByGroup(groupID)
-		if err != nil {
-			slog.Error("list upstreams failed", "err", err)
-			return nil
-		}
-		return ups
+	// Runtime policies live in the settings table. Environment values only seed
+	// an installation that has not stored the corresponding setting yet.
+	initialMaxAttempts := cfg.MaxRetries
+	if initialMaxAttempts < 6 {
+		initialMaxAttempts = 6
 	}
-
-	// 依赖顺序：健康状态 -> 调度 -> 转发 -> 主动监控 -> HTTP 接入。
-	hm := health.New(cfg.FailThreshold, cfg.Cooldown)
-	// 重启恢复：用最近的转发样本重建选路用的渠道延迟 EWMA，不重建熔断状态
-	if samples, err := st.RecentSamples(2000); err != nil {
-		slog.Warn("seed route stats from logs failed", "err", err)
-	} else if len(samples) > 0 {
-		hs := make([]health.RouteSample, len(samples))
-		for i, s := range samples {
-			hs[i] = health.RouteSample{UpstreamID: s.UpstreamID, OK: s.OK, LatencyMs: s.LatencyMs}
-		}
-		hm.Seed(hs)
-		slog.Info("seeded route stats from logs", "samples", len(hs))
+	runtimeDefaults := map[string]string{
+		"fail_threshold":        strconv.Itoa(cfg.FailThreshold),
+		"cooldown":              cfg.Cooldown.String(),
+		"max_upstream_attempts": strconv.Itoa(initialMaxAttempts),
+		"max_body_bytes":        strconv.FormatInt(cfg.MaxBody, 10),
 	}
-	sched := scheduler.New(listByGroup, hm)
-	fwd := forward.New(sched, hm, cfg.MaxRetries)
-	mon := monitor.New(st)
+	for key, value := range runtimeDefaults {
+		if st.GetSetting(key, "") != "" {
+			continue
+		}
+		if err := st.SetSetting(key, value); err != nil {
+			slog.Error("seed runtime setting failed", "key", key, "err", err)
+			return
+		}
+	}
 	settingDuration := func(key string, def time.Duration) func() time.Duration {
 		return func() time.Duration {
 			if d, err := time.ParseDuration(st.GetSetting(key, "")); err == nil && d > 0 {
@@ -87,6 +83,47 @@ func main() {
 			return def
 		}
 	}
+	settingInt64 := func(key string, def int64) func() int64 {
+		return func() int64 {
+			if n, err := strconv.ParseInt(st.GetSetting(key, ""), 10, 64); err == nil && n > 0 {
+				return n
+			}
+			return def
+		}
+	}
+
+	// 调度用：某分组下启用的上游（实时查库，后台增删即时生效）
+	listByGroup := func(groupID int64) []*upstream.Upstream {
+		ups, err := st.ListEnabledByGroup(groupID)
+		if err != nil {
+			slog.Error("list upstreams failed", "err", err)
+			return nil
+		}
+		return ups
+	}
+
+	// 依赖顺序：健康状态 -> 调度 -> 转发 -> 主动监控 -> HTTP 接入。
+	failThreshold := settingInt("fail_threshold", cfg.FailThreshold)
+	cooldown := settingDuration("cooldown", cfg.Cooldown)
+	hm := health.New(failThreshold(), cooldown())
+	// 重启恢复：用最近的转发样本重建选路用的渠道延迟 EWMA，不重建熔断状态
+	if samples, err := st.RecentSamples(2000); err != nil {
+		slog.Warn("seed route stats from logs failed", "err", err)
+	} else if len(samples) > 0 {
+		hs := make([]health.RouteSample, len(samples))
+		for i, s := range samples {
+			hs[i] = health.RouteSample{UpstreamID: s.UpstreamID, OK: s.OK, LatencyMs: s.LatencyMs}
+		}
+		hm.Seed(hs)
+		slog.Info("seeded route stats from logs", "samples", len(hs))
+	}
+	sched := scheduler.New(listByGroup, hm)
+	maxUpstreamAttempts := settingInt("max_upstream_attempts", initialMaxAttempts)
+	var maxAttemptsValue atomic.Int64
+	maxAttemptsValue.Store(int64(maxUpstreamAttempts()))
+	fwd := forward.New(sched, hm, int(maxAttemptsValue.Load()))
+	fwd.SetMaxAttemptsProvider(func() int { return int(maxAttemptsValue.Load()) })
+	mon := monitor.New(st)
 	// 首个响应或流中连续无数据达到阈值时取消上游；每收到字节都会重置计时器。
 	firstResponseTimeoutMs := settingInt("first_response_timeout_ms", 120000)
 	fwd.SetFirstResponseTimeout(func() time.Duration {
@@ -115,7 +152,16 @@ func main() {
 	monProber := monitor.NewProber(mon, st, hm, nil, nil)
 	billingMgr := billing.NewManager(st)
 	backupSvc := backup.NewService(st, cfg.DatabaseURL)
-	srv := server.New(fwd, cfg.AdminToken, st, hm, mon, monProber, cfg.MaxBody)
+	maxBodyBytes := settingInt64("max_body_bytes", cfg.MaxBody)
+	var maxBodyValue atomic.Int64
+	maxBodyValue.Store(maxBodyBytes())
+	srv := server.New(fwd, cfg.AdminToken, st, hm, mon, monProber, maxBodyValue.Load())
+	srv.SetMaxBodyProvider(maxBodyValue.Load)
+	srv.SetSettingsChanged(func() {
+		hm.SetFailurePolicy(failThreshold(), cooldown())
+		maxAttemptsValue.Store(int64(maxUpstreamAttempts()))
+		maxBodyValue.Store(maxBodyBytes())
+	})
 	srv.SetBillingManager(billingMgr)
 	srv.SetBackupService(backupSvc)
 

@@ -870,6 +870,18 @@ const alertDebounceSource = ref('')
 const firstResponseTimeoutSec = ref('')    // 首字节超时(秒，后端存毫秒)
 const effectiveFirstResponseTimeoutMs = ref('')
 const firstResponseTimeoutSource = ref('')
+const failThreshold = ref('')
+const cooldown = ref('')
+const maxUpstreamAttempts = ref('')
+const maxBodyMB = ref('')
+const effectiveFailThreshold = ref('')
+const effectiveCooldown = ref('')
+const effectiveMaxUpstreamAttempts = ref('')
+const effectiveMaxBodyBytes = ref('')
+const failThresholdSource = ref('')
+const cooldownSource = ref('')
+const maxUpstreamAttemptsSource = ref('')
+const maxBodyBytesSource = ref('')
 const apiBase = location.origin    // 当前访问地址，用于展示客户端接入端点
 const settingsSaved = ref(false)
 const settingsSection = ref('logs')  // 设置页左锚点：logs | alert | endpoint | backup
@@ -987,8 +999,20 @@ async function loadSettings() {
   // 后端存毫秒，UI 展示秒：优先取页面设置值，否则用 effective
   firstResponseTimeoutSec.value = String(Math.round((Number(s.first_response_timeout_ms || s.effective_first_response_timeout_ms) || 120000) / 1000))
   firstResponseTimeoutSource.value = s.first_response_timeout_ms_source || ''
+  effectiveFailThreshold.value = s.effective_fail_threshold || ''
+  effectiveCooldown.value = s.effective_cooldown || ''
+  effectiveMaxUpstreamAttempts.value = s.effective_max_upstream_attempts || ''
+  effectiveMaxBodyBytes.value = s.effective_max_body_bytes || ''
+  failThreshold.value = s.fail_threshold || effectiveFailThreshold.value
+  cooldown.value = s.cooldown || effectiveCooldown.value
+  maxUpstreamAttempts.value = s.max_upstream_attempts || effectiveMaxUpstreamAttempts.value
+  maxBodyMB.value = String(Math.round((Number(s.max_body_bytes || s.effective_max_body_bytes) || 33554432) / 1048576))
+  failThresholdSource.value = s.fail_threshold_source || ''
+  cooldownSource.value = s.cooldown_source || ''
+  maxUpstreamAttemptsSource.value = s.max_upstream_attempts_source || ''
+  maxBodyBytesSource.value = s.max_body_bytes_source || ''
 }
-const sourceText = s => s === 'settings' ? '页面设置' : '默认值'
+const sourceText = s => s === 'settings' ? '数据库设置' : '默认值'
 // 设置页左锚点点击：滚动到对应 section 并高亮
 function gotoSection(id) {
   settingsSection.value = id
@@ -1000,6 +1024,10 @@ function saveSettings() {
       alert_webhook: alertWebhook.value,
       alert_debounce: alertDebounce.value,
       first_response_timeout_ms: String((Number(firstResponseTimeoutSec.value) || 120) * 1000),
+      fail_threshold: String(failThreshold.value),
+      cooldown: cooldown.value,
+      max_upstream_attempts: String(maxUpstreamAttempts.value),
+      max_body_bytes: String(Math.round((Number(maxBodyMB.value) || 32) * 1048576)),
     })
     await loadSettings()
     settingsSaved.value = true
@@ -1756,10 +1784,17 @@ function logout() {
                 <div class="settings-title"><h3>渠道路由</h3><p>首字节前允许故障切换，流开始后保持透明传输。</p></div>
                 <div class="settings-fields">
                   <div class="field"><label>首字节超时（秒）</label><input v-model="firstResponseTimeoutSec" type="number" min="1" max="600" placeholder="120" /></div>
+                  <div class="field"><label>最大上游尝试数</label><input v-model="maxUpstreamAttempts" type="number" min="1" max="100" placeholder="6" /></div>
+                  <div class="field"><label>熔断失败阈值</label><input v-model="failThreshold" type="number" min="1" max="100" placeholder="3" /></div>
+                  <div class="field"><label>熔断冷却时间</label><input v-model="cooldown" placeholder="30s / 5m" /></div>
+                  <div class="field"><label>请求体上限（MB）</label><input v-model="maxBodyMB" type="number" min="1" max="256" placeholder="32" /></div>
                 </div>
                 <div class="settings-info">
                   <div><span>算法</span><b>标准 P2C</b><em>渠道级</em></div>
                   <div><span>首字节超时</span><b>{{ effectiveFirstResponseTimeoutMs ? Math.round(effectiveFirstResponseTimeoutMs / 1000) + ' 秒' : '—' }}</b><em>{{ sourceText(firstResponseTimeoutSource) }}</em></div>
+                  <div><span>故障切换</span><b>最多 {{ effectiveMaxUpstreamAttempts || '—' }} 个上游</b><em>{{ sourceText(maxUpstreamAttemptsSource) }}</em></div>
+                  <div><span>熔断策略</span><b>{{ effectiveFailThreshold || '—' }} 次 / {{ effectiveCooldown || '—' }}</b><em>{{ sourceText(failThresholdSource || cooldownSource) }}</em></div>
+                  <div><span>请求体上限</span><b>{{ effectiveMaxBodyBytes ? Math.round(effectiveMaxBodyBytes / 1048576) + ' MB' : '—' }}</b><em>{{ sourceText(maxBodyBytesSource) }}</em></div>
                 </div>
                 <p class="hint">收到任何响应字节前可切换渠道；开始传输后不再解析或强制等待结束事件。</p>
                 <div class="settings-actions">

@@ -120,6 +120,22 @@ func New(failThreshold int, cooldown time.Duration) *Manager {
 // SetAlerter 设置状态翻转通知器。
 func (m *Manager) SetAlerter(a Alerter) { m.alerter = a }
 
+// SetFailurePolicy updates the breaker policy for future state transitions.
+// Existing OPEN channels keep their current deadline; the new cooldown is used
+// when they are opened or reopened next.
+func (m *Manager) SetFailurePolicy(failThreshold int, cooldown time.Duration) {
+	if failThreshold < 1 {
+		failThreshold = 1
+	}
+	if cooldown <= 0 {
+		cooldown = 30 * time.Second
+	}
+	m.mu.Lock()
+	m.failThreshold = failThreshold
+	m.cooldown = cooldown
+	m.mu.Unlock()
+}
+
 func (m *Manager) get(id int64) *breaker {
 	b := m.breakers[id]
 	if b == nil {

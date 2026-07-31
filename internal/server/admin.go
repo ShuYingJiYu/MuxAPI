@@ -2,7 +2,6 @@ package server
 
 import (
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -120,77 +119,6 @@ func (s *Server) adminLogOptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, opt)
-}
-
-// adminSettings GET 返回 / PUT 保存运行时设置。
-func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		logRetention, logRetentionSource := intSettingValue(s.store.GetSetting("request_retention_days", ""), 7)
-		alertWebhook, alertWebhookSource := stringSettingValue(s.store.GetSetting("alert_webhook", ""), "")
-		alertDebounce, alertDebounceSource := settingValue(s.store.GetSetting("alert_debounce", ""), "60s")
-		firstResponseTimeout, firstResponseTimeoutSource := intSettingValue(s.store.GetSetting("first_response_timeout_ms", ""), 120000)
-		writeJSON(w, map[string]string{
-			"log_retention":                       s.store.GetSetting("request_retention_days", ""),
-			"alert_webhook":                       s.store.GetSetting("alert_webhook", ""),
-			"alert_debounce":                      s.store.GetSetting("alert_debounce", ""),
-			"first_response_timeout_ms":           s.store.GetSetting("first_response_timeout_ms", ""),
-			"effective_log_retention":             logRetention,
-			"effective_alert_webhook":             alertWebhook,
-			"effective_alert_debounce":            alertDebounce,
-			"effective_first_response_timeout_ms": firstResponseTimeout,
-			"log_retention_source":                logRetentionSource,
-			"alert_webhook_source":                alertWebhookSource,
-			"alert_debounce_source":               alertDebounceSource,
-			"first_response_timeout_ms_source":    firstResponseTimeoutSource,
-		})
-	case http.MethodPut:
-		var raw struct {
-			LogRetention           any `json:"log_retention"`
-			AlertWebhook           any `json:"alert_webhook"`
-			AlertDebounce          any `json:"alert_debounce"`
-			FirstResponseTimeoutMs any `json:"first_response_timeout_ms"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
-			http.Error(w, "设置参数格式无效", 400)
-			return
-		}
-		d := struct {
-			LogRetention           string
-			AlertWebhook           string
-			AlertDebounce          string
-			FirstResponseTimeoutMs string
-		}{
-			LogRetention:           settingString(raw.LogRetention),
-			AlertWebhook:           settingString(raw.AlertWebhook),
-			AlertDebounce:          settingString(raw.AlertDebounce),
-			FirstResponseTimeoutMs: settingString(raw.FirstResponseTimeoutMs),
-		}
-		if n, err := strconv.Atoi(d.LogRetention); err != nil || n < 1 || n > 365 {
-			http.Error(w, "请求记录保留天数须为 1~365 的整数", 400)
-			return
-		}
-		// 告警 webhook 可空(空=关闭)；非空须 http(s):// 前缀
-		if d.AlertWebhook != "" && !strings.HasPrefix(d.AlertWebhook, "http://") && !strings.HasPrefix(d.AlertWebhook, "https://") {
-			http.Error(w, "告警 Webhook 须以 http:// 或 https:// 开头，或留空关闭", 400)
-			return
-		}
-		if _, err := time.ParseDuration(d.AlertDebounce); err != nil {
-			http.Error(w, "无效去抖间隔，用 30s/1m 格式", 400)
-			return
-		}
-		if n, err := strconv.Atoi(d.FirstResponseTimeoutMs); err != nil || n < 1000 || n > 600000 {
-			http.Error(w, "首响应超时须为 1000~600000 的毫秒数(1~600 秒)", 400)
-			return
-		}
-		s.store.SetSetting("request_retention_days", d.LogRetention)
-		s.store.SetSetting("alert_webhook", d.AlertWebhook)
-		s.store.SetSetting("alert_debounce", d.AlertDebounce)
-		s.store.SetSetting("first_response_timeout_ms", d.FirstResponseTimeoutMs)
-		w.WriteHeader(204)
-	default:
-		http.Error(w, "method not allowed", 405)
-	}
 }
 
 func settingString(v any) string {

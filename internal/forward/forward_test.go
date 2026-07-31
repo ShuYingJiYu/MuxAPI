@@ -54,6 +54,50 @@ func TestForwardAuditsCompressedCodexSSE(t *testing.T) {
 	}
 }
 
+func TestForwardUsesDynamicMaxAttemptsPerRequest(t *testing.T) {
+	servers := make([]*httptest.Server, 0, 4)
+	upstreams := make([]*upstream.Upstream, 0, 4)
+	for i := 1; i <= 4; i++ {
+		status := http.StatusServiceUnavailable
+		if i == 4 {
+			status = http.StatusOK
+		}
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(status)
+			if status == http.StatusOK {
+				_, _ = io.WriteString(w, `{"ok":true}`)
+			}
+		}))
+		servers = append(servers, server)
+		upstreams = append(upstreams, &upstream.Upstream{
+			ID: int64(i), BaseURL: server.URL, APIKey: "k", Priority: i, Weight: 1,
+		})
+	}
+	defer func() {
+		for _, server := range servers {
+			server.Close()
+		}
+	}()
+
+	hm := health.New(100, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 2)
+	var limit atomic.Int64
+	limit.Store(2)
+	fwd.SetMaxAttemptsProvider(func() int { return int(limit.Load()) })
+	body := []byte(`{"model":"gpt"}`)
+
+	first := fwd.Forward(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)), body, 1, "")
+	if len(first.Attempts) != 2 || first.Outcome == OutcomeSuccess {
+		t.Fatalf("first request should stop after two upstreams: %+v", first)
+	}
+
+	limit.Store(4)
+	second := fwd.Forward(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)), body, 1, "")
+	if len(second.Attempts) != 4 || second.Outcome != OutcomeSuccess || second.FinalUpstreamID != 4 {
+		t.Fatalf("updated limit should take effect on the next request: %+v", second)
+	}
+}
+
 // 验证 SSE 流式逐行透传不丢事件、不破坏格式。
 func TestForwardSSEStreaming(t *testing.T) {
 	upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

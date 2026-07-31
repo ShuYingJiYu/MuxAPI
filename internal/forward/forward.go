@@ -45,6 +45,7 @@ type Forwarder struct {
 	picker               Picker
 	health               Health
 	maxAttempts          int
+	maxAttemptsProvider  func() int
 	firstResponseTimeout func() time.Duration
 }
 
@@ -60,6 +61,26 @@ func New(p Picker, h Health, maxRetries int) *Forwarder {
 // SetFirstResponseTimeout 设置动态首响应超时读取器，便于运行时修改配置。
 func (f *Forwarder) SetFirstResponseTimeout(timeout func() time.Duration) {
 	f.firstResponseTimeout = timeout
+}
+
+// SetMaxAttemptsProvider supplies the current per-request upstream attempt limit.
+// The provider is evaluated once when a request starts, so a settings change
+// cannot alter the retry budget halfway through an in-flight request.
+func (f *Forwarder) SetMaxAttemptsProvider(provider func() int) {
+	f.maxAttemptsProvider = provider
+}
+
+func (f *Forwarder) maxAttemptLimit() int {
+	limit := f.maxAttempts
+	if f.maxAttemptsProvider != nil {
+		if value := f.maxAttemptsProvider(); value > 0 {
+			limit = value
+		}
+	}
+	if limit < 1 {
+		return 1
+	}
+	return limit
 }
 
 func (f *Forwarder) firstByteTimeout() time.Duration {
@@ -194,9 +215,10 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 	}
 	tried := map[int64]bool{}
 	var lastErr error
-	attempts := make([]AttemptResult, 0, f.maxAttempts)
+	maxAttempts := f.maxAttemptLimit()
+	attempts := make([]AttemptResult, 0, maxAttempts)
 
-	for upstreamAttempts := 0; upstreamAttempts < f.maxAttempts; {
+	for upstreamAttempts := 0; upstreamAttempts < maxAttempts; {
 		// tried 同时防止重复选择；本地协议不兼容不消耗实际网络尝试次数。
 		candidate, err := f.picker.PickExcluding(groupID, model, tried)
 		if err != nil {

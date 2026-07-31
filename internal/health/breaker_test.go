@@ -39,6 +39,24 @@ func TestTimeoutOpensChannelImmediately(t *testing.T) {
 	}
 }
 
+func TestSetFailurePolicyAppliesWithoutRestart(t *testing.T) {
+	m := New(3, time.Hour)
+	m.Report(1, "gpt", false, 0)
+	if !m.IsAvailable(1, "gpt") {
+		t.Fatal("one failure should remain below the initial threshold")
+	}
+
+	m.SetFailurePolicy(1, 5*time.Millisecond)
+	m.Report(2, "gpt", false, 0)
+	if m.IsAvailable(2, "gpt") {
+		t.Fatal("updated threshold should open a new channel after one failure")
+	}
+	time.Sleep(10 * time.Millisecond)
+	if !m.IsAvailable(2, "gpt") {
+		t.Fatal("updated cooldown should expose the channel after expiry")
+	}
+}
+
 func TestClosedSuccessResetsConsecutiveFailures(t *testing.T) {
 	m := New(3, time.Hour)
 	m.Report(1, "a", false, 0)

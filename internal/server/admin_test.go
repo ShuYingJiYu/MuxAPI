@@ -207,6 +207,49 @@ func TestSettingsFirstResponseTimeout(t *testing.T) {
 	}
 }
 
+func TestRuntimeRoutingSettings(t *testing.T) {
+	ts, st, tok := newAdminTestServer(t)
+	url := ts.URL + "/admin/settings"
+	put := adminReq(t, http.MethodPut, url, tok, `{
+		"log_retention":"7",
+		"alert_webhook":"",
+		"alert_debounce":"60s",
+		"first_response_timeout_ms":"120000",
+		"fail_threshold":"4",
+		"cooldown":"2m",
+		"max_upstream_attempts":"8",
+		"max_body_bytes":"67108864"
+	}`)
+	put.Body.Close()
+	if put.StatusCode != http.StatusNoContent {
+		t.Fatalf("save runtime settings returned %d", put.StatusCode)
+	}
+	for key, want := range map[string]string{
+		"fail_threshold": "4", "cooldown": "2m",
+		"max_upstream_attempts": "8", "max_body_bytes": "67108864",
+	} {
+		if got := st.GetSetting(key, ""); got != want {
+			t.Fatalf("setting %s = %q, want %q", key, got, want)
+		}
+	}
+
+	get := adminReq(t, http.MethodGet, url, tok, "")
+	defer get.Body.Close()
+	var settings map[string]string
+	if err := json.NewDecoder(get.Body).Decode(&settings); err != nil {
+		t.Fatal(err)
+	}
+	if settings["effective_max_upstream_attempts"] != "8" || settings["max_upstream_attempts_source"] != "settings" {
+		t.Fatalf("unexpected effective runtime settings: %+v", settings)
+	}
+
+	bad := adminReq(t, http.MethodPut, url, tok, `{"max_upstream_attempts":"101"}`)
+	bad.Body.Close()
+	if bad.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid max attempts returned %d", bad.StatusCode)
+	}
+}
+
 // L13 回归：布尔启停 PUT 收到空/畸形 body 必须 400，绝不静默写 enabled=false。
 func TestKeyEnabledRejectsMalformedBody(t *testing.T) {
 	ts, st, tok := newAdminTestServer(t)

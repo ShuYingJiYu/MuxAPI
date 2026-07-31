@@ -36,15 +36,17 @@ type modelCacheEntry struct {
 
 // Server 汇集转发、健康、监控和存储依赖，并维护模型列表缓存。
 type Server struct {
-	fwd        *forward.Forwarder
-	adminToken string
-	store      *store.Store
-	health     *health.Manager
-	mon        *monitor.Manager
-	monProber  *monitor.Prober
-	billingMgr *billing.Manager
-	backupSvc  *backup.Service
-	maxBody    int64 // 请求体字节上限（<=0 表示不限制）
+	fwd             *forward.Forwarder
+	adminToken      string
+	store           *store.Store
+	health          *health.Manager
+	mon             *monitor.Manager
+	monProber       *monitor.Prober
+	billingMgr      *billing.Manager
+	backupSvc       *backup.Service
+	maxBody         int64 // 请求体字节上限（<=0 表示不限制）
+	maxBodyProvider func() int64
+	settingsChanged func()
 
 	modelMu     sync.Mutex                // 保护 modelCache 与 modelFlight
 	modelCache  map[int64]modelCacheEntry // 按 upstream_id 缓存其 /v1/models 结果，TTL=modelsTTL
@@ -63,6 +65,14 @@ func (s *Server) SetBillingManager(manager *billing.Manager) { s.billingMgr = ma
 
 // SetBackupService enables the S3 backup feature.
 func (s *Server) SetBackupService(svc *backup.Service) { s.backupSvc = svc }
+
+// SetMaxBodyProvider supplies the current request body limit without requiring
+// a process restart after a settings update.
+func (s *Server) SetMaxBodyProvider(provider func() int64) { s.maxBodyProvider = provider }
+
+// SetSettingsChanged registers the runtime policy refresh hook used after the
+// admin settings endpoint persists a new breaker policy.
+func (s *Server) SetSettingsChanged(handler func()) { s.settingsChanged = handler }
 
 // New 创建 HTTP 服务；maxBody 控制客户端请求正文上限。
 func New(fwd *forward.Forwarder, adminToken string, st *store.Store, hm *health.Manager, mon *monitor.Manager, mp *monitor.Prober, maxBody int64) *Server {
@@ -174,8 +184,14 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 限制请求体大小，防无上限 io.ReadAll 被超大 body 打爆内存(DoS)。
-	if s.maxBody > 0 {
-		r.Body = http.MaxBytesReader(w, r.Body, s.maxBody)
+	maxBody := s.maxBody
+	if s.maxBodyProvider != nil {
+		if value := s.maxBodyProvider(); value >= 0 {
+			maxBody = value
+		}
+	}
+	if maxBody > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, maxBody)
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {

@@ -51,7 +51,7 @@ func Load() *Config {
 		AdminToken:    env("MUXAPI_TOKEN", ""),
 		FailThreshold: envInt("MUXAPI_FAIL_THRESHOLD", 3),
 		Cooldown:      envDur("MUXAPI_COOLDOWN", 30*time.Second),
-		MaxRetries:    envInt("MUXAPI_MAX_RETRIES", 3),
+		MaxRetries:    envInt("MUXAPI_MAX_RETRIES", 6),
 		// 请求体上限：防 io.ReadAll 无限读导致 OOM/DoS。默认 32MB，单位字节。
 		MaxBody: envInt64("MUXAPI_MAX_BODY", 32<<20),
 	}
