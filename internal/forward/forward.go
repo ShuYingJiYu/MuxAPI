@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -250,15 +251,16 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		}
 		translate.ConfigureRequestHeaders(req.Header, targetFormat, exchange.Translated())
 
-		// 超时覆盖建立连接到首个响应正文；正文开始后由回调停止计时器。
+		// 计时器覆盖建立连接到响应正文结束；收到任意上游字节会重置，
+		// 因此正常持续输出的流不会被限制，卡住的流会及时释放渠道占用。
 		ctx, cancel := context.WithCancelCause(r.Context())
-		firstByteTimer := time.AfterFunc(f.firstByteTimeout(), func() { cancel(errFirstResponseTimeout) })
+		watchdog := newResponseWatchdog(f.firstByteTimeout(), cancel)
 		req = req.WithContext(ctx)
 		client := &http.Client{Timeout: 0, Transport: candidate.NewTransport()}
 		start := time.Now()
 		resp, err := client.Do(req)
 		if err != nil {
-			firstByteTimer.Stop()
+			watchdog.stop()
 			cause := context.Cause(ctx)
 			cancel(nil)
 			release()
@@ -276,11 +278,12 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			lastErr = err
 			continue
 		}
+		resp.Body = watchdogReadCloser{ReadCloser: resp.Body, touch: watchdog.touch}
 
 		// 400/404 需要先读取正文，以区分“不支持模型”和普通客户端参数错误。
 		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound {
 			payload, readErr := readLimitedBody(resp.Body, 2<<20)
-			firstByteTimer.Stop()
+			watchdog.stop()
 			cause := context.Cause(ctx)
 			cancel(nil)
 			resp.Body.Close()
@@ -335,7 +338,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		// 认证、限流及 5xx 属于渠道失败：记录熔断反馈后尝试下一个上游。
 		if upstream.IsFailureStatus(resp.StatusCode) {
 			payload, _ := readLimitedBody(resp.Body, 64<<10)
-			firstByteTimer.Stop()
+			watchdog.stop()
 			resp.Body.Close()
 			cancel(nil)
 			latency := time.Since(start).Milliseconds()
@@ -349,8 +352,8 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		}
 
 		// relayResult.committed 表示响应是否已写出；只有未写出时才能安全换源。
-		result := relayTranslatedResponse(r.Context(), w, resp, start, func() { firstByteTimer.Stop() }, exchange)
-		firstByteTimer.Stop()
+		result := relayTranslatedResponse(r.Context(), w, resp, start, nil, exchange)
+		watchdog.stop()
 		cause := context.Cause(ctx)
 		cancel(nil)
 		release()
@@ -497,6 +500,83 @@ func parseStream(body []byte) bool {
 var errEmptyResponse = errors.New("upstream returned an empty response")
 var errErrorPayload = errors.New("upstream returned an error payload with a successful status")
 var errFirstResponseTimeout = errors.New("upstream first response timeout")
+
+// responseWatchdog cancels an upstream attempt when no response bytes arrive
+// within the configured interval. It is reset by every successful body read,
+// so a healthy long-running stream remains allowed to continue.
+type responseWatchdog struct {
+	timeout  time.Duration
+	cancel   context.CancelCauseFunc
+	activity chan struct{}
+	done     chan struct{}
+	stopped  chan struct{}
+	once     sync.Once
+}
+
+func newResponseWatchdog(timeout time.Duration, cancel context.CancelCauseFunc) *responseWatchdog {
+	w := &responseWatchdog{
+		timeout: timeout, cancel: cancel,
+		activity: make(chan struct{}, 1), done: make(chan struct{}), stopped: make(chan struct{}),
+	}
+	go w.run()
+	return w
+}
+
+func (w *responseWatchdog) run() {
+	timer := time.NewTimer(w.timeout)
+	defer func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		close(w.stopped)
+	}()
+	for {
+		select {
+		case <-timer.C:
+			w.cancel(errFirstResponseTimeout)
+			return
+		case <-w.activity:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(w.timeout)
+		case <-w.done:
+			return
+		}
+	}
+}
+
+func (w *responseWatchdog) touch() {
+	select {
+	case w.activity <- struct{}{}:
+	default:
+	}
+}
+
+func (w *responseWatchdog) stop() {
+	w.once.Do(func() { close(w.done) })
+	<-w.stopped
+}
+
+// watchdogReadCloser reports body activity without changing the body API.
+type watchdogReadCloser struct {
+	io.ReadCloser
+	touch func()
+}
+
+func (r watchdogReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if n > 0 && r.touch != nil {
+		r.touch()
+	}
+	return n, err
+}
 
 type relaySource int
 

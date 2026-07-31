@@ -128,7 +128,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o muxapi-linux-amd64 ./cmd/muxap
 | `request_retention_days` | `7` | 请求记录保留天数，每 10 分钟分批删除过期请求与尝试链 |
 | `alert_webhook` | （空） | 熔断翻转告警 Webhook URL，留空关闭 |
 | `alert_debounce` | `60s` | 告警去抖窗口，同键窗口内最多发一次 |
-| `first_response_timeout_ms` | `120000` | 首个响应字节超时，超时后切换渠道；流开始后不再施加应用层超时 |
+| `first_response_timeout_ms` | `120000` | 上游首个响应或流中连续无数据的超时；每收到字节都会重新计时，超时后切换渠道或结束卡住的流 |
 
 ## API
 

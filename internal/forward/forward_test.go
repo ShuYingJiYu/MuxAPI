@@ -648,6 +648,36 @@ func TestFirstByteTimeoutFailsOver(t *testing.T) {
 	}
 }
 
+func TestResponseWatchdogReleasesStalledStreamAfterFirstByte(t *testing.T) {
+	stalled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		io.WriteString(w, "data: {\"chunk\":1}\n\n")
+		flusher.Flush()
+		<-r.Context().Done()
+	}))
+	defer stalled.Close()
+
+	upstreams := []*upstream.Upstream{{ID: 1, BaseURL: stalled.URL, APIKey: "k", Priority: 1, Weight: 1}}
+	hm := health.New(1, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 1)
+	fwd.SetFirstResponseTimeout(func() time.Duration { return 20 * time.Millisecond })
+	body := []byte(`{"model":"gpt","stream":true}`)
+	recorder := httptest.NewRecorder()
+	started := time.Now()
+	result := fwd.Forward(recorder, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)), body, 1, "")
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stalled stream was not cancelled promptly: %v", elapsed)
+	}
+	if result.Outcome != OutcomePartial || result.ErrorKind != "first_response_timeout" {
+		t.Fatalf("result = %+v, want a timed-out partial stream", result)
+	}
+	if hm.EffectiveState(1) != "OPEN" {
+		t.Fatalf("stalled upstream should be opened by the breaker, state=%s", hm.EffectiveState(1))
+	}
+}
+
 func TestStreamingLatencyUsesTTFT(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
