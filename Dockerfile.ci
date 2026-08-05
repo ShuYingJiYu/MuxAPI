@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1
+# 三段构建。顺序不可颠倒:web/embed.go 是 //go:embed all:dist,
+# web/dist 不存在则 go build 直接失败(上游 README 明确警告)。
+FROM node:22-alpine AS web
+WORKDIR /src/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
+# Go 版本必须 >= go.mod 的 1.26.3。同步上游后必须 grep go.mod 核对本行。
+FROM golang:1.26.3-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+# go.mod 有本地 replace 指向 ./third_party/cliproxyapi(库内 vendor 子树,非 submodule),
+# go mod download 解析该 replace 时就要求目录存在,必须先拷进来再 download。
+COPY third_party/ ./third_party/
+RUN go mod download
+COPY . .
+COPY --from=web /src/web/dist ./web/dist
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/muxapi ./cmd/muxapi
+
+FROM alpine:3.21
+RUN apk add --no-cache ca-certificates tzdata \
+ && adduser -D -u 10001 muxapi
+COPY --from=build /out/muxapi /usr/local/bin/muxapi
+USER 10001
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/muxapi"]
