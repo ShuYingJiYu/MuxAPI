@@ -46,6 +46,12 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	rootResult := gjson.ParseBytes(rawJSON)
 	toolNameMap := buildReverseMapFromClaudeOriginalToShort(rawJSON)
 	template, _ = sjson.SetBytes(template, "model", modelName)
+	// Claude Code carries a stable session identifier in metadata.user_id. Codex
+	// uses prompt_cache_key to keep prompt-cache entries on the same session;
+	// dropping the identifier makes every translated request a new cache stream.
+	if promptCacheKey := claudePromptCacheKey(modelName, rootResult); promptCacheKey != "" {
+		template, _ = sjson.SetBytes(template, "prompt_cache_key", promptCacheKey)
+	}
 
 	// Process system messages and convert them to input content format.
 	systemsResult := rootResult.Get("system")
@@ -348,6 +354,32 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	template, _ = sjson.SetBytes(template, "include", []string{"reasoning.encrypted_content"})
 
 	return template
+}
+
+// claudePromptCacheKey converts Claude Code's session identity into a stable,
+// provider-neutral Codex cache key without forwarding the client's identity.
+// Claude Code normally sends user_<id>_account_<id>_session_<uuid>; only the
+// session suffix is used so separate sessions do not share a prompt cache.
+func claudePromptCacheKey(modelName string, root gjson.Result) string {
+	sessionID := strings.TrimSpace(root.Get("metadata.session_id").String())
+	if sessionID == "" {
+		userID := root.Get("metadata.user_id")
+		if userID.IsObject() {
+			sessionID = strings.TrimSpace(userID.Get("session_id").String())
+		} else {
+			userIDText := strings.TrimSpace(userID.String())
+			const marker = "_session_"
+			if index := strings.LastIndex(userIDText, marker); index >= 0 {
+				sessionID = strings.TrimSpace(userIDText[index+len(marker):])
+			}
+		}
+	}
+	if sessionID == "" {
+		return ""
+	}
+
+	sum := sha256.Sum256([]byte("muxapi:claude-prompt-cache:" + modelName + ":" + sessionID))
+	return "muxapi-claude-" + hex.EncodeToString(sum[:])[:48]
 }
 
 func codexClaudeTargetAcceptsGrokSignature(modelName string) bool {

@@ -102,6 +102,46 @@ func TestConvertClaudeRequestToCodex_SystemMessageScenarios(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeRequestToCodex_AddsStablePromptCacheKey(t *testing.T) {
+	payload := []byte(`{
+		"model":"gpt-5.6-sol",
+		"metadata":{"user_id":"user_abc_account_def_session_01234567-89ab-cdef-0123-456789abcdef"},
+		"messages":[{"role":"user","content":"hello"}]
+	}`)
+
+	first := ConvertClaudeRequestToCodex("gpt-5.6-sol", payload, true)
+	second := ConvertClaudeRequestToCodex("gpt-5.6-sol", payload, true)
+	firstKey := gjson.GetBytes(first, "prompt_cache_key")
+	secondKey := gjson.GetBytes(second, "prompt_cache_key")
+	if !firstKey.Exists() || firstKey.String() == "" {
+		t.Fatalf("translated request has no prompt_cache_key: %s", first)
+	}
+	if firstKey.String() != secondKey.String() {
+		t.Fatalf("prompt_cache_key is not stable: %q vs %q", firstKey.String(), secondKey.String())
+	}
+	if strings.Contains(firstKey.String(), "01234567") || len(firstKey.String()) > 64 {
+		t.Fatalf("prompt_cache_key must not expose the session or exceed Codex limits: %q", firstKey.String())
+	}
+
+	other := ConvertClaudeRequestToCodex("gpt-5.6-sol", []byte(`{
+		"metadata":{"user_id":"user_abc_account_def_session_fedcba98-7654-3210-fedc-ba9876543210"},
+		"messages":[{"role":"user","content":"hello"}]
+	}`), true)
+	if firstKey.String() == gjson.GetBytes(other, "prompt_cache_key").String() {
+		t.Fatal("different Claude sessions must not share a prompt_cache_key")
+	}
+}
+
+func TestConvertClaudeRequestToCodex_SkipsPromptCacheKeyWithoutSession(t *testing.T) {
+	result := ConvertClaudeRequestToCodex("gpt-5.6-sol", []byte(`{
+		"metadata":{"user_id":"user_abc_account_def"},
+		"messages":[{"role":"user","content":"hello"}]
+	}`), true)
+	if gjson.GetBytes(result, "prompt_cache_key").Exists() {
+		t.Fatalf("request without a session must not get a shared cache key: %s", result)
+	}
+}
+
 func TestConvertClaudeRequestToCodex_MessageSystemRoleWrapsAsUserReminder(t *testing.T) {
 	inputJSON := `{
 		"model": "claude-3-opus",
