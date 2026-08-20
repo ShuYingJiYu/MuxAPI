@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/netip"
+	"path"
 	"sort"
 	"strings"
 	"sync"
@@ -93,9 +94,42 @@ func (s *Server) Handler() http.Handler {
 	s.registerAdmin(mux)
 	// 内嵌前端（"/" 兜底，/v1、/admin、/healthz 等更长前缀优先匹配，不冲突）
 	if sub, err := fs.Sub(muxweb.Dist, "dist"); err == nil {
-		mux.Handle("/", http.FileServer(http.FS(sub)))
+		mux.Handle("/", spaFileServer(sub))
 	}
 	return mux
+}
+
+// spaFileServer serves real build assets when they exist and falls back to
+// index.html for extensionless client-side routes used by Vue Router history mode.
+func spaFileServer(root fs.FS) http.Handler {
+	files := http.FileServer(http.FS(root))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.NotFound(w, r)
+			return
+		}
+
+		name := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
+		if name == "." {
+			name = ""
+		}
+		if name == "" {
+			files.ServeHTTP(w, r)
+			return
+		}
+		if _, err := fs.Stat(root, name); err == nil {
+			files.ServeHTTP(w, r)
+			return
+		}
+		if path.Ext(name) != "" {
+			http.NotFound(w, r)
+			return
+		}
+
+		indexRequest := r.Clone(r.Context())
+		indexRequest.URL.Path = "/"
+		files.ServeHTTP(w, indexRequest)
+	})
 }
 
 // auth 后台管理鉴权（adminToken）。AdminToken 为空时跳过（仅本地调试）。

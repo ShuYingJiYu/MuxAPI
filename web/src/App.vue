@@ -1,7 +1,8 @@
 <script setup>
-// 单页管理后台：集中管理页面状态、轮询、表单动作和管理 API 调用。
+// 管理后台页面壳：集中管理页面状态、轮询、表单动作和管理 API 调用。
 // 大型派生视图使用 computed，跨页面异步请求使用 epoch 防止旧响应覆盖新状态。
-import { ref, reactive, onMounted, onUnmounted, computed } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, computed, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import Icon from './Icon.vue'
 import Fence from './Fence.vue'
 import FancySelect from './FancySelect.vue'
@@ -10,7 +11,9 @@ import { api } from './api.js'
 import { useLogs } from './composables/useLogs.js'
 import { useMonitorViews } from './composables/useMonitorViews.js'
 
-const page = ref('overview')      // overview | groups | upstreams | monitors
+const route = useRoute()
+const pageNames = new Set(['overview', 'groups', 'upstreams', 'monitors', 'logs', 'settings'])
+const page = computed(() => pageNames.has(String(route.name)) ? String(route.name) : 'overview')
 const detailGroup = ref(null)     // 进入分组详情时设置
 
 // 后端资源缓存；详情页成员与密钥只对应 detailGroup。
@@ -88,7 +91,7 @@ async function guard(fn) {
 }
 
 onMounted(() => {
-  if (loggedIn.value) guard(async () => { await loadTags(); await loadUpstreams(); await loadMonitors(); await loadSettings(); startMonPoll() })
+  if (loggedIn.value) activatePage(page.value)
 })
 
 // 看板自动刷新：探测间隔 5min，这里每 60s 拉一次快照即可，离开即停
@@ -109,8 +112,8 @@ function stopRtPoll() { if (rtTimer) { clearInterval(rtTimer); rtTimer = null } 
 function stopAllPoll() { stopMonPoll(); stopRtPoll(); stopLogPoll() }
 onUnmounted(() => { stopAllPoll() })
 
-function go(p) {
-  page.value = p; detailGroup.value = null
+function activatePage(p) {
+  detailGroup.value = null
   window.scrollTo({ top: 0, behavior: 'instant' })
   cellDrawerId.value = null; logDetail.value = null
   loadEpoch++   // 离开详情，作废在途的 members/keys 加载
@@ -124,6 +127,9 @@ function go(p) {
     else if (p === 'settings') { await loadSettings(); await Promise.all([loadBackupConfig(), loadBackupSchedule(), loadBackups()]) }
   })
 }
+watch(() => route.name, () => {
+  if (loggedIn.value) activatePage(page.value)
+})
 function openDetail(g) {
   detailGroup.value = g
   loadEpoch++   // 切入新分组详情，作废上一组在途加载
@@ -1210,7 +1216,7 @@ function login() {
   if (!loginForm.token.trim()) { err.value = '请输入管理 Token'; return }
   api.setToken(loginForm.token.trim())
   loggedIn.value = true
-  guard(async () => { await loadTags(); await loadUpstreams(); await loadMonitors(); await loadSettings(); startMonPoll() })
+  activatePage(page.value)
 }
 function logout() {
   api.clearToken()
@@ -1238,12 +1244,12 @@ function logout() {
     <aside class="sidebar">
       <div class="logo"><Icon name="bolt" :size="22" /><span class="logo-text">MuxAPI</span></div>
       <nav class="nav">
-        <div class="nav-item" :class="{ active: page === 'overview' }" @click="go('overview')"><Icon class="ic" name="bolt" :size="18" />总览</div>
-        <div class="nav-item" :class="{ active: page === 'groups' }" @click="go('groups')"><Icon class="ic" name="cube" :size="18" />分组管理</div>
-        <div class="nav-item" :class="{ active: page === 'upstreams' }" @click="go('upstreams')"><Icon class="ic" name="server" :size="18" />上游池</div>
-        <div class="nav-item" :class="{ active: page === 'monitors' }" @click="go('monitors')"><Icon class="ic" name="heart" :size="18" />监控看板</div>
-        <div class="nav-item" :class="{ active: page === 'logs' }" @click="go('logs')"><Icon class="ic" name="refresh" :size="18" />请求记录</div>
-        <div class="nav-item" :class="{ active: page === 'settings' }" @click="go('settings')"><Icon class="ic" name="cog" :size="18" />设置</div>
+        <RouterLink class="nav-item" :class="{ active: page === 'overview' }" :to="{ name: 'overview' }"><Icon class="ic" name="bolt" :size="18" />总览</RouterLink>
+        <RouterLink class="nav-item" :class="{ active: page === 'groups' }" :to="{ name: 'groups' }" @click.exact="detailGroup && backToGroups()"><Icon class="ic" name="cube" :size="18" />分组管理</RouterLink>
+        <RouterLink class="nav-item" :class="{ active: page === 'upstreams' }" :to="{ name: 'upstreams' }"><Icon class="ic" name="server" :size="18" />上游池</RouterLink>
+        <RouterLink class="nav-item" :class="{ active: page === 'monitors' }" :to="{ name: 'monitors' }"><Icon class="ic" name="heart" :size="18" />监控看板</RouterLink>
+        <RouterLink class="nav-item" :class="{ active: page === 'logs' }" :to="{ name: 'logs' }"><Icon class="ic" name="refresh" :size="18" />请求记录</RouterLink>
+        <RouterLink class="nav-item" :class="{ active: page === 'settings' }" :to="{ name: 'settings' }"><Icon class="ic" name="cog" :size="18" />设置</RouterLink>
       </nav>
     </aside>
 
