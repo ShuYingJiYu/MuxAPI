@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mirainya/muxapi/internal/store"
+	"github.com/mirainya/muxapi/internal/translate"
 	"github.com/mirainya/muxapi/internal/upstream"
 )
 
@@ -167,6 +168,11 @@ func buildProbeBody(m *store.Monitor) []byte {
 	path := strings.TrimSpace(m.Path)
 	var body map[string]any
 	switch {
+	case isGeminiGeneratePath(path):
+		body = map[string]any{
+			"contents":         []map[string]any{{"role": "user", "parts": []map[string]string{{"text": text}}}},
+			"generationConfig": map[string]any{"maxOutputTokens": maxTok},
+		}
 	case strings.HasSuffix(path, "/v1/responses"):
 		body = map[string]any{
 			"model":             m.Model,
@@ -180,7 +186,7 @@ func buildProbeBody(m *store.Monitor) []byte {
 			"messages":   []map[string]string{{"role": "user", "content": text}},
 		}
 	}
-	if m.Stream {
+	if m.Stream && !isGeminiGeneratePath(path) {
 		body["stream"] = true
 	}
 	b, _ := json.Marshal(body)
@@ -203,6 +209,7 @@ func (p *Prober) Probe(ctx context.Context, m *store.Monitor) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+m.APIKey)
 	req.Header.Set("x-api-key", m.APIKey)
+	req.Header.Set("x-goog-api-key", m.APIKey)
 	if strings.HasSuffix(path, "/v1/messages") {
 		req.Header.Set("anthropic-version", "2023-06-01")
 	}
@@ -283,9 +290,16 @@ func validProbePayload(contentType string, payload []byte, stream bool) bool {
 			strings.Contains(text, `"type":"message_stop"`) ||
 			strings.Contains(text, `"type": "message_stop"`) ||
 			strings.Contains(text, `"type":"response.completed"`) ||
-			strings.Contains(text, `"type": "response.completed"`)
+			strings.Contains(text, `"type": "response.completed"`) ||
+			strings.Contains(text, `"finishReason":"`) ||
+			strings.Contains(text, `"finishReason": "`)
 	}
 	return json.Valid(trimmed) && !upstream.IsErrorPayload(trimmed)
+}
+
+func isGeminiGeneratePath(path string) bool {
+	_, _, ok := translate.GeminiRequest(path)
+	return ok
 }
 
 // classify 把上游状态码映射到栅栏档位：2xx 正常 / 429 降级 / 其余故障。

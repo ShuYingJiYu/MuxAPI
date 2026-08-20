@@ -206,6 +206,7 @@ type upstreamInput struct {
 	Proxy        string   `json:"proxy"`
 	Protocol     string   `json:"protocol"`
 	BillingType  string   `json:"billing_type"`
+	CacheMode    string   `json:"cache_mode"`
 	APIKey       string   `json:"api_key"`
 	CreditRatio  *float64 `json:"credit_ratio"`
 	Enabled      bool     `json:"enabled"`
@@ -226,6 +227,7 @@ func decodeUpstream(r *http.Request) (*upstream.Upstream, error) {
 	d.BaseURL = strings.TrimSpace(d.BaseURL)
 	d.Protocol = strings.TrimSpace(d.Protocol)
 	d.BillingType = strings.TrimSpace(d.BillingType)
+	d.CacheMode = strings.TrimSpace(d.CacheMode)
 	if d.Name == "" {
 		return nil, errors.New("name is required")
 	}
@@ -242,9 +244,13 @@ func decodeUpstream(r *http.Request) (*upstream.Upstream, error) {
 	if !ok {
 		return nil, errors.New("unsupported billing type")
 	}
+	cacheMode, ok := upstream.NormalizeCacheMode(d.CacheMode)
+	if !ok {
+		return nil, errors.New("unsupported cache mode")
+	}
 	result := &upstream.Upstream{
 		Name: d.Name, Source: d.Source, BaseURL: d.BaseURL, APIKey: d.APIKey, Proxy: d.Proxy, Enabled: d.Enabled,
-		Protocol: string(protocol), BillingType: billingType, ChannelProbe: d.ChannelProbe,
+		Protocol: string(protocol), BillingType: billingType, CacheMode: cacheMode, ChannelProbe: d.ChannelProbe,
 	}
 	if d.CreditRatio != nil {
 		if *d.CreditRatio <= 0 {

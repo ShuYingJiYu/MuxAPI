@@ -54,6 +54,42 @@ func TestForwardAuditsCompressedCodexSSE(t *testing.T) {
 	}
 }
 
+func TestForwardNativeGeminiRequest(t *testing.T) {
+	var gotPath, gotKey string
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.RequestURI()
+		gotKey = r.Header.Get("x-goog-api-key")
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), `"contents"`) || strings.Contains(string(body), `"model"`) {
+			t.Errorf("native Gemini body changed: %s", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":1}}\n\n")
+	}))
+	defer upstreamServer.Close()
+
+	ups := []*upstream.Upstream{{ID: 1, BaseURL: upstreamServer.URL, APIKey: "gemini-key", Protocol: "gemini", Priority: 1, Weight: 1}}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 1)
+	body := []byte(`{"contents":[{"parts":[{"text":"hello"}]}]}`)
+	request := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-test:streamGenerateContent?key=client-key", bytes.NewReader(body))
+	request.Header.Set("x-goog-api-key", "client-key")
+	recorder := httptest.NewRecorder()
+	result := fwd.Forward(recorder, request, body, 1, "")
+	if result.Outcome != OutcomeSuccess || recorder.Code != http.StatusOK {
+		t.Fatalf("native Gemini result status=%d result=%+v body=%s", recorder.Code, result, recorder.Body.String())
+	}
+	if gotPath != "/v1beta/models/gemini-test:streamGenerateContent?alt=sse" {
+		t.Fatalf("native Gemini path/query = %q", gotPath)
+	}
+	if gotKey != "gemini-key" {
+		t.Fatalf("native Gemini key = %q", gotKey)
+	}
+	if !strings.Contains(recorder.Body.String(), "\"finishReason\":\"STOP\"") || result.InputTokens != 3 || result.OutputTokens != 1 {
+		t.Fatalf("native Gemini response/audit = %s %+v", recorder.Body.String(), result)
+	}
+}
+
 func TestForwardUsesDynamicMaxAttemptsPerRequest(t *testing.T) {
 	servers := make([]*httptest.Server, 0, 4)
 	upstreams := make([]*upstream.Upstream, 0, 4)

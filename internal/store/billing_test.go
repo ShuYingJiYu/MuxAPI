@@ -341,9 +341,24 @@ func TestBillingTypeValidation(t *testing.T) {
 	if u.BillingType != upstream.BillingNone {
 		t.Fatalf("empty billing type should normalize to none, got %q", u.BillingType)
 	}
+	if u.CacheMode != upstream.CacheAuto {
+		t.Fatalf("empty cache mode should normalize to auto, got %q", u.CacheMode)
+	}
+	u.CacheMode = upstream.CacheEnabled
+	if err := st.Update(u); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := st.Get(u.ID)
+	if err != nil || loaded.CacheMode != upstream.CacheEnabled {
+		t.Fatalf("cache mode round trip = %q, err=%v", loaded.CacheMode, err)
+	}
 	invalid := &upstream.Upstream{Name: "invalid", BaseURL: "https://example.com", BillingType: "other"}
 	if err := st.Create(invalid); err == nil {
 		t.Fatal("unsupported billing type should be rejected")
+	}
+	invalidCache := &upstream.Upstream{Name: "invalid-cache", BaseURL: "https://example.com", CacheMode: "other"}
+	if err := st.Create(invalidCache); err == nil {
+		t.Fatal("unsupported cache mode should be rejected")
 	}
 }
 

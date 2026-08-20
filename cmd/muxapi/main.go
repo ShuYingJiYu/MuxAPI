@@ -19,6 +19,7 @@ import (
 	"github.com/mirainya/muxapi/internal/forward"
 	"github.com/mirainya/muxapi/internal/health"
 	"github.com/mirainya/muxapi/internal/monitor"
+	"github.com/mirainya/muxapi/internal/routing"
 	"github.com/mirainya/muxapi/internal/scheduler"
 	"github.com/mirainya/muxapi/internal/server"
 	"github.com/mirainya/muxapi/internal/store"
@@ -123,6 +124,12 @@ func main() {
 		slog.Info("seeded route stats from logs", "samples", len(hs))
 	}
 	sched := scheduler.New(listByGroup, hm)
+	// Cost/cache-aware selection is enabled globally. It falls back to the
+	// existing health/P2C scheduler when pricing is incomplete or cold.
+	routeConfig := func() routing.Config {
+		return routing.DefaultConfig()
+	}
+	sched.SetIntelligentRouting(st, routeConfig)
 	maxUpstreamAttempts := settingInt("max_upstream_attempts", initialMaxAttempts)
 	var maxAttemptsValue atomic.Int64
 	maxAttemptsValue.Store(int64(maxUpstreamAttempts()))
@@ -241,9 +248,9 @@ func main() {
 	wg.Wait() // 等后台 goroutine 退出，再让 defer st.Close() 安全关库
 }
 
-// runLogJanitor 定时清理请求审计与探测结果：启动先清一次，之后每 10 分钟一轮。
+// runLogJanitor 定时执行可选的数据清理：启动先执行一次，之后每 10 分钟一轮。
 // keepDays() 每轮读取最新保留天数；每批最多 5000 个请求，避免长事务影响业务查询。
-// 探测结果固定保留 48h（覆盖看板 24h 展示窗口有余），防 probe_results 表无限增长。
+// 默认不删除探测结果、请求记录或计费快照；正数保留策略仍可由运维显式启用。
 func runLogJanitor(ctx context.Context, st *store.Store, keepDays func() int) {
 	const (
 		probeKeepHours = 0
@@ -272,7 +279,7 @@ func runLogJanitor(ctx context.Context, st *store.Store, keepDays func() int) {
 		} else if deleted > 0 {
 			slog.Info("probe janitor pruned", "deleted", deleted, "keepHours", probeKeepHours)
 		}
-		// 计费快照：每上游每刷新间隔一行，无清理会无限增长；保底留最近 2 条。
+		// 计费快照同样默认永久保留；仅显式正数策略才清理。
 		billingKeepDays := 0
 		if value, err := strconv.Atoi(st.GetSetting("billing_snapshot_retention_days", "0")); err == nil {
 			billingKeepDays = value

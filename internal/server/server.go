@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"path"
 	"sort"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"github.com/mirainya/muxapi/internal/health"
 	"github.com/mirainya/muxapi/internal/monitor"
 	"github.com/mirainya/muxapi/internal/store"
+	"github.com/mirainya/muxapi/internal/translate"
 	"github.com/mirainya/muxapi/internal/upstream"
 	muxweb "github.com/mirainya/muxapi/web"
 )
@@ -96,10 +98,14 @@ func (s *Server) Handler() http.Handler {
 		w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("/admin/version", s.adminVersion)
-	mux.HandleFunc("/v1/messages", s.messages)         // Claude 格式
-	mux.HandleFunc("/v1/chat/completions", s.messages) // OpenAI 格式
-	mux.HandleFunc("/v1/responses", s.messages)        // OpenAI Responses API (codex)
-	mux.HandleFunc("/v1/models", s.listModels)         // 模型清单：汇总分组内各上游
+	mux.HandleFunc("/v1/messages", s.messages)           // Claude 格式
+	mux.HandleFunc("/v1/chat/completions", s.messages)   // OpenAI 格式
+	mux.HandleFunc("/v1/responses", s.messages)          // OpenAI Responses API (codex)
+	mux.HandleFunc("/v1/models", s.listModels)           // 模型清单：汇总分组内各上游
+	mux.HandleFunc("/v1/models/", s.geminiModelAPI)      // Gemini v1 generateContent/model detail
+	mux.HandleFunc("/v1beta/models", s.geminiModels)     // Gemini 原生模型清单
+	mux.HandleFunc("/v1beta/models/", s.geminiModelAPI)  // Gemini v1beta generateContent/model detail
+	mux.HandleFunc("/v1alpha/models/", s.geminiModelAPI) // Gemini preview generateContent/model detail
 	s.registerAdmin(mux)
 	// 内嵌前端（"/" 兜底，/v1、/admin、/healthz 等更长前缀优先匹配，不冲突）
 	if sub, err := fs.Sub(muxweb.Dist, "dist"); err == nil {
@@ -193,7 +199,13 @@ func clientKey(r *http.Request) string {
 	if k := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "); k != "" {
 		return k
 	}
-	return r.Header.Get("x-api-key")
+	if k := r.Header.Get("x-api-key"); k != "" {
+		return k
+	}
+	if k := r.Header.Get("x-goog-api-key"); k != "" {
+		return k
+	}
+	return r.URL.Query().Get("key")
 }
 
 // requestClientIP trusts forwarding headers only when the direct peer is a local reverse proxy.
@@ -273,20 +285,20 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		var mbErr *http.MaxBytesError
 		if errors.As(err, &mbErr) {
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
-			model, stream := parseBodyAudit(body)
+			model, stream := parseRequestAudit(r.URL.Path, body)
 			s.recordRequest(requestID, started, groupID, keyName, model, endpoint, clientIP, userAgent, stream, int64(len(body)),
 				forward.Result{Status: http.StatusRequestEntityTooLarge, Outcome: forward.OutcomeClientError,
 					ErrorKind: "request_too_large", ErrorSource: "client", Error: "request body too large"})
 			return
 		}
 		http.Error(w, "read body failed", http.StatusBadRequest)
-		model, stream := parseBodyAudit(body)
+		model, stream := parseRequestAudit(r.URL.Path, body)
 		s.recordRequest(requestID, started, groupID, keyName, model, endpoint, clientIP, userAgent, stream, int64(len(body)),
 			forward.Result{Status: http.StatusBadRequest, Outcome: forward.OutcomeClientError,
 				ErrorKind: "request_read", ErrorSource: "client", Error: "read body failed"})
 		return
 	}
-	model, stream := parseBodyAudit(body)
+	model, stream := parseRequestAudit(r.URL.Path, body)
 	result := s.fwd.Forward(w, r, body, groupID, keyName)
 	s.recordRequest(requestID, started, groupID, keyName, model, endpoint, clientIP, userAgent, stream, int64(len(body)), result)
 }
@@ -321,35 +333,135 @@ func (s *Server) recordRequest(requestID string, started time.Time, groupID int6
 		Outcome: result.Outcome, TTFTMs: result.TTFTMs, DurationMs: completed.Sub(started).Milliseconds(),
 		CreatedAt: started, CompletedAt: completed, Error: result.Error, Attempts: attempts,
 	})
+	s.persistRoutingAudit(requestID, started, groupID, model, endpoint, result)
 }
 
 func parseBodyModel(body []byte) string {
-	model, _ := parseBodyAudit(body)
+	model, _ := parseRequestAudit("", body)
 	return model
 }
 
-func parseBodyAudit(body []byte) (string, bool) {
-	var payload struct {
-		Model  string `json:"model"`
-		Stream bool   `json:"stream"`
+func parseRequestAudit(path string, body []byte) (string, bool) {
+	return translate.RequestModel(path, body), translate.RequestStream(path, body)
+}
+
+// geminiModelAPI accepts native generateContent calls while keeping GET model
+// metadata compatible with Gemini SDK discovery.
+func (s *Server) geminiModelAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		if format, ok := translate.SourceFromPath(r.URL.Path); ok && format == translate.Gemini {
+			s.messages(w, r)
+			return
+		}
+		http.NotFound(w, r)
+		return
 	}
-	_ = json.Unmarshal(body, &payload)
-	return payload.Model, payload.Stream
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	model, ok := geminiModelFromPath(r.URL.Path)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	ids, status, err := s.groupModelIDs(r)
+	if err != nil {
+		writeGeminiError(w, status, err.Error())
+		return
+	}
+	for _, id := range ids {
+		if id == model {
+			writeJSON(w, geminiModelObject(id))
+			return
+		}
+	}
+	writeGeminiError(w, http.StatusNotFound, "model not found")
+}
+
+func geminiModelFromPath(requestPath string) (string, bool) {
+	for _, prefix := range []string{"/v1beta/models/", "/v1/models/", "/v1alpha/models/"} {
+		if strings.HasPrefix(requestPath, prefix) {
+			value := strings.TrimPrefix(requestPath, prefix)
+			if value == "" || strings.Contains(value, ":") {
+				return "", false
+			}
+			decoded, err := url.PathUnescape(value)
+			return decoded, err == nil && decoded != ""
+		}
+	}
+	return "", false
 }
 
 // listModels 下游模型清单：按接入 key 找到分组，实时汇总分组内各启用上游的
 // /v1/models 并集去重，输出 OpenAI 兼容格式。单上游拉取失败只跳过该上游，
 // 保证部分可用；结果按 upstream 维度缓存 modelsTTL，避免每次请求都打上游。
 func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
+	ids, status, err := s.groupModelIDs(r)
+	if err != nil {
+		http.Error(w, err.Error(), status)
+		return
+	}
+	now := time.Now().Unix()
+	type modelObj struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		Created int64  `json:"created"`
+		OwnedBy string `json:"owned_by"`
+	}
+	data := make([]modelObj, 0, len(ids))
+	for _, id := range ids {
+		data = append(data, modelObj{ID: id, Object: "model", Created: now, OwnedBy: "muxapi"})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
+}
+
+// geminiModels exposes the same group-scoped model union in Gemini's native
+// discovery envelope.
+func (s *Server) geminiModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ids, status, err := s.groupModelIDs(r)
+	if err != nil {
+		writeGeminiError(w, status, err.Error())
+		return
+	}
+	models := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		models = append(models, geminiModelObject(id))
+	}
+	writeJSON(w, map[string]any{"models": models})
+}
+
+func geminiModelObject(id string) map[string]any {
+	return map[string]any{
+		"name":                       "models/" + id,
+		"version":                    id,
+		"displayName":                id,
+		"description":                "Routed by MuxAPI",
+		"supportedGenerationMethods": []string{"generateContent", "streamGenerateContent"},
+	}
+}
+
+func writeGeminiError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	w.Write(translate.ErrorResponse(translate.Gemini, status, []byte(message)))
+}
+
+// groupModelIDs aggregates model discovery for both OpenAI and Gemini-shaped
+// client endpoints.
+func (s *Server) groupModelIDs(r *http.Request) ([]string, int, error) {
 	groupID, ok := s.store.GroupByKey(clientKey(r))
 	if !ok {
-		http.Error(w, "unauthorized: unknown access key", http.StatusUnauthorized)
-		return
+		return nil, http.StatusUnauthorized, errors.New("unauthorized: unknown access key")
 	}
 	ups, err := s.store.ListEnabledByGroup(groupID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return nil, http.StatusInternalServerError, err
 	}
 	// 并发拉取各上游：串行时任一上游超时都会线性累加到客户端等待时间。
 	perUpstream := make([][]string, len(ups))
@@ -373,19 +485,7 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	sort.Strings(ids)
-	now := time.Now().Unix()
-	type modelObj struct {
-		ID      string `json:"id"`
-		Object  string `json:"object"`
-		Created int64  `json:"created"`
-		OwnedBy string `json:"owned_by"`
-	}
-	data := make([]modelObj, 0, len(ids))
-	for _, id := range ids {
-		data = append(data, modelObj{ID: id, Object: "model", Created: now, OwnedBy: "muxapi"})
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
+	return ids, http.StatusOK, nil
 }
 
 // forgetUpstreamModels 丢弃某上游的模型清单缓存，供上游删除后调用。
