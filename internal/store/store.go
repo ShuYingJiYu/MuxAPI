@@ -281,9 +281,9 @@ func openSQLite(path string) (*Store, error) {
 	// 迁移：旧库 groups 表补 sort_order 列（拖拽排序权重，0=未排序按 id）。
 	db.Exec(`ALTER TABLE groups ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`)
 	db.Exec(`ALTER TABLE groups ADD COLUMN max_multiplier REAL`)
-	// Intelligent routing keeps request and billing history permanently by
-	// default. Existing explicit settings are respected; this only seeds a
-	// value for installations that never configured retention.
+	// Intelligent routing keeps request, billing, and probe history permanently
+	// by default. Upgrade existing installations to the explicit zero setting;
+	// operators can later opt into a positive manual retention window.
 	db.Exec(`INSERT INTO settings(key,value) VALUES('request_retention_days','0')
 		ON CONFLICT(key) DO UPDATE SET value='0'`)
 	db.Exec(`INSERT INTO settings(key,value) VALUES('billing_snapshot_retention_days','0')
