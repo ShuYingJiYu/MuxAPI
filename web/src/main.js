@@ -1,6 +1,8 @@
-import { createApp } from 'vue'
-import App from './App.vue'
+import { createApp, h } from 'vue'
+import { RouterView } from 'vue-router'
+import { router } from './router.js'
 import './style.css'
 
-// 前端唯一入口：挂载管理后台并加载全局设计样式。
-createApp(App).mount('#app')
+const app = createApp({ render: () => h(RouterView) })
+app.use(router)
+router.isReady().then(() => app.mount('#app'))
