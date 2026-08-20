@@ -190,7 +190,10 @@ func main() {
 		backupSvc.Run(ctx)
 	}()
 	// 请求审计按天保留，默认 7 天；每 10 分钟分批删除过期请求及其尝试链。
-	requestRetentionDays := settingInt("request_retention_days", 7)
+	// Zero means permanent retention. This is the default for routing and
+	// billing history; a positive value remains available as an explicit
+	// operator-configured cleanup policy.
+	requestRetentionDays := settingInt("request_retention_days", 0)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -228,7 +231,7 @@ func main() {
 // 探测结果固定保留 48h（覆盖看板 24h 展示窗口有余），防 probe_results 表无限增长。
 func runLogJanitor(ctx context.Context, st *store.Store, keepDays func() int) {
 	const (
-		probeKeepHours = 48
+		probeKeepHours = 0
 		requestBatch   = 5000
 		maxBatches     = 10
 	)
@@ -255,7 +258,11 @@ func runLogJanitor(ctx context.Context, st *store.Store, keepDays func() int) {
 			slog.Info("probe janitor pruned", "deleted", deleted, "keepHours", probeKeepHours)
 		}
 		// 计费快照：每上游每刷新间隔一行，无清理会无限增长；保底留最近 2 条。
-		if deleted, err := st.PruneBillingSnapshots(store.BillingSnapshotKeepDays); err != nil {
+		billingKeepDays := 0
+		if value, err := strconv.Atoi(st.GetSetting("billing_snapshot_retention_days", "0")); err == nil {
+			billingKeepDays = value
+		}
+		if deleted, err := st.PruneBillingSnapshots(billingKeepDays); err != nil {
 			slog.Error("billing snapshot janitor prune failed", "err", err)
 		} else if deleted > 0 {
 			slog.Info("billing snapshot janitor pruned", "deleted", deleted,
