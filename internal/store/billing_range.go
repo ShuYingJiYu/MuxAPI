@@ -42,15 +42,16 @@ func LookupBillingWindow(key string) BillingWindow {
 	return billingWindows[0]
 }
 
-// BillingSnapshotKeepDays 快照保留天数。须显著大于最长聚合窗口(7d)，为「窗口
-// 左端点」留余量；每上游每刷新间隔一行，30 天的量很小。
-const BillingSnapshotKeepDays = 30
+// BillingSnapshotKeepDays is zero by default: billing snapshots are part of
+// the permanent routing and reconciliation history. Operators may still pass
+// a positive value to PruneBillingSnapshots for an explicit, manual cleanup.
+const BillingSnapshotKeepDays = 0
 
 // PruneBillingSnapshots 删除过期快照，但每个上游保底留最近 2 条——
 // 否则久无流量的上游会被清空，连即时窗口都算不出来。
 func (s *Store) PruneBillingSnapshots(keepDays int) (int64, error) {
 	if keepDays <= 0 {
-		keepDays = BillingSnapshotKeepDays
+		return 0, nil
 	}
 	cutoff := time.Now().AddDate(0, 0, -keepDays)
 	result, err := s.db.Exec(`DELETE FROM upstream_billing_snapshots WHERE id IN (

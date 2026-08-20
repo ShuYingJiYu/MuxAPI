@@ -281,6 +281,15 @@ func openSQLite(path string) (*Store, error) {
 	// 迁移：旧库 groups 表补 sort_order 列（拖拽排序权重，0=未排序按 id）。
 	db.Exec(`ALTER TABLE groups ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`)
 	db.Exec(`ALTER TABLE groups ADD COLUMN max_multiplier REAL`)
+	// Intelligent routing keeps request and billing history permanently by
+	// default. Existing explicit settings are respected; this only seeds a
+	// value for installations that never configured retention.
+	db.Exec(`INSERT INTO settings(key,value) VALUES('request_retention_days','0')
+		ON CONFLICT(key) DO UPDATE SET value='0'`)
+	db.Exec(`INSERT INTO settings(key,value) VALUES('billing_snapshot_retention_days','0')
+		ON CONFLICT(key) DO UPDATE SET value='0'`)
+	db.Exec(`INSERT INTO settings(key,value) VALUES('probe_retention_hours','0')
+		ON CONFLICT(key) DO UPDATE SET value='0'`)
 	// 迁移：旧库 group_upstreams 补 enabled 列（组内成员开关，默认启用）
 	db.Exec(`ALTER TABLE group_upstreams ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`)
 	// 迁移：旧库 monitors 补可配探测列（空/0 表示沿用全局默认）
@@ -536,6 +545,119 @@ CREATE TABLE IF NOT EXISTS request_attempts (
 	FOREIGN KEY (request_id) REFERENCES requests(request_id) ON DELETE CASCADE,
 	UNIQUE (request_id, attempt_no)
 );
+CREATE TABLE IF NOT EXISTS route_decisions (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	request_id TEXT NOT NULL UNIQUE,
+	group_id INTEGER NOT NULL DEFAULT 0,
+	model TEXT NOT NULL DEFAULT '',
+	protocol TEXT NOT NULL DEFAULT '',
+	endpoint TEXT NOT NULL DEFAULT '',
+	session_key TEXT NOT NULL DEFAULT '',
+	prefix_hash TEXT NOT NULL DEFAULT '',
+	cache_key TEXT NOT NULL DEFAULT '',
+	strategy TEXT NOT NULL DEFAULT 'cost',
+	reason TEXT NOT NULL DEFAULT '',
+	selected_upstream_id INTEGER NOT NULL DEFAULT 0,
+	candidate_count INTEGER NOT NULL DEFAULT 0,
+	forecast_window_seconds INTEGER NOT NULL DEFAULT 0,
+	forecast_requests REAL NOT NULL DEFAULT 0,
+	estimated_input_tokens INTEGER NOT NULL DEFAULT 0,
+	reusable_prefix_tokens INTEGER NOT NULL DEFAULT 0,
+	estimated_output_tokens INTEGER NOT NULL DEFAULT 0,
+	selected_cost REAL,
+	no_cache_cost REAL,
+	cache_cost REAL,
+	estimated_savings REAL,
+	confidence REAL NOT NULL DEFAULT 0,
+	cache_selected INTEGER NOT NULL DEFAULT 0,
+	exploration INTEGER NOT NULL DEFAULT 0,
+	actual_cost REAL,
+	actual_input_tokens INTEGER,
+	actual_output_tokens INTEGER,
+	actual_cached_tokens INTEGER,
+	actual_cache_creation_tokens INTEGER,
+	actual_outcome TEXT NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL,
+	completed_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS route_decision_candidates (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	decision_id INTEGER NOT NULL,
+	upstream_id INTEGER NOT NULL DEFAULT 0,
+	api_key_hash TEXT NOT NULL DEFAULT '',
+	upstream_name TEXT NOT NULL DEFAULT '',
+	protocol TEXT NOT NULL DEFAULT '',
+	priority INTEGER NOT NULL DEFAULT 0,
+	eligible INTEGER NOT NULL DEFAULT 1,
+	selected INTEGER NOT NULL DEFAULT 0,
+	rejection_reason TEXT NOT NULL DEFAULT '',
+	pricing_source TEXT NOT NULL DEFAULT '',
+	pricing_confidence REAL NOT NULL DEFAULT 0,
+	cache_supported INTEGER NOT NULL DEFAULT 0,
+	cache_existing INTEGER NOT NULL DEFAULT 0,
+	cache_selected INTEGER NOT NULL DEFAULT 0,
+	cache_hit_rate REAL NOT NULL DEFAULT 0,
+	forecast_total_cost REAL,
+	forecast_no_cache_cost REAL,
+	forecast_cache_cost REAL,
+	estimated_savings REAL,
+	break_even_requests REAL,
+	expected_hits REAL NOT NULL DEFAULT 0,
+	expected_misses REAL NOT NULL DEFAULT 0,
+	expected_creates REAL NOT NULL DEFAULT 0,
+	estimated_ttft_ms REAL NOT NULL DEFAULT 0,
+	estimated_duration_ms REAL NOT NULL DEFAULT 0,
+	success_rate REAL NOT NULL DEFAULT 0,
+	details_json TEXT NOT NULL DEFAULT '{}',
+	FOREIGN KEY (decision_id) REFERENCES route_decisions(id) ON DELETE CASCADE,
+	UNIQUE (decision_id, upstream_id)
+);
+CREATE TABLE IF NOT EXISTS routing_observations (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	request_id TEXT NOT NULL,
+	attempt_no INTEGER NOT NULL DEFAULT 1,
+	group_id INTEGER NOT NULL DEFAULT 0,
+	upstream_id INTEGER NOT NULL DEFAULT 0,
+	api_key_hash TEXT NOT NULL DEFAULT '',
+	model TEXT NOT NULL DEFAULT '',
+	session_key TEXT NOT NULL DEFAULT '',
+	prefix_hash TEXT NOT NULL DEFAULT '',
+	cache_key TEXT NOT NULL DEFAULT '',
+	prefix_tokens INTEGER NOT NULL DEFAULT 0,
+	input_tokens INTEGER NOT NULL DEFAULT 0,
+	output_tokens INTEGER NOT NULL DEFAULT 0,
+	cached_tokens INTEGER NOT NULL DEFAULT 0,
+	cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+	ttft_ms INTEGER NOT NULL DEFAULT 0,
+	duration_ms INTEGER NOT NULL DEFAULT 0,
+	success INTEGER NOT NULL DEFAULT 0,
+	cache_eligible INTEGER NOT NULL DEFAULT 0,
+	cache_hit INTEGER NOT NULL DEFAULT 0,
+	cache_created INTEGER NOT NULL DEFAULT 0,
+	cache_expires_at INTEGER,
+	observed_at INTEGER NOT NULL,
+	UNIQUE (request_id, attempt_no)
+);
+CREATE TABLE IF NOT EXISTS upstream_prefix_cache_stats (
+	api_key_hash TEXT NOT NULL,
+	upstream_id INTEGER NOT NULL,
+	model TEXT NOT NULL,
+	prefix_hash TEXT NOT NULL,
+	session_key TEXT NOT NULL DEFAULT '',
+	cache_key TEXT NOT NULL DEFAULT '',
+	prefix_tokens INTEGER NOT NULL DEFAULT 0,
+	observations INTEGER NOT NULL DEFAULT 0,
+	hit_count INTEGER NOT NULL DEFAULT 0,
+	miss_count INTEGER NOT NULL DEFAULT 0,
+	create_count INTEGER NOT NULL DEFAULT 0,
+	last_hit_at INTEGER,
+	last_miss_at INTEGER,
+	last_created_at INTEGER,
+	expires_at INTEGER,
+	first_seen_at INTEGER NOT NULL,
+	last_seen_at INTEGER NOT NULL,
+	PRIMARY KEY (api_key_hash, upstream_id, model, prefix_hash)
+);
 CREATE INDEX IF NOT EXISTS idx_probe_mon_time ON probe_results(monitor_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_logs_group_time ON logs(group_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests(created_at);
@@ -547,4 +669,13 @@ CREATE INDEX IF NOT EXISTS idx_requests_error_time ON requests(error_kind, creat
 CREATE INDEX IF NOT EXISTS idx_attempts_request ON request_attempts(request_id, attempt_no);
 CREATE INDEX IF NOT EXISTS idx_attempts_upstream_time ON request_attempts(upstream_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_attempts_upstream_completed ON request_attempts(upstream_id, completed_at);
-CREATE INDEX IF NOT EXISTS idx_upstream_billing_snapshots_time ON upstream_billing_snapshots(upstream_id, observed_at DESC);`
+CREATE INDEX IF NOT EXISTS idx_upstream_billing_snapshots_time ON upstream_billing_snapshots(upstream_id, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_route_decisions_created ON route_decisions(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_route_decisions_session_model ON route_decisions(session_key, model, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_route_decisions_prefix_model ON route_decisions(prefix_hash, model, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_route_candidates_upstream ON route_decision_candidates(upstream_id, decision_id DESC);
+CREATE INDEX IF NOT EXISTS idx_routing_observations_time ON routing_observations(observed_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_routing_observations_session_model ON routing_observations(session_key, model, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_routing_observations_prefix_model ON routing_observations(prefix_hash, model, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_routing_observations_upstream_model ON routing_observations(upstream_id, model, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_upstream_prefix_cache_expiry ON upstream_prefix_cache_stats(api_key_hash, upstream_id, model, expires_at);`

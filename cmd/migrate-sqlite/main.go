@@ -126,8 +126,14 @@ func main() {
 		mustExec(tx, `INSERT INTO settings(key,value) VALUES($1,$2)
 			ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value`, row.key, row.value)
 	}
-	mustExec(tx, `INSERT INTO settings(key,value) VALUES('request_retention_days','7')
-		ON CONFLICT(key) DO UPDATE SET value='7'`)
+	// Request and billing/probe history are retained permanently. A value of
+	// zero disables the janitor; existing request rows are never rewritten.
+	mustExec(tx, `INSERT INTO settings(key,value) VALUES('request_retention_days','0')
+		ON CONFLICT(key) DO UPDATE SET value='0'`)
+	mustExec(tx, `INSERT INTO settings(key,value) VALUES('billing_snapshot_retention_days','0')
+		ON CONFLICT(key) DO NOTHING`)
+	mustExec(tx, `INSERT INTO settings(key,value) VALUES('probe_retention_hours','0')
+		ON CONFLICT(key) DO NOTHING`)
 	// 保留旧 ID 后同步序列，防止迁移后的新记录与现有主键冲突。
 	for _, table := range []string{"groups", "upstreams", "access_keys", "monitors"} {
 		mustExec(tx, fmt.Sprintf(`SELECT setval(pg_get_serial_sequence('%s','id'),
