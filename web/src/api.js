@@ -58,6 +58,12 @@ async function req(method, path, body, timeoutMs = REQUEST_TIMEOUT_MS, externalS
 }
 
 function groupTestRequest(protocol, model) {
+	if (protocol === 'gemini') {
+		return {
+			path: `/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`,
+			body: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }], generationConfig: { maxOutputTokens: 32 } },
+		}
+	}
   if (protocol === 'claude') {
     return { path: '/v1/messages', body: { model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 32, stream: true } }
   }
@@ -68,12 +74,14 @@ function groupTestRequest(protocol, model) {
 }
 
 function groupTestText(protocol, payload) {
+	if (protocol === 'gemini') return (payload?.candidates || []).flatMap(item => item?.content?.parts || []).map(item => item?.text || '').join('')
   if (protocol === 'claude') return payload?.delta?.text || ''
   if (protocol === 'chat') return payload?.choices?.[0]?.delta?.content || ''
   return payload?.type === 'response.output_text.delta' ? (payload.delta || '') : ''
 }
 
 function groupTestBodyText(protocol, payload) {
+	if (protocol === 'gemini') return (payload?.candidates || []).flatMap(item => item?.content?.parts || []).map(item => item?.text || '').join('')
   if (protocol === 'claude') return (payload?.content || []).filter(item => item.type === 'text').map(item => item.text || '').join('')
   if (protocol === 'chat') return payload?.choices?.[0]?.message?.content || ''
   return (payload?.output || []).flatMap(item => item.content || []).filter(item => item.type === 'output_text').map(item => item.text || '').join('')

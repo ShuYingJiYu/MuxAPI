@@ -42,6 +42,18 @@ type Result struct {
 // Fetch selects the configured provider adapter. The caller owns timeout and scheduling.
 func Fetch(ctx context.Context, item *upstream.Upstream) (Result, error) {
 	switch item.BillingType {
+	case upstream.BillingAuto:
+		// Probe the two known relay billing contracts without requiring the
+		// operator to identify the platform first. A failed probe is harmless;
+		// only return disabled when neither contract is available.
+		if result, err := fetchSub2API(ctx, item); err == nil {
+			return result, nil
+		}
+		result, err := fetchNewAPI(ctx, item)
+		if err == nil {
+			return result, nil
+		}
+		return Result{}, fmt.Errorf("automatic billing detection failed: %w", err)
 	case upstream.BillingSub2API:
 		return fetchSub2API(ctx, item)
 	case upstream.BillingNewAPI:

@@ -73,6 +73,31 @@ func TestStoreCRUD(t *testing.T) {
 	}
 }
 
+func TestRetentionMigrationRunsOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "retention.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.GetSetting("request_retention_days", ""); got != "0" {
+		t.Fatalf("initial request retention = %q, want 0", got)
+	}
+	if err := st.SetSetting("request_retention_days", "30"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if got := st.GetSetting("request_retention_days", ""); got != "30" {
+		t.Fatalf("explicit request retention was reset after reopen: %q", got)
+	}
+}
+
 func TestUpstreamSourceAndBatchUpdate(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
