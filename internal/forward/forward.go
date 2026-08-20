@@ -6,6 +6,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -15,6 +17,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/mirainya/muxapi/internal/routing"
 	"github.com/mirainya/muxapi/internal/translate"
 	"github.com/mirainya/muxapi/internal/upstream"
 )
@@ -38,6 +41,13 @@ type timeoutHealth interface {
 // Picker 从指定分组选择一个未尝试且可用的上游。
 type Picker interface {
 	PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, error)
+}
+
+// FeaturePicker is an optional extension implemented by the intelligent
+// scheduler. Keeping it separate from Picker preserves compatibility with
+// embedders and tests that provide a minimal picker.
+type FeaturePicker interface {
+	PickWithFeatures(groupID int64, model string, features routing.RequestFeatures, exclude map[int64]bool) (*upstream.Upstream, routing.Decision, error)
 }
 
 // Forwarder 协调一次客户端请求的选路、重试、协议转换和响应审计。
@@ -135,6 +145,8 @@ type AttemptResult struct {
 	CreatedAt           time.Time
 	CompletedAt         time.Time
 	Error               string
+	UpstreamKeyHash     string
+	RouteDecision       *routing.Decision
 }
 
 // Result 汇总最终响应及按时间排列的全部上游尝试。
@@ -155,6 +167,8 @@ type Result struct {
 	ErrorSource         string
 	Error               string
 	Attempts            []AttemptResult
+	RouteFeatures       routing.RequestFeatures
+	RouteDecision       *routing.Decision
 }
 
 type attemptContext struct {
@@ -164,6 +178,8 @@ type attemptContext struct {
 	priority        int
 	selectionReason string
 	healthBefore    string
+	keyHash         string
+	routeDecision   *routing.Decision
 	started         time.Time
 }
 
@@ -190,6 +206,7 @@ func (a attemptContext) finish(h Health, status int, outcome string, relay relay
 		UpstreamRequestID: relay.upstreamRequestID,
 		ErrorKind:         errorKind, ErrorSource: errorSource,
 		CreatedAt: a.started, CompletedAt: completed, Error: clipErr(errText),
+		UpstreamKeyHash: a.keyHash, RouteDecision: a.routeDecision,
 	}
 }
 
@@ -202,25 +219,58 @@ func resultFromAttempt(attempt AttemptResult, attempts []AttemptResult) Result {
 		CacheCreationTokens: attempt.CacheCreationTokens,
 		UpstreamRequestID:   attempt.UpstreamRequestID, ErrorKind: attempt.ErrorKind,
 		ErrorSource: attempt.ErrorSource, Error: attempt.Error, Attempts: attempts,
+		RouteDecision: attempt.RouteDecision,
 	}
 }
 
 // Forward 执行一次请求。只有在响应尚未提交给客户端时，失败才会切换上游。
 func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte, groupID int64, keyName string) Result {
-	model := parseModel(body)
-	streamRequested := parseStream(body)
+	model := translate.RequestModel(r.URL.Path, body)
+	streamRequested := translate.RequestStream(r.URL.Path, body)
 	sourceFormat, sourceKnown := translate.SourceFromRequest(r.URL.Path, r.Header)
 	if !sourceKnown {
 		sourceFormat = translate.Passthrough
 	}
+	features, featureErr := routing.ExtractRequestFeatures(body, routing.FeatureOptions{
+		Protocol: string(sourceFormat), Headers: r.Header,
+	})
+	if featureErr != nil {
+		features = routing.RequestFeatures{Model: model, Protocol: string(sourceFormat), Stream: streamRequested}.Normalize()
+	}
+	if features.Model == "" {
+		features.Model = model
+	}
+	if features.Protocol == "" {
+		features.Protocol = string(sourceFormat)
+	}
+	// Native Gemini carries stream mode in the endpoint suffix, not the JSON
+	// body; keep the routing feature in sync with the request boundary helper.
+	features.Stream = streamRequested
 	tried := map[int64]bool{}
 	var lastErr error
 	maxAttempts := f.maxAttemptLimit()
 	attempts := make([]AttemptResult, 0, maxAttempts)
+	var routeDecision *routing.Decision
+	withRouting := func(result Result) Result {
+		result.RouteFeatures = features
+		result.RouteDecision = routeDecision
+		return result
+	}
 
 	for upstreamAttempts := 0; upstreamAttempts < maxAttempts; {
 		// tried 同时防止重复选择；本地协议不兼容不消耗实际网络尝试次数。
-		candidate, err := f.picker.PickExcluding(groupID, model, tried)
+		var candidate *upstream.Upstream
+		var decision routing.Decision
+		var err error
+		if picker, ok := f.picker.(FeaturePicker); ok {
+			candidate, decision, err = picker.PickWithFeatures(groupID, model, features, tried)
+			if err == nil && routeDecision == nil && decision.SelectedID != 0 {
+				copyDecision := decision
+				routeDecision = &copyDecision
+			}
+		} else {
+			candidate, err = f.picker.PickExcluding(groupID, model, tried)
+		}
 		if err != nil {
 			break
 		}
@@ -236,10 +286,14 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		if beforeState == "HALF_OPEN" {
 			selectionReason = "recovery_trial"
 		}
+		if routeDecision != nil && attemptNo == 1 {
+			selectionReason = routeDecision.Reason
+		}
 		attemptCtx := attemptContext{
 			number: attemptNo, protocol: candidate.Protocol, upstreamID: candidate.ID,
 			priority:        candidate.Priority,
 			selectionReason: selectionReason, healthBefore: beforeState, started: attemptStarted,
+			keyHash: hashUpstreamKey(candidate.APIKey), routeDecision: routeDecision,
 		}
 
 		// 每次换源都从原始客户端请求重新转换，不能复用上一上游的请求体。
@@ -258,15 +312,15 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			lastErr = err
 			continue
 		}
-		targetPath, err := translate.TargetPath(targetFormat, r.URL.Path)
+		targetPath, err := translate.TargetPathForRequest(targetFormat, r.URL.Path, model, exchange.UpstreamStream)
 		if err != nil {
 			release()
 			attempts = append(attempts, attemptCtx.finish(f.health, 0, OutcomeUnsupported, relayResult{}, "protocol_unsupported", "gateway", err.Error()))
 			lastErr = err
 			continue
 		}
-		if r.URL.RawQuery != "" {
-			targetPath += "?" + r.URL.RawQuery
+		if query := translate.TargetQuery(sourceFormat, targetFormat, r.URL.Query(), exchange.UpstreamStream); query != "" {
+			targetPath += "?" + query
 		}
 		upstreamAttempts++
 		req, err := candidate.BuildRequest(r.Method, targetPath, bytes.NewReader(exchange.UpstreamRequest), r.Header)
@@ -295,7 +349,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			if r.Context().Err() != nil {
 				finished := attemptCtx.finish(f.health, StatusClientClosedRequest, OutcomeCanceled, relayResult{}, "client_canceled", "client", r.Context().Err().Error())
 				attempts = append(attempts, finished)
-				return resultFromAttempt(finished, attempts)
+				return withRouting(resultFromAttempt(finished, attempts))
 			}
 			errorKind := "upstream_network"
 			if errors.Is(cause, errFirstResponseTimeout) {
@@ -320,7 +374,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 				if r.Context().Err() != nil {
 					finished := attemptCtx.finish(f.health, StatusClientClosedRequest, OutcomeCanceled, relayResult{}, "client_canceled", "client", r.Context().Err().Error())
 					attempts = append(attempts, finished)
-					return resultFromAttempt(finished, attempts)
+					return withRouting(resultFromAttempt(finished, attempts))
 				}
 				errorKind := "upstream_read"
 				if errors.Is(cause, errFirstResponseTimeout) {
@@ -355,12 +409,12 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 				finished := attemptCtx.finish(f.health, StatusClientClosedRequest, OutcomeCanceled,
 					result, "downstream_write", "client", result.err.Error())
 				attempts = append(attempts, finished)
-				return resultFromAttempt(finished, attempts)
+				return withRouting(resultFromAttempt(finished, attempts))
 			}
 			finished := attemptCtx.finish(f.health, resp.StatusCode, OutcomeClientError,
 				result, "client_request", "client", string(payload))
 			attempts = append(attempts, finished)
-			return resultFromAttempt(finished, attempts)
+			return withRouting(resultFromAttempt(finished, attempts))
 		}
 
 		// 认证、限流及 5xx 属于渠道失败：记录熔断反馈后尝试下一个上游。
@@ -398,7 +452,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 				finished := attemptCtx.finish(f.health, StatusClientClosedRequest, OutcomeCanceled,
 					result, errorKind, "client", errText)
 				attempts = append(attempts, finished)
-				return resultFromAttempt(finished, attempts)
+				return withRouting(resultFromAttempt(finished, attempts))
 			}
 			f.reportFailure(candidate.ID, model, result.ttftMs, cause)
 			outcome := OutcomeFailed
@@ -414,7 +468,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			if !result.committed {
 				continue
 			}
-			return resultFromAttempt(finished, attempts)
+			return withRouting(resultFromAttempt(finished, attempts))
 		}
 
 		// 上游在流中投递了 error 事件：HTTP 状态码仍是 200，但这次调用其实失败了。
@@ -445,14 +499,15 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		}
 		finished := attemptCtx.finish(f.health, resp.StatusCode, outcome, result, errorKind, errorSource, "")
 		attempts = append(attempts, finished)
-		return resultFromAttempt(finished, attempts)
+		return withRouting(resultFromAttempt(finished, attempts))
 	}
 
 	// 循环结束后统一生成网关错误，并保留最后一次尝试的审计信息。
 	if len(tried) == 0 {
 		http.Error(w, "no upstream available", http.StatusServiceUnavailable)
 		return Result{Status: http.StatusServiceUnavailable, Outcome: OutcomeUnavailable,
-			ErrorKind: "no_upstream", ErrorSource: "gateway", Error: "no upstream available", Attempts: attempts}
+			ErrorKind: "no_upstream", ErrorSource: "gateway", Error: "no upstream available", Attempts: attempts,
+			RouteFeatures: features, RouteDecision: routeDecision}
 	}
 	if lastErr != nil {
 		// 只回笼统信息：上游原文可能含渠道地址等内部细节，完整错误留在审计里。
@@ -463,14 +518,26 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			result.Status = http.StatusBadGateway
 			result.Outcome = OutcomeFailed
 			result.Error = clipErr(lastErr.Error())
+			result.RouteFeatures = features
+			result.RouteDecision = routeDecision
 			return result
 		}
 		return Result{Status: http.StatusBadGateway, Outcome: OutcomeFailed,
-			ErrorKind: "upstream_error", ErrorSource: "upstream", Error: clipErr(lastErr.Error()), Attempts: attempts}
+			ErrorKind: "upstream_error", ErrorSource: "upstream", Error: clipErr(lastErr.Error()), Attempts: attempts,
+			RouteFeatures: features, RouteDecision: routeDecision}
 	}
 	http.Error(w, "all upstreams failed", http.StatusBadGateway)
 	return Result{Status: http.StatusBadGateway, Outcome: OutcomeFailed,
-		ErrorKind: "upstream_error", ErrorSource: "upstream", Error: "all upstreams failed", Attempts: attempts}
+		ErrorKind: "upstream_error", ErrorSource: "upstream", Error: "all upstreams failed", Attempts: attempts,
+		RouteFeatures: features, RouteDecision: routeDecision}
+}
+
+func hashUpstreamKey(value string) string {
+	if value == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }
 
 func (f *Forwarder) reportFailure(id int64, model string, latencyMs int64, cause error) {
@@ -518,22 +585,6 @@ func clipUTF8(value string, maxBytes int) string {
 
 func readLimitedBody(reader io.Reader, limit int64) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(reader, limit))
-}
-
-func parseModel(body []byte) string {
-	var payload struct {
-		Model string `json:"model"`
-	}
-	_ = json.Unmarshal(body, &payload)
-	return payload.Model
-}
-
-func parseStream(body []byte) bool {
-	var payload struct {
-		Stream bool `json:"stream"`
-	}
-	_ = json.Unmarshal(body, &payload)
-	return payload.Stream
 }
 
 var errEmptyResponse = errors.New("upstream returned an empty response")

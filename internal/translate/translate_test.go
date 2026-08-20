@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -14,12 +15,34 @@ func TestSourceFromPath(t *testing.T) {
 		"/v1/chat/completions": OpenAI,
 		"/v1/responses":        OpenAIResponses,
 		"/v1/messages":         Claude,
+		"/v1beta/models/gemini-2.5-flash:generateContent":       Gemini,
+		"/v1beta/models/gemini-2.5-flash:streamGenerateContent": Gemini,
 	}
 	for path, want := range tests {
 		got, ok := SourceFromPath(path)
 		if !ok || got != want {
 			t.Fatalf("SourceFromPath(%q) = %q, %v; want %q, true", path, got, ok, want)
 		}
+	}
+}
+
+func TestGeminiRequestPathHelpers(t *testing.T) {
+	model, stream, ok := GeminiRequest("/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=secret")
+	if !ok || model != "gemini-2.5-flash" || !stream {
+		t.Fatalf("GeminiRequest() = %q, %v, %v", model, stream, ok)
+	}
+	if got := RequestModel("/v1beta/models/gemini-2.5-flash:generateContent", []byte(`{"model":"wrong"}`)); got != "gemini-2.5-flash" {
+		t.Fatalf("RequestModel() = %q", got)
+	}
+	if !RequestStream("/v1beta/models/gemini-2.5-flash:streamGenerateContent", nil) {
+		t.Fatal("RequestStream() should read native Gemini URL")
+	}
+	if got, err := TargetPathForRequest(Gemini, "/v1/responses", "gemini-2.5-flash", true); err != nil || got != "/v1beta/models/gemini-2.5-flash:streamGenerateContent" {
+		t.Fatalf("TargetPathForRequest() = %q, %v", got, err)
+	}
+	query := TargetQuery(Gemini, Gemini, url.Values{"key": {"secret"}, "alt": {"sse"}, "trace": {"1"}}, true)
+	if strings.Contains(query, "secret") || !strings.Contains(query, "alt=sse") || !strings.Contains(query, "trace=1") {
+		t.Fatalf("TargetQuery() = %q", query)
 	}
 }
 
@@ -64,6 +87,35 @@ func TestNewExchangeTranslatesResponsesRequestToClaude(t *testing.T) {
 	}
 	if !exchange.UpstreamStream {
 		t.Fatal("translated Claude non-stream response should be aggregated from upstream SSE")
+	}
+}
+
+func TestNewExchangeTranslatesGeminiRequestToOpenAI(t *testing.T) {
+	original := []byte(`{"contents":[{"role":"user","parts":[{"text":"hello"}]}],"generationConfig":{"maxOutputTokens":16}}`)
+	exchange, err := NewExchange(Gemini, OpenAI, "gemini-test", true, original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(exchange.UpstreamRequest), `"messages"`) || !strings.Contains(string(exchange.UpstreamRequest), "hello") {
+		t.Fatalf("Gemini request was not translated to OpenAI: %s", exchange.UpstreamRequest)
+	}
+	if !exchange.UpstreamStream {
+		t.Fatal("streaming Gemini request should stay streaming upstream")
+	}
+}
+
+func TestExchangeTranslatesOpenAIStreamBackToGemini(t *testing.T) {
+	original := []byte(`{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`)
+	exchange, err := NewExchange(Gemini, OpenAI, "gemini-test", true, original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputs, err := exchange.TranslateStream(context.Background(), []byte(`data: {"choices":[{"delta":{"content":"hello"}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outputs) != 1 || !strings.HasPrefix(string(outputs[0]), "data: ") || !strings.Contains(string(outputs[0]), "hello") {
+		t.Fatalf("Gemini response framing = %q", outputs)
 	}
 }
 

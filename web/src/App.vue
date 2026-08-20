@@ -185,16 +185,25 @@ const protocolOptions = [
   { value: 'openai-response', label: 'OpenAI Responses' },
   { value: 'claude', label: 'Anthropic Messages' },
   { value: 'codex', label: 'Codex Responses' },
+  { value: 'gemini', label: 'Google Gemini' },
 ]
 const protocolLabels = Object.fromEntries(protocolOptions.map(option => [option.value, option.label]))
 function protocolLabel(protocol) { return protocolLabels[protocol || 'passthrough'] || protocol }
 const billingTypeOptions = [
   { value: 'none', label: '不采集' },
+  { value: 'auto', label: '自动探测' },
   { value: 'sub2api', label: 'Sub2API' },
   { value: 'newapi', label: 'New API' },
 ]
 const billingTypeLabels = Object.fromEntries(billingTypeOptions.map(option => [option.value, option.label]))
 function billingTypeLabel(value) { return billingTypeLabels[value || 'none'] || value }
+const cacheModeOptions = [
+  { value: 'auto', label: '自动学习' },
+  { value: 'enabled', label: '支持缓存' },
+  { value: 'disabled', label: '不使用缓存' },
+]
+const cacheModeLabels = Object.fromEntries(cacheModeOptions.map(option => [option.value, option.label]))
+function cacheModeLabel(value) { return cacheModeLabels[value || 'auto'] || value }
 function billingAmount(item) {
   const state = item.billing
   if (state?.unlimited) return '无限额度'
@@ -344,7 +353,7 @@ function billingDetailRows(item) {
   return rows
 }
 function billingMeta(item) {
-  return [billingTypeLabel(item.billing_type), item.billing?.billing_group, billingStatusText(item)].filter(Boolean).join(' · ')
+  return [billingTypeLabel(item.billing_type), cacheModeLabel(item.cache_mode), item.billing?.billing_group, billingStatusText(item)].filter(Boolean).join(' · ')
 }
 function billingTitle(item) {
   return [billingMeta(item), item.billing?.error, item.billing?.refreshed_at ? `更新于 ${sinceText(item.billing.refreshed_at)}` : '尚未采集'].filter(Boolean).join('\n')
@@ -384,12 +393,12 @@ const upstreamFormAvailableTags = computed(() => {
 function newUpstream() {
   upstreamFormTagSearch.value = ''
   dlg.type = 'upstream'
-  dlg.form = { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', billing_type: 'none', credit_ratio: 1, enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] }
+  dlg.form = { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', billing_type: 'none', cache_mode: 'auto', credit_ratio: 1, enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] }
 }
 function editUpstream(u) {
   upstreamFormTagSearch.value = ''
   dlg.type = 'upstream'
-  dlg.form = { ...u, protocol: u.protocol || 'passthrough', billing_type: u.billing_type || 'none', credit_ratio: u.credit_ratio || 1, api_key: '', primary_tag_id: u.primary_tag_id || 0, tag_ids: [...(u.tag_ids || [])] }
+  dlg.form = { ...u, protocol: u.protocol || 'passthrough', billing_type: u.billing_type || 'none', cache_mode: u.cache_mode || 'auto', credit_ratio: u.credit_ratio || 1, api_key: '', primary_tag_id: u.primary_tag_id || 0, tag_ids: [...(u.tag_ids || [])] }
 }
 function saveUpstream() {
   guard(async () => {
@@ -784,6 +793,7 @@ const groupTestProtocolOptions = [
   { value: 'responses', label: 'OpenAI Responses' },
   { value: 'chat', label: 'Chat Completions' },
   { value: 'claude', label: 'Anthropic Messages' },
+  { value: 'gemini', label: 'Gemini GenerateContent' },
 ]
 const groupTestModelOptions = computed(() => {
   if (groupTestState.modelsLoading) return [{ value: '', label: '加载模型中…', disabled: true }]
@@ -1773,9 +1783,9 @@ function logout() {
 
             <div class="settings-body">
               <section id="set-logs" v-show="settingsSection === 'logs'" class="card settings-card">
-                <div class="settings-title"><h3>日志清理</h3><p>按完成时间保留请求记录，过期记录与尝试链自动删除。</p></div>
+                <div class="settings-title"><h3>日志清理</h3><p>按完成时间保留请求记录；设为 0 可永久保留完整路由与计费历史。</p></div>
                 <div class="settings-fields">
-                  <div class="field"><label>保留天数</label><input v-model="logRetention" type="number" min="1" max="365" placeholder="7" /></div>
+                  <div class="field"><label>保留天数（0=永久）</label><input v-model="logRetention" type="number" min="0" max="365" placeholder="0" /></div>
                 </div>
                 <div class="settings-info">
                   <div><span>请求记录</span><b>{{ effectiveLogRetention ? effectiveLogRetention + ' 天' : '—' }}</b><em>{{ sourceText(logRetentionSource) }}</em></div>
@@ -1831,8 +1841,9 @@ function logout() {
                   <div><span>OpenAI</span><code>{{ apiBase }}/v1/chat/completions</code></div>
                   <div><span>Responses</span><code>{{ apiBase }}/v1/responses</code></div>
                   <div><span>Claude</span><code>{{ apiBase }}/v1/messages</code></div>
+                  <div><span>Gemini</span><code>{{ apiBase }}/v1beta/models/&lt;model&gt;:generateContent</code></div>
                 </div>
-                <p class="hint">请求头：<code>Authorization: Bearer &lt;密钥&gt;</code></p>
+                <p class="hint">请求头：<code>Authorization: Bearer &lt;密钥&gt;</code>；Gemini SDK 也可使用 <code>x-goog-api-key</code>。</p>
               </section>
 
               <!-- 数据备份 -->
@@ -2161,6 +2172,7 @@ function logout() {
           <div class="field"><label>base_url</label><input v-model="dlg.form.base_url" placeholder="https://..." /></div>
           <div class="field"><label>协议</label><FancySelect v-model="dlg.form.protocol" :options="protocolOptions" /></div>
           <div class="field"><label>计费平台</label><FancySelect v-model="dlg.form.billing_type" :options="billingTypeOptions" /></div>
+          <div class="field"><label>缓存策略</label><FancySelect v-model="dlg.form.cache_mode" :options="cacheModeOptions" /></div>
           <div class="field"><label>储值倍率</label><input v-model="dlg.form.credit_ratio" type="number" step="any" min="0" placeholder="充1得N积分时填 N；默认 1" /></div>
           <div class="field"><label>api_key</label><input v-model="dlg.form.api_key" :placeholder="dlg.form.id ? '留空则不修改' : 'sk-...'" /></div>
           <div class="field"><label>代理</label><input v-model="dlg.form.proxy" placeholder="留空=直连/环境变量；如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></div>
@@ -2211,7 +2223,7 @@ function logout() {
             <div class="field"><label>探测间隔(秒)</label><input v-model="dlg.form.interval_sec" type="number" min="0" placeholder="留空/0 用默认 5 分钟" /></div>
             <div class="field"><label>max_tokens</label><input v-model="dlg.form.max_tokens" type="number" min="0" placeholder="留空/0 用默认 1" /></div>
           </div>
-          <div class="field"><label>探测路径</label><input v-model="dlg.form.path" placeholder="留空用默认 /v1/chat/completions，Claude 填 /v1/messages" /></div>
+          <div class="field"><label>探测路径</label><input v-model="dlg.form.path" placeholder="留空用默认 /v1/chat/completions；Gemini 填 /v1beta/models/{model}:generateContent" /></div>
           <div class="field"><label>探测消息</label><input v-model="dlg.form.probe_text" placeholder="留空用默认「hi」" /></div>
           <label class="check"><input type="checkbox" v-model="dlg.form.stream" /> 流式探测（请求体加 stream:true）</label>
           <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>
@@ -2239,7 +2251,7 @@ function logout() {
               <div class="field"><label>探测间隔(秒)</label><input v-model="dlg.form.interval_sec" type="number" min="0" placeholder="留空/0 用默认 5 分钟" /></div>
               <div class="field"><label>max_tokens</label><input v-model="dlg.form.max_tokens" type="number" min="0" placeholder="留空/0 用默认 1" /></div>
             </div>
-            <div class="field"><label>探测路径</label><input v-model="dlg.form.path" placeholder="留空用默认 /v1/chat/completions，Claude 填 /v1/messages" /></div>
+            <div class="field"><label>探测路径</label><input v-model="dlg.form.path" placeholder="留空用默认 /v1/chat/completions；Gemini 填 /v1beta/models/{model}:generateContent" /></div>
             <div class="field"><label>探测消息</label><input v-model="dlg.form.probe_text" placeholder="留空用默认「hi」" /></div>
             <label class="check"><input type="checkbox" v-model="dlg.form.stream" /> 流式探测（请求体加 stream:true）</label>
             <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>

@@ -246,6 +246,7 @@ func openSQLite(path string) (*Store, error) {
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN proxy TEXT NOT NULL DEFAULT ''`)
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN protocol TEXT NOT NULL DEFAULT 'passthrough'`)
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN billing_type TEXT NOT NULL DEFAULT 'none'`)
+	db.Exec(`ALTER TABLE upstreams ADD COLUMN cache_mode TEXT NOT NULL DEFAULT 'auto'`)
 	db.Exec(`ALTER TABLE upstreams ADD COLUMN source TEXT NOT NULL DEFAULT ''`)
 	db.Exec(`INSERT OR IGNORE INTO tags(name,color,sort_order)
 		SELECT DISTINCT TRIM(source),'gray',0 FROM upstreams WHERE TRIM(source)<>''`)
@@ -261,14 +262,20 @@ func openSQLite(path string) (*Store, error) {
 	db.Exec(`ALTER TABLE groups ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`)
 	db.Exec(`ALTER TABLE groups ADD COLUMN max_multiplier REAL`)
 	// Intelligent routing keeps request, billing, and probe history permanently
-	// by default. Upgrade existing installations to the explicit zero setting;
-	// operators can later opt into a positive manual retention window.
-	db.Exec(`INSERT INTO settings(key,value) VALUES('request_retention_days','0')
-		ON CONFLICT(key) DO UPDATE SET value='0'`)
-	db.Exec(`INSERT INTO settings(key,value) VALUES('billing_snapshot_retention_days','0')
-		ON CONFLICT(key) DO UPDATE SET value='0'`)
-	db.Exec(`INSERT INTO settings(key,value) VALUES('probe_retention_hours','0')
-		ON CONFLICT(key) DO UPDATE SET value='0'`)
+	// by default. Apply that upgrade once; a later administrator-selected
+	// positive retention window must survive process restarts.
+	var retentionMigration string
+	_ = db.QueryRow(`SELECT value FROM settings WHERE key=?`, "intelligent_routing_retention_migrated").Scan(&retentionMigration)
+	if retentionMigration != "1" {
+		db.Exec(`INSERT INTO settings(key,value) VALUES('request_retention_days','0')
+			ON CONFLICT(key) DO UPDATE SET value='0'`)
+		db.Exec(`INSERT INTO settings(key,value) VALUES('billing_snapshot_retention_days','0')
+			ON CONFLICT(key) DO UPDATE SET value='0'`)
+		db.Exec(`INSERT INTO settings(key,value) VALUES('probe_retention_hours','0')
+			ON CONFLICT(key) DO UPDATE SET value='0'`)
+		db.Exec(`INSERT INTO settings(key,value) VALUES('intelligent_routing_retention_migrated','1')
+			ON CONFLICT(key) DO UPDATE SET value='1'`)
+	}
 	// 迁移：旧库 group_upstreams 补 enabled 列（组内成员开关，默认启用）
 	db.Exec(`ALTER TABLE group_upstreams ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`)
 	// 迁移：旧库 monitors 补可配探测列（空/0 表示沿用全局默认）
@@ -342,6 +349,7 @@ CREATE TABLE IF NOT EXISTS upstreams (
 	proxy    TEXT NOT NULL DEFAULT '',
 	protocol TEXT NOT NULL DEFAULT 'passthrough',
 	billing_type TEXT NOT NULL DEFAULT 'none',
+	cache_mode TEXT NOT NULL DEFAULT 'auto',
 	enabled  INTEGER NOT NULL DEFAULT 1,
 	channel_probe INTEGER NOT NULL DEFAULT 1,
 	sort_order INTEGER NOT NULL DEFAULT 0,

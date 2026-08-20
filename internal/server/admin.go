@@ -30,9 +30,11 @@ func (s *Server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/logs/cache-stats", s.auth(s.adminLogCacheStats)) // GET 按渠道汇总缓存命中率
 	mux.HandleFunc("/admin/logs/options", s.auth(s.adminLogOptions))        // GET 筛选下拉选项(全量去重)
 	mux.HandleFunc("/admin/logs/", s.auth(s.adminLogItem))                  // GET 单条请求完整尝试链
-	mux.HandleFunc("/admin/settings", s.auth(s.adminSettings))              // GET/PUT 运行时设置
-	mux.HandleFunc("/admin/backup", s.auth(s.adminBackup))                  // GET 列表 / POST 触发
-	mux.HandleFunc("/admin/backup/", s.auth(s.adminBackup))                 // config / schedule / records/{id}
+	mux.HandleFunc("/admin/routing/decisions", s.auth(s.adminRouteDecisions))
+	mux.HandleFunc("/admin/routing/decisions/", s.auth(s.adminRouteDecisionItem))
+	mux.HandleFunc("/admin/settings", s.auth(s.adminSettings)) // GET/PUT 运行时设置
+	mux.HandleFunc("/admin/backup", s.auth(s.adminBackup))     // GET 列表 / POST 触发
+	mux.HandleFunc("/admin/backup/", s.auth(s.adminBackup))    // config / schedule / records/{id}
 }
 
 // adminLogs 返回调用日志，兼容游标和偏移量分页。
@@ -121,6 +123,59 @@ func (s *Server) adminLogOptions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, opt)
 }
 
+func (s *Server) adminRouteDecisions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	items, err := s.store.ListRouteDecisions(parseRouteDecisionFilter(r.URL.Query()))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"items": items})
+}
+
+func (s *Server) adminRouteDecisionItem(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	value := strings.Trim(strings.TrimPrefix(r.URL.Path, "/admin/routing/decisions/"), "/")
+	id, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || id <= 0 {
+		http.Error(w, "invalid route decision id", http.StatusBadRequest)
+		return
+	}
+	entry, err := s.store.GetRouteDecision(id)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "route decision not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, entry)
+}
+
+func parseRouteDecisionFilter(q url.Values) store.RouteDecisionFilter {
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	before, _ := strconv.ParseInt(q.Get("before"), 10, 64)
+	groupID, _ := strconv.ParseInt(q.Get("group_id"), 10, 64)
+	selected, _ := strconv.ParseInt(q.Get("selected_upstream_id"), 10, 64)
+	filter := store.RouteDecisionFilter{Limit: limit, BeforeID: before, GroupID: groupID,
+		SelectedUpstreamID: selected, Model: q.Get("model"), SessionKey: q.Get("session_key"),
+		PrefixHash: q.Get("prefix_hash"), IncludeCandidates: q.Get("include_candidates") == "true"}
+	if value, _ := strconv.ParseInt(q.Get("since"), 10, 64); value > 0 {
+		filter.Since = time.Unix(value, 0)
+	}
+	if value, _ := strconv.ParseInt(q.Get("until"), 10, 64); value > 0 {
+		filter.Until = time.Unix(value, 0)
+	}
+	return filter
+}
+
 func settingString(v any) string {
 	switch x := v.(type) {
 	case string:
@@ -148,6 +203,13 @@ func stringSettingValue(dbValue, def string) (string, string) {
 
 func intSettingValue(dbValue string, def int) (string, string) {
 	if n, err := strconv.Atoi(dbValue); err == nil && n > 0 {
+		return dbValue, "settings"
+	}
+	return strconv.Itoa(def), "default"
+}
+
+func intSettingValueAllowZero(dbValue string, def int) (string, string) {
+	if n, err := strconv.Atoi(dbValue); err == nil && n >= 0 {
 		return dbValue, "settings"
 	}
 	return strconv.Itoa(def), "default"

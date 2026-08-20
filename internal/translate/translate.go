@@ -2,11 +2,13 @@
 package translate
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -22,6 +24,7 @@ const (
 	OpenAIResponses Format = "openai-response"
 	Claude          Format = "claude"
 	Codex           Format = "codex"
+	Gemini          Format = "gemini"
 )
 
 // ErrUnsupported 表示当前源协议与目标协议之间没有完整的双向转换链。
@@ -34,7 +37,7 @@ func NormalizeFormat(value string) (Format, bool) {
 		format = Passthrough
 	}
 	switch format {
-	case Passthrough, OpenAI, OpenAIResponses, Claude, Codex:
+	case Passthrough, OpenAI, OpenAIResponses, Claude, Codex, Gemini:
 		return format, true
 	default:
 		return "", false
@@ -43,7 +46,14 @@ func NormalizeFormat(value string) (Format, bool) {
 
 // SourceFromPath 根据客户端入口路径识别请求协议。
 func SourceFromPath(path string) (Format, bool) {
-	switch strings.TrimSuffix(strings.TrimSpace(path), "/") {
+	path = strings.TrimSpace(path)
+	if index := strings.IndexByte(path, '?'); index >= 0 {
+		path = path[:index]
+	}
+	if _, _, ok := GeminiRequest(path); ok {
+		return Gemini, true
+	}
+	switch strings.TrimSuffix(path, "/") {
 	case "/v1/chat/completions":
 		return OpenAI, true
 	case "/v1/responses":
@@ -53,6 +63,69 @@ func SourceFromPath(path string) (Format, bool) {
 	default:
 		return "", false
 	}
+}
+
+// GeminiRequest extracts the model and streaming mode from native Gemini
+// generateContent endpoints. Gemini carries both values in the URL rather
+// than the JSON request body.
+func GeminiRequest(path string) (model string, stream bool, ok bool) {
+	path = strings.TrimSpace(path)
+	if index := strings.IndexByte(path, '?'); index >= 0 {
+		path = path[:index]
+	}
+	var rest string
+	for _, prefix := range []string{"/v1beta/models/", "/v1/models/", "/v1alpha/models/"} {
+		if strings.HasPrefix(path, prefix) {
+			rest = strings.TrimPrefix(path, prefix)
+			break
+		}
+	}
+	if rest == "" {
+		return "", false, false
+	}
+	actionIndex := strings.LastIndexByte(rest, ':')
+	if actionIndex <= 0 || actionIndex == len(rest)-1 {
+		return "", false, false
+	}
+	action := rest[actionIndex+1:]
+	switch action {
+	case "generateContent":
+		stream = false
+	case "streamGenerateContent":
+		stream = true
+	default:
+		return "", false, false
+	}
+	decoded, err := url.PathUnescape(rest[:actionIndex])
+	if err != nil || strings.TrimSpace(decoded) == "" {
+		return "", false, false
+	}
+	return decoded, stream, true
+}
+
+// RequestModel returns the model selected by the client. Native Gemini paths
+// are authoritative; every other protocol keeps the body-level model field.
+func RequestModel(path string, body []byte) string {
+	if model, _, ok := GeminiRequest(path); ok {
+		return model
+	}
+	var payload struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &payload)
+	return payload.Model
+}
+
+// RequestStream returns whether the client requested a streaming response.
+func RequestStream(path string, body []byte) bool {
+	if _, stream, ok := GeminiRequest(path); ok {
+		return stream
+	}
+	var payload struct {
+		Stream bool `json:"stream"`
+	}
+	_ = json.Unmarshal(body, &payload)
+	return payload.Stream
 }
 
 // SourceFromRequest distinguishes native Codex clients from generic Responses
@@ -80,6 +153,12 @@ func SourceFromRequest(path string, header http.Header) (Format, bool) {
 
 // TargetPath 返回目标协议的标准端点；透传模式保留原路径。
 func TargetPath(format Format, originalPath string) (string, error) {
+	return TargetPathForRequest(format, originalPath, "", false)
+}
+
+// TargetPathForRequest returns the endpoint for one translated request. A
+// native Gemini target needs the selected model and streaming mode in its URL.
+func TargetPathForRequest(format Format, originalPath, model string, stream bool) (string, error) {
 	switch format {
 	case Passthrough:
 		return originalPath, nil
@@ -89,9 +168,46 @@ func TargetPath(format Format, originalPath string) (string, error) {
 		return "/v1/responses", nil
 	case Claude:
 		return "/v1/messages", nil
+	case Gemini:
+		if _, _, ok := GeminiRequest(originalPath); ok {
+			return originalPath, nil
+		}
+		model = strings.TrimSpace(model)
+		if model == "" {
+			return "", fmt.Errorf("%w: Gemini target requires a model", ErrUnsupported)
+		}
+		action := "generateContent"
+		if stream {
+			action = "streamGenerateContent"
+		}
+		return "/v1beta/models/" + url.PathEscape(model) + ":" + action, nil
 	default:
 		return "", fmt.Errorf("%w: target format %q", ErrUnsupported, format)
 	}
+}
+
+// TargetQuery removes native Gemini client credentials before forwarding and
+// requests SSE explicitly when the selected Gemini upstream is streaming.
+func TargetQuery(source, target Format, original url.Values, stream bool) string {
+	values := make(url.Values, len(original)+1)
+	for key, items := range original {
+		values[key] = append([]string(nil), items...)
+	}
+	if source == Gemini {
+		values.Del("key")
+		if target != Passthrough {
+			values.Del("alt")
+		}
+	}
+	if target == Gemini {
+		values.Del("key")
+		if stream {
+			values.Set("alt", "sse")
+		} else {
+			values.Del("alt")
+		}
+	}
+	return values.Encode()
 }
 
 // ConfigureRequestHeaders removes source-protocol headers after translation
@@ -114,6 +230,9 @@ func ConfigureRequestHeaders(header http.Header, target Format, translated bool)
 	}
 	header.Del("anthropic-version")
 	header.Del("anthropic-beta")
+	if target == Gemini {
+		header.Del("OpenAI-Beta")
+	}
 }
 
 // ErrorResponse converts an upstream error envelope to the client's protocol.
@@ -138,6 +257,18 @@ func ErrorResponse(source Format, status int, body []byte) []byte {
 				"message": details.Message,
 			},
 		}
+	} else if source == Gemini {
+		code := details.Code
+		if code == nil {
+			code = status
+		}
+		response = map[string]any{
+			"error": map[string]any{
+				"code":    code,
+				"message": details.Message,
+				"status":  geminiErrorStatus(status),
+			},
+		}
 	} else {
 		response = map[string]any{
 			"error": map[string]any{
@@ -153,6 +284,27 @@ func ErrorResponse(source Format, status int, body []byte) []byte {
 		return append([]byte(nil), body...)
 	}
 	return encoded
+}
+
+func geminiErrorStatus(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "INVALID_ARGUMENT"
+	case http.StatusUnauthorized:
+		return "UNAUTHENTICATED"
+	case http.StatusForbidden:
+		return "PERMISSION_DENIED"
+	case http.StatusNotFound:
+		return "NOT_FOUND"
+	case http.StatusConflict:
+		return "ALREADY_EXISTS"
+	case http.StatusTooManyRequests:
+		return "RESOURCE_EXHAUSTED"
+	case http.StatusServiceUnavailable:
+		return "UNAVAILABLE"
+	default:
+		return "INTERNAL"
+	}
 }
 
 type errorDetails struct {
@@ -452,6 +604,14 @@ func (e *Exchange) TranslateStream(ctx context.Context, line []byte) (outputs []
 	}
 	from, to := e.sdkFormats()
 	outputs = e.registry.TranslateStream(ctx, to, from, e.Model, e.OriginalRequest, e.UpstreamRequest, line, &e.state)
+	if e.Source == Gemini {
+		for index, output := range outputs {
+			trimmed := bytes.TrimSpace(output)
+			if json.Valid(trimmed) {
+				outputs[index] = append([]byte("data: "), trimmed...)
+			}
+		}
+	}
 	return outputs, nil
 }
 

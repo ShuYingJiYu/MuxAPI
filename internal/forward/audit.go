@@ -168,7 +168,28 @@ func (a *responseAudit) consumeSSEBlock(block []byte) {
 			a.streamErrored = true
 		}
 	}
+	if geminiResponseComplete(payload) {
+		a.lastEvent = "generateContent.completed"
+		a.streamCompleted = true
+	}
 	a.usage.merge(usageFromValue(payload))
+}
+
+func geminiResponseComplete(payload map[string]any) bool {
+	candidates, ok := payload["candidates"].([]any)
+	if !ok {
+		return false
+	}
+	for _, candidate := range candidates {
+		object, ok := candidate.(map[string]any)
+		if !ok {
+			continue
+		}
+		if reason, _ := object["finishReason"].(string); strings.TrimSpace(reason) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // isStreamErrorEvent 识别各协议在 2xx 流中投递失败的终止事件：
@@ -217,6 +238,7 @@ func usageFromValue(value any) tokenUsage {
 		}
 	}
 	mergeUsageObject(root["usage"])
+	mergeUsageObject(root["usageMetadata"])
 	for _, key := range []string{"response", "message"} {
 		if nested, ok := root[key].(map[string]any); ok {
 			mergeUsageObject(nested["usage"])
@@ -227,9 +249,9 @@ func usageFromValue(value any) tokenUsage {
 
 // parseUsageObject 将 OpenAI 与 Claude 的字段名归一为统一计数。
 func parseUsageObject(usage map[string]any) tokenUsage {
-	input := maxInt64(number(usage["input_tokens"]), number(usage["prompt_tokens"]))
-	output := maxInt64(number(usage["output_tokens"]), number(usage["completion_tokens"]))
-	cached := maxInt64(number(usage["cached_tokens"]), number(usage["cache_read_input_tokens"]))
+	input := maxInt64(maxInt64(number(usage["input_tokens"]), number(usage["prompt_tokens"])), number(usage["promptTokenCount"]))
+	output := maxInt64(maxInt64(maxInt64(number(usage["output_tokens"]), number(usage["completion_tokens"])), number(usage["candidatesTokenCount"])), number(usage["thoughtsTokenCount"]))
+	cached := maxInt64(maxInt64(number(usage["cached_tokens"]), number(usage["cache_read_input_tokens"])), number(usage["cachedContentTokenCount"]))
 	cacheCreation := maxInt64(number(usage["cache_creation_tokens"]), number(usage["cache_creation_input_tokens"]))
 	for _, key := range []string{"input_tokens_details", "prompt_tokens_details"} {
 		if details, ok := usage[key].(map[string]any); ok {

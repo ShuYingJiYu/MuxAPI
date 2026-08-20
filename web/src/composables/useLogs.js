@@ -269,7 +269,16 @@ export function useLogs({ page, guard }) {
   // 状态展示文案：0=网络失败，否则状态码
   const statusText = s => s === 0 ? '网络失败' : s === 499 ? '客户端取消' : String(s)
   // 端点路径简化展示：去掉 /v1/ 前缀，空则 —
-  const fmtEndpoint = p => !p ? '—' : p.replace(/^\/v1\//, '')
+  const fmtEndpoint = p => {
+    if (!p) return '—'
+    const gemini = p.match(/^\/v1(?:alpha|beta)?\/models\/([^:]+):(streamGenerateContent|generateContent)$/)
+    if (gemini) {
+      let model = gemini[1]
+      try { model = decodeURIComponent(model) } catch {}
+      return `gemini/${model}${gemini[2] === 'streamGenerateContent' ? ' · stream' : ''}`
+    }
+    return p.replace(/^\/v1\//, '')
+  }
   return {
     logs, logPageSize, logCurrentPage, logLoading, logDetail, logDetailLoading, logStats,
     logCacheStats, logCacheExpanded, logCacheSummary,
