@@ -66,3 +66,16 @@ func TestSPAFileServerKeepsAssetResponses(t *testing.T) {
 		t.Fatalf("missing asset status = %d", missing.Code)
 	}
 }
+
+func TestHandlerDoesNotServeSPAForUnknownBackendRoutes(t *testing.T) {
+	handler := New(nil, "", nil, nil, nil, nil, 0).Handler()
+	for _, route := range []string{"/v1/unknown", "/admin/unknown", "/unknown"} {
+		t.Run(route, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, route, nil))
+			if response.Code != http.StatusNotFound {
+				t.Fatalf("GET %s status = %d, want %d", route, response.Code, http.StatusNotFound)
+			}
+		})
+	}
+}

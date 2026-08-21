@@ -125,11 +125,27 @@ func spaFileServer(root fs.FS) http.Handler {
 			http.NotFound(w, r)
 			return
 		}
+		if !isSPAHistoryRoute(name) {
+			http.NotFound(w, r)
+			return
+		}
 
 		indexRequest := r.Clone(r.Context())
 		indexRequest.URL.Path = "/"
 		files.ServeHTTP(w, indexRequest)
 	})
+}
+
+// isSPAHistoryRoute lists the admin pages that Vue Router can render directly.
+// Backend prefixes must never reach the HTML fallback, otherwise an unknown API
+// request would incorrectly receive a successful index.html response.
+func isSPAHistoryRoute(name string) bool {
+	switch name {
+	case "overview", "groups", "upstreams", "monitors", "logs", "settings":
+		return true
+	default:
+		return false
+	}
 }
 
 // auth 后台管理鉴权（adminToken）。AdminToken 为空时跳过（仅本地调试）。
