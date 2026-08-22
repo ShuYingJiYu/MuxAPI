@@ -177,6 +177,7 @@ func main() {
 	srv.SetBillingManager(billingMgr)
 	srv.SetBackupService(backupSvc)
 	srv.SetModelMappingService(modelMapper)
+	modelMapper.SetModelLister(srv)
 
 	// 收到 SIGINT/SIGTERM 时取消：停探测并触发优雅关闭
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

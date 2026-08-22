@@ -32,11 +32,18 @@ type cacheEntry struct {
 	expires time.Time
 }
 
+// ModelLister returns the known model list for a specific upstream.
+// Used during auto-learning to find date-suffixed variants.
+type ModelLister interface {
+	UpstreamModels(upstreamID int64) []string
+}
+
 // Service manages model name resolution with in-memory caching.
 type Service struct {
-	store *store.Store
-	mu    sync.RWMutex
-	cache map[cacheKey]cacheEntry
+	store  *store.Store
+	lister ModelLister
+	mu     sync.RWMutex
+	cache  map[cacheKey]cacheEntry
 }
 
 type cacheKey struct {
@@ -50,6 +57,11 @@ func New(st *store.Store) *Service {
 		store: st,
 		cache: make(map[cacheKey]cacheEntry),
 	}
+}
+
+// SetModelLister installs the upstream model list provider for auto-learning.
+func (s *Service) SetModelLister(lister ModelLister) {
+	s.lister = lister
 }
 
 // Resolve returns the effective model name for a specific upstream.
@@ -103,6 +115,9 @@ func (s *Service) RecordFailure(upstreamID int64, model string) {
 
 	if count >= autoLearnThreshold {
 		fallback := deriveFallback(model)
+		if fallback == "" && s.lister != nil {
+			fallback = findPrefixMatch(model, s.lister.UpstreamModels(upstreamID))
+		}
 		if fallback != "" && fallback != model {
 			expires := time.Now().Add(autoLearnTTL)
 			s.store.UpsertModelMapping(&store.ModelMapping{
@@ -180,6 +195,25 @@ func deriveFallback(model string) string {
 
 	// No derivable fallback
 	return ""
+}
+
+// findPrefixMatch finds a model in the upstream's list that starts with the
+// requested model name followed by a separator. For example, requesting
+// "claude-haiku-4-5" matches "claude-haiku-4-5-20251001" from the list.
+// Prefers the shortest match (most specific) when multiple candidates exist.
+func findPrefixMatch(model string, available []string) string {
+	var best string
+	for _, candidate := range available {
+		if candidate == model {
+			continue
+		}
+		if strings.HasPrefix(candidate, model+"-") {
+			if best == "" || len(candidate) < len(best) {
+				best = candidate
+			}
+		}
+	}
+	return best
 }
 
 func isAllDigits(s string) bool {
