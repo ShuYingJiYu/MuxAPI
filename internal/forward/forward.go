@@ -1089,7 +1089,10 @@ func injectClaudeCacheControl(body []byte, ttl time.Duration) []byte {
 		return body
 	}
 
-	ttlSeconds := int(ttl / time.Second)
+	// Anthropic cache_control only accepts {"type": "ephemeral"}.
+	// The TTL is controlled by the provider (5min default, 1h with beta header),
+	// not by a field in cache_control.
+	cacheControl := map[string]any{"type": "ephemeral"}
 
 	// Try system field first (can be string or array of content blocks).
 	if system, ok := payload["system"]; ok {
@@ -1097,27 +1100,25 @@ func injectClaudeCacheControl(body []byte, ttl time.Duration) []byte {
 		case []any:
 			if len(s) > 0 {
 				if block, ok := s[len(s)-1].(map[string]any); ok {
-					block["cache_control"] = map[string]any{"type": "ephemeral", "ttl": ttlSeconds}
+					block["cache_control"] = cacheControl
 					payload["system"] = s
 				}
 			}
 		case string:
-			// Convert string system to array form to add cache_control.
 			payload["system"] = []any{
 				map[string]any{
 					"type":          "text",
 					"text":          s,
-					"cache_control": map[string]any{"type": "ephemeral", "ttl": ttlSeconds},
+					"cache_control": cacheControl,
 				},
 			}
 		}
 	} else {
-		// No system message; inject on the first user message's last content block.
 		if messages, ok := payload["messages"].([]any); ok && len(messages) > 0 {
 			if firstMsg, ok := messages[0].(map[string]any); ok {
 				if content, ok := firstMsg["content"].([]any); ok && len(content) > 0 {
 					if block, ok := content[len(content)-1].(map[string]any); ok {
-						block["cache_control"] = map[string]any{"type": "ephemeral", "ttl": ttlSeconds}
+						block["cache_control"] = cacheControl
 					}
 				}
 			}
