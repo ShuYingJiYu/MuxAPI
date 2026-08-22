@@ -130,7 +130,7 @@ func IsModelUnsupported(code int, model, body string) bool {
 	if model == "" {
 		return false
 	}
-	if code != http.StatusBadRequest && code != http.StatusNotFound {
+	if code != http.StatusBadRequest && code != http.StatusNotFound && code != http.StatusServiceUnavailable {
 		return false
 	}
 	lower := strings.ToLower(body)
@@ -140,6 +140,7 @@ func IsModelUnsupported(code int, model, body string) bool {
 		"model does not exist",
 		"unknown model",
 		"unsupported model",
+		"no available channel",
 		"模型不存在",
 		"不支持该模型",
 		"不支持模型",
