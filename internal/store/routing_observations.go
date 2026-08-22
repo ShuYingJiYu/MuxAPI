@@ -504,14 +504,16 @@ func (s *Store) getSessionCacheStats(apiKeyHash string, upstreamID int64, model,
 		COALESCE(SUM(CASE WHEN cache_created THEN 1 ELSE 0 END),0),
 		COALESCE(MAX(prefix_tokens),0),
 		COALESCE(MAX(CASE WHEN cache_hit THEN `+s.unixExpr("observed_at")+` ELSE 0 END),0),
-		COALESCE(MAX(CASE WHEN cache_created THEN `+s.unixExpr("observed_at")+` ELSE 0 END),0)
+		COALESCE(MAX(CASE WHEN cache_created THEN `+s.unixExpr("observed_at")+` ELSE 0 END),0),
+		COALESCE(MIN(`+s.unixExpr("observed_at")+`),0)
 		FROM routing_observations
 		WHERE api_key_hash=? AND upstream_id=? AND model=? AND session_key=?
 		AND observed_at>=? AND observed_at<?`,
 		apiKeyHash, upstreamID, model, sessionKey,
 		s.timeValue(from), s.timeValue(now)).Scan(
 		&stats.WindowObservations, &stats.WindowHitCount, &stats.WindowMissCount,
-		&stats.CreateCount, &stats.PrefixTokens, &stats.LastHitAt, &stats.LastCreatedAt)
+		&stats.CreateCount, &stats.PrefixTokens, &stats.LastHitAt, &stats.LastCreatedAt,
+		&stats.FirstSeenAt)
 	if err != nil {
 		return stats, err
 	}
@@ -528,7 +530,15 @@ func (s *Store) getSessionCacheStats(apiKeyHash string, upstreamID int64, model,
 		if stats.LastCreatedAt > latestCache {
 			latestCache = stats.LastCreatedAt
 		}
-		stats.ExpiresAt = latestCache + int64(5*time.Minute/time.Second)
+		// Use adaptive TTL for ExpiresAt: if the session has been running
+		// long enough and cache was rebuilt multiple times, assume 1h TTL
+		// was used for the latest creation (see selectCacheTTL in scheduler).
+		assumedTTL := 5 * time.Minute
+		sessionDuration := now.Unix() - stats.FirstSeenAt
+		if sessionDuration > int64((10*time.Minute)/time.Second) && stats.CreateCount >= 2 {
+			assumedTTL = time.Hour
+		}
+		stats.ExpiresAt = latestCache + int64(assumedTTL/time.Second)
 		stats.Valid = stats.ExpiresAt > now.Unix()
 	}
 	return stats, nil

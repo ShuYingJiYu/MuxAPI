@@ -319,6 +319,15 @@ export const api = {
   logDetail: (id, signal, timeoutMs = REQUEST_TIMEOUT_MS) => req('GET', '/logs/' + id, undefined, timeoutMs, signal),
   logOptions: () => req('GET', '/logs/options'),
 
+  // 路由决策
+  routeDecisions: (params) => {
+    const p = new URLSearchParams()
+    if (params) for (const [k, v] of Object.entries(params)) { if (v != null && v !== '') p.set(k, v) }
+    const qs = p.toString()
+    return req('GET', '/routing/decisions' + (qs ? '?' + qs : ''))
+  },
+  routeDecisionDetail: (id) => req('GET', `/routing/decisions/${id}`),
+
   // 数据备份
   backupConfig: () => req('GET', '/backup/config'),
   saveBackupConfig: cfg => req('PUT', '/backup/config', cfg),

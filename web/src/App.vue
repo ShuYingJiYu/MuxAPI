@@ -9,12 +9,13 @@ import FancySelect from './FancySelect.vue'
 import UpstreamPicker from './UpstreamPicker.vue'
 import Chart from './Chart.vue'
 import ThemePicker from './ThemePicker.vue'
+import RoutingView from './RoutingView.vue'
 import { api } from './api.js'
 import { useLogs } from './composables/useLogs.js'
 import { useMonitorViews } from './composables/useMonitorViews.js'
 
 const route = useRoute()
-const pageNames = new Set(['overview', 'groups', 'upstreams', 'monitors', 'logs', 'settings'])
+const pageNames = new Set(['overview', 'groups', 'upstreams', 'monitors', 'logs', 'routing', 'settings'])
 const page = computed(() => pageNames.has(String(route.name)) ? String(route.name) : 'overview')
 const detailGroup = ref(null)     // 进入分组详情时设置
 
@@ -315,6 +316,7 @@ const pages = {
   upstreams: { title: '上游池', desc: '按主标签管理全局渠道，并用普通标签快速筛选' },
   monitors: { title: '监控看板', desc: '按主标签组织模型探测卡片与运行时健康' },
   logs: { title: '请求记录', desc: '每一次转发请求的真实去向：模型 → 选中渠道 → 状态 → 延迟' },
+  routing: { title: '路由决策', desc: '实时查看路由引擎的选路逻辑与候选成本对比' },
   settings: { title: '设置', desc: '运行时配置，保存后即时生效（无需重启）' },
 }
 
@@ -2048,6 +2050,7 @@ function logout() {
         <RouterLink class="subnav-item" :class="{ active: page === 'overview' }" :to="{ name: 'overview' }" aria-label="总览" data-label="总览"><Icon name="bolt" :size="18" /><span>总览</span></RouterLink>
         <RouterLink class="subnav-item" :class="{ active: page === 'monitors' }" :to="{ name: 'monitors' }" aria-label="渠道监控" data-label="渠道监控"><Icon name="heart" :size="18" /><span>渠道监控</span></RouterLink>
         <RouterLink class="subnav-item" :class="{ active: page === 'logs' }" :to="{ name: 'logs' }" aria-label="请求记录" data-label="请求记录"><Icon name="refresh" :size="18" /><span>请求记录</span></RouterLink>
+        <RouterLink class="subnav-item" :class="{ active: page === 'routing' }" :to="{ name: 'routing' }" aria-label="路由" data-label="路由"><Icon name="link" :size="18" /><span>路由</span></RouterLink>
         <RouterLink class="subnav-item" :class="{ active: page === 'groups' }" :to="{ name: 'groups' }" aria-label="分组管理" data-label="分组管理" @click.exact="detailGroup && backToGroups()"><Icon name="cube" :size="18" /><span>分组管理</span></RouterLink>
         <RouterLink class="subnav-item" :class="{ active: page === 'upstreams' }" :to="{ name: 'upstreams' }" aria-label="上游池" data-label="上游池"><Icon name="server" :size="18" /><span>上游池</span></RouterLink>
         <RouterLink class="subnav-item" :class="{ active: page === 'settings' }" :to="{ name: 'settings' }" aria-label="系统设置" data-label="系统设置"><Icon name="cog" :size="18" /><span>系统设置</span></RouterLink>
@@ -2707,6 +2710,11 @@ function logout() {
               </button>
             </div>
           </div>
+        </template>
+
+        <!-- 路由决策 -->
+        <template v-else-if="page === 'routing'">
+          <RoutingView />
         </template>
 
         <!-- 设置页：页面内配置分类 -->

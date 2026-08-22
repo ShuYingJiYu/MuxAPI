@@ -232,7 +232,7 @@ func (r *intelligentRouter) cache(item *upstream.Upstream, model string, feature
 	if !supported {
 		return routing.CacheProfile{}
 	}
-	ttl := 5 * time.Minute
+	ttl := selectCacheTTL(stats, now)
 	if strings.EqualFold(strings.TrimSpace(item.Protocol), "gemini") {
 		ttl = time.Hour
 	}
@@ -240,6 +240,7 @@ func (r *intelligentRouter) cache(item *upstream.Upstream, model string, feature
 		Supported: supported, TTL: ttl, MinTokens: 1024,
 		HitRateKnown: observed && stats.Observations > 0,
 		Existing:     routing.CacheEntry{Valid: observed && stats.Valid, PrefixTokens: stats.PrefixTokens},
+		PreferredTTL: ttl,
 	}
 	if observed {
 		profile.HitRate = stats.WindowHitRate
@@ -248,6 +249,36 @@ func (r *intelligentRouter) cache(item *upstream.Upstream, model string, feature
 		}
 	}
 	return profile
+}
+
+// selectCacheTTL picks an adaptive TTL based on observed session behavior.
+// Sessions that keep losing their cache (multiple creates over a long period)
+// benefit from requesting longer provider TTLs; infrequent requesters may also
+// benefit when the break-even math works out.
+func selectCacheTTL(stats store.PrefixCacheStats, now time.Time) time.Duration {
+	const defaultTTL = 5 * time.Minute
+	const extendedTTL = time.Hour
+
+	if stats.FirstSeenAt <= 0 || stats.Observations <= 0 {
+		return defaultTTL
+	}
+	sessionDuration := time.Duration(now.Unix()-stats.FirstSeenAt) * time.Second
+
+	// If session has been running > 10min and cache was rebuilt >= 2 times,
+	// the session keeps losing cache — extend TTL to reduce rebuilds.
+	if sessionDuration > 10*time.Minute && stats.CreateCount >= 2 {
+		return extendedTTL
+	}
+
+	// If average request interval > 4min, evaluate whether extended TTL
+	// breaks even: a 1h TTL covers ~15 requests at 4min intervals vs
+	// rebuilding every 5min. Worth it if we'd otherwise create more than once.
+	avgInterval := sessionDuration / time.Duration(stats.Observations)
+	if avgInterval > 4*time.Minute && stats.CreateCount >= 1 {
+		return extendedTTL
+	}
+
+	return defaultTTL
 }
 
 func (r *intelligentRouter) forecast(all []*upstream.Upstream, model string, features routing.RequestFeatures, cfg routing.Config, now time.Time) routing.TrafficForecast {

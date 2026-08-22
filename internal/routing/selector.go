@@ -101,6 +101,7 @@ type Decision struct {
 	EstimatedSavings float64               `json:"estimated_savings,omitempty"`
 	Confidence       float64               `json:"confidence"`
 	Exploration      bool                  `json:"exploration,omitempty"`
+	CacheProfile     CacheProfile          `json:"cache_profile,omitempty"`
 	Evaluations      []CandidateEvaluation `json:"evaluations"`
 }
 
@@ -211,6 +212,7 @@ func Choose(request Request) (Decision, error) {
 	decision.Cost = winnerEval.Cost
 	decision.EffectiveCost = winnerEval.EffectiveCost
 	decision.Confidence = winnerEval.Cost.Confidence
+	decision.CacheProfile = winner.Cache
 
 	allByCost := append([]int(nil), eligible...)
 	sort.SliceStable(allByCost, func(i, j int) bool {
