@@ -7,12 +7,16 @@ import (
 	"time"
 
 	"github.com/mirainya/muxapi/internal/forward"
+	"github.com/mirainya/muxapi/internal/routing"
 	"github.com/mirainya/muxapi/internal/store"
 )
 
 func (s *Server) persistRoutingAudit(requestID string, started time.Time, groupID int64, model, endpoint string, result forward.Result) {
 	features := result.RouteFeatures.Normalize()
 	decision := result.RouteDecision
+
+	// Emit structured audit log for every request (JSON, greppable by "route_audit").
+	s.emitRouteAuditLog(requestID, started, model, endpoint, features, decision, result)
 	if decision != nil && decision.SelectedID != 0 {
 		record := store.RouteDecisionRecord{
 			RequestID: requestID, GroupID: groupID, Model: model, Protocol: features.Protocol,
@@ -115,4 +119,60 @@ func cacheTTLForProtocol(protocol string) time.Duration {
 	default:
 		return 5 * time.Minute
 	}
+}
+
+func (s *Server) emitRouteAuditLog(requestID string, started time.Time, model, endpoint string, features routing.RequestFeatures, decision *routing.Decision, result forward.Result) {
+	entry := map[string]any{
+		"type":       "route_audit",
+		"request_id": requestID,
+		"ts":         started.UnixMilli(),
+		"model":      model,
+		"endpoint":   endpoint,
+		"outcome":    result.Outcome,
+		"status":     result.Status,
+		"ttft_ms":    result.TTFTMs,
+		"duration_ms": time.Since(started).Milliseconds(),
+		"input_tokens":  result.InputTokens,
+		"output_tokens": result.OutputTokens,
+		"cached_tokens": result.CachedTokens,
+		"cache_creation_tokens": result.CacheCreationTokens,
+		"features": map[string]any{
+			"input_tokens":    features.InputTokens,
+			"reusable_prefix": features.ReusableInputTokens,
+			"session_id":      features.SessionID,
+			"cache_key":       features.CacheKey,
+			"stream":          features.Stream,
+		},
+	}
+	if decision != nil {
+		entry["decision"] = map[string]any{
+			"selected_id":      decision.SelectedID,
+			"selected_name":    decision.SelectedName,
+			"reason":           decision.Reason,
+			"effective_cost":   decision.EffectiveCost,
+			"confidence":       decision.Confidence,
+			"exploration":      decision.Exploration,
+			"runner_up_id":     decision.RunnerUpID,
+			"estimated_savings": decision.EstimatedSavings,
+			"forecast_requests": decision.Forecast.Requests,
+			"forecast_rpm":     decision.Forecast.RequestsPerMinute,
+			"cache_used":       decision.Cost.CacheUsed,
+			"break_even":       decision.Cost.BreakEvenRequests,
+		}
+	}
+	attempts := make([]map[string]any, 0, len(result.Attempts))
+	for _, a := range result.Attempts {
+		attempts = append(attempts, map[string]any{
+			"upstream_id": a.UpstreamID,
+			"outcome":     a.Outcome,
+			"status":      a.Status,
+			"ttft_ms":     a.TTFTMs,
+			"duration_ms": a.DurationMs,
+			"cached":      a.CachedTokens,
+			"cache_created": a.CacheCreationTokens,
+		})
+	}
+	entry["attempts"] = attempts
+	raw, _ := json.Marshal(entry)
+	slog.Info(string(raw), "audit", "route")
 }
