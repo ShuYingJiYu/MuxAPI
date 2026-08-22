@@ -679,4 +679,10 @@ CREATE TABLE IF NOT EXISTS model_mappings (
 	UNIQUE (upstream_id, source_model)
 );
 CREATE INDEX IF NOT EXISTS idx_model_mappings_source ON model_mappings(source_model);
-CREATE INDEX IF NOT EXISTS idx_model_mappings_upstream ON model_mappings(upstream_id, source_model);`
+CREATE INDEX IF NOT EXISTS idx_model_mappings_upstream ON model_mappings(upstream_id, source_model);
+CREATE TABLE IF NOT EXISTS upstream_models (
+    upstream_id INTEGER NOT NULL,
+    model TEXT NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(upstream_id, model)
+);`
