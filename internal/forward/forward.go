@@ -51,11 +51,20 @@ type FeaturePicker interface {
 	PickWithFeatures(groupID int64, model string, features routing.RequestFeatures, exclude map[int64]bool) (*upstream.Upstream, routing.Decision, error)
 }
 
+// ModelMapper resolves model names per-upstream and records outcomes for
+// auto-learning. Implementations must be safe for concurrent use.
+type ModelMapper interface {
+	Resolve(upstreamID int64, model string) string
+	RecordFailure(upstreamID int64, model string)
+	RecordSuccess(upstreamID int64, model string)
+}
+
 // Forwarder 协调一次客户端请求的选路、重试、协议转换和响应审计。
 type Forwarder struct {
 	picker               Picker
 	health               Health
 	modelAliases         map[string]string
+	modelMapper          ModelMapper
 	maxAttempts          int
 	maxAttemptsProvider  func() int
 	firstResponseTimeout func() time.Duration
@@ -78,6 +87,12 @@ func (f *Forwarder) SetFirstResponseTimeout(timeout func() time.Duration) {
 // SetModelAliases 配置模型别名映射，启动时设置一次。
 func (f *Forwarder) SetModelAliases(aliases map[string]string) {
 	f.modelAliases = aliases
+}
+
+// SetModelMapper installs the per-upstream model name resolver. When set,
+// the forwarder translates model names before building upstream requests.
+func (f *Forwarder) SetModelMapper(mapper ModelMapper) {
+	f.modelMapper = mapper
 }
 
 // SetMaxAttemptsProvider supplies the current per-request upstream attempt limit.
@@ -320,14 +335,21 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			lastErr = err
 			continue
 		}
-		exchange, err := translate.NewExchange(sourceFormat, targetFormat, model, streamRequested, body)
+		// Resolve per-upstream model name translation. The original `model`
+		// is used for health/scheduler tracking; `upstreamModel` goes to the
+		// actual upstream request.
+		upstreamModel := model
+		if f.modelMapper != nil {
+			upstreamModel = f.modelMapper.Resolve(candidate.ID, model)
+		}
+		exchange, err := translate.NewExchange(sourceFormat, targetFormat, upstreamModel, streamRequested, body)
 		if err != nil {
 			release()
 			attempts = append(attempts, attemptCtx.finish(f.health, 0, OutcomeUnsupported, relayResult{}, "protocol_unsupported", "gateway", err.Error()))
 			lastErr = err
 			continue
 		}
-		targetPath, err := translate.TargetPathForRequest(targetFormat, r.URL.Path, model, exchange.UpstreamStream)
+		targetPath, err := translate.TargetPathForRequest(targetFormat, r.URL.Path, upstreamModel, exchange.UpstreamStream)
 		if err != nil {
 			release()
 			attempts = append(attempts, attemptCtx.finish(f.health, 0, OutcomeUnsupported, relayResult{}, "protocol_unsupported", "gateway", err.Error()))
@@ -403,6 +425,9 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			responseMeta := relayResult{ttftMs: time.Since(start).Milliseconds(), upstreamRequestID: upstreamRequestID(resp.Header)}
 			if upstream.IsModelUnsupported(resp.StatusCode, model, string(payload)) {
 				f.health.MarkModelUnsupported(candidate.ID, model)
+				if f.modelMapper != nil {
+					f.modelMapper.RecordFailure(candidate.ID, model)
+				}
 				release()
 				attempts = append(attempts, attemptCtx.finish(f.health, resp.StatusCode, OutcomeUnsupported,
 					responseMeta, "model_unsupported", "upstream", string(payload)))
@@ -506,6 +531,9 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 				f.health.Report(candidate.ID, model, false, result.ttftMs)
 			} else {
 				f.health.MarkModelSupported(candidate.ID, model)
+				if f.modelMapper != nil {
+					f.modelMapper.RecordSuccess(candidate.ID, model)
+				}
 				f.health.Report(candidate.ID, model, true, result.ttftMs)
 			}
 		}
