@@ -495,6 +495,19 @@ func (s *Server) forgetUpstreamModels(id int64) {
 	s.modelMu.Unlock()
 }
 
+// UpstreamModels returns the cached model list for a specific upstream ID.
+// Returns nil if no cache entry exists. This is used by the model mapping
+// service for auto-learning (finding date-suffixed variants).
+func (s *Server) UpstreamModels(upstreamID int64) []string {
+	s.modelMu.Lock()
+	ent, ok := s.modelCache[upstreamID]
+	s.modelMu.Unlock()
+	if !ok {
+		return nil
+	}
+	return ent.models
+}
+
 // upstreamModels 取单个上游的模型列表，命中缓存(TTL 内)则直接返回，
 // 否则实时拉取并写缓存；拉取失败时回退到上次缓存（可能过期），仍无则空。
 // 同一上游同时只允许一次在途拉取，其余调用者等待并复用结果——否则缓存过期瞬间
