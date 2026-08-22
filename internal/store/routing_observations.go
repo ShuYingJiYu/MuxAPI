@@ -517,6 +517,31 @@ func (s *Store) getSessionCacheStats(apiKeyHash string, upstreamID int64, model,
 	if err != nil {
 		return stats, err
 	}
+	// If no observations in window, widen to entire session lifetime.
+	// This handles the case where a channel was healthy 20min ago (with cache hits)
+	// but got circuit-broken and is now recovering — we want its historical
+	// cache behavior to inform the routing decision.
+	if stats.WindowObservations == 0 {
+		err = s.db.QueryRow(`SELECT
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN cache_eligible AND NOT cache_hit THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN cache_created THEN 1 ELSE 0 END),0),
+			COALESCE(MAX(prefix_tokens),0),
+			COALESCE(MAX(CASE WHEN cache_hit THEN `+s.unixExpr("observed_at")+` ELSE 0 END),0),
+			COALESCE(MAX(CASE WHEN cache_created THEN `+s.unixExpr("observed_at")+` ELSE 0 END),0),
+			COALESCE(MIN(`+s.unixExpr("observed_at")+`),0)
+			FROM routing_observations
+			WHERE api_key_hash=? AND upstream_id=? AND model=? AND session_key=?
+			AND success=TRUE`,
+			apiKeyHash, upstreamID, model, sessionKey).Scan(
+			&stats.WindowObservations, &stats.WindowHitCount, &stats.WindowMissCount,
+			&stats.CreateCount, &stats.PrefixTokens, &stats.LastHitAt, &stats.LastCreatedAt,
+			&stats.FirstSeenAt)
+		if err != nil {
+			return stats, err
+		}
+	}
 	if stats.WindowObservations == 0 {
 		return stats, sql.ErrNoRows
 	}
