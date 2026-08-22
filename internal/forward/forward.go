@@ -1,5 +1,5 @@
 // Package forward 负责选取上游、协议转换、故障切换及响应转发。
-// 它以“响应尚未写给客户端”为换源边界，避免流式响应重复输出。
+// 它以"响应尚未写给客户端"为换源边界，避免流式响应重复输出。
 package forward
 
 import (
@@ -384,8 +384,8 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		}
 		resp.Body = watchdogReadCloser{ReadCloser: resp.Body, touch: watchdog.touch}
 
-		// 400/404 需要先读取正文，以区分“不支持模型”和普通客户端参数错误。
-		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound {
+		// 400/404/503 需要先读取正文，以区分"不支持模型"和普通客户端/上游错误。
+		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusServiceUnavailable {
 			payload, readErr := readLimitedBody(resp.Body, 2<<20)
 			watchdog.stop()
 			cause := context.Cause(ctx)
@@ -416,6 +416,17 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 				release()
 				attempts = append(attempts, attemptCtx.finish(f.health, resp.StatusCode, OutcomeUnsupported,
 					responseMeta, "model_unsupported", "upstream", string(payload)))
+				continue
+			}
+
+			// 503 that is NOT model-unsupported should fall through to normal
+			// failure handling (breaker + failover), not be treated as client error.
+			if resp.StatusCode == http.StatusServiceUnavailable {
+				release()
+				f.reportFailure(candidate.ID, model, responseMeta.ttftMs, nil)
+				attempts = append(attempts, attemptCtx.finish(f.health, resp.StatusCode, OutcomeFailed,
+					responseMeta, "upstream_error", "upstream", string(payload)))
+				lastErr = errors.New(string(payload))
 				continue
 			}
 
@@ -722,7 +733,7 @@ func relayResponse(w http.ResponseWriter, resp *http.Response, start time.Time, 
 	return relayTranslatedResponse(context.Background(), w, resp, start, onFirstByte, nil)
 }
 
-// relayTranslatedResponse 按“上游是否流式”和“客户端是否要求流式”选择转发方式。
+// relayTranslatedResponse 按"上游是否流式"和"客户端是否要求流式"选择转发方式。
 // auditReadCloser 在同一次读取中旁路提取完成事件、Token 用量和请求 ID。
 func relayTranslatedResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func(), exchange *translate.Exchange) relayResult {
 	contentType := resp.Header.Get("Content-Type")
@@ -968,7 +979,7 @@ func relaySSE(w http.ResponseWriter, resp *http.Response, start time.Time, onFir
 	}
 }
 
-// relayBody 先暂存最多 64 KiB，用于识别“HTTP 2xx 包含错误 JSON”的异常上游。
+// relayBody 先暂存最多 64 KiB，用于识别"HTTP 2xx 包含错误 JSON"的异常上游。
 // 超过检查窗口后立即提交并继续流式复制，避免大响应全部驻留内存。
 func relayBody(w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func()) relayResult {
 	const inspectLimit = 64 << 10
