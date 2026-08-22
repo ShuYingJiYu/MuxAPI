@@ -461,11 +461,19 @@ func (s *Store) GetPrefixCacheStats(apiKeyHash string, upstreamID int64, model, 
 		COALESCE(` + s.unixExpr("last_created_at") + `,0),COALESCE(` + s.unixExpr("expires_at") + `,0),
 		` + s.unixExpr("first_seen_at") + `,` + s.unixExpr("last_seen_at") + `
 		FROM upstream_prefix_cache_stats WHERE api_key_hash=? AND upstream_id=? AND model=? AND prefix_hash=?`
-	if err := s.db.QueryRow(query, apiKeyHash, upstreamID, model, prefixHash).Scan(
+	err := s.db.QueryRow(query, apiKeyHash, upstreamID, model, prefixHash).Scan(
 		&stats.SessionKey, &stats.CacheKey, &stats.PrefixTokens, &stats.Observations,
 		&stats.HitCount, &stats.MissCount, &stats.CreateCount, &stats.LastHitAt, &stats.LastMissAt,
-		&stats.LastCreatedAt, &stats.ExpiresAt, &stats.FirstSeenAt, &stats.LastSeenAt); err != nil {
-		return stats, err
+		&stats.LastCreatedAt, &stats.ExpiresAt, &stats.FirstSeenAt, &stats.LastSeenAt)
+	if err != nil {
+		// Fallback: if no exact prefix_hash match, aggregate by session_key from
+		// routing_observations. This handles multi-turn sessions where the prefix
+		// hash changes every turn but the session (and its cache behavior) is stable.
+		stats, fallbackErr := s.getSessionCacheStats(apiKeyHash, upstreamID, model, prefixHash, window, now)
+		if fallbackErr != nil {
+			return stats, err
+		}
+		return stats, nil
 	}
 	stats.HitRate = routingRatio(stats.HitCount, stats.HitCount+stats.MissCount)
 	stats.Valid = stats.ExpiresAt > now.Unix()
@@ -480,5 +488,48 @@ func (s *Store) GetPrefixCacheStats(apiKeyHash string, upstreamID int64, model, 
 		return stats, err
 	}
 	stats.WindowHitRate = routingRatio(stats.WindowHitCount, stats.WindowHitCount+stats.WindowMissCount)
+	return stats, nil
+}
+
+// getSessionCacheStats aggregates cache observations by session_key when the
+// exact prefix_hash doesn't exist in the summary table. This is the common case
+// for multi-turn conversations where each request has a slightly different prefix.
+func (s *Store) getSessionCacheStats(apiKeyHash string, upstreamID int64, model, sessionKey string, window time.Duration, now time.Time) (PrefixCacheStats, error) {
+	stats := PrefixCacheStats{APIKeyHash: apiKeyHash, UpstreamID: upstreamID, Model: model, PrefixHash: sessionKey, SessionKey: sessionKey}
+	from := now.Add(-window)
+	err := s.db.QueryRow(`SELECT
+		COUNT(*),
+		COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN cache_eligible AND NOT cache_hit THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN cache_created THEN 1 ELSE 0 END),0),
+		COALESCE(MAX(prefix_tokens),0),
+		COALESCE(MAX(CASE WHEN cache_hit THEN `+s.unixExpr("observed_at")+` ELSE 0 END),0),
+		COALESCE(MAX(CASE WHEN cache_created THEN `+s.unixExpr("observed_at")+` ELSE 0 END),0)
+		FROM routing_observations
+		WHERE api_key_hash=? AND upstream_id=? AND model=? AND session_key=?
+		AND observed_at>=? AND observed_at<?`,
+		apiKeyHash, upstreamID, model, sessionKey,
+		s.timeValue(from), s.timeValue(now)).Scan(
+		&stats.WindowObservations, &stats.WindowHitCount, &stats.WindowMissCount,
+		&stats.CreateCount, &stats.PrefixTokens, &stats.LastHitAt, &stats.LastCreatedAt)
+	if err != nil {
+		return stats, err
+	}
+	if stats.WindowObservations == 0 {
+		return stats, sql.ErrNoRows
+	}
+	stats.Observations = stats.WindowObservations
+	stats.HitCount = stats.WindowHitCount
+	stats.MissCount = stats.WindowMissCount
+	stats.HitRate = routingRatio(stats.HitCount, stats.HitCount+stats.MissCount)
+	stats.WindowHitRate = stats.HitRate
+	if stats.LastHitAt > 0 || stats.LastCreatedAt > 0 {
+		latestCache := stats.LastHitAt
+		if stats.LastCreatedAt > latestCache {
+			latestCache = stats.LastCreatedAt
+		}
+		stats.ExpiresAt = latestCache + int64(5*time.Minute/time.Second)
+		stats.Valid = stats.ExpiresAt > now.Unix()
+	}
 	return stats, nil
 }

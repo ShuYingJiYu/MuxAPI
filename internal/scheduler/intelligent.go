@@ -214,7 +214,15 @@ func (r *intelligentRouter) cache(item *upstream.Upstream, model string, feature
 		return routing.CacheProfile{}
 	}
 	keyHash := hashCredential(item.APIKey)
+	// Use SessionID for prefix stats lookup when available. In multi-turn
+	// conversations (like Claude Code), each request adds content so the
+	// exact prefix hash changes every turn — but the session's cache behavior
+	// is stable: hits accumulate across turns because the provider caches the
+	// growing prefix. Using session_key lets the hit rate observation persist.
 	prefixHash := features.CacheKey
+	if features.SessionID != "" && features.SessionID != features.CacheKey {
+		prefixHash = features.SessionID
+	}
 	stats, err := r.prefixStats(keyHash, item.ID, model, prefixHash, window, now)
 	observed := err == nil
 	// A row containing only misses is useful for the hit-rate denominator, but
