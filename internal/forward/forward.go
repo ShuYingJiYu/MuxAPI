@@ -334,6 +334,12 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			lastErr = err
 			continue
 		}
+		// Inject cache_control hint for extended TTL on Claude protocol.
+		if routeDecision != nil && routeDecision.Cost.CacheUsed &&
+			routeDecision.CacheProfile.PreferredTTL > 5*time.Minute &&
+			targetFormat == translate.Claude {
+			exchange.UpstreamRequest = injectClaudeCacheControl(exchange.UpstreamRequest, routeDecision.CacheProfile.PreferredTTL)
+		}
 		targetPath, err := translate.TargetPathForRequest(targetFormat, r.URL.Path, upstreamModel, exchange.UpstreamStream)
 		if err != nil {
 			release()
@@ -1071,4 +1077,56 @@ func isHopByHopHeader(key string) bool {
 	default:
 		return false
 	}
+}
+
+// injectClaudeCacheControl modifies the Anthropic Messages API request body to
+// add cache_control with an extended TTL to the last content block of the last
+// system message. This signals to the provider that the prefix should be cached
+// for longer than the default 5 minutes.
+func injectClaudeCacheControl(body []byte, ttl time.Duration) []byte {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+
+	ttlSeconds := int(ttl / time.Second)
+
+	// Try system field first (can be string or array of content blocks).
+	if system, ok := payload["system"]; ok {
+		switch s := system.(type) {
+		case []any:
+			if len(s) > 0 {
+				if block, ok := s[len(s)-1].(map[string]any); ok {
+					block["cache_control"] = map[string]any{"type": "ephemeral", "ttl": ttlSeconds}
+					payload["system"] = s
+				}
+			}
+		case string:
+			// Convert string system to array form to add cache_control.
+			payload["system"] = []any{
+				map[string]any{
+					"type":          "text",
+					"text":          s,
+					"cache_control": map[string]any{"type": "ephemeral", "ttl": ttlSeconds},
+				},
+			}
+		}
+	} else {
+		// No system message; inject on the first user message's last content block.
+		if messages, ok := payload["messages"].([]any); ok && len(messages) > 0 {
+			if firstMsg, ok := messages[0].(map[string]any); ok {
+				if content, ok := firstMsg["content"].([]any); ok && len(content) > 0 {
+					if block, ok := content[len(content)-1].(map[string]any); ok {
+						block["cache_control"] = map[string]any{"type": "ephemeral", "ttl": ttlSeconds}
+					}
+				}
+			}
+		}
+	}
+
+	result, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return result
 }

@@ -161,6 +161,10 @@ type CacheProfile struct {
 	HitRate      float64       `json:"hit_rate"`
 	HitRateKnown bool          `json:"hit_rate_known"`
 	Existing     CacheEntry    `json:"existing"`
+	// PreferredTTL is the adaptive TTL selected by the scheduler based on
+	// session behavior. When longer than the default 5min, the forwarder may
+	// inject cache_control hints into the upstream request.
+	PreferredTTL time.Duration `json:"preferred_ttl,omitempty"`
 	// Required means this candidate's billing/cache policy cannot be disabled
 	// for the request. If false, the estimate is free to use ordinary input
 	// when a cache write would cost more than it can save in the window.

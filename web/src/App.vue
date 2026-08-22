@@ -7,12 +7,13 @@ import Icon from './Icon.vue'
 import Fence from './Fence.vue'
 import FancySelect from './FancySelect.vue'
 import UpstreamPicker from './UpstreamPicker.vue'
+import RoutingView from './RoutingView.vue'
 import { api } from './api.js'
 import { useLogs } from './composables/useLogs.js'
 import { useMonitorViews } from './composables/useMonitorViews.js'
 
 const route = useRoute()
-const pageNames = new Set(['overview', 'groups', 'upstreams', 'monitors', 'logs', 'settings'])
+const pageNames = new Set(['overview', 'groups', 'upstreams', 'monitors', 'logs', 'routing', 'settings'])
 const page = computed(() => pageNames.has(String(route.name)) ? String(route.name) : 'overview')
 const detailGroup = ref(null)     // 进入分组详情时设置
 
@@ -151,6 +152,7 @@ const pages = {
   upstreams: { title: '上游池', desc: '按主标签管理全局渠道，并用普通标签快速筛选' },
   monitors: { title: '监控看板', desc: '按主标签组织模型探测卡片与运行时健康' },
   logs: { title: '请求记录', desc: '每一次转发请求的真实去向：模型 → 选中渠道 → 状态 → 延迟' },
+  routing: { title: '路由决策', desc: '实时查看路由引擎的选路逻辑与候选成本对比' },
   settings: { title: '设置', desc: '运行时配置，保存后即时生效（无需重启）' },
 }
 
@@ -1259,6 +1261,7 @@ function logout() {
         <RouterLink class="nav-item" :class="{ active: page === 'upstreams' }" :to="{ name: 'upstreams' }"><Icon class="ic" name="server" :size="18" />上游池</RouterLink>
         <RouterLink class="nav-item" :class="{ active: page === 'monitors' }" :to="{ name: 'monitors' }"><Icon class="ic" name="heart" :size="18" />监控看板</RouterLink>
         <RouterLink class="nav-item" :class="{ active: page === 'logs' }" :to="{ name: 'logs' }"><Icon class="ic" name="refresh" :size="18" />请求记录</RouterLink>
+        <RouterLink class="nav-item" :class="{ active: page === 'routing' }" :to="{ name: 'routing' }"><Icon class="ic" name="link" :size="18" />路由</RouterLink>
         <RouterLink class="nav-item" :class="{ active: page === 'settings' }" :to="{ name: 'settings' }"><Icon class="ic" name="cog" :size="18" />设置</RouterLink>
       </nav>
     </aside>
@@ -1767,6 +1770,11 @@ function logout() {
               </button>
             </div>
           </div>
+        </template>
+
+        <!-- 路由决策 -->
+        <template v-else-if="page === 'routing'">
+          <RoutingView />
         </template>
 
         <!-- 设置页：左锚点菜单 + 右内容 -->
