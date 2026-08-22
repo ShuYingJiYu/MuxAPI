@@ -84,8 +84,17 @@ func (s *Server) SetSettingsChanged(handler func()) { s.settingsChanged = handle
 
 // New 创建 HTTP 服务；maxBody 控制客户端请求正文上限。
 func New(fwd *forward.Forwarder, adminToken string, st *store.Store, hm *health.Manager, mon *monitor.Manager, mp *monitor.Prober, maxBody int64) *Server {
-	return &Server{fwd: fwd, adminToken: adminToken, store: st, health: hm, mon: mon, monProber: mp, maxBody: maxBody,
+	srv := &Server{fwd: fwd, adminToken: adminToken, store: st, health: hm, mon: mon, monProber: mp, maxBody: maxBody,
 		modelCache: make(map[int64]modelCacheEntry), modelFlight: make(map[int64]*modelFetch)}
+	// Restore persisted model lists so model mapping works immediately after restart.
+	if st != nil {
+		if cached, err := st.LoadAllUpstreamModels(); err == nil {
+			for id, models := range cached {
+				srv.modelCache[id] = modelCacheEntry{models: models, ts: time.Now().Add(-30 * time.Second)}
+			}
+		}
+	}
+	return srv
 }
 
 // SetVersion sets the build version string displayed in the admin UI.
@@ -541,6 +550,7 @@ func (s *Server) upstreamModels(ctx context.Context, u *upstream.Upstream) []str
 	s.modelMu.Lock()
 	if err == nil {
 		s.modelCache[u.ID] = modelCacheEntry{models: models, ts: time.Now()}
+		go s.store.SaveUpstreamModels(u.ID, models)
 	}
 	delete(s.modelFlight, u.ID)
 	s.modelMu.Unlock()
