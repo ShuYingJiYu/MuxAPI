@@ -665,4 +665,18 @@ CREATE INDEX IF NOT EXISTS idx_routing_observations_time ON routing_observations
 CREATE INDEX IF NOT EXISTS idx_routing_observations_session_model ON routing_observations(session_key, model, observed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_routing_observations_prefix_model ON routing_observations(prefix_hash, model, observed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_routing_observations_upstream_model ON routing_observations(upstream_id, model, observed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_upstream_prefix_cache_expiry ON upstream_prefix_cache_stats(api_key_hash, upstream_id, model, expires_at);`
+CREATE INDEX IF NOT EXISTS idx_upstream_prefix_cache_expiry ON upstream_prefix_cache_stats(api_key_hash, upstream_id, model, expires_at);
+CREATE TABLE IF NOT EXISTS model_mappings (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	upstream_id INTEGER NOT NULL DEFAULT 0,
+	source_model TEXT NOT NULL,
+	target_model TEXT NOT NULL,
+	mapping_type TEXT NOT NULL DEFAULT 'static',
+	failure_count INTEGER NOT NULL DEFAULT 0,
+	expires_at INTEGER,
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL,
+	UNIQUE (upstream_id, source_model)
+);
+CREATE INDEX IF NOT EXISTS idx_model_mappings_source ON model_mappings(source_model);
+CREATE INDEX IF NOT EXISTS idx_model_mappings_upstream ON model_mappings(upstream_id, source_model);`

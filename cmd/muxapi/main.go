@@ -18,6 +18,7 @@ import (
 	"github.com/mirainya/muxapi/internal/config"
 	"github.com/mirainya/muxapi/internal/forward"
 	"github.com/mirainya/muxapi/internal/health"
+	"github.com/mirainya/muxapi/internal/modelmapping"
 	"github.com/mirainya/muxapi/internal/monitor"
 	"github.com/mirainya/muxapi/internal/routing"
 	"github.com/mirainya/muxapi/internal/scheduler"
@@ -137,6 +138,10 @@ func main() {
 		return time.Duration(firstResponseTimeoutMs()) * time.Millisecond
 	})
 
+	// Model mapping: per-upstream model name translation + auto-learning.
+	modelMapper := modelmapping.New(st)
+	fwd.SetModelMapper(modelMapper)
+
 	// 健康事件主动告警：熔断翻转时推送 Webhook（URL 空则关闭）。
 	// id→name 解析用现成 List()，解析不到回退 id 字符串。
 	upstreamName := func(id int64) string {
@@ -171,6 +176,7 @@ func main() {
 	})
 	srv.SetBillingManager(billingMgr)
 	srv.SetBackupService(backupSvc)
+	srv.SetModelMappingService(modelMapper)
 
 	// 收到 SIGINT/SIGTERM 时取消：停探测并触发优雅关闭
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
