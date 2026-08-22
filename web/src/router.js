@@ -7,6 +7,7 @@ export const pageRoutes = [
   { path: '/upstreams', name: 'upstreams' },
   { path: '/monitors', name: 'monitors' },
   { path: '/logs', name: 'logs' },
+  { path: '/routing', name: 'routing' },
   { path: '/settings', name: 'settings' },
 ]
 

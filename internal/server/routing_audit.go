@@ -128,6 +128,7 @@ func (s *Server) emitRouteAuditLog(requestID string, started time.Time, model, e
 		"ts":         started.UnixMilli(),
 		"model":      model,
 		"endpoint":   endpoint,
+		"session_id": features.SessionID,
 		"outcome":    result.Outcome,
 		"status":     result.Status,
 		"ttft_ms":    result.TTFTMs,
@@ -145,6 +146,46 @@ func (s *Server) emitRouteAuditLog(requestID string, started time.Time, model, e
 		},
 	}
 	if decision != nil {
+		// Determine cache_state and ttl_type from the selected candidate's evaluation.
+		cacheState := "cold"
+		ttlType := ""
+		for _, eval := range decision.Evaluations {
+			if eval.CandidateID == decision.SelectedID {
+				if eval.CacheExisting && decision.Cost.CacheUsed {
+					cacheState = "hot"
+				} else if eval.CacheExisting && !decision.Cost.CacheUsed {
+					// Cache existed but decision chose not to use it (e.g. expired/stale).
+					cacheState = "expired"
+				}
+				// Derive ttl_type from the cost estimate's cache lifetime hint.
+				if eval.Cost.CacheEligible {
+					ttl := cacheTTLForProtocol(eval.Protocol)
+					if ttl >= time.Hour {
+						ttlType = "1h"
+					} else {
+						ttlType = "5m"
+					}
+				}
+				break
+			}
+		}
+
+		// Build candidates_summary for quick scanning.
+		candidates := make([]map[string]any, 0, len(decision.Evaluations))
+		for _, eval := range decision.Evaluations {
+			candidates = append(candidates, map[string]any{
+				"name":     eval.CandidateName,
+				"cost":     eval.EffectiveCost,
+				"eligible": eval.Eligible,
+				"selected": eval.CandidateID == decision.SelectedID,
+			})
+		}
+
+		entry["cache_state"] = cacheState
+		if ttlType != "" {
+			entry["ttl_type"] = ttlType
+		}
+		entry["candidates_summary"] = candidates
 		entry["decision"] = map[string]any{
 			"selected_id":      decision.SelectedID,
 			"selected_name":    decision.SelectedName,
