@@ -94,6 +94,7 @@ type RouteDecisionEntry struct {
 	Strategy                  string                `json:"strategy"`
 	Reason                    string                `json:"reason"`
 	SelectedUpstreamID        int64                 `json:"selected_upstream_id"`
+	SelectedUpstreamName      string                `json:"selected_upstream"`
 	CandidateCount            int                   `json:"candidate_count"`
 	ForecastWindowSeconds     int64                 `json:"forecast_window_seconds"`
 	ForecastRequests          float64               `json:"forecast_requests"`
@@ -302,20 +303,20 @@ func (s *Store) CompleteRouteDecision(requestID string, outcome RouteDecisionOut
 }
 
 func (s *Store) routeDecisionSelect(where string) string {
-	return `SELECT id,request_id,group_id,model,protocol,endpoint,session_key,prefix_hash,cache_key,strategy,
-		reason,selected_upstream_id,candidate_count,forecast_window_seconds,forecast_requests,
-		estimated_input_tokens,reusable_prefix_tokens,estimated_output_tokens,selected_cost,no_cache_cost,
-		cache_cost,estimated_savings,confidence,cache_selected,exploration,actual_cost,actual_input_tokens,
-		actual_output_tokens,actual_cached_tokens,actual_cache_creation_tokens,actual_outcome,` +
-		s.unixExpr("created_at") + `,COALESCE(` + s.unixExpr("completed_at") + `,0)
-		FROM route_decisions` + where
+	return `SELECT rd.id,rd.request_id,rd.group_id,rd.model,rd.protocol,rd.endpoint,rd.session_key,rd.prefix_hash,rd.cache_key,rd.strategy,
+		rd.reason,rd.selected_upstream_id,COALESCE(u.name,''),rd.candidate_count,rd.forecast_window_seconds,rd.forecast_requests,
+		rd.estimated_input_tokens,rd.reusable_prefix_tokens,rd.estimated_output_tokens,rd.selected_cost,rd.no_cache_cost,
+		rd.cache_cost,rd.estimated_savings,rd.confidence,rd.cache_selected,rd.exploration,rd.actual_cost,rd.actual_input_tokens,
+		rd.actual_output_tokens,rd.actual_cached_tokens,rd.actual_cache_creation_tokens,rd.actual_outcome,` +
+		s.unixExpr("rd.created_at") + `,COALESCE(` + s.unixExpr("rd.completed_at") + `,0)
+		FROM route_decisions rd LEFT JOIN upstreams u ON u.id=rd.selected_upstream_id` + where
 }
 
 func scanRouteDecision(scanner rowScanner) (*RouteDecisionEntry, error) {
 	entry := &RouteDecisionEntry{}
 	err := scanner.Scan(&entry.ID, &entry.RequestID, &entry.GroupID, &entry.Model, &entry.Protocol,
 		&entry.Endpoint, &entry.SessionKey, &entry.PrefixHash, &entry.CacheKey, &entry.Strategy,
-		&entry.Reason, &entry.SelectedUpstreamID, &entry.CandidateCount, &entry.ForecastWindowSeconds,
+		&entry.Reason, &entry.SelectedUpstreamID, &entry.SelectedUpstreamName, &entry.CandidateCount, &entry.ForecastWindowSeconds,
 		&entry.ForecastRequests, &entry.EstimatedInputTokens, &entry.ReusablePrefixTokens,
 		&entry.EstimatedOutputTokens, &entry.SelectedCost, &entry.NoCacheCost, &entry.CacheCost,
 		&entry.EstimatedSavings, &entry.Confidence, &entry.CacheSelected, &entry.Exploration,
@@ -325,7 +326,7 @@ func scanRouteDecision(scanner rowScanner) (*RouteDecisionEntry, error) {
 }
 
 func (s *Store) GetRouteDecisionByRequestID(requestID string) (*RouteDecisionEntry, error) {
-	entry, err := scanRouteDecision(s.db.QueryRow(s.routeDecisionSelect(" WHERE request_id=?"), requestID))
+	entry, err := scanRouteDecision(s.db.QueryRow(s.routeDecisionSelect(" WHERE rd.request_id=?"), requestID))
 	if err != nil {
 		return nil, err
 	}
@@ -334,7 +335,7 @@ func (s *Store) GetRouteDecisionByRequestID(requestID string) (*RouteDecisionEnt
 }
 
 func (s *Store) GetRouteDecision(id int64) (*RouteDecisionEntry, error) {
-	entry, err := scanRouteDecision(s.db.QueryRow(s.routeDecisionSelect(" WHERE id=?"), id))
+	entry, err := scanRouteDecision(s.db.QueryRow(s.routeDecisionSelect(" WHERE rd.id=?"), id))
 	if err != nil {
 		return nil, err
 	}
@@ -385,38 +386,38 @@ func (s *Store) ListRouteDecisions(filter RouteDecisionFilter) ([]*RouteDecision
 	where.WriteString(" WHERE 1=1")
 	var args []any
 	if filter.BeforeID > 0 {
-		where.WriteString(" AND id<?")
+		where.WriteString(" AND rd.id<?")
 		args = append(args, filter.BeforeID)
 	}
 	if filter.GroupID > 0 {
-		where.WriteString(" AND group_id=?")
+		where.WriteString(" AND rd.group_id=?")
 		args = append(args, filter.GroupID)
 	}
 	if filter.SelectedUpstreamID > 0 {
-		where.WriteString(" AND selected_upstream_id=?")
+		where.WriteString(" AND rd.selected_upstream_id=?")
 		args = append(args, filter.SelectedUpstreamID)
 	}
 	if filter.Model != "" {
-		where.WriteString(" AND model=?")
+		where.WriteString(" AND rd.model=?")
 		args = append(args, filter.Model)
 	}
 	if filter.SessionKey != "" {
-		where.WriteString(" AND session_key=?")
+		where.WriteString(" AND rd.session_key=?")
 		args = append(args, filter.SessionKey)
 	}
 	if filter.PrefixHash != "" {
-		where.WriteString(" AND prefix_hash=?")
+		where.WriteString(" AND rd.prefix_hash=?")
 		args = append(args, filter.PrefixHash)
 	}
 	if !filter.Since.IsZero() {
-		where.WriteString(" AND created_at>=?")
+		where.WriteString(" AND rd.created_at>=?")
 		args = append(args, s.timeValue(filter.Since))
 	}
 	if !filter.Until.IsZero() {
-		where.WriteString(" AND created_at<?")
+		where.WriteString(" AND rd.created_at<?")
 		args = append(args, s.timeValue(filter.Until))
 	}
-	query := s.routeDecisionSelect(where.String()) + " ORDER BY id DESC LIMIT ?"
+	query := s.routeDecisionSelect(where.String()) + " ORDER BY rd.id DESC LIMIT ?"
 	args = append(args, limit)
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
