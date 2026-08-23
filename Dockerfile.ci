@@ -10,6 +10,7 @@ RUN npm run build
 
 # Go 版本必须 >= go.mod 的 1.26.3。同步上游后必须 grep go.mod 核对本行。
 FROM golang:1.26.3-alpine AS build
+ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
 # go.mod 有本地 replace 指向 ./third_party/cliproxyapi(库内 vendor 子树,非 submodule),
@@ -18,7 +19,7 @@ COPY third_party/ ./third_party/
 RUN go mod download
 COPY . .
 COPY --from=web /src/web/dist ./web/dist
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/muxapi ./cmd/muxapi
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" -o /out/muxapi ./cmd/muxapi
 
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata \
