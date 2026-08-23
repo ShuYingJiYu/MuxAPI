@@ -99,6 +99,20 @@ type UpstreamRoutingStats struct {
 	P95DurationMs       int64   `json:"p95_duration_ms"`
 }
 
+// CacheCoverageRatio returns the average fraction of tokens that were actually
+// cached (cached_tokens / total_tokens) for an upstream. This accounts for
+// proxied upstreams that only cache a portion of the prefix.
+func (s *Store) CacheCoverageRatio(upstreamID int64) (float64, error) {
+	var ratio float64
+	err := s.db.QueryRow(`SELECT AVG(cached_tokens::float / NULLIF(cached_tokens + input_tokens + cache_creation_tokens, 0))
+		FROM request_attempts WHERE upstream_id=? AND status=200 AND cached_tokens > 0
+		ORDER BY id DESC LIMIT 50`, upstreamID).Scan(&ratio)
+	if err != nil {
+		return 0, err
+	}
+	return ratio, nil
+}
+
 type PrefixCacheStats struct {
 	APIKeyHash         string  `json:"api_key_hash,omitempty"`
 	UpstreamID         int64   `json:"upstream_id"`
