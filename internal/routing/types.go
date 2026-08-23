@@ -160,7 +160,10 @@ type CacheProfile struct {
 	MinTokens    int64         `json:"min_tokens,omitempty"`
 	HitRate      float64       `json:"hit_rate"`
 	HitRateKnown bool          `json:"hit_rate_known"`
-	Existing     CacheEntry    `json:"existing"`
+	// DefaultHitRate is the optimistic prior used when HitRateKnown is false.
+	// As observations accumulate, the real HitRate replaces this prior.
+	DefaultHitRate float64 `json:"default_hit_rate,omitempty"`
+	Existing       CacheEntry `json:"existing"`
 	// PreferredTTL is the adaptive TTL selected by the scheduler based on
 	// session behavior. When longer than the default 5min, the forwarder may
 	// inject cache_control hints into the upstream request.
