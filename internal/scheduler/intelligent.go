@@ -248,6 +248,7 @@ func (r *intelligentRouter) cache(item *upstream.Upstream, model string, feature
 		Supported: supported, TTL: ttl, MinTokens: 1024,
 		HitRateKnown:   observed && stats.Observations > 0,
 		DefaultHitRate: 0.85,
+		CoverageRatio:  r.cacheCoverage(item.ID),
 		Existing:       routing.CacheEntry{Valid: observed && stats.Valid, PrefixTokens: stats.PrefixTokens},
 		PreferredTTL:   ttl,
 	}
@@ -342,6 +343,14 @@ func (r *intelligentRouter) billingStatuses(now time.Time) map[int64]store.Billi
 func (r *intelligentRouter) lastKnownMultiplier(upstreamID int64) float64 {
 	m, _ := r.store.LastKnownMultiplier(upstreamID)
 	return m
+}
+
+func (r *intelligentRouter) cacheCoverage(upstreamID int64) float64 {
+	ratio, _ := r.store.CacheCoverageRatio(upstreamID)
+	if ratio <= 0 || ratio > 1 {
+		return 1
+	}
+	return ratio
 }
 
 func (r *intelligentRouter) modelPricing(model string, now time.Time) (store.ModelPricing, error) {

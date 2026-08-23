@@ -163,6 +163,10 @@ type CacheProfile struct {
 	// DefaultHitRate is the optimistic prior used when HitRateKnown is false.
 	// As observations accumulate, the real HitRate replaces this prior.
 	DefaultHitRate float64 `json:"default_hit_rate,omitempty"`
+	// CoverageRatio is the fraction of the reusable prefix that the upstream
+	// actually caches. Some proxied upstreams only cache ~77% of the prefix.
+	// 0 or 1 means assume full prefix is cached (the standard behavior).
+	CoverageRatio float64 `json:"coverage_ratio,omitempty"`
 	Existing       CacheEntry `json:"existing"`
 	// PreferredTTL is the adaptive TTL selected by the scheduler based on
 	// session behavior. When longer than the default 5min, the forwarder may
