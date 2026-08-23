@@ -17,13 +17,14 @@ import (
 // caches reduce database work on the request hot path; PostgreSQL remains the
 // source of truth and the existing health manager supplies fast breaker state.
 type intelligentRouter struct {
-	store   *store.Store
-	config  func() routing.Config
-	mu      sync.Mutex
-	billing billingCacheEntry
-	prices  map[string]priceCacheEntry
-	stats   map[statsCacheKey]statsCacheEntry
-	prefix  map[prefixCacheKey]prefixCacheEntry
+	store     *store.Store
+	config    func() routing.Config
+	mu        sync.Mutex
+	billing   billingCacheEntry
+	prices    map[string]priceCacheEntry
+	stats     map[statsCacheKey]statsCacheEntry
+	prefix    map[prefixCacheKey]prefixCacheEntry
+	inflation map[int64]inflationCacheEntry
 }
 
 const (
@@ -67,6 +68,11 @@ type prefixCacheEntry struct {
 	expires time.Time
 	value   store.PrefixCacheStats
 	err     error
+}
+
+type inflationCacheEntry struct {
+	expires time.Time
+	value   float64
 }
 
 func (r *intelligentRouter) pick(s *Scheduler, groupID int64, model string, features routing.RequestFeatures, exclude map[int64]bool) (*upstream.Upstream, routing.Decision, error) {
@@ -233,7 +239,9 @@ func (r *intelligentRouter) cache(item *upstream.Upstream, model string, feature
 	}
 
 	sc := routing.ResolveSessionCache(params, now)
-	return sc.ToCacheProfile()
+	profile := sc.ToCacheProfile()
+	profile.InputInflation = r.tokenInflation(item.ID, now)
+	return profile
 }
 
 func (r *intelligentRouter) forecast(all []*upstream.Upstream, model string, features routing.RequestFeatures, cfg routing.Config, now time.Time) routing.TrafficForecast {
@@ -291,6 +299,28 @@ func (r *intelligentRouter) cacheCoverage(upstreamID int64) float64 {
 		return 1
 	}
 	return ratio
+}
+
+func (r *intelligentRouter) tokenInflation(upstreamID int64, now time.Time) float64 {
+	r.mu.Lock()
+	if r.inflation != nil {
+		if entry, ok := r.inflation[upstreamID]; ok && now.Before(entry.expires) {
+			r.mu.Unlock()
+			return entry.value
+		}
+	}
+	r.mu.Unlock()
+	factor, _ := r.store.TokenInflationFactor(upstreamID)
+	if factor < 1 {
+		factor = 1
+	}
+	r.mu.Lock()
+	if r.inflation == nil {
+		r.inflation = make(map[int64]inflationCacheEntry)
+	}
+	r.inflation[upstreamID] = inflationCacheEntry{expires: now.Add(billingCacheTTL), value: factor}
+	r.mu.Unlock()
+	return factor
 }
 
 func (r *intelligentRouter) modelPricing(model string, now time.Time) (store.ModelPricing, error) {
