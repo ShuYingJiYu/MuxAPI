@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
 import { api } from './api.js'
+import { normalizeTs } from './api.generated.js'
 
 const decisions = ref([])
 const expanded = ref(null)
@@ -10,8 +11,7 @@ const err = ref('')
 
 async function load() {
   try {
-    const data = await api.routeDecisions()
-    decisions.value = (data && data.items) || []
+    decisions.value = await api.routeDecisions() || []
   } catch (e) {
     err.value = e.message || String(e)
   }
@@ -33,9 +33,8 @@ onMounted(() => { load(); timer = setInterval(load, 5000) })
 onUnmounted(() => { if (timer) clearInterval(timer) })
 
 function timeAgo(ts) {
-  if (!ts) return '—'
-  // ts may be unix seconds (>1e9 and <1e12)
-  const ms = ts > 1e12 ? ts : ts * 1000
+  const ms = normalizeTs(ts)
+  if (!ms) return '—'
   const diff = Math.max(0, Math.floor((Date.now() - ms) / 1000))
   if (diff < 60) return diff + '秒前'
   if (diff < 3600) return Math.floor(diff / 60) + '分钟前'
