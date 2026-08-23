@@ -144,6 +144,15 @@ func (p Pricing) Complete(cacheRequired bool) bool {
 	return !cacheRequired || (p.CacheReadKnown && p.CacheWriteKnown)
 }
 
+// HitRateSource indicates the provenance of the CacheProfile.HitRate value.
+type HitRateSource string
+
+const (
+	HitRateObserved HitRateSource = "observed"
+	HitRatePrior    HitRateSource = "prior"
+	HitRateUnknown  HitRateSource = "unknown"
+)
+
 // CacheEntry describes the cache state for this exact API-key/model/prefix
 // tuple.  ExpiresAt may be zero when the caller only knows that the entry is
 // valid for the current request.
@@ -155,14 +164,11 @@ type CacheEntry struct {
 
 // CacheProfile describes provider cache behavior and observed hit rate.
 type CacheProfile struct {
-	Supported    bool          `json:"supported"`
-	TTL          time.Duration `json:"ttl"`
-	MinTokens    int64         `json:"min_tokens,omitempty"`
-	HitRate      float64       `json:"hit_rate"`
-	HitRateKnown bool          `json:"hit_rate_known"`
-	// DefaultHitRate is the optimistic prior used when HitRateKnown is false.
-	// As observations accumulate, the real HitRate replaces this prior.
-	DefaultHitRate float64 `json:"default_hit_rate,omitempty"`
+	Supported     bool          `json:"supported"`
+	TTL           time.Duration `json:"ttl"`
+	MinTokens     int64         `json:"min_tokens,omitempty"`
+	HitRate       float64       `json:"hit_rate"`
+	HitRateSource HitRateSource `json:"hit_rate_source"`
 	// CoverageRatio is the fraction of the reusable prefix that the upstream
 	// actually caches. Some proxied upstreams only cache ~77% of the prefix.
 	// 0 or 1 means assume full prefix is cached (the standard behavior).

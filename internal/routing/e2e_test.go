@@ -103,7 +103,7 @@ func TestE2ELowFrequencyPrefersCheapNoCache(t *testing.T) {
 					Supported:    true,
 					TTL:          5 * time.Minute,
 					HitRate:      0.95,
-					HitRateKnown: true,
+					HitRateSource: HitRateObserved,
 				},
 			},
 		},
@@ -159,7 +159,7 @@ func TestE2EHighFrequencyPrefersCachePath(t *testing.T) {
 					Supported:    true,
 					TTL:          5 * time.Minute,
 					HitRate:      1.0,
-					HitRateKnown: true,
+					HitRateSource: HitRateObserved,
 				},
 			},
 		},
@@ -202,7 +202,7 @@ func TestE2EBreakEvenThreshold(t *testing.T) {
 				Supported:    true,
 				TTL:          5 * time.Minute,
 				HitRate:      1.0,
-				HitRateKnown: true,
+				HitRateSource: HitRateObserved,
 			},
 		}
 	}
@@ -312,7 +312,7 @@ func TestE2ECacheTTLExpiryMidWindow(t *testing.T) {
 					Supported:    true,
 					TTL:          5 * time.Minute, // 3 lifetimes in 15min window
 					HitRate:      1.0,
-					HitRateKnown: true,
+					HitRateSource: HitRateObserved,
 					Existing: CacheEntry{
 						Valid:     true,
 						ExpiresAt: now.Add(2 * time.Minute), // expires in 2 min
@@ -386,7 +386,7 @@ func TestE2ECircuitBreakerFailover(t *testing.T) {
 				ID: 2, Name: "mid-price", Priority: 5,
 				Healthy: true, SupportsModel: true,
 				Price:   anthropicSonnetPrice(),
-				Cache:   CacheProfile{Supported: true, TTL: 5 * time.Minute, HitRate: 0.9, HitRateKnown: true},
+				Cache:   CacheProfile{Supported: true, TTL: 5 * time.Minute, HitRate: 0.9, HitRateSource: HitRateObserved},
 			},
 			{
 				ID: 3, Name: "expensive-backup", Priority: 10,
@@ -451,7 +451,7 @@ func TestE2EModelNotSupportedFiltered(t *testing.T) {
 				ID: 2, Name: "haiku-capable", Priority: 5,
 				Healthy: true, SupportsModel: true,
 				Price:   anthropicSonnetPrice(),
-				Cache:   CacheProfile{Supported: true, TTL: 5 * time.Minute, HitRate: 0.8, HitRateKnown: true},
+				Cache:   CacheProfile{Supported: true, TTL: 5 * time.Minute, HitRate: 0.8, HitRateSource: HitRateObserved},
 			},
 		},
 		Config: DefaultConfig(),

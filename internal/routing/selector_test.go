@@ -49,7 +49,7 @@ func TestChooseCacheCandidateAtRepeatedVolume(t *testing.T) {
 			healthyCandidate(1, "no cache", 0, basePrice(1e-6)),
 			func() Candidate {
 				c := healthyCandidate(2, "cache", 5, cachePrice)
-				c.Cache = CacheProfile{Supported: true, TTL: 5 * time.Minute, HitRate: 1, HitRateKnown: true}
+				c.Cache = CacheProfile{Supported: true, TTL: 5 * time.Minute, HitRate: 1, HitRateSource: HitRateObserved}
 				return c
 			}(),
 		},
