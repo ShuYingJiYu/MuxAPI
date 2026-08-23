@@ -143,14 +143,14 @@ func EstimateWindowCost(features RequestFeatures, forecast TrafficForecast, pric
 
 	lifetimes, initialExisting := cacheLifetimes(cache, forecast.Window, n, now)
 	hitRate := cache.HitRate
-	if !cache.HitRateKnown {
-		if cache.DefaultHitRate > 0 {
-			hitRate = cache.DefaultHitRate
-			result.Warnings = append(result.Warnings, "using optimistic prior hit rate; will converge to observed")
-		} else {
-			hitRate = 0
-			result.Warnings = append(result.Warnings, "cache hit rate is unknown; assuming misses")
-		}
+	switch cache.HitRateSource {
+	case HitRateObserved:
+		// use HitRate as-is
+	case HitRatePrior:
+		result.Warnings = append(result.Warnings, "using optimistic prior hit rate; will converge to observed")
+	case HitRateUnknown, "":
+		hitRate = 0
+		result.Warnings = append(result.Warnings, "cache hit rate is unknown; assuming misses")
 	}
 	if hitRate < 0 || math.IsNaN(hitRate) || math.IsInf(hitRate, 0) {
 		hitRate = 0
@@ -271,7 +271,7 @@ func breakEvenRequests(features RequestFeatures, forecast TrafficForecast, prici
 	}
 	noCache := float64(features.InputTokens)*input + out
 	h := cache.HitRate
-	if !cache.HitRateKnown {
+	if cache.HitRateSource == HitRateUnknown || cache.HitRateSource == "" {
 		h = 0
 	}
 	if h < 0 || h > 1 || math.IsNaN(h) || math.IsInf(h, 0) {

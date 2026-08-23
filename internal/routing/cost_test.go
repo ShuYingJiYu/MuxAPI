@@ -27,7 +27,7 @@ func TestEstimateWindowCostCacheWinsAtVolume(t *testing.T) {
 		InputKnown: true, OutputKnown: true, CacheWriteKnown: true, CacheReadKnown: true,
 		Multiplier: 1, Confidence: 0.9,
 	}
-	cache := CacheProfile{Supported: true, TTL: 15 * time.Minute, HitRate: 1, HitRateKnown: true}
+	cache := CacheProfile{Supported: true, TTL: 15 * time.Minute, HitRate: 1, HitRateSource: HitRateObserved}
 	cost := EstimateWindowCost(features, TrafficForecast{Requests: 10, Window: 15 * time.Minute}, price, cache, time.Time{}, 15*time.Minute)
 
 	if !cost.CacheUsed || !cost.CacheEligible {
@@ -53,7 +53,7 @@ func TestEstimateWindowCostChoosesOrdinaryWhenWriteIsTooExpensive(t *testing.T) 
 		InputKnown: true, OutputKnown: true, CacheWriteKnown: true, CacheReadKnown: true,
 	}
 	cost := EstimateWindowCost(features, TrafficForecast{Requests: 1}, price,
-		CacheProfile{Supported: true, HitRate: 1, HitRateKnown: true}, time.Time{}, 5*time.Minute)
+		CacheProfile{Supported: true, HitRate: 1, HitRateSource: HitRateObserved}, time.Time{}, 5*time.Minute)
 
 	if cost.CacheUsed {
 		t.Fatalf("one expensive cache write should not win: %+v", cost)
@@ -68,7 +68,7 @@ func TestEstimateWindowCostDefaultsMissingCacheRates(t *testing.T) {
 	features := RequestFeatures{InputTokens: 2_000, ReusableInputTokens: 1_800, EstimatedOutputTokens: 100}
 	price := Pricing{InputPerToken: 1e-6, OutputPerToken: 2e-6, InputKnown: true, OutputKnown: true, Confidence: 0.8}
 	cost := EstimateWindowCost(features, TrafficForecast{Requests: 20, Window: 15 * time.Minute}, price,
-		CacheProfile{Supported: true, HitRate: 0.9, HitRateKnown: true}, time.Time{}, 15*time.Minute)
+		CacheProfile{Supported: true, HitRate: 0.9, HitRateSource: HitRateObserved}, time.Time{}, 15*time.Minute)
 	if !cost.PricingComplete || len(cost.Warnings) == 0 {
 		t.Fatalf("missing cache rates should use an auditable default: %+v", cost)
 	}
@@ -84,7 +84,7 @@ func TestEstimateWindowCostAccountsForTTLLifetimes(t *testing.T) {
 		InputKnown: true, OutputKnown: true, CacheWriteKnown: true, CacheReadKnown: true,
 	}
 	cost := EstimateWindowCost(features, TrafficForecast{Requests: 10, Window: 12 * time.Minute}, price,
-		CacheProfile{Supported: true, TTL: 5 * time.Minute, HitRate: 1, HitRateKnown: true}, time.Time{}, 15*time.Minute)
+		CacheProfile{Supported: true, TTL: 5 * time.Minute, HitRate: 1, HitRateSource: HitRateObserved}, time.Time{}, 15*time.Minute)
 
 	closeTo(t, cost.CacheLifetimes, 3)
 	closeTo(t, cost.ExpectedCreates, 3)
@@ -99,7 +99,7 @@ func TestExistingCacheAvoidsInitialWrite(t *testing.T) {
 		InputKnown: true, OutputKnown: true, CacheWriteKnown: true, CacheReadKnown: true,
 	}
 	cost := EstimateWindowCost(features, TrafficForecast{Requests: 2, Window: time.Minute}, price,
-		CacheProfile{Supported: true, TTL: 5 * time.Minute, HitRate: 1, HitRateKnown: true,
+		CacheProfile{Supported: true, TTL: 5 * time.Minute, HitRate: 1, HitRateSource: HitRateObserved,
 			Existing: CacheEntry{Valid: true, ExpiresAt: now.Add(2 * time.Minute)}}, now, 15*time.Minute)
 
 	closeTo(t, cost.ExpectedCreates, 0)
