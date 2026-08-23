@@ -1,5 +1,7 @@
 // 轻量 admin API 封装：所有请求经 vite proxy /admin → 后端 8080。
 // adminToken 存在 localStorage（后端 AdminToken 为空时鉴权跳过，本地调试免填）。
+import { unwrap, normalizeTs, validate, ROUTE_DECISION_ENTRY_FIELDS } from './api.generated.js'
+
 const token = () => localStorage.getItem('muxapi_token') || ''
 
 async function req(method, path, body) {
@@ -216,11 +218,15 @@ export const api = {
   logOptions: () => req('GET', '/logs/options'),
 
   // 路由决策
-  routeDecisions: (params) => {
+  routeDecisions: async (params) => {
     const p = new URLSearchParams()
     if (params) for (const [k, v] of Object.entries(params)) { if (v != null && v !== '') p.set(k, v) }
+    p.set('include_candidates', 'true')
     const qs = p.toString()
-    return req('GET', '/routing/decisions' + (qs ? '?' + qs : ''))
+    const raw = await req('GET', '/routing/decisions' + (qs ? '?' + qs : ''))
+    const items = unwrap(raw)
+    if (Array.isArray(items)) items.forEach(i => validate('RouteDecisionEntry', i, ROUTE_DECISION_ENTRY_FIELDS))
+    return items
   },
   routeDecisionDetail: (id) => req('GET', `/routing/decisions/${id}`),
 
