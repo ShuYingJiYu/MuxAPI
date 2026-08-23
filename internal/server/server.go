@@ -45,6 +45,7 @@ type Server struct {
 	monProber       *monitor.Prober
 	billingMgr      *billing.Manager
 	backupSvc       *backup.Service
+	version         string
 	maxBody         int64 // 请求体字节上限（<=0 表示不限制）
 	maxBodyProvider func() int64
 	settingsChanged func()
@@ -81,12 +82,16 @@ func New(fwd *forward.Forwarder, adminToken string, st *store.Store, hm *health.
 		modelCache: make(map[int64]modelCacheEntry), modelFlight: make(map[int64]*modelFetch)}
 }
 
+// SetVersion sets the build version string displayed in the admin UI.
+func (s *Server) SetVersion(v string) { s.version = v }
+
 // Handler 注册客户端、管理、健康检查和静态前端路由。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
+	mux.HandleFunc("/admin/version", s.adminVersion)
 	mux.HandleFunc("/v1/messages", s.messages)         // Claude 格式
 	mux.HandleFunc("/v1/chat/completions", s.messages) // OpenAI 格式
 	mux.HandleFunc("/v1/responses", s.messages)        // OpenAI Responses API (codex)
@@ -97,6 +102,14 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("/", spaFileServer(sub))
 	}
 	return mux
+}
+
+func (s *Server) adminVersion(w http.ResponseWriter, _ *http.Request) {
+	v := s.version
+	if v == "" {
+		v = "dev"
+	}
+	writeJSON(w, map[string]string{"version": v})
 }
 
 // spaFileServer serves real build assets when they exist and falls back to
