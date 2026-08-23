@@ -113,6 +113,28 @@ func (s *Store) CacheCoverageRatio(upstreamID int64) (float64, error) {
 	return ratio, nil
 }
 
+// TokenInflationFactor returns the average ratio of actual billed tokens to the
+// routing estimate (prefix_tokens) for an upstream. Upstreams that inject extra
+// system prompts will have inflation > 1.0, meaning the cost model should use a
+// larger InputTokens when estimating the no-cache baseline and suffix cost.
+// Only considers recent cache-eligible observations where prefix_tokens is
+// meaningful (> 1024).
+func (s *Store) TokenInflationFactor(upstreamID int64) (float64, error) {
+	var factor float64
+	err := s.db.QueryRow(`SELECT AVG((input_tokens + cached_tokens + cache_creation_tokens)::float / prefix_tokens)
+		FROM (SELECT input_tokens, cached_tokens, cache_creation_tokens, prefix_tokens
+			FROM routing_observations
+			WHERE upstream_id=? AND prefix_tokens > 1024 AND (cached_tokens > 0 OR cache_creation_tokens > 0)
+			ORDER BY observed_at DESC LIMIT 50) sub`, upstreamID).Scan(&factor)
+	if err != nil {
+		return 1, err
+	}
+	if factor < 1 {
+		return 1, nil
+	}
+	return factor, nil
+}
+
 type PrefixCacheStats struct {
 	APIKeyHash         string  `json:"api_key_hash,omitempty"`
 	UpstreamID         int64   `json:"upstream_id"`

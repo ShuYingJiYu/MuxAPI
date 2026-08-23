@@ -56,6 +56,16 @@ func EstimateWindowCost(features RequestFeatures, forecast TrafficForecast, pric
 	forecast = forecast.normalized(features, defaultWindow)
 	pricing = pricing.Normalized()
 
+	// InputInflation corrects for upstreams that inject additional tokens
+	// (system prompts, tool definitions) not visible to the router at decision
+	// time. The inflated InputTokens produces a realistic suffix size.
+	if cache.InputInflation > 1 {
+		inflated := int64(float64(features.InputTokens) * cache.InputInflation)
+		if inflated > features.InputTokens {
+			features.InputTokens = inflated
+		}
+	}
+
 	prefix := float64(features.ReusableInputTokens)
 	if !cache.Supported || (cache.MinTokens > 0 && int64(prefix) < cache.MinTokens) {
 		prefix = 0
@@ -253,6 +263,12 @@ func cacheLifetimes(cache CacheProfile, window time.Duration, requests float64, 
 // supplied prices, or the equation is not defined.
 func breakEvenRequests(features RequestFeatures, forecast TrafficForecast, pricing Pricing, cache CacheProfile, multiplier float64) float64 {
 	features = features.Normalize()
+	if cache.InputInflation > 1 {
+		inflated := int64(float64(features.InputTokens) * cache.InputInflation)
+		if inflated > features.InputTokens {
+			features.InputTokens = inflated
+		}
+	}
 	prefix := float64(features.ReusableInputTokens)
 	if !cache.Supported || prefix == 0 || (cache.MinTokens > 0 && int64(prefix) < cache.MinTokens) {
 		return -1

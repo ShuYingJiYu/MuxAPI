@@ -188,6 +188,11 @@ type CacheProfile struct {
 	// false by default.
 	CacheWriteIncludesInput bool `json:"cache_write_includes_input,omitempty"`
 	CacheReadIncludesInput  bool `json:"cache_read_includes_input,omitempty"`
+	// InputInflation is the observed ratio of actual billed input tokens to the
+	// router's estimated InputTokens. Upstreams that inject system prompts will
+	// have inflation > 1.0. The cost model uses this to correct the suffix size
+	// (InputTokens * inflation - ReusableInputTokens). 0 or 1 means no correction.
+	InputInflation float64 `json:"input_inflation,omitempty"`
 }
 
 // TrafficForecast is the expected load over a decision window. Requests may be
