@@ -27,6 +27,9 @@ import (
 	"github.com/mirainya/muxapi/internal/upstream"
 )
 
+// Version is set at build time via -ldflags "-X main.Version=v1.2.3".
+var Version = "dev"
+
 func main() {
 	cfg := config.Load()
 	if cfg.AdminToken == "" {
@@ -168,6 +171,7 @@ func main() {
 	var maxBodyValue atomic.Int64
 	maxBodyValue.Store(maxBodyBytes())
 	srv := server.New(fwd, cfg.AdminToken, st, hm, mon, monProber, maxBodyValue.Load())
+	srv.SetVersion(Version)
 	srv.SetMaxBodyProvider(maxBodyValue.Load)
 	srv.SetSettingsChanged(func() {
 		hm.SetFailurePolicy(failThreshold(), cooldown())

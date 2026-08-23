@@ -52,6 +52,7 @@ svg { display: block; flex-shrink: 0; }
 .nav-item.active .ic { color: #fff; opacity: 1; }
 .nav-item .ic { color: currentColor; opacity: .8; transition: all .22s; }
 .sidebar-footer { padding: 8px 12px 14px; border-top: 1px solid var(--g100); }
+.sidebar-version { padding: 12px 20px 16px; font-size: 11px; color: var(--g400); font-weight: 500; letter-spacing: .02em; }
 
 /* Header (glass, sticky — 复刻 sub2api AppHeader) */
 .header {
@@ -1064,6 +1065,7 @@ table.matrix th, table.matrix td { padding: 0; }
   .header { height: 58px; padding: 0 13px; }
   .header-title { font-size: 16px; }
   .header-desc, .header-badge { display: none; }
+  .sidebar-version { display: none; }
   .main { padding: 14px 12px; }
   .drawer-mask { overflow: hidden; }
   .upstream-toolbar { align-items: stretch; flex-direction: column; }
