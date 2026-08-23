@@ -147,51 +147,30 @@ func (r *intelligentRouter) candidates(s *Scheduler, all []*upstream.Upstream, m
 }
 
 func (r *intelligentRouter) price(item *upstream.Upstream, model string, statuses map[int64]store.BillingStatus) routing.Pricing {
-	price, err := r.modelPricing(model, time.Now())
+	catalogPrice, err := r.modelPricing(model, time.Now())
 	if err != nil {
 		return routing.Pricing{}
 	}
-	result := routing.Pricing{Source: "LiteLLM", Confidence: 0.55, Multiplier: 1}
-	if price.InputCostPerToken != nil {
-		result.InputPerToken, result.InputKnown = *price.InputCostPerToken, true
+
+	params := routing.PricingParams{
+		InputCostPerToken:  catalogPrice.InputCostPerToken,
+		OutputCostPerToken: catalogPrice.OutputCostPerToken,
+		CacheReadPerToken:  catalogPrice.CacheReadInputTokenCost,
+		CacheWritePerToken: catalogPrice.CacheWriteInputTokenCost,
+		CreditRatio:        item.CreditRatio,
 	}
-	if price.OutputCostPerToken != nil {
-		result.OutputPerToken, result.OutputKnown = *price.OutputCostPerToken, true
-	}
-	if price.CacheReadInputTokenCost != nil {
-		result.CacheReadPerToken, result.CacheReadKnown = *price.CacheReadInputTokenCost, true
-	}
-	if price.CacheWriteInputTokenCost != nil {
-		result.CacheWritePerToken, result.CacheWriteKnown = *price.CacheWriteInputTokenCost, true
-	}
+
 	if status, ok := statuses[item.ID]; ok {
 		if status.EffectiveMultiplier != nil && *status.EffectiveMultiplier > 0 {
-			multiplier := *status.EffectiveMultiplier
-			if item.CreditRatio > 0 {
-				multiplier /= item.CreditRatio
-			}
-			result.Multiplier = multiplier
-			result.Source = "LiteLLM+provider-billing"
-			result.Confidence = 0.8
+			params.EffectiveMultiplier = *status.EffectiveMultiplier
 		} else if status.GroupMultiplier != nil && *status.GroupMultiplier > 0 {
-			multiplier := *status.GroupMultiplier
-			if item.CreditRatio > 0 {
-				multiplier /= item.CreditRatio
-			}
-			result.Multiplier = multiplier
-			result.Source = "LiteLLM+provider-billing-group"
-			result.Confidence = 0.7
-		} else if lastKnown := r.lastKnownMultiplier(item.ID); lastKnown > 0 {
-			multiplier := lastKnown
-			if item.CreditRatio > 0 {
-				multiplier /= item.CreditRatio
-			}
-			result.Multiplier = multiplier
-			result.Source = "LiteLLM+provider-billing-stale"
-			result.Confidence = 0.6
+			params.GroupMultiplier = *status.GroupMultiplier
+		} else {
+			params.LastKnownMultiplier = r.lastKnownMultiplier(item.ID)
 		}
 	}
-	return result
+
+	return routing.ResolvePricing(params)
 }
 
 func (r *intelligentRouter) performance(id int64, model string, window time.Duration, now time.Time, h Health) routing.Performance {
@@ -221,81 +200,44 @@ func (r *intelligentRouter) cache(item *upstream.Upstream, model string, feature
 	if cacheMode == upstream.CacheDisabled {
 		return routing.CacheProfile{}
 	}
+
 	keyHash := hashCredential(item.APIKey)
-	// Use SessionID for prefix stats lookup when available. In multi-turn
-	// conversations (like Claude Code), each request adds content so the
-	// exact prefix hash changes every turn — but the session's cache behavior
-	// is stable: hits accumulate across turns because the provider caches the
-	// growing prefix. Using session_key lets the hit rate observation persist.
 	prefixHash := features.CacheKey
 	if features.SessionID != "" && features.SessionID != features.CacheKey {
 		prefixHash = features.SessionID
 	}
+
 	stats, err := r.prefixStats(keyHash, item.ID, model, prefixHash, window, now)
 	observed := err == nil
-	// A row containing only misses is useful for the hit-rate denominator, but
-	// does not prove that the provider actually supports prompt caching.
 	cacheObserved := observed && (stats.HitCount > 0 || stats.CreateCount > 0)
 	supported := cacheMode == upstream.CacheEnabled || cacheObserved
 	if !supported {
 		return routing.CacheProfile{}
 	}
-	ttl := selectCacheTTL(stats, now)
-	if strings.EqualFold(strings.TrimSpace(item.Protocol), "gemini") {
-		ttl = time.Hour
-	}
-	profile := routing.CacheProfile{
-		Supported: supported, TTL: ttl, MinTokens: 1024,
-		HitRateKnown:   observed && stats.Observations > 0,
-		DefaultHitRate: 0.85,
-		CoverageRatio:  r.cacheCoverage(item.ID),
-		Existing:       routing.CacheEntry{Valid: observed && stats.Valid, PrefixTokens: stats.PrefixTokens},
-		PreferredTTL:   ttl,
+
+	params := routing.CacheStateParams{
+		Supported:     true,
+		CacheMode:     string(cacheMode),
+		CoverageRatio: r.cacheCoverage(item.ID),
+		Protocol:      item.Protocol,
 	}
 	if observed {
-		profile.HitRate = stats.WindowHitRate
-		if stats.ExpiresAt > 0 {
-			profile.Existing.ExpiresAt = time.Unix(stats.ExpiresAt, 0)
-		}
-	}
-	return profile
-}
-
-// selectCacheTTL picks an adaptive TTL based on observed session behavior.
-// Sessions that keep losing their cache (multiple creates over a long period)
-// benefit from requesting longer provider TTLs; infrequent requesters may also
-// benefit when the break-even math works out.
-func selectCacheTTL(stats store.PrefixCacheStats, now time.Time) time.Duration {
-	const defaultTTL = 5 * time.Minute
-	const extendedTTL = time.Hour
-
-	if stats.FirstSeenAt <= 0 || stats.Observations <= 0 {
-		return defaultTTL
-	}
-	sessionDuration := time.Duration(now.Unix()-stats.FirstSeenAt) * time.Second
-
-	// If session has been running > 10min and cache was rebuilt >= 2 times,
-	// the session keeps losing cache — extend TTL to reduce rebuilds.
-	if sessionDuration > 10*time.Minute && stats.CreateCount >= 2 {
-		return extendedTTL
+		params.Observations = stats.WindowObservations
+		params.HitCount = stats.WindowHitCount
+		params.MissCount = stats.WindowMissCount
+		params.CreateCount = stats.CreateCount
+		params.PrefixTokens = stats.PrefixTokens
+		params.ExpiresAt = stats.ExpiresAt
+		params.FirstSeenAt = stats.FirstSeenAt
+		params.LastHitAt = stats.LastHitAt
 	}
 
-	// If average request interval > 4min, evaluate whether extended TTL
-	// breaks even: a 1h TTL covers ~15 requests at 4min intervals vs
-	// rebuilding every 5min. Worth it if we'd otherwise create more than once.
-	avgInterval := sessionDuration / time.Duration(stats.Observations)
-	if avgInterval > 4*time.Minute && stats.CreateCount >= 1 {
-		return extendedTTL
-	}
-
-	return defaultTTL
+	sc := routing.ResolveSessionCache(params, now)
+	return sc.ToCacheProfile()
 }
 
 func (r *intelligentRouter) forecast(all []*upstream.Upstream, model string, features routing.RequestFeatures, cfg routing.Config, now time.Time) routing.TrafficForecast {
-	// Aggregate over all upstreams so a channel with no own history does not
-	// receive a zero-volume forecast merely because it is newly configured.
-	var requestsPerMinute, outputPerRequest float64
-	var count int
+	samples := make([]routing.UpstreamTrafficSample, 0, len(all))
 	for _, item := range all {
 		if item == nil {
 			continue
@@ -304,14 +246,12 @@ func (r *intelligentRouter) forecast(all []*upstream.Upstream, model string, fea
 		if err != nil || stats.Requests == 0 {
 			continue
 		}
-		requestsPerMinute += stats.RequestsPerMinute
-		outputPerRequest += stats.OutputPerRequest
-		count++
+		samples = append(samples, routing.UpstreamTrafficSample{
+			RequestsPerMinute: stats.RequestsPerMinute,
+			OutputPerRequest:  stats.OutputPerRequest,
+		})
 	}
-	if count > 0 {
-		outputPerRequest /= float64(count)
-	}
-	return routing.TrafficForecast{Window: cfg.Window, RequestsPerMinute: requestsPerMinute, OutputTokensPerReq: outputPerRequest}
+	return routing.BuildForecast(samples, cfg.Window)
 }
 
 func hashCredential(value string) string {
