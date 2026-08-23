@@ -238,9 +238,10 @@ func (r *intelligentRouter) cache(item *upstream.Upstream, model string, feature
 	}
 	profile := routing.CacheProfile{
 		Supported: supported, TTL: ttl, MinTokens: 1024,
-		HitRateKnown: observed && stats.Observations > 0,
-		Existing:     routing.CacheEntry{Valid: observed && stats.Valid, PrefixTokens: stats.PrefixTokens},
-		PreferredTTL: ttl,
+		HitRateKnown:   observed && stats.Observations > 0,
+		DefaultHitRate: 0.85,
+		Existing:       routing.CacheEntry{Valid: observed && stats.Valid, PrefixTokens: stats.PrefixTokens},
+		PreferredTTL:   ttl,
 	}
 	if observed {
 		profile.HitRate = stats.WindowHitRate

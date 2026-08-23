@@ -136,10 +136,13 @@ func EstimateWindowCost(features RequestFeatures, forecast TrafficForecast, pric
 	lifetimes, initialExisting := cacheLifetimes(cache, forecast.Window, n, now)
 	hitRate := cache.HitRate
 	if !cache.HitRateKnown {
-		// Unknown hit rates are intentionally conservative: no future hit is
-		// assumed, while a currently valid entry is still usable once.
-		hitRate = 0
-		result.Warnings = append(result.Warnings, "cache hit rate is unknown; assuming misses")
+		if cache.DefaultHitRate > 0 {
+			hitRate = cache.DefaultHitRate
+			result.Warnings = append(result.Warnings, "using optimistic prior hit rate; will converge to observed")
+		} else {
+			hitRate = 0
+			result.Warnings = append(result.Warnings, "cache hit rate is unknown; assuming misses")
+		}
 	}
 	if hitRate < 0 || math.IsNaN(hitRate) || math.IsInf(hitRate, 0) {
 		hitRate = 0

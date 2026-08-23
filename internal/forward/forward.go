@@ -350,6 +350,8 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			continue
 		}
 		// Inject cache_control hint for extended TTL on Claude protocol.
+		// NOTE: Only inject when adaptive TTL selects 1h. For 5min TTL, the
+		// upstream auto-detects cacheable prefixes without client hints.
 		if routeDecision != nil && routeDecision.Cost.CacheUsed &&
 			routeDecision.CacheProfile.PreferredTTL > 5*time.Minute &&
 			targetFormat == translate.Claude {
