@@ -248,6 +248,8 @@ func Choose(request Request) (Decision, error) {
 // chooseExploration uses a stable time-bucketed hash instead of process-global
 // randomness. This keeps request tests and audit replay deterministic while
 // still sending a small, bounded sample to less-observed eligible channels.
+// Only explores candidates within CostTieTolerance of the runner-up to avoid
+// wasting money on channels that are obviously more expensive.
 func chooseExploration(request Request, cfg Config, eligible []int, winner int, now time.Time) (int, bool) {
 	if request.Now.IsZero() || cfg.ExplorationRate <= 0 || len(eligible) < 2 {
 		return 0, false
@@ -262,12 +264,22 @@ func chooseExploration(request Request, cfg Config, eligible []int, winner int, 
 	if binary.BigEndian.Uint64(hash[:8]) > threshold {
 		return 0, false
 	}
+	// Only explore among candidates that are at most 2x the winner's cost.
+	// Expensive fallback channels are not worth exploring.
+	winnerCost := request.Candidates[winner].Price.Multiplier
+	if winnerCost <= 0 {
+		winnerCost = 1
+	}
+	costCeiling := winnerCost * 2
 	best := -1
 	for _, index := range eligible {
 		if index == winner {
 			continue
 		}
 		candidate := request.Candidates[index]
+		if candidate.Price.Multiplier > costCeiling {
+			continue
+		}
 		if best < 0 || candidate.Performance.Samples < request.Candidates[best].Performance.Samples ||
 			(candidate.Performance.Samples == request.Candidates[best].Performance.Samples && candidate.ID < request.Candidates[best].ID) {
 			best = index
