@@ -2767,6 +2767,7 @@ function logout() {
                     <div><b>{{ attempt.upstream_name || ('#' + attempt.upstream_id) }}</b><span>{{ selectionText(attempt.selection_reason) }} · 优先级 {{ attempt.priority || '—' }}</span></div>
                     <span class="log-status" :class="attempt.outcome === 'success' ? 'ok' : attempt.outcome === 'canceled' ? 'muted' : 'fail'">{{ outcomeText(attempt.outcome) }} · {{ statusText(attempt.status) }}</span>
                   </header>
+                  <div v-if="attempt.mapped_model" class="attempt-mapping">模型映射 <code>{{ logDetail.model }} → {{ attempt.mapped_model }}</code></div>
                   <div class="attempt-facts">
                     <span>熔断 {{ attempt.health_before || '—' }} → {{ attempt.health_after || '—' }}</span>
                     <span>TTFT {{ fmtMs(attempt.ttft_ms) }}</span>
