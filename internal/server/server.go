@@ -156,7 +156,7 @@ func spaFileServer(root fs.FS) http.Handler {
 // request would incorrectly receive a successful index.html response.
 func isSPAHistoryRoute(name string) bool {
 	switch name {
-	case "overview", "groups", "upstreams", "monitors", "logs", "settings":
+	case "overview", "groups", "upstreams", "monitors", "logs", "routing", "settings":
 		return true
 	default:
 		return false
