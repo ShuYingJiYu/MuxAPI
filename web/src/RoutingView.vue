@@ -51,19 +51,30 @@ function fmtCost(v) {
 
 function fmtReason(d) {
   if (!d.reason) return '—'
-  // Parse "lowest forecast cost via provider cache: 1.35 over 15m0s; saves 1.71 versus runner-up"
   if (d.cache_selected) {
     const saves = d.estimated_savings
-    if (saves > 0) return `缓存省 ${fmtCost(saves)}（vs 次优）`
+    const n = d.forecast_requests || 1
+    if (saves > 0) return `缓存省 ${fmtCost(saves / n)}/请求`
   }
   if (d.exploration) return '探索采样'
   if (d.reason.includes('ordinary input')) return '无缓存最低价'
   return d.reason.split(';')[0].replace('lowest forecast cost via ', '').replace(' over ', ' / ')
 }
 
-function maxCost(candidates) {
+function maxCost(candidates, detail) {
   if (!candidates || !candidates.length) return 1
-  return Math.max(...candidates.map(c => c.forecast_total_cost || c.cost || 0), 0.0001)
+  const n = detail?.forecast_requests || 1
+  return Math.max(...candidates.map(c => (c.forecast_total_cost || 0) / n), 0.0001)
+}
+
+function perReqCost(d) {
+  if (!d.selected_cost || !d.forecast_requests) return d.selected_cost
+  return d.selected_cost / d.forecast_requests
+}
+
+function perReqCandidateCost(c, detail) {
+  const n = detail?.forecast_requests || 1
+  return (c.forecast_total_cost || 0) / n
 }
 </script>
 
@@ -77,7 +88,7 @@ function maxCost(candidates) {
         <span class="routing-time">{{ timeAgo(d.created_at) }}</span>
         <span class="routing-model">{{ d.model || '—' }}</span>
         <span class="routing-upstream selected">{{ d.selected_upstream || '—' }}</span>
-        <span class="routing-cost">{{ fmtCost(d.selected_cost) }}</span>
+        <span class="routing-cost">{{ fmtCost(perReqCost(d)) }}</span>
         <span class="routing-badge" :class="d.cache_selected ? 'cache-hit' : 'cache-miss'">
           {{ d.cache_selected ? '缓存' : '直连' }}
         </span>
@@ -90,17 +101,17 @@ function maxCost(candidates) {
         <template v-else>
           <!-- Cost bar chart -->
           <div v-if="detail.candidates && detail.candidates.length" class="routing-candidates">
-            <h4>候选成本对比（{{ detail.forecast_requests?.toFixed(0) || '?' }} 请求 / 15min 窗口）</h4>
+            <h4>单请求各渠道成本对比</h4>
             <div class="routing-bars">
               <div v-for="c in detail.candidates.filter(x => x.eligible)" :key="c.upstream_id || c.upstream_name"
                 class="routing-bar-row">
                 <span class="bar-label">{{ c.upstream_name || c.name }}</span>
                 <div class="bar-track">
                   <div class="bar-fill" :class="{ accent: c.selected }"
-                    :style="{ width: Math.max((c.forecast_total_cost || 0) / maxCost(detail.candidates.filter(x => x.eligible)) * 100, 3) + '%' }">
+                    :style="{ width: Math.max(perReqCandidateCost(c, detail) / maxCost(detail.candidates.filter(x => x.eligible), detail) * 100, 3) + '%' }">
                   </div>
                 </div>
-                <span class="bar-cost">{{ fmtCost(c.forecast_total_cost) }}</span>
+                <span class="bar-cost">{{ fmtCost(perReqCandidateCost(c, detail)) }}</span>
                 <span v-if="c.selected" class="bar-note accent-text">✓ 已选</span>
                 <span v-else-if="c.cache_supported" class="bar-note">有缓存</span>
                 <span v-else class="bar-note">无缓存</span>
