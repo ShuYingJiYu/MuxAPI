@@ -181,6 +181,14 @@ func (r *intelligentRouter) price(item *upstream.Upstream, model string, statuse
 			result.Multiplier = multiplier
 			result.Source = "LiteLLM+provider-billing-group"
 			result.Confidence = 0.7
+		} else if lastKnown := r.lastKnownMultiplier(item.ID); lastKnown > 0 {
+			multiplier := lastKnown
+			if item.CreditRatio > 0 {
+				multiplier /= item.CreditRatio
+			}
+			result.Multiplier = multiplier
+			result.Source = "LiteLLM+provider-billing-stale"
+			result.Confidence = 0.6
 		}
 	}
 	return result
@@ -329,6 +337,11 @@ func (r *intelligentRouter) billingStatuses(now time.Time) map[int64]store.Billi
 	r.billing = billingCacheEntry{expires: now.Add(billingCacheTTL), values: values}
 	r.mu.Unlock()
 	return values
+}
+
+func (r *intelligentRouter) lastKnownMultiplier(upstreamID int64) float64 {
+	m, _ := r.store.LastKnownMultiplier(upstreamID)
+	return m
 }
 
 func (r *intelligentRouter) modelPricing(model string, now time.Time) (store.ModelPricing, error) {
