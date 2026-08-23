@@ -210,7 +210,7 @@ func (r *intelligentRouter) cache(item *upstream.Upstream, model string, feature
 	stats, err := r.prefixStats(keyHash, item.ID, model, prefixHash, window, now)
 	observed := err == nil
 	cacheObserved := observed && (stats.HitCount > 0 || stats.CreateCount > 0)
-	supported := cacheMode == upstream.CacheEnabled || cacheObserved
+	supported := cacheMode == upstream.CacheEnabled || cacheMode == upstream.CacheAuto || cacheObserved
 	if !supported {
 		return routing.CacheProfile{}
 	}
