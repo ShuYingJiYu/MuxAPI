@@ -63,6 +63,14 @@ func EstimateWindowCost(features RequestFeatures, forecast TrafficForecast, pric
 	if prefix < 0 || math.IsNaN(prefix) || math.IsInf(prefix, 0) {
 		prefix = 0
 	}
+	// CoverageRatio models upstreams that only cache a fraction of the prefix.
+	// The uncached portion is billed at full input price even on hits.
+	coverage := cache.CoverageRatio
+	if coverage <= 0 || coverage > 1 || math.IsNaN(coverage) || math.IsInf(coverage, 0) {
+		coverage = 1
+	}
+	cachedPrefix := prefix * coverage
+	uncachedPrefix := prefix - cachedPrefix
 	suffix := float64(features.InputTokens) - prefix
 	if suffix < 0 {
 		suffix = 0
@@ -180,14 +188,15 @@ func EstimateWindowCost(features RequestFeatures, forecast TrafficForecast, pric
 	result.ExpectedCreates = misses
 	result.CacheLifetimes = lifetimes
 
-	result.CacheReadCost = hits * prefix * pricing.CacheReadPerToken * multiplier
-	result.CacheWriteCost = misses * prefix * pricing.CacheWritePerToken * multiplier
-	result.CacheInputCost = n * suffix * input * multiplier
+	result.CacheReadCost = hits * cachedPrefix * pricing.CacheReadPerToken * multiplier
+	result.CacheWriteCost = misses * cachedPrefix * pricing.CacheWritePerToken * multiplier
+	// suffix + uncached portion of prefix always pay full input price
+	result.CacheInputCost = n * (suffix + uncachedPrefix) * input * multiplier
 	if cache.CacheReadIncludesInput {
-		result.CacheReadCost += hits * prefix * input * multiplier
+		result.CacheReadCost += hits * cachedPrefix * input * multiplier
 	}
 	if cache.CacheWriteIncludesInput {
-		result.CacheWriteCost += misses * prefix * input * multiplier
+		result.CacheWriteCost += misses * cachedPrefix * input * multiplier
 	}
 	result.CacheTotal = result.CacheInputCost + result.CacheReadCost + result.CacheWriteCost + result.OutputCost
 	result.SelectedTotal = result.NoCacheTotal
@@ -248,8 +257,18 @@ func breakEvenRequests(features RequestFeatures, forecast TrafficForecast, prici
 	if !cache.Supported || prefix == 0 || (cache.MinTokens > 0 && int64(prefix) < cache.MinTokens) {
 		return -1
 	}
+	coverage := cache.CoverageRatio
+	if coverage <= 0 || coverage > 1 || math.IsNaN(coverage) || math.IsInf(coverage, 0) {
+		coverage = 1
+	}
+	cachedPrefix := prefix * coverage
+	uncachedPrefix := prefix - cachedPrefix
 	input := pricing.InputPerToken * multiplier
 	out := forecast.OutputTokensPerReq * pricing.OutputPerToken * multiplier
+	suffix := float64(features.InputTokens) - prefix
+	if suffix < 0 {
+		suffix = 0
+	}
 	noCache := float64(features.InputTokens)*input + out
 	h := cache.HitRate
 	if !cache.HitRateKnown {
@@ -258,13 +277,13 @@ func breakEvenRequests(features RequestFeatures, forecast TrafficForecast, prici
 	if h < 0 || h > 1 || math.IsNaN(h) || math.IsInf(h, 0) {
 		h = 0
 	}
-	miss := float64(features.InputTokens-features.ReusableInputTokens)*input + prefix*pricing.CacheWritePerToken*multiplier + out
-	hit := float64(features.InputTokens-features.ReusableInputTokens)*input + prefix*pricing.CacheReadPerToken*multiplier + out
+	miss := (suffix+uncachedPrefix)*input + cachedPrefix*pricing.CacheWritePerToken*multiplier + out
+	hit := (suffix+uncachedPrefix)*input + cachedPrefix*pricing.CacheReadPerToken*multiplier + out
 	if cache.CacheWriteIncludesInput {
-		miss += prefix * input
+		miss += cachedPrefix * input
 	}
 	if cache.CacheReadIncludesInput {
-		hit += prefix * input
+		hit += cachedPrefix * input
 	}
 	// Expected subsequent request cost at the observed hit rate.
 	steady := h*hit + (1-h)*miss
