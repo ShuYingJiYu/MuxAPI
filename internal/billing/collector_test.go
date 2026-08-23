@@ -91,6 +91,10 @@ func TestFetchNewAPI(t *testing.T) {
 		result.ReportedActualCost == nil || math.Abs(*result.ReportedActualCost-5.728422) > 0.000001 {
 		t.Fatalf("unexpected New API result: %+v", result)
 	}
+	expectedListCost := *result.ReportedActualCost / *result.EffectiveMultiplier
+	if result.ReportedListCost == nil || math.Abs(*result.ReportedListCost-expectedListCost) > 0.000001 {
+		t.Fatalf("ReportedListCost should be actual/multiplier: got %v, want %v", result.ReportedListCost, expectedListCost)
+	}
 }
 
 // 关键回归：New API 的 /api/log/token 把错误日志(type=5)和消费日志(type=2)混在
