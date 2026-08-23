@@ -248,7 +248,15 @@ export function useLogs({ page, guard }) {
     request_too_large: '请求体过大', request_read: '请求体读取失败',
   }[kind] || kind || '—')
   const errorSourceText = source => ({ upstream: '上游', client: '客户端', gateway: 'MuxAPI' }[source] || source || '—')
-  const selectionText = reason => ({ initial: '首次选择', failover: '故障切换', recovery_trial: '恢复验证' }[reason] || reason || '—')
+  const selectionText = reason => {
+    const map = { initial: '首次选择', failover: '故障切换', recovery_trial: '恢复验证' }
+    if (map[reason]) return map[reason]
+    if (!reason) return '—'
+    if (reason.includes('provider cache')) return '缓存路由'
+    if (reason.includes('ordinary input')) return '直连最优'
+    if (reason.includes('exploration')) return '探索采样'
+    return reason.split(':')[0] || reason
+  }
   const streamStateText = entry => {
     if (!entry.stream) return '非流式'
     if (entry.stream_completed) return entry.last_event ? `完整 · ${entry.last_event}` : '完整结束'
