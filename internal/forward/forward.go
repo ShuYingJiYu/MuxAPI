@@ -137,6 +137,7 @@ type AttemptResult struct {
 	// Protocol 快照本次尝试实际使用的渠道协议。费用比对靠它决定 cached_tokens
 	// 的口径，事后现查会用改动后的协议解释历史用量。
 	Protocol            string
+	MappedModel         string
 	UpstreamID          int64
 	Priority            int
 	SelectionReason     string
@@ -189,6 +190,7 @@ type Result struct {
 type attemptContext struct {
 	number          int
 	protocol        string
+	mappedModel     string
 	upstreamID      int64
 	priority        int
 	selectionReason string
@@ -212,7 +214,8 @@ func healthState(h Health, id int64) string {
 func (a attemptContext) finish(h Health, status int, outcome string, relay relayResult, errorKind, errorSource, errText string) AttemptResult {
 	completed := time.Now()
 	return AttemptResult{
-		AttemptNo: a.number, Protocol: a.protocol, UpstreamID: a.upstreamID, Priority: a.priority,
+		AttemptNo: a.number, Protocol: a.protocol, MappedModel: a.mappedModel,
+		UpstreamID: a.upstreamID, Priority: a.priority,
 		SelectionReason: a.selectionReason, HealthBefore: a.healthBefore, HealthAfter: healthState(h, a.upstreamID),
 		Status: status, Outcome: outcome, TTFTMs: relay.ttftMs, DurationMs: completed.Sub(a.started).Milliseconds(),
 		ResponseBytes: relay.bytesSent, Stream: relay.stream, StreamCompleted: relay.streamCompleted,
@@ -326,6 +329,9 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		upstreamModel := model
 		if f.modelMapper != nil {
 			upstreamModel = f.modelMapper.Resolve(candidate.ID, model)
+		}
+		if upstreamModel != model {
+			attemptCtx.mappedModel = upstreamModel
 		}
 		exchange, err := translate.NewExchange(sourceFormat, targetFormat, upstreamModel, streamRequested, body)
 		if err != nil {

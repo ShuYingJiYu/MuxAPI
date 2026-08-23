@@ -326,6 +326,7 @@ func openSQLite(path string) (*Store, error) {
 		// 快照当次尝试的渠道协议：费用比对靠它决定 cached_tokens 的口径，
 		// 现查会用改后的协议解释历史用量。
 		`ALTER TABLE request_attempts ADD COLUMN protocol TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE request_attempts ADD COLUMN mapped_model TEXT NOT NULL DEFAULT ''`,
 	} {
 		db.Exec(statement)
 	}
