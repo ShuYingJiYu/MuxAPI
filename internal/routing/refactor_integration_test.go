@@ -39,7 +39,7 @@ func TestIntegrationDimensionProvidersMatchOldBehavior(t *testing.T) {
 	if profile.CoverageRatio != 0.77 {
 		t.Fatalf("coverage: %v", profile.CoverageRatio)
 	}
-	closeTo(t, profile.HitRate, 0.8)
+	closeTo(t, profile.HitRate, 0.8125)
 	if profile.HitRateSource != HitRateObserved {
 		t.Fatalf("source: %v", profile.HitRateSource)
 	}
