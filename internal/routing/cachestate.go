@@ -29,6 +29,16 @@ func (s SessionCacheState) String() string {
 
 const defaultPriorHitRate = 0.85
 
+// Bayesian prior pseudo-observations. The prior hit rate is modeled as a
+// Beta(priorAlpha, priorBeta) distribution. With strength=5 and rate=0.85,
+// alpha=4.25 and beta=0.75. A single observed miss moves the posterior mean
+// from 0.85 to ~0.71 instead of the naïve 0.0.
+const (
+	priorStrength = 5.0
+	priorAlpha    = defaultPriorHitRate * priorStrength       // 4.25
+	priorBeta     = (1 - defaultPriorHitRate) * priorStrength // 0.75
+)
+
 // CacheStateParams holds the raw observations needed to determine cache state.
 // All timestamps are Unix seconds (0 = unknown). The caller fetches these from
 // the store layer; this function is a pure deterministic transform.
@@ -75,12 +85,15 @@ func ResolveSessionCache(params CacheStateParams, now time.Time) SessionCache {
 
 	sc.PreferredTTL = selectAdaptiveTTL(params, now)
 
-	// Determine hit rate
+	// Determine hit rate using Bayesian posterior (Beta-Binomial model).
+	// Prior Beta(4.25, 0.75) encodes the belief that caching generally works.
+	// Observed hits/misses update the posterior; the mean converges to the
+	// true rate as observations accumulate, while a single miss no longer
+	// collapses the estimate to zero.
 	if params.Observations > 0 && (params.HitCount > 0 || params.MissCount > 0) {
-		denom := params.HitCount + params.MissCount
-		if denom > 0 {
-			sc.HitRate = float64(params.HitCount) / float64(denom)
-		}
+		hits := float64(params.HitCount)
+		misses := float64(params.MissCount)
+		sc.HitRate = (priorAlpha + hits) / (priorAlpha + priorBeta + hits + misses)
 		sc.HitRateSource = HitRateObserved
 	} else if params.CacheMode == "enabled" || (params.Supported && params.Observations == 0) {
 		sc.HitRate = defaultPriorHitRate

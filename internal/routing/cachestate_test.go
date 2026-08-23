@@ -41,8 +41,8 @@ func TestResolveSessionCacheHot(t *testing.T) {
 	if sc.ExpiresAt.IsZero() || sc.ExpiresAt.Before(now) {
 		t.Fatalf("HOT should have future ExpiresAt: %v", sc.ExpiresAt)
 	}
-	if sc.HitRate != 0.8 {
-		t.Fatalf("hit rate: got %v want 0.8", sc.HitRate)
+	if sc.HitRate < 0.78 || sc.HitRate > 0.85 {
+		t.Fatalf("hit rate: got %v want ~0.8 (Bayesian posterior)", sc.HitRate)
 	}
 	if sc.CoverageRatio != 0.77 {
 		t.Fatalf("coverage: got %v", sc.CoverageRatio)
