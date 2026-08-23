@@ -123,8 +123,10 @@ func (s *Store) SaveBillingSuccess(state BillingStatus) error {
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(upstream_id) DO UPDATE SET
 		currency=excluded.currency,remaining=excluded.remaining,unlimited=excluded.unlimited,
-		billing_group=excluded.billing_group,group_multiplier=excluded.group_multiplier,
-		effective_multiplier=excluded.effective_multiplier,reported_list_cost=excluded.reported_list_cost,
+		billing_group=COALESCE(excluded.billing_group,upstream_billing_status.billing_group),
+		group_multiplier=COALESCE(excluded.group_multiplier,upstream_billing_status.group_multiplier),
+		effective_multiplier=COALESCE(excluded.effective_multiplier,upstream_billing_status.effective_multiplier),
+		reported_list_cost=excluded.reported_list_cost,
 		reported_actual_cost=excluded.reported_actual_cost,status=excluded.status,error_text=excluded.error_text,
 		observed_at=excluded.observed_at,last_success_at=excluded.last_success_at,refreshed_at=excluded.refreshed_at`,
 		state.UpstreamID, state.Currency, state.Remaining, state.Unlimited, state.BillingGroup,
@@ -153,6 +155,20 @@ func (s *Store) SaveBillingFailure(upstreamID int64, message string, refreshedAt
 		ON CONFLICT(upstream_id) DO UPDATE SET status='error',error_text=excluded.error_text,
 		refreshed_at=excluded.refreshed_at`, upstreamID, message, s.timeValue(refreshed))
 	return err
+}
+
+// LastKnownMultiplier returns the most recent non-null effective_multiplier
+// from billing snapshots. Used as fallback when the current status has lost
+// its multiplier due to partial/error refreshes.
+func (s *Store) LastKnownMultiplier(upstreamID int64) (float64, error) {
+	var m float64
+	err := s.db.QueryRow(`SELECT effective_multiplier FROM upstream_billing_snapshots
+		WHERE upstream_id=? AND effective_multiplier IS NOT NULL AND effective_multiplier > 0
+		ORDER BY observed_at DESC LIMIT 1`, upstreamID).Scan(&m)
+	if err != nil {
+		return 0, err
+	}
+	return m, nil
 }
 
 // ResetBillingData removes counters tied to an old provider type, URL, or API key.
