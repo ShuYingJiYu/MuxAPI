@@ -179,7 +179,15 @@ func (sc SessionCache) ToCacheProfile() CacheProfile {
 			ExpiresAt:    sc.ExpiresAt,
 		}
 	case CacheExpired, CacheCold:
-		profile.Existing = CacheEntry{Valid: false}
+		// When using a prior hit rate (never routed), assume the cache entry
+		// already exists. This prevents cold channels from being permanently
+		// penalized by a guaranteed first-miss write cost that hot channels
+		// have already amortized — making the comparison fair at steady state.
+		if sc.HitRateSource == HitRatePrior {
+			profile.Existing = CacheEntry{Valid: true, PrefixTokens: sc.PrefixTokens}
+		} else {
+			profile.Existing = CacheEntry{Valid: false}
+		}
 	}
 
 	return profile
