@@ -1505,7 +1505,7 @@ function logout() {
                   <FancySelect v-if="overviewCurrencyOptions.length > 1" v-model="overviewBalanceCurrency" :options="overviewCurrencyOptions" />
                   <span v-else class="ov-chart-meta">{{ overviewSelectedBalance?.currency || '暂无币种' }}</span>
                 </header>
-                <div v-if="overviewBalanceHasData" class="ov-chart"><Chart :key="`balance-${overviewTrendTagID}-${overviewTrends?.to_at || 0}`" :labels="overviewChartLabels" :datasets="overviewBalanceDatasets" color="#d39b35" axis-labels :fmt="overviewBalanceText" /></div>
+                <div v-if="overviewBalanceHasData" class="ov-chart"><Chart :key="`balance-${overviewTrendTagID}-${overviewTrends?.to_at || 0}`" :labels="overviewChartLabels" :datasets="overviewBalanceDatasets" color="#d39b35" axis-labels show-legend :fmt="overviewBalanceText" /></div>
                 <div v-else class="ov-chart-empty"><Icon name="server" :size="18" />暂无余额历史</div>
                 <p class="ov-chart-foot">{{ overviewTrends?.upstream_count || 0 }} 个渠道 · {{ overviewTrends?.unlimited_count || 0 }} 个无限额度</p>
               </section>
