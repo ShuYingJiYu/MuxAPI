@@ -70,6 +70,13 @@ func (s *Store) hourExpr(column string) string {
 	return "(" + column + "/3600)*3600"
 }
 
+func (s *Store) bucketExpr(column string, seconds int64) string {
+	if s.postgres {
+		return fmt.Sprintf("CAST(EXTRACT(EPOCH FROM %s) AS BIGINT)/%d*%d", column, seconds, seconds)
+	}
+	return fmt.Sprintf("(%s/%d)*%d", column, seconds, seconds)
+}
+
 // allModels returns the full list of GORM model structs for AutoMigrate.
 func allModels() []any {
 	return []any{
