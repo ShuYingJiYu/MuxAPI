@@ -104,7 +104,7 @@ type UpstreamRoutingStats struct {
 // proxied upstreams that only cache a portion of the prefix.
 func (s *Store) CacheCoverageRatio(upstreamID int64) (float64, error) {
 	var ratio float64
-	err := s.db.QueryRow(`SELECT AVG(cached_tokens::float / NULLIF(cached_tokens + input_tokens + cache_creation_tokens, 0))
+	err := s.queryRow(`SELECT AVG(cached_tokens::float / NULLIF(cached_tokens + input_tokens + cache_creation_tokens, 0))
 		FROM request_attempts WHERE upstream_id=? AND status=200 AND cached_tokens > 0
 		ORDER BY id DESC LIMIT 50`, upstreamID).Scan(&ratio)
 	if err != nil {
@@ -121,7 +121,7 @@ func (s *Store) CacheCoverageRatio(upstreamID int64) (float64, error) {
 // meaningful (> 1024).
 func (s *Store) TokenInflationFactor(upstreamID int64) (float64, error) {
 	var factor float64
-	err := s.db.QueryRow(`SELECT AVG((input_tokens + cached_tokens + cache_creation_tokens)::float / prefix_tokens)
+	err := s.queryRow(`SELECT AVG((input_tokens + cached_tokens + cache_creation_tokens)::float / prefix_tokens)
 		FROM (SELECT input_tokens, cached_tokens, cache_creation_tokens, prefix_tokens
 			FROM routing_observations
 			WHERE upstream_id=? AND prefix_tokens > 1024 AND (cached_tokens > 0 OR cache_creation_tokens > 0)
@@ -228,7 +228,7 @@ func (s *Store) SaveRoutingObservations(observations []RoutingObservationRecord)
 			return err
 		}
 	}
-	tx, err := s.db.Begin()
+	tx, err := s.beginTx()
 	if err != nil {
 		return err
 	}
@@ -270,7 +270,7 @@ func boolCount(value bool) int64 {
 	return 0
 }
 
-func (s *Store) upsertPrefixCacheStats(tx *txAdapter, observation RoutingObservationRecord) error {
+func (s *Store) upsertPrefixCacheStats(tx *rawTx, observation RoutingObservationRecord) error {
 	hitCount := boolCount(observation.CacheHit)
 	missCount := boolCount(observation.CacheEligible && !observation.CacheHit)
 	createCount := boolCount(observation.CacheCreated)
@@ -371,7 +371,7 @@ func (s *Store) ListRoutingObservations(filter RoutingObservationFilter) ([]Rout
 	}
 	query := s.routingObservationSelect(where.String()) + " ORDER BY id DESC LIMIT ?"
 	args = append(args, limit)
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -425,7 +425,7 @@ func (s *Store) GetUpstreamRoutingStats(upstreamID int64, model string, window t
 	}
 	from := now.Add(-window)
 	stats := UpstreamRoutingStats{UpstreamID: upstreamID, Model: model, FromAt: from.Unix(), ToAt: now.Unix()}
-	rows, err := s.db.Query(`SELECT success,input_tokens,output_tokens,cached_tokens,cache_creation_tokens,
+	rows, err := s.query(`SELECT success,input_tokens,output_tokens,cached_tokens,cache_creation_tokens,
 		cache_eligible,cache_hit,ttft_ms,duration_ms FROM routing_observations
 		WHERE upstream_id=? AND model=? AND observed_at>=? AND observed_at<?`,
 		upstreamID, model, s.timeValue(from), s.timeValue(now))
@@ -497,7 +497,7 @@ func (s *Store) GetPrefixCacheStats(apiKeyHash string, upstreamID int64, model, 
 		COALESCE(` + s.unixExpr("last_created_at") + `,0),COALESCE(` + s.unixExpr("expires_at") + `,0),
 		` + s.unixExpr("first_seen_at") + `,` + s.unixExpr("last_seen_at") + `
 		FROM upstream_prefix_cache_stats WHERE api_key_hash=? AND upstream_id=? AND model=? AND prefix_hash=?`
-	err := s.db.QueryRow(query, apiKeyHash, upstreamID, model, prefixHash).Scan(
+	err := s.queryRow(query, apiKeyHash, upstreamID, model, prefixHash).Scan(
 		&stats.SessionKey, &stats.CacheKey, &stats.PrefixTokens, &stats.Observations,
 		&stats.HitCount, &stats.MissCount, &stats.CreateCount, &stats.LastHitAt, &stats.LastMissAt,
 		&stats.LastCreatedAt, &stats.ExpiresAt, &stats.FirstSeenAt, &stats.LastSeenAt)
@@ -514,7 +514,7 @@ func (s *Store) GetPrefixCacheStats(apiKeyHash string, upstreamID int64, model, 
 	stats.HitRate = routingRatio(stats.HitCount, stats.HitCount+stats.MissCount)
 	stats.Valid = stats.ExpiresAt > now.Unix()
 	from := now.Add(-window)
-	if err := s.db.QueryRow(`SELECT COUNT(*),
+	if err := s.queryRow(`SELECT COUNT(*),
 		COALESCE(SUM(CASE WHEN cache_eligible=TRUE AND cache_hit=TRUE THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN cache_eligible=TRUE AND cache_hit=FALSE THEN 1 ELSE 0 END),0)
 		FROM routing_observations WHERE api_key_hash=? AND upstream_id=? AND model=? AND prefix_hash=?
@@ -533,7 +533,7 @@ func (s *Store) GetPrefixCacheStats(apiKeyHash string, upstreamID int64, model, 
 func (s *Store) getSessionCacheStats(apiKeyHash string, upstreamID int64, model, sessionKey string, window time.Duration, now time.Time) (PrefixCacheStats, error) {
 	stats := PrefixCacheStats{APIKeyHash: apiKeyHash, UpstreamID: upstreamID, Model: model, PrefixHash: sessionKey, SessionKey: sessionKey}
 	from := now.Add(-window)
-	err := s.db.QueryRow(`SELECT
+	err := s.queryRow(`SELECT
 		COUNT(*),
 		COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN cache_eligible AND NOT cache_hit THEN 1 ELSE 0 END),0),
@@ -558,7 +558,7 @@ func (s *Store) getSessionCacheStats(apiKeyHash string, upstreamID int64, model,
 	// but got circuit-broken and is now recovering — we want its historical
 	// cache behavior to inform the routing decision.
 	if stats.WindowObservations == 0 {
-		err = s.db.QueryRow(`SELECT
+		err = s.queryRow(`SELECT
 			COUNT(*),
 			COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END),0),
 			COALESCE(SUM(CASE WHEN cache_eligible AND NOT cache_hit THEN 1 ELSE 0 END),0),

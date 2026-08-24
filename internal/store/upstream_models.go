@@ -1,61 +1,51 @@
 package store
 
-import "time"
+import (
+	"time"
+
+	"gorm.io/gorm"
+)
 
 // SaveUpstreamModels persists the model list for an upstream. Called after a
 // successful /v1/models probe. Existing entries are replaced atomically.
 func (s *Store) SaveUpstreamModels(upstreamID int64, models []string) error {
 	now := time.Now().Unix()
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`DELETE FROM upstream_models WHERE upstream_id=?`, upstreamID); err != nil {
-		return err
-	}
-	for _, model := range models {
-		if _, err := tx.Exec(`INSERT INTO upstream_models(upstream_id, model, updated_at) VALUES(?,?,?)`,
-			upstreamID, model, now); err != nil {
+	return s.gormDB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("upstream_id = ?", upstreamID).Delete(&UpstreamModelEntry{}).Error; err != nil {
 			return err
 		}
-	}
-	return tx.Commit()
+		for _, model := range models {
+			entry := UpstreamModelEntry{UpstreamID: upstreamID, Model: model, UpdatedAt: now}
+			if err := tx.Create(&entry).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // LoadUpstreamModels returns the persisted model list for an upstream.
 func (s *Store) LoadUpstreamModels(upstreamID int64) ([]string, error) {
-	rows, err := s.db.Query(`SELECT model FROM upstream_models WHERE upstream_id=? ORDER BY model`, upstreamID)
-	if err != nil {
+	var entries []UpstreamModelEntry
+	if err := s.gormDB.Where("upstream_id = ?", upstreamID).Order("model").Find(&entries).Error; err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var models []string
-	for rows.Next() {
-		var m string
-		if err := rows.Scan(&m); err != nil {
-			return nil, err
-		}
-		models = append(models, m)
+	models := make([]string, len(entries))
+	for i, e := range entries {
+		models[i] = e.Model
 	}
-	return models, rows.Err()
+	return models, nil
 }
 
 // LoadAllUpstreamModels returns model lists for all upstreams, keyed by ID.
 func (s *Store) LoadAllUpstreamModels() (map[int64][]string, error) {
-	rows, err := s.db.Query(`SELECT upstream_id, model FROM upstream_models ORDER BY upstream_id, model`)
-	if err != nil {
+	var entries []UpstreamModelEntry
+	if err := s.gormDB.Order("upstream_id, model").Find(&entries).Error; err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	result := make(map[int64][]string)
-	for rows.Next() {
-		var id int64
-		var m string
-		if err := rows.Scan(&id, &m); err != nil {
-			return nil, err
-		}
-		result[id] = append(result[id], m)
+	for _, e := range entries {
+		result[e.UpstreamID] = append(result[e.UpstreamID], e.Model)
 	}
-	return result, rows.Err()
+	return result, nil
 }

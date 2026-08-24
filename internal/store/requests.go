@@ -150,7 +150,7 @@ func (s *Store) ListRequestsPage(filter RequestFilter) (*RequestPage, error) {
 		q += " OFFSET ?"
 		args = append(args, filter.Offset)
 	}
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +196,7 @@ func (s *Store) loadRouteSummaries(entries []*RequestEntry) error {
 		LEFT JOIN upstreams u ON u.id=a.upstream_id
 		WHERE CAST(a.request_id AS TEXT) IN (` + strings.Join(placeholders, ",") + `)
 		ORDER BY a.request_id,a.attempt_no`
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.query(q, args...)
 	if err != nil {
 		return err
 	}
@@ -216,7 +216,7 @@ func (s *Store) loadRouteSummaries(entries []*RequestEntry) error {
 }
 
 func (s *Store) GetRequest(id int64) (*RequestEntry, error) {
-	entry, err := scanRequestEntry(s.db.QueryRow(s.requestSelect(" WHERE r.id=?"), id))
+	entry, err := scanRequestEntry(s.queryRow(s.requestSelect(" WHERE r.id=?"), id))
 	if err != nil {
 		return nil, err
 	}
@@ -235,7 +235,7 @@ func (s *Store) listRequestAttempts(requestID string) ([]*RequestAttemptEntry, e
 		FROM request_attempts a LEFT JOIN upstreams u ON u.id=a.upstream_id
 		WHERE a.request_id=? ORDER BY a.attempt_no`,
 		s.unixExpr("a.created_at"), s.unixExpr("a.completed_at"))
-	rows, err := s.db.Query(q, requestID)
+	rows, err := s.query(q, requestID)
 	if err != nil {
 		return nil, err
 	}
