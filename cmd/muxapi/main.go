@@ -151,6 +151,8 @@ func main() {
 	// Model mapping: per-upstream model name translation + auto-learning.
 	modelMapper := modelmapping.New(st)
 	fwd.SetModelMapper(modelMapper)
+	// Adaptive first-byte timeout: use per-upstream P95 TTFT from routing stats.
+	fwd.SetTTFTEstimator(sched)
 
 	// 健康事件主动告警：熔断翻转时推送 Webhook（URL 空则关闭）。
 	// id→name 解析用现成 List()，解析不到回退 id 字符串。

@@ -59,12 +59,18 @@ type ModelMapper interface {
 	RecordSuccess(upstreamID int64, model string)
 }
 
+// TTFTEstimator provides per-upstream latency estimates for adaptive timeout.
+type TTFTEstimator interface {
+	EstimateTTFT(upstreamID int64, model string) (p95Ms float64, samples int64)
+}
+
 // Forwarder 协调一次客户端请求的选路、重试、协议转换和响应审计。
 type Forwarder struct {
 	picker               Picker
 	health               Health
 	modelAliases         map[string]string
 	modelMapper          ModelMapper
+	ttftEstimator        TTFTEstimator
 	maxAttempts          int
 	maxAttemptsProvider  func() int
 	firstResponseTimeout func() time.Duration
@@ -95,6 +101,13 @@ func (f *Forwarder) SetModelMapper(mapper ModelMapper) {
 	f.modelMapper = mapper
 }
 
+// SetTTFTEstimator installs the per-upstream latency estimator for adaptive
+// first-byte timeout. When set, each attempt uses a timeout derived from the
+// upstream's historical P95 TTFT instead of the global fixed value.
+func (f *Forwarder) SetTTFTEstimator(estimator TTFTEstimator) {
+	f.ttftEstimator = estimator
+}
+
 // SetMaxAttemptsProvider supplies the current per-request upstream attempt limit.
 // The provider is evaluated once when a request starts, so a settings change
 // cannot alter the retry budget halfway through an in-flight request.
@@ -122,6 +135,24 @@ func (f *Forwarder) firstByteTimeout() time.Duration {
 		}
 	}
 	return defaultFirstResponseTimeout
+}
+
+// adaptiveTimeout returns a per-attempt timeout based on the upstream's
+// historical P95 TTFT and the request's input token count. Falls back to
+// the global firstByteTimeout when no estimator is configured or data is cold.
+func (f *Forwarder) adaptiveTimeout(upstreamID int64, model string, inputTokens int64) time.Duration {
+	if f.ttftEstimator == nil {
+		return f.firstByteTimeout()
+	}
+	p95, samples := f.ttftEstimator.EstimateTTFT(upstreamID, model)
+	return ComputeAdaptiveTimeout(AdaptiveTimeoutParams{
+		P95Ms:       p95,
+		Samples:     samples,
+		InputTokens: inputTokens,
+		Multiplier:  2.0,
+		Floor:       10 * time.Second,
+		Ceiling:     f.firstByteTimeout(),
+	})
 }
 
 // StatusClientClosedRequest 用于审计客户端提前断开；Go 标准库没有该常量。
@@ -387,7 +418,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		// 计时器覆盖建立连接到响应正文结束；收到任意上游字节会重置，
 		// 因此正常持续输出的流不会被限制，卡住的流会及时释放渠道占用。
 		ctx, cancel := context.WithCancelCause(r.Context())
-		watchdog := newResponseWatchdog(f.firstByteTimeout(), cancel)
+		watchdog := newResponseWatchdog(f.adaptiveTimeout(candidate.ID, model, features.InputTokens), cancel)
 		req = req.WithContext(ctx)
 		client := &http.Client{Timeout: 0, Transport: candidate.NewTransport()}
 		start := time.Now()
