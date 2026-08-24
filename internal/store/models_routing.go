@@ -28,8 +28,8 @@ type RouteDecisionModel struct {
 	CacheCost               *float64   `gorm:"column:cache_cost;type:real"`
 	EstimatedSavings        *float64   `gorm:"column:estimated_savings;type:real"`
 	Confidence              float64    `gorm:"type:real;not null;default:0"`
-	CacheSelected           bool       `gorm:"column:cache_selected;type:integer;not null;default:0"`
-	Exploration             bool       `gorm:"type:integer;not null;default:0"`
+	CacheSelected           bool       `gorm:"column:cache_selected;not null;default:false"`
+	Exploration             bool       `gorm:"not null;default:false"`
 	ActualCost              *float64   `gorm:"column:actual_cost;type:real"`
 	ActualInputTokens       *int64     `gorm:"column:actual_input_tokens;type:integer"`
 	ActualOutputTokens      *int64     `gorm:"column:actual_output_tokens;type:integer"`
@@ -50,14 +50,14 @@ type RouteDecisionCandidateModel struct {
 	UpstreamName        string   `gorm:"column:upstream_name;type:text;not null;default:''"`
 	Protocol            string   `gorm:"type:text;not null;default:''"`
 	Priority            int      `gorm:"type:integer;not null;default:0"`
-	Eligible            bool     `gorm:"type:integer;not null;default:1"`
-	Selected            bool     `gorm:"type:integer;not null;default:0"`
+	Eligible            bool     `gorm:"not null;default:true"`
+	Selected            bool     `gorm:"not null;default:false"`
 	RejectionReason     string   `gorm:"column:rejection_reason;type:text;not null;default:''"`
 	PricingSource       string   `gorm:"column:pricing_source;type:text;not null;default:''"`
 	PricingConfidence   float64  `gorm:"column:pricing_confidence;type:real;not null;default:0"`
-	CacheSupported      bool     `gorm:"column:cache_supported;type:integer;not null;default:0"`
-	CacheExisting       bool     `gorm:"column:cache_existing;type:integer;not null;default:0"`
-	CacheSelected       bool     `gorm:"column:cache_selected;type:integer;not null;default:0"`
+	CacheSupported      bool     `gorm:"column:cache_supported;not null;default:false"`
+	CacheExisting       bool     `gorm:"column:cache_existing;not null;default:false"`
+	CacheSelected       bool     `gorm:"column:cache_selected;not null;default:false"`
 	CacheHitRate        float64  `gorm:"column:cache_hit_rate;type:real;not null;default:0"`
 	ForecastTotalCost   *float64 `gorm:"column:forecast_total_cost;type:real"`
 	ForecastNoCacheCost *float64 `gorm:"column:forecast_no_cache_cost;type:real"`
@@ -93,10 +93,10 @@ type RoutingObservationModel struct {
 	CacheCreationTokens int64      `gorm:"column:cache_creation_tokens;type:integer;not null;default:0"`
 	TTFTMs              int64      `gorm:"column:ttft_ms;type:integer;not null;default:0"`
 	DurationMs          int64      `gorm:"column:duration_ms;type:integer;not null;default:0"`
-	Success             bool       `gorm:"type:integer;not null;default:0"`
-	CacheEligible       bool       `gorm:"column:cache_eligible;type:integer;not null;default:0"`
-	CacheHit            bool       `gorm:"column:cache_hit;type:integer;not null;default:0"`
-	CacheCreated        bool       `gorm:"column:cache_created;type:integer;not null;default:0"`
+	Success             bool       `gorm:"not null;default:false"`
+	CacheEligible       bool       `gorm:"column:cache_eligible;not null;default:false"`
+	CacheHit            bool       `gorm:"column:cache_hit;not null;default:false"`
+	CacheCreated        bool       `gorm:"column:cache_created;not null;default:false"`
 	CacheExpiresAt      *time.Time `gorm:"column:cache_expires_at"`
 	ObservedAt          time.Time  `gorm:"column:observed_at;not null;index:idx_routing_observations_time"`
 }
