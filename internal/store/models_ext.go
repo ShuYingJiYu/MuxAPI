@@ -8,7 +8,7 @@ type UpstreamBillingStatusModel struct {
 	UpstreamID          int64    `gorm:"column:upstream_id;primaryKey"`
 	Currency            string   `gorm:"type:text;not null;default:'USD'"`
 	Remaining           *float64 `gorm:"type:real"`
-	Unlimited           bool     `gorm:"type:integer;not null;default:0"`
+	Unlimited           bool     `gorm:"not null;default:false"`
 	BillingGroup        string   `gorm:"column:billing_group;type:text;not null;default:''"`
 	GroupMultiplier     *float64 `gorm:"column:group_multiplier;type:real"`
 	EffectiveMultiplier *float64 `gorm:"column:effective_multiplier;type:real"`
@@ -28,7 +28,7 @@ type UpstreamBillingSnapshotModel struct {
 	UpstreamID          int64    `gorm:"column:upstream_id;type:integer;not null"`
 	Currency            string   `gorm:"type:text;not null;default:'USD'"`
 	Remaining           *float64 `gorm:"type:real"`
-	Unlimited           bool     `gorm:"type:integer;not null;default:0"`
+	Unlimited           bool     `gorm:"not null;default:false"`
 	BillingGroup        string   `gorm:"column:billing_group;type:text;not null;default:''"`
 	GroupMultiplier     *float64 `gorm:"column:group_multiplier;type:real"`
 	EffectiveMultiplier *float64 `gorm:"column:effective_multiplier;type:real"`
@@ -89,14 +89,14 @@ type RequestModel struct {
 	CreatedAt           time.Time `gorm:"column:created_at;not null;index:idx_requests_created_at"`
 	CompletedAt         time.Time `gorm:"column:completed_at;not null"`
 	ErrorText           string    `gorm:"column:error_text;type:text;not null;default:''"`
-	Stream              bool      `gorm:"type:integer;not null;default:0"`
+	Stream              bool      `gorm:"not null;default:false"`
 	RequestBytes        int64     `gorm:"column:request_bytes;type:integer;not null;default:0"`
 	ResponseBytes       int64     `gorm:"column:response_bytes;type:integer;not null;default:0"`
 	InputTokens         int64     `gorm:"column:input_tokens;type:integer;not null;default:0"`
 	OutputTokens        int64     `gorm:"column:output_tokens;type:integer;not null;default:0"`
 	CachedTokens        int64     `gorm:"column:cached_tokens;type:integer;not null;default:0"`
 	CacheCreationTokens int64     `gorm:"column:cache_creation_tokens;type:integer;not null;default:0"`
-	StreamCompleted     bool      `gorm:"column:stream_completed;type:integer;not null;default:0"`
+	StreamCompleted     bool      `gorm:"column:stream_completed;not null;default:false"`
 	LastEvent           string    `gorm:"column:last_event;type:text;not null;default:''"`
 	UpstreamRequestID   string    `gorm:"column:upstream_request_id;type:text;not null;default:''"`
 	ErrorKind           string    `gorm:"column:error_kind;type:text;not null;default:'';index:idx_requests_error_time,priority:1"`
@@ -122,8 +122,8 @@ type RequestAttemptModel struct {
 	HealthBefore        string    `gorm:"column:health_before;type:text;not null;default:''"`
 	HealthAfter         string    `gorm:"column:health_after;type:text;not null;default:''"`
 	ResponseBytes       int64     `gorm:"column:response_bytes;type:integer;not null;default:0"`
-	Stream              bool      `gorm:"type:integer;not null;default:0"`
-	StreamCompleted     bool      `gorm:"column:stream_completed;type:integer;not null;default:0"`
+	Stream              bool      `gorm:"not null;default:false"`
+	StreamCompleted     bool      `gorm:"column:stream_completed;not null;default:false"`
 	LastEvent           string    `gorm:"column:last_event;type:text;not null;default:''"`
 	InputTokens         int64     `gorm:"column:input_tokens;type:integer;not null;default:0"`
 	OutputTokens        int64     `gorm:"column:output_tokens;type:integer;not null;default:0"`

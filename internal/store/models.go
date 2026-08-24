@@ -24,8 +24,8 @@ type UpstreamModel struct {
 	Protocol     string  `gorm:"type:text;not null;default:'passthrough'"`
 	BillingType  string  `gorm:"column:billing_type;type:text;not null;default:'none'"`
 	CacheMode    string  `gorm:"column:cache_mode;type:text;not null;default:'auto'"`
-	Enabled      bool    `gorm:"type:integer;not null;default:1"`
-	ChannelProbe bool    `gorm:"column:channel_probe;type:integer;not null;default:1"`
+	Enabled      bool    `gorm:"not null;default:true"`
+	ChannelProbe bool    `gorm:"column:channel_probe;not null;default:true"`
 	SortOrder    int     `gorm:"column:sort_order;type:integer;not null;default:0"`
 	CreditRatio  float64 `gorm:"column:credit_ratio;type:real;not null;default:1"`
 }
@@ -44,7 +44,7 @@ func (TagModel) TableName() string { return "tags" }
 type UpstreamTagModel struct {
 	UpstreamID int64 `gorm:"column:upstream_id;primaryKey"`
 	TagID      int64 `gorm:"column:tag_id;primaryKey"`
-	IsPrimary  bool  `gorm:"column:is_primary;type:integer;not null;default:0"`
+	IsPrimary  bool  `gorm:"column:is_primary;not null;default:false"`
 }
 
 func (UpstreamTagModel) TableName() string { return "upstream_tags" }
@@ -54,7 +54,7 @@ type GroupUpstreamModel struct {
 	UpstreamID int64 `gorm:"column:upstream_id;primaryKey"`
 	Priority   int   `gorm:"type:integer;not null;default:50"`
 	Weight     int   `gorm:"type:integer;not null;default:1"`
-	Enabled    bool  `gorm:"type:integer;not null;default:1"`
+	Enabled    bool  `gorm:"not null;default:true"`
 }
 
 func (GroupUpstreamModel) TableName() string { return "group_upstreams" }
@@ -64,7 +64,7 @@ type AccessKeyModel struct {
 	Name    string `gorm:"type:text;not null;default:''"`
 	Key     string `gorm:"type:text;not null;uniqueIndex"`
 	GroupID int64  `gorm:"column:group_id;type:integer;not null"`
-	Enabled bool   `gorm:"type:integer;not null;default:1"`
+	Enabled bool   `gorm:"not null;default:true"`
 }
 
 func (AccessKeyModel) TableName() string { return "access_keys" }
@@ -74,8 +74,8 @@ type MonitorModel struct {
 	UpstreamID  int64  `gorm:"column:upstream_id;type:integer;not null"`
 	Model       string `gorm:"type:text;not null"`
 	Name        string `gorm:"type:text;not null;default:''"`
-	Enabled     bool   `gorm:"type:integer;not null;default:1"`
-	Stream      bool   `gorm:"type:integer;not null;default:0"`
+	Enabled     bool   `gorm:"not null;default:true"`
+	Stream      bool   `gorm:"not null;default:false"`
 	ProbeText   string `gorm:"column:probe_text;type:text;not null;default:''"`
 	MaxTokens   int    `gorm:"column:max_tokens;type:integer;not null;default:0"`
 	IntervalSec int    `gorm:"column:interval_sec;type:integer;not null;default:0"`
