@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -106,6 +107,7 @@ func allModels() []any {
 }
 
 // Open 根据连接串选择数据库，通过 GORM AutoMigrate 管理 schema。
+// 设置环境变量 MUXAPI_SKIP_MIGRATE=1 跳过 AutoMigrate（用于已有数据库）。
 func Open(databaseURL string) (*Store, error) {
 	if strings.HasPrefix(databaseURL, "postgres://") || strings.HasPrefix(databaseURL, "postgresql://") {
 		return openPostgres(databaseURL)
@@ -139,11 +141,15 @@ func openPostgres(databaseURL string) (*Store, error) {
 		sqlDB.Close()
 		return nil, fmt.Errorf("connect PostgreSQL: %w", err)
 	}
-	if err := gormDB.AutoMigrate(allModels()...); err != nil {
-		sqlDB.Close()
-		return nil, fmt.Errorf("migrate PostgreSQL: %w", err)
+	if os.Getenv("MUXAPI_SKIP_MIGRATE") != "1" {
+		if err := gormDB.AutoMigrate(allModels()...); err != nil {
+			sqlDB.Close()
+			return nil, fmt.Errorf("migrate PostgreSQL: %w", err)
+		}
+		createCustomIndexes(gormDB, true)
+	} else {
+		slog.Info("skipping AutoMigrate (MUXAPI_SKIP_MIGRATE=1)")
 	}
-	createCustomIndexes(gormDB, true)
 	return newStore(gormDB, sqlDB, true), nil
 }
 
