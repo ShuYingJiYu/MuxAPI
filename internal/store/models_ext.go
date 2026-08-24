@@ -50,7 +50,7 @@ type ModelPricingModel struct {
 func (ModelPricingModel) TableName() string { return "model_pricing" }
 
 type PricingCatalogStatusModel struct {
-	ID            int64      `gorm:"primaryKey;default:1"`
+	ID            int64      `gorm:"primaryKey"`
 	Source        string     `gorm:"type:text;not null;default:''"`
 	Version       string     `gorm:"type:text;not null;default:''"`
 	ModelCount    int        `gorm:"column:model_count;type:integer;not null;default:0"`
