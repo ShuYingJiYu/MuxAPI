@@ -27,6 +27,10 @@ const tags = ref([])              // 上游管理标签
 const err = ref('')
 const loggedIn = ref(!!api.getToken())
 const loginForm = reactive({ token: api.getToken() })
+// 页面级加载状态：首次进入或切换页面时保留稳定布局，避免慢查询期间出现大片空白。
+const pageLoading = ref(!!loggedIn.value)
+const pageLoadingLabel = ref('正在加载页面')
+let pageLoadEpoch = 0
 const overviewStats = ref({})
 const overviewLoading = ref(false)
 const overviewTrendWindow = ref('24h')
@@ -89,6 +93,8 @@ async function loadOverview() {
 // 单项「立即探测」：探完用返回的快照原地更新该卡片
 // 用 Set 记录正在探测的卡片 id，支持多卡并发互不串台
 const probing = reactive(new Set())
+const probingChannels = reactive(new Set())
+const removingChannels = reactive(new Set())
 const recoveringUpstreams = reactive(new Set())
 const recoveringModels = reactive(new Set())
 const refreshingBilling = reactive(new Set())
@@ -104,12 +110,27 @@ async function probeOne(m) {
   try {
     const sn = await api.probeMonitor(m.id)
     m.snapshot = sn
+    const source = monitors.value.find(item => item.id === m.id)
+    if (source && source !== m) source.snapshot = sn
   } finally { probing.delete(m.id) }
+}
+async function probeChannel(channel) {
+  const items = channel.monitors.filter(item => item.enabled && item.upstream?.enabled)
+  if (!items.length) return
+  probingChannels.add(channel.id)
+  try {
+    // 单个模型失败不应中止整个渠道的检测，确保渠道状态由完整模型集合计算。
+    for (const item of items) {
+      try { await probeOne(item) } catch { /* 结果会由该模型的历史状态保留 */ }
+    }
+  } finally {
+    probingChannels.delete(channel.id)
+  }
 }
 
 const {
   primaryTagFor, auxiliaryTagsFor, tagGroupKey, tagGroupName,
-  monitorItems, monitorSearch, monitorStatusFilter,
+  monitorItems, monitorChannels, monitorSearch, monitorStatusFilter,
   monitorTagFilter, collapsedMonitorTags, monitorStatusOptions, monitorTagOptions,
   monitorSections, monitorVisibleCount, summary, toggleMonitorTag, matrix, ovSummary,
   cellDrawerId, cellDrawer, openCell, closeCell, probeCell,
@@ -175,6 +196,9 @@ function stopAllPoll() { stopMonPoll(); stopOverviewPoll(); stopRtPoll(); stopLo
 onUnmounted(() => { stopAllPoll() })
 
 function activatePage(p) {
+  const epoch = ++pageLoadEpoch
+  pageLoading.value = true
+  pageLoadingLabel.value = ({ overview: '正在读取总览', groups: '正在读取分组', upstreams: '正在读取上游池', monitors: '正在读取监控', logs: '正在读取请求记录', settings: '正在读取设置' })[p] || '正在加载页面'
   detailGroup.value = null
   window.scrollTo({ top: 0, behavior: 'instant' })
   cellDrawerId.value = null; logDetail.value = null
@@ -187,20 +211,32 @@ function activatePage(p) {
     else if (p === 'monitors') { await loadTags(); await loadUpstreams(); await loadMonitors(); startMonPoll() }
     else if (p === 'logs') { await loadLogOptions(); await loadLogs(true); startLogPoll() }
     else if (p === 'settings') { await loadSettings(); await Promise.all([loadBackupConfig(), loadBackupSchedule(), loadBackups()]) }
+  }).finally(() => {
+    if (epoch === pageLoadEpoch) pageLoading.value = false
   })
 }
 watch(() => route.name, () => {
   if (loggedIn.value) activatePage(page.value)
 })
 function openDetail(g) {
+  const epoch = ++pageLoadEpoch
+  pageLoading.value = true
+  pageLoadingLabel.value = '正在读取分组详情'
   detailGroup.value = g
   loadEpoch++   // 切入新分组详情，作废上一组在途加载
   stopAllPoll()
-  guard(async () => { await loadUpstreams(); await loadDetail(g.id); startRtPoll(() => loadMembers(g.id)) })
+  guard(async () => { await loadUpstreams(); await loadDetail(g.id); startRtPoll(() => loadMembers(g.id)) }).finally(() => {
+    if (epoch === pageLoadEpoch) pageLoading.value = false
+  })
 }
 function backToGroups() {
+  const epoch = ++pageLoadEpoch
+  pageLoading.value = true
+  pageLoadingLabel.value = '正在读取分组'
   detailGroup.value = null; loadEpoch++; stopAllPoll()
-  guard(async () => { await loadGroups(); startRtPoll(loadGroups) })
+  guard(async () => { await loadGroups(); startRtPoll(loadGroups) }).finally(() => {
+    if (epoch === pageLoadEpoch) pageLoading.value = false
+  })
 }
 
 // 上游池里未加入当前分组的（供"添加成员"下拉）
@@ -218,9 +254,17 @@ const pages = {
 
 // --- 弹窗状态 ---
 const dlg = reactive({ type: '', form: {} })
+const dialogSaving = ref(false)
 const upstreamFormTagSearch = ref('')
 const tagManagerSearch = ref('')
 function closeDlg() { dlg.type = ''; upstreamFormTagSearch.value = ''; tagManagerSearch.value = '' }
+
+// 表单保存统一显示进行中状态，避免重复点击和无反馈等待。
+async function guardDialogSave(fn) {
+  if (dialogSaving.value) return
+  dialogSaving.value = true
+  try { await guard(fn) } finally { dialogSaving.value = false }
+}
 
 // 通用确认弹窗：confirm(消息, 危险操作回调)
 const confirmState = reactive({ show: false, msg: '', onOk: null })
@@ -230,7 +274,7 @@ function confirmOk() { confirmState.show = false; confirmState.onOk?.() }
 function newGroup() { dlg.type = 'group'; dlg.form = { name: '', description: '', max_multiplier: '' } }
 function editGroup(g) { dlg.type = 'group'; dlg.form = { id: g.id, name: g.name, description: g.description, max_multiplier: g.max_multiplier ?? '' } }
 function saveGroup() {
-  guard(async () => {
+  guardDialogSave(async () => {
     const rawMultiplier = String(dlg.form.max_multiplier ?? '').trim()
     const maxMultiplier = rawMultiplier === '' ? null : Number(rawMultiplier)
     if (maxMultiplier !== null && (!Number.isFinite(maxMultiplier) || maxMultiplier <= 0)) throw new Error('最大计费倍率必须大于 0')
@@ -454,7 +498,7 @@ function editUpstream(u) {
   dlg.form = { ...u, protocol: u.protocol || 'passthrough', billing_type: u.billing_type || 'none', credit_ratio: u.credit_ratio || 1, api_key: '', primary_tag_id: u.primary_tag_id || 0, tag_ids: [...(u.tag_ids || [])] }
 }
 function saveUpstream() {
-  guard(async () => {
+  guardDialogSave(async () => {
     const primaryTagID = Number(dlg.form.primary_tag_id) || 0
     const tagIDs = [...new Set((dlg.form.tag_ids || []).map(Number).filter(id => id && id !== primaryTagID))]
     const f = { ...dlg.form, primary_tag_id: primaryTagID, tag_ids: tagIDs, credit_ratio: Number(dlg.form.credit_ratio) || 1 }
@@ -652,7 +696,7 @@ function resetTagDraft() { Object.assign(tagDraft, { id: 0, name: '', color: 'gr
 function openTagManager() { tagManagerSearch.value = ''; dlg.type = 'tags'; dlg.form = {}; resetTagDraft() }
 function editTagDraft(tag) { Object.assign(tagDraft, { id: tag.id, name: tag.name, color: tag.color }) }
 function saveTag() {
-  guard(async () => {
+  guardDialogSave(async () => {
     const payload = { name: tagDraft.name.trim(), color: tagDraft.color }
     if (!payload.name) return
     if (tagDraft.id) await api.updateTag(tagDraft.id, payload)
@@ -910,7 +954,7 @@ async function runGroupTest() {
 // 组成员
 function addMember() { dlg.type = 'member'; dlg.form = { upstream_id: '', priority: 50, weight: 1 } }
 function saveMember() {
-  guard(async () => {
+  guardDialogSave(async () => {
     await api.addMember(detailGroup.value.id, { ...dlg.form, upstream_id: Number(dlg.form.upstream_id) })
     closeDlg(); await loadDetail(detailGroup.value.id)
   })
@@ -1032,7 +1076,7 @@ const backupStatusText = s => ({ pending: '待处理', running: '进行中', com
 const fmtFileSize = b => b < 1024 ? b + 'B' : b < 1024 * 1024 ? (b / 1024).toFixed(1) + 'KB' : (b / 1024 / 1024).toFixed(1) + 'MB'
 function createKey() { dlg.type = 'keygen'; dlg.form = { name: '' } }
 function saveKey() {
-  guard(async () => {
+  guardDialogSave(async () => {
     const r = await api.createKey(detailGroup.value.id, dlg.form.name || '')
     closeDlg()
     newKey.value = r.key
@@ -1105,6 +1149,7 @@ function saveSettings() {
 
 // 监控项状态映射
 const stateLabel = s => ({ OK: '正常', DEGRADED: '降级', DOWN: '故障' }[s] || '无数据')
+const channelStateLabel = s => ({ OK: '可用', DEGRADED: '波动', DOWN: '不可用', NODATA: '待检测', DISABLED: '已停用' }[s] || '待检测')
 const dotClass = s => ({ OK: 'closed', DEGRADED: 'half', DOWN: 'open' }[s] || 'nodata')
 
 // 路由熔断状态映射（成员表/上游池运行时列用）。未探测过(last_probe=0 且无请求)显示「待探测」。
@@ -1215,8 +1260,70 @@ const overviewServiceAlerts = computed(() => {
 })
 const overviewIssues = computed(() => [...overviewBillingAlerts.value, ...overviewServiceAlerts.value]
   .sort((a, b) => overviewLevelRank[a.level] - overviewLevelRank[b.level] || a.name.localeCompare(b.name)))
-const overviewVisibleIssues = computed(() => overviewIssues.value.slice(0, 6))
-const overviewMoreIssueCount = computed(() => Math.max(0, overviewIssues.value.length - overviewVisibleIssues.value.length))
+const overviewIssuesExpanded = ref(false)
+const overviewIssueFilter = ref('all')
+const overviewIssueFilterDefinitions = [
+  { key: 'debt', label: '欠费' },
+  { key: 'low-balance', label: '余额偏低' },
+  { key: 'billing-collect', label: '采集异常' },
+  { key: 'billing-audit', label: '费用核对' },
+  { key: 'channel', label: '渠道状态' },
+  { key: 'monitor', label: '模型监控' },
+  { key: 'request', label: '请求异常' },
+]
+function overviewIssueCategory(issue) {
+  if (issue.key.startsWith('balance-debt-') || issue.key.startsWith('balance-empty-')) return 'debt'
+  if (issue.key.startsWith('balance-low-')) return 'low-balance'
+  if (issue.key.startsWith('billing-') && !issue.key.startsWith('billing-audit-')) return 'billing-collect'
+  if (issue.key.startsWith('audit-') || issue.key.startsWith('multiplier-')) return 'billing-audit'
+  if (issue.kind === 'runtime') return 'channel'
+  if (issue.kind === 'monitor') return 'monitor'
+  return 'request'
+}
+const overviewIssueFilterOptions = computed(() => {
+  const counts = new Map()
+  for (const issue of overviewIssues.value) {
+    const key = overviewIssueCategory(issue)
+    counts.set(key, (counts.get(key) || 0) + 1)
+  }
+  return [
+    { key: 'all', label: '全部', count: overviewIssues.value.length },
+    ...overviewIssueFilterDefinitions
+      .map(option => ({ ...option, count: counts.get(option.key) || 0 }))
+      .filter(option => option.count > 0 || option.key === overviewIssueFilter.value),
+  ]
+})
+const overviewFilteredIssues = computed(() => overviewIssueFilter.value === 'all'
+  ? overviewIssues.value
+  : overviewIssues.value.filter(issue => overviewIssueCategory(issue) === overviewIssueFilter.value))
+const overviewVisibleIssues = computed(() => overviewIssuesExpanded.value ? overviewFilteredIssues.value : overviewFilteredIssues.value.slice(0, 5))
+const overviewMoreIssueCount = computed(() => Math.max(0, overviewFilteredIssues.value.length - 5))
+const overviewIssueSummary = computed(() => ({
+  critical: overviewFilteredIssues.value.filter(issue => issue.level === 'critical').length,
+  warning: overviewFilteredIssues.value.filter(issue => issue.level === 'warning').length,
+  info: overviewFilteredIssues.value.filter(issue => issue.level === 'info').length,
+}))
+function selectOverviewIssueFilter(key) {
+  overviewIssueFilter.value = key
+  overviewIssuesExpanded.value = false
+}
+const overviewIssueKindText = kind => ({ billing: '计费', runtime: '渠道', monitor: '监控', request: '请求' }[kind] || '系统')
+const overviewIssueLevelText = level => ({ critical: '紧急', warning: '警告', info: '提示' }[level] || '提示')
+function overviewIssueTime(issue) {
+  if (issue.kind === 'billing') {
+    const ts = Number(issue.upstream?.billing?.last_success_at || issue.upstream?.billing?.refreshed_at)
+    return ts ? `更新于 ${sinceText(ts)}` : '尚未采集'
+  }
+  if (issue.kind === 'runtime') {
+    const ts = Number(issue.upstream?.health?.last_probe)
+    return ts ? `探测于 ${sinceText(ts)}` : '尚未探测'
+  }
+  if (issue.kind === 'monitor') {
+    const ts = Number(issue.monitor?.snapshot?.last_ts)
+    return ts ? `探测于 ${sinceText(ts)}` : '尚未探测'
+  }
+  return '近 24 小时'
+}
 
 const overviewWindowOptions = [
   { value: '24h', label: '24 小时' },
@@ -1235,8 +1342,8 @@ const overviewTrendTagOptions = computed(() => {
 })
 const overviewSelectedTag = computed(() => tags.value.find(tag => Number(tag.id) === Number(overviewTrendTagID.value)))
 const overviewTrendScopeDescription = computed(() => overviewSelectedTag.value
-  ? `主标签「${overviewSelectedTag.value.name}」 · 余额按币种分别统计，成功率按请求记录统计`
-  : '全部标签 · 余额按币种分别统计，成功率按请求记录统计')
+  ? `主标签「${overviewSelectedTag.value.name}」 · 余额按储值倍率折算并显示上游明细`
+  : '全部标签 · 余额按储值倍率折算并按主标签汇总')
 const overviewCurrencyOptions = computed(() => (overviewTrends.value?.balances || [])
   .map(series => ({ value: series.currency, label: series.currency })))
 const overviewSelectedBalance = computed(() => {
@@ -1255,15 +1362,53 @@ const overviewChartLabels = computed(() => {
 const overviewBalanceData = computed(() => (overviewSelectedBalance.value?.points || [])
   .map(point => point.remaining == null ? null : Number(point.remaining)))
 const overviewBalanceChannelColors = ['#e46f86', '#d39b35', '#36b99d', '#5598d9', '#9270d6', '#df709e', '#70a84a', '#c97bba', '#7c8bd6', '#d77b4b']
-const overviewBalanceDatasets = computed(() => (overviewTrends.value?.upstream_balances || [])
+const overviewUpstreamByID = computed(() => new Map(upstreams.value.map(item => [Number(item.id), item])))
+const overviewTagByID = computed(() => new Map(tags.value.map(item => [Number(item.id), item])))
+const overviewRawBalanceDatasets = computed(() => (overviewTrends.value?.upstream_balances || [])
   .filter(series => series.currency === (overviewSelectedBalance.value?.currency || 'USD'))
   .filter(series => series.points?.some(point => point.remaining != null))
-  .map((series, index) => ({
-    label: series.name || `上游 #${series.upstream_id}`,
-    data: series.points.map(point => point.remaining == null ? null : Number(point.remaining)),
+  .map((series, index) => {
+    const upstream = overviewUpstreamByID.value.get(Number(series.upstream_id))
+    const tag = overviewTagByID.value.get(Number(upstream?.primary_tag_id))
+    return {
+      label: series.name || `上游 #${series.upstream_id}`,
+      data: series.points.map(point => point.remaining == null ? null : Number(point.remaining)),
+      color: overviewBalanceChannelColors[index % overviewBalanceChannelColors.length],
+      group: tag?.name || '未设置主标签',
+      groupColor: tag?.color || 'gray',
+      fill: false,
+    }
+  }))
+const overviewBalanceDatasets = computed(() => {
+  const source = overviewRawBalanceDatasets.value
+  if (Number(overviewTrendTagID.value) > 0) return source
+
+  const groups = new Map()
+  for (const series of source) {
+    if (!groups.has(series.group)) {
+      groups.set(series.group, {
+        label: series.group,
+        group: '主标签汇总',
+        groupColor: 'gray',
+        tagColor: series.groupColor,
+        channelCount: 0,
+        data: Array(series.data.length).fill(null),
+        fill: false,
+      })
+    }
+    const aggregate = groups.get(series.group)
+    aggregate.channelCount++
+    series.data.forEach((value, index) => {
+      if (value == null) return
+      aggregate.data[index] = (aggregate.data[index] ?? 0) + Number(value)
+    })
+  }
+  return [...groups.values()].map((series, index) => ({
+    ...series,
+    label: `${series.label}（${series.channelCount}）`,
     color: overviewBalanceChannelColors[index % overviewBalanceChannelColors.length],
-    fill: false,
-  })))
+  }))
+})
 const overviewSuccessData = computed(() => (overviewTrends.value?.success || [])
   .map(point => point.rate == null ? null : Number(point.rate) * 100))
 const overviewBalanceHasData = computed(() => overviewBalanceDatasets.value.length > 0)
@@ -1347,7 +1492,7 @@ function batchToggleAll() {
 function saveBatchMonitors() {
   const models = batchSelectable.value.filter(m => batchMon.picked[m])
   if (!models.length) return
-  guard(async () => {
+  guardDialogSave(async () => {
     const f = dlg.form
     const r = await api.createMonitorsBatch(f.upstream_id, {
       models, enabled: f.enabled, stream: f.stream, probe_text: f.probe_text,
@@ -1405,7 +1550,7 @@ function editMonitor(m) {
   loadMonModels(m.upstream_id)
 }
 function saveMonitor() {
-  guard(async () => {
+  guardDialogSave(async () => {
     const f = { ...dlg.form, upstream_id: Number(dlg.form.upstream_id), max_tokens: Number(dlg.form.max_tokens) || 0, interval_sec: Number(dlg.form.interval_sec) || 0 }
     if (f.id) await api.updateMonitor(f.id, f)
     else await api.createMonitor(f)
@@ -1416,8 +1561,59 @@ function delMonitor(m) {
   ask(`删除监控项「${monTitle(m)}」？`, () =>
     guard(async () => { await api.deleteMonitor(m.id); await loadMonitors() }))
 }
+function removeChannelMonitors(channel) {
+  const items = channel.monitors || []
+  if (!items.length || removingChannels.has(channel.id)) return
+  ask(`移除「${channel.upstream.name}」下的 ${items.length} 个监控项？`, () =>
+    guard(async () => {
+      removingChannels.add(channel.id)
+      try {
+        for (const item of items) await api.deleteMonitor(item.id)
+        await loadMonitors()
+      } finally {
+        removingChannels.delete(channel.id)
+      }
+    }))
+}
 function toggleMonitor(m) {
   guard(async () => { await api.updateMonitor(m.id, { ...m, enabled: !m.enabled }); await loadMonitors() })
+}
+
+// 分组内容使用真实高度过渡，避免 grid 行高动画触发连续重排造成卡顿。
+const monitorMotionReduced = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+function clearMonitorGroupStyles(el) {
+  el.style.removeProperty('height')
+  el.style.removeProperty('opacity')
+  el.style.removeProperty('transform')
+  el.style.removeProperty('overflow')
+}
+function monitorGroupBeforeEnter(el) {
+  el.style.overflow = 'hidden'
+  el.style.height = '0px'
+  el.style.opacity = '0'
+  el.style.transform = 'translateY(-4px)'
+}
+function monitorGroupEnter(el, done) {
+  if (monitorMotionReduced()) { clearMonitorGroupStyles(el); done(); return }
+  requestAnimationFrame(() => {
+    el.style.height = `${el.scrollHeight}px`
+    el.style.opacity = '1'
+    el.style.transform = 'translateY(0)'
+  })
+  window.setTimeout(() => { clearMonitorGroupStyles(el); done() }, 170)
+}
+function monitorGroupBeforeLeave(el) {
+  el.style.overflow = 'hidden'
+  el.style.height = `${el.scrollHeight}px`
+}
+function monitorGroupLeave(el, done) {
+  if (monitorMotionReduced()) { clearMonitorGroupStyles(el); done(); return }
+  requestAnimationFrame(() => {
+    el.style.height = '0px'
+    el.style.opacity = '0'
+    el.style.transform = 'translateY(-4px)'
+  })
+  window.setTimeout(() => { clearMonitorGroupStyles(el); done() }, 170)
 }
 
 function login() {
@@ -1433,6 +1629,7 @@ function logout() {
   groups.value = []; upstreams.value = []; members.value = []; keys.value = []; monitors.value = []; tags.value = []
   stopBackupPoll()
   stopAllPoll()
+  pageLoading.value = false
 }
 </script>
 
@@ -1479,6 +1676,26 @@ function logout() {
         <p v-if="err" class="err-banner">{{ err }}</p>
         <p v-if="notice" class="ok-banner">{{ notice }}</p>
 
+        <section v-if="pageLoading" class="page-loading" aria-live="polite" aria-busy="true">
+          <div class="page-loading-status">
+            <span class="page-loading-icon"><Icon name="loader" :size="17" /></span>
+            <div><strong>{{ pageLoadingLabel }}</strong><span>数据准备完成后将自动显示</span></div>
+          </div>
+          <div class="page-loading-toolbar">
+            <span class="loading-line loading-line-short"></span>
+            <span class="loading-button"></span>
+          </div>
+          <div class="page-loading-stats">
+            <span v-for="item in 4" :key="`loading-stat-${item}`" class="loading-stat"></span>
+          </div>
+          <div class="page-loading-panel">
+            <span class="loading-line loading-line-title"></span>
+            <span v-for="item in 5" :key="`loading-row-${item}`" class="loading-row"></span>
+          </div>
+        </section>
+
+        <template v-else>
+
         <!-- 总览：趋势先于文字，异常只保留需要处理的提示。 -->
         <template v-if="page === 'overview'">
           <section class="ov-trends">
@@ -1501,7 +1718,7 @@ function logout() {
             <div v-else class="ov-chart-grid">
               <section class="ov-chart-card">
                 <header class="ov-chart-head">
-                  <div><span class="ov-chart-kicker">余额总额</span><strong>{{ overviewBalanceText(overviewLatestBalance) }}</strong></div>
+                  <div><span class="ov-chart-kicker">折算余额总额</span><strong>{{ overviewBalanceText(overviewLatestBalance) }}</strong></div>
                   <FancySelect v-if="overviewCurrencyOptions.length > 1" v-model="overviewBalanceCurrency" :options="overviewCurrencyOptions" />
                   <span v-else class="ov-chart-meta">{{ overviewSelectedBalance?.currency || '暂无币种' }}</span>
                 </header>
@@ -1523,16 +1740,40 @@ function logout() {
           </section>
 
           <section class="ov-alert-strip">
-            <div class="ov-alert-strip-head"><div><h2>需要处理</h2><p>仅显示余额、计费和服务异常</p></div><span v-if="overviewIssues.length" class="ov-issue-count">{{ overviewIssues.length }}</span></div>
+            <header class="ov-alert-head">
+              <div><h2>需要处理</h2><p>按紧急度排列，显示余额、计费和服务异常</p></div>
+              <div v-if="overviewIssues.length" class="ov-alert-summary">
+                <span v-if="overviewIssueSummary.critical" class="critical"><i></i>紧急 {{ overviewIssueSummary.critical }}</span>
+                <span v-if="overviewIssueSummary.warning" class="warning"><i></i>警告 {{ overviewIssueSummary.warning }}</span>
+                <span v-if="overviewIssueSummary.info" class="info"><i></i>提示 {{ overviewIssueSummary.info }}</span>
+              </div>
+            </header>
+            <div v-if="overviewIssues.length" class="ov-alert-filters" role="tablist" aria-label="待处理类型">
+              <button v-for="option in overviewIssueFilterOptions" :key="option.key" type="button" role="tab" :aria-selected="overviewIssueFilter === option.key" :class="{ active: overviewIssueFilter === option.key }" @click="selectOverviewIssueFilter(option.key)">
+                {{ option.label }}<small>{{ option.count }}</small>
+              </button>
+            </div>
             <div v-if="!overviewIssues.length" class="ov-alert-clear"><Icon name="check" :size="15" />暂无异常</div>
-            <div v-else class="ov-alert-items">
-              <article v-for="issue in overviewVisibleIssues.slice(0, 4)" :key="issue.key" class="ov-alert-item" :class="issue.level">
-                <span class="ov-alert-dot"></span><div><strong>{{ issue.title }}</strong><span>{{ issue.name }}<template v-if="issue.detail"> · {{ issue.detail }}</template></span></div>
-                <button v-if="issue.action === 'refresh-billing'" class="icon-btn" :disabled="refreshingBilling.has(issue.upstream.id)" title="刷新计费数据" @click="guard(() => refreshUpstreamBilling(issue.upstream))"><Icon name="refresh" :size="15" /></button>
-                <button v-else-if="issue.action === 'recover-upstream'" class="icon-btn" :disabled="recoveringUpstreams.has(issue.upstream.id)" title="手动恢复渠道" @click="guard(() => recoverUpstream(issue.upstream))"><Icon name="refresh" :size="15" /></button>
-                <RouterLink v-else class="ov-alert-link" :to="{ name: issue.to }" :title="`查看${issue.name}`"><Icon name="chevron-right" :size="15" /></RouterLink>
+            <div v-else-if="!overviewFilteredIssues.length" class="ov-alert-clear"><Icon name="check" :size="15" />当前类型暂无待处理事项</div>
+            <div v-else class="ov-alert-table" role="table" aria-label="待处理事项">
+              <div class="ov-alert-row ov-alert-row-head" role="row">
+                <span>级别</span><span>事项</span><span>详情</span><span>时间</span><span>操作</span>
+              </div>
+              <article v-for="issue in overviewVisibleIssues" :key="issue.key" class="ov-alert-row" :class="issue.level" role="row">
+                <span class="ov-alert-level"><i></i>{{ overviewIssueLevelText(issue.level) }}</span>
+                <span class="ov-alert-subject"><strong>{{ issue.title }}</strong><small>{{ overviewIssueKindText(issue.kind) }} · {{ issue.name }}</small></span>
+                <span class="ov-alert-detail" :title="issue.detail || ''">{{ issue.detail || '—' }}</span>
+                <span class="ov-alert-time">{{ overviewIssueTime(issue) }}</span>
+                <span class="ov-alert-operation">
+                  <button v-if="issue.action === 'refresh-billing'" class="ov-alert-action" :disabled="refreshingBilling.has(issue.upstream.id)" @click="guard(() => refreshUpstreamBilling(issue.upstream))"><Icon name="refresh" :size="14" />刷新</button>
+                  <button v-else-if="issue.action === 'recover-upstream'" class="ov-alert-action" :disabled="recoveringUpstreams.has(issue.upstream.id)" @click="guard(() => recoverUpstream(issue.upstream))"><Icon name="refresh" :size="14" />恢复</button>
+                  <RouterLink v-else class="ov-alert-action" :to="{ name: issue.to }">查看<Icon name="chevron-right" :size="14" /></RouterLink>
+                </span>
               </article>
-              <span v-if="overviewMoreIssueCount" class="ov-alert-more">另有 {{ overviewMoreIssueCount }} 项</span>
+              <button v-if="overviewMoreIssueCount" class="ov-alert-expand" type="button" @click="overviewIssuesExpanded = !overviewIssuesExpanded">
+                {{ overviewIssuesExpanded ? '收起事项' : ('查看全部 ' + overviewFilteredIssues.length + ' 项') }}
+                <Icon name="chevron-right" :size="14" :class="{ rotated: overviewIssuesExpanded }" />
+              </button>
             </div>
           </section>
         </template>
@@ -1809,22 +2050,28 @@ function logout() {
 
         <!-- 监控看板 -->
         <template v-else-if="page === 'monitors'">
-          <!-- 探测设置已移至「设置」页 -->
-
-          <!-- 顶部整体状态横幅 -->
-          <div class="hbanner" :class="summary.allOk ? 'ok' : (summary.down ? 'down' : 'warn')">
-            <div class="hb-icon"><Icon :name="summary.allOk ? 'check' : 'alert'" :size="20" /></div>
-            <div class="hb-text">
-              <div class="hb-title">{{ summary.allOk ? '所有模型探测运行正常' : (summary.down ? `${summary.down} 个模型探测故障` : summary.degraded ? `${summary.degraded} 个模型探测降级` : `${summary.nodata} 个模型待探测`) }}</div>
-              <div class="hb-sub">{{ summary.total }} 个启用模型探测 · {{ summary.up }} 正常 · {{ summary.degraded }} 降级 · {{ summary.down }} 故障 · {{ summary.nodata }} 待探测 · 成功率 {{ summary.probeReqs ? (summary.rate * 100).toFixed(1) + '%' : '—' }}</div>
+          <section class="availability-overview">
+            <div class="availability-heading">
+              <span class="availability-mark" :class="summary.allOk ? 'closed' : (summary.down ? 'open' : 'half')"><Icon :name="summary.allOk ? 'check' : 'server'" :size="19" /></span>
+              <div><h2>渠道可用性</h2><p>基于该渠道下已启用模型的探测结果汇总</p></div>
             </div>
-            <button class="btn" @click="newMonitor"><Icon name="plus" :size="16" />新增监控</button>
-          </div>
+            <div class="availability-stats" role="tablist" aria-label="渠道可用性筛选">
+              <button type="button" :class="{ active: !monitorStatusFilter }" @click="monitorStatusFilter = ''"><span>监测渠道</span><b>{{ summary.total }}</b></button>
+              <button type="button" class="closed" :class="{ active: monitorStatusFilter === 'OK' }" @click="monitorStatusFilter = monitorStatusFilter === 'OK' ? '' : 'OK'"><span>可用</span><b>{{ summary.up }}</b></button>
+              <button type="button" class="half" :class="{ active: monitorStatusFilter === 'DEGRADED' }" @click="monitorStatusFilter = monitorStatusFilter === 'DEGRADED' ? '' : 'DEGRADED'"><span>波动</span><b>{{ summary.degraded }}</b></button>
+              <button type="button" class="open" :class="{ active: monitorStatusFilter === 'DOWN' }" @click="monitorStatusFilter = monitorStatusFilter === 'DOWN' ? '' : 'DOWN'"><span>不可用</span><b>{{ summary.down }}</b></button>
+              <button type="button" class="nodata" :class="{ active: monitorStatusFilter === 'NODATA' }" @click="monitorStatusFilter = monitorStatusFilter === 'NODATA' ? '' : 'NODATA'"><span>待检测</span><b>{{ summary.nodata }}</b></button>
+            </div>
+            <div class="availability-actions">
+              <button class="icon-btn" title="刷新渠道状态" @click="guard(loadMonitors)"><Icon name="refresh" :size="16" /></button>
+              <button class="icon-btn availability-add" title="新增监控" @click="newMonitor"><Icon name="plus" :size="17" /></button>
+            </div>
+          </section>
           <div class="monitor-toolbar">
-            <div class="search-box monitor-search"><Icon class="ic" name="search" :size="16" /><input v-model="monitorSearch" class="search-input" placeholder="渠道、模型或标签" /></div>
+            <div class="search-box monitor-search"><Icon class="ic" name="search" :size="16" /><input v-model="monitorSearch" class="search-input" placeholder="搜索渠道、模型或标签" /></div>
             <FancySelect v-model="monitorTagFilter" :options="monitorTagOptions" />
             <FancySelect v-model="monitorStatusFilter" :options="monitorStatusOptions" />
-            <span class="monitor-result-count">{{ monitorVisibleCount }} / {{ monitorItems.length }} 个模型探测</span>
+            <span class="monitor-result-count">{{ monitorVisibleCount }} / {{ monitorChannels.length }} 个渠道</span>
           </div>
 
           <div class="monitor-wall">
@@ -1833,43 +2080,45 @@ function logout() {
                 <Icon class="source-chevron" :class="{ collapsed: collapsedMonitorTags.has(section.key) }" name="chevron-right" :size="17" />
                 <span class="tag-color-dot" :class="`tag-${section.tag?.color || 'gray'}`"></span>
                 <strong>{{ section.name }}</strong>
-                <span>{{ section.enabled }} 个启用模型</span>
-                <span v-if="section.down" class="source-stat down">{{ section.down }} 故障</span>
-                <span v-if="section.degraded" class="source-stat warn">{{ section.degraded }} 降级</span>
-                <span v-if="section.nodata" class="source-stat">{{ section.nodata }} 待探测</span>
-                <em>{{ section.reqs ? (section.rate * 100).toFixed(1) + '% 探测成功' : '暂无探测数据' }}</em>
+                <span>{{ section.enabled }} 个监测渠道</span>
+                <span v-if="section.down" class="source-stat down">{{ section.down }} 不可用</span>
+                <span v-if="section.degraded" class="source-stat warn">{{ section.degraded }} 波动</span>
+                <span v-if="section.nodata" class="source-stat">{{ section.nodata }} 待检测</span>
+                <em>{{ section.reqs ? (section.rate * 100).toFixed(1) + '% 可用率' : '暂无探测数据' }}</em>
               </button>
-              <div v-if="!collapsedMonitorTags.has(section.key)" class="channel-card-grid monitor-model-grid">
-                <article v-for="m in section.items" :key="m.id" class="card mon-card model-monitor-card"
-                  :class="[dotClass(m.state), { disabled: m.state === 'DISABLED', dragging: monitorDragId === m.id, dragover: monitorDragOverId === m.id }]"
-                  @dragover="onMonitorDragOver(m, $event)" @drop="onMonitorDrop(m)">
-                  <div class="mon-head">
-                    <span class="mon-grip" draggable="true" title="拖拽调整顺序" @dragstart="onMonitorDragStart(m, $event)" @dragend="onMonitorDragEnd"><Icon name="grip" :size="16" /></span>
-                    <span class="mon-avatar" :class="dotClass(m.state)">{{ initial(m) }}</span>
-                    <div class="mon-id">
-                      <span class="mon-name">{{ m.model }}</span>
-                      <span class="mon-sub">{{ m.upstream.name }}<span v-if="m.stream" class="tag on">流式</span></span>
-                    </div>
-                    <span class="state-badge" :class="dotClass(m.state)">{{ m.state === 'DISABLED' ? '已停用' : stateLabel(m.state) }}</span>
+              <Transition name="monitor-group" @before-enter="monitorGroupBeforeEnter" @enter="monitorGroupEnter" @before-leave="monitorGroupBeforeLeave" @leave="monitorGroupLeave">
+                <div v-if="!collapsedMonitorTags.has(section.key)" class="monitor-group-content">
+                  <div class="channel-card-grid availability-channel-grid">
+                    <article v-for="channel in section.items" :key="channel.id" class="card channel-monitor-card availability-channel-card"
+                      :class="[dotClass(channel.state), { disabled: channel.state === 'DISABLED' }]">
+                  <div class="availability-channel-head">
+                    <span class="channel-state-mark" :class="dotClass(channel.state)"><Icon name="server" :size="18" /></span>
+                    <span class="availability-channel-id"><strong>{{ channel.upstream.name }}</strong><small>{{ channel.upstream.base_url || '未设置地址' }}</small></span>
+                    <span class="availability-channel-actions">
+                      <span class="state-badge" :class="dotClass(channel.state)">{{ channelStateLabel(channel.state) }}</span>
+                      <button class="icon-btn availability-edit" title="编辑渠道" @click.stop="editUpstream(channel.upstream)"><Icon name="edit" :size="15" /></button>
+                      <button class="icon-btn danger availability-remove" :disabled="removingChannels.has(channel.id)" title="移除该渠道的全部监控" @click.stop="removeChannelMonitors(channel)"><Icon :name="removingChannels.has(channel.id) ? 'loader' : 'trash'" :class="{ spin: removingChannels.has(channel.id) }" :size="15" /></button>
+                    </span>
                   </div>
-                  <div class="channel-runtime-row">
-                    <span>渠道 <b>{{ m.upstream.name }}</b></span><span>路由 <b :class="rtClass(m.upstream.health)">{{ m.upstream.enabled ? rtLabel(m.upstream.health) : '已停用' }}</b></span>
+                  <div class="availability-channel-meta">
+                    <span>{{ channel.enabledCount }} 个启用模型</span>
+                    <span>路由 <b :class="rtClass(channel.upstream.health)">{{ channel.upstream.enabled ? rtLabel(channel.upstream.health) : '已停用' }}</b></span>
                   </div>
-                  <div class="card-metrics">
-                    <div class="metric-item"><span class="metric-label">成功率<small class="mh">24h</small></span><span class="metric-value" :class="m.snapshot.reqs && m.snapshot.succ_rate < .95 ? 'warn' : ''">{{ m.snapshot.reqs ? (m.snapshot.succ_rate * 100).toFixed(0) + '%' : '—' }}</span></div>
-                    <div class="metric-item"><span class="metric-label">平均延迟<small class="mh">24h</small></span><span class="metric-value">{{ m.snapshot.avg_ms || m.snapshot.last_ms || 0 }}<small>ms</small></span></div>
-                    <div class="metric-item"><span class="metric-label">最后探测</span><span class="metric-value sm">{{ sinceText(m.snapshot.last_ts) }}</span></div>
+                  <div class="card-metrics availability-metrics">
+                    <div class="metric-item"><span class="metric-label">可用率<small class="mh">24h</small></span><span class="metric-value" :class="channel.reqs && channel.rate < .95 ? 'warn' : ''">{{ channel.reqs ? (channel.rate * 100).toFixed(1) + '%' : '—' }}</span></div>
+                    <div class="metric-item"><span class="metric-label">平均延迟<small class="mh">24h</small></span><span class="metric-value">{{ channel.avgMs || channel.lastMs || '—' }}<small v-if="channel.avgMs || channel.lastMs">ms</small></span></div>
+                    <div class="metric-item"><span class="metric-label">最近检测</span><span class="metric-value sm">{{ sinceText(channel.lastTS) }}</span></div>
                   </div>
-                  <Fence :trend="m.snapshot.trend || []" unit="探测" />
-                  <div class="tag-chip-row monitor-card-tags"><span v-for="tag in auxiliaryTagsFor(m.upstream)" :key="tag.id" class="manage-tag" :class="`tag-${tag.color}`">{{ tag.name }}</span></div>
-                  <div class="mon-foot">
-                    <button class="btn-link sm" :disabled="probing.has(m.id)" @click="guard(() => probeOne(m))">{{ probing.has(m.id) ? '探测中…' : '立即探测' }}</button>
-                    <span class="hspacer" />
-                    <button class="btn-link sm" @click="toggleMonitor(m)">{{ m.enabled ? '停用' : '启用' }}</button>
-                    <button class="icon-btn" @click="editMonitor(m)"><Icon name="edit" :size="16" /></button><button class="icon-btn danger" @click="delMonitor(m)"><Icon name="trash" :size="16" /></button>
+                  <Fence :trend="channel.trend" unit="探测" />
+                  <div class="tag-chip-row monitor-card-tags"><span v-for="tag in auxiliaryTagsFor(channel.upstream)" :key="tag.id" class="manage-tag" :class="`tag-${tag.color}`">{{ tag.name }}</span></div>
+                  <div class="mon-foot availability-channel-foot">
+                    <button class="btn-link sm" :disabled="probingChannels.has(channel.id) || !channel.enabledCount" @click="guard(() => probeChannel(channel))">{{ probingChannels.has(channel.id) ? '检测中…' : '立即检测' }}</button>
+                    <span class="availability-detail-hint">{{ channel.monitors.length }} 个监控项</span>
                   </div>
-                </article>
-              </div>
+                    </article>
+                  </div>
+                </div>
+              </Transition>
             </section>
             <div v-if="!monitorSections.length" class="empty">没有符合条件的渠道。</div>
           </div>
@@ -2144,6 +2393,7 @@ function logout() {
             </div>
           </div>
         </template>
+        </template>
       </main>
     </div>
 
@@ -2353,52 +2603,54 @@ function logout() {
 
     <!-- 表单弹窗 -->
     <div class="mask" v-if="dlg.type" @click.self="closeDlg">
-      <div class="dialog" :class="dlg.type === 'tags' ? 'tag-dialog' : (dlg.type === 'upstream' ? 'upstream-dialog' : '')">
+      <div class="dialog" :class="[dlg.type === 'tags' ? 'tag-dialog' : (dlg.type === 'upstream' ? 'upstream-dialog' : ''), { 'dialog-saving': dialogSaving }]">
         <template v-if="dlg.type === 'group'">
           <h3>{{ dlg.form.id ? '编辑分组' : '新建分组' }}</h3>
           <div class="field"><label>名称</label><input v-model="dlg.form.name" placeholder="如 Claude 池" /></div>
           <div class="field"><label>描述</label><input v-model="dlg.form.description" placeholder="可选" /></div>
           <div class="field"><label>最大计费倍率</label><input v-model="dlg.form.max_multiplier" type="number" min="0.0001" step="0.01" placeholder="不限" /></div>
-          <div class="dialog-foot"><button class="btn btn-ghost" @click="closeDlg">取消</button><button class="btn" @click="saveGroup">保存</button></div>
+          <div class="dialog-foot"><button class="btn btn-ghost" :disabled="dialogSaving" @click="closeDlg">取消</button><button class="btn" :disabled="dialogSaving" @click="saveGroup"><Icon :name="dialogSaving ? 'loader' : 'check'" :class="{ spin: dialogSaving }" :size="16" />{{ dialogSaving ? '保存中…' : '保存' }}</button></div>
         </template>
 
         <template v-else-if="dlg.type === 'keygen'">
           <h3>生成接入密钥</h3>
           <div class="field"><label>名称</label><input v-model="dlg.form.name" placeholder="备注用，如「客户端A」，可留空" @keyup.enter="saveKey" /></div>
           <p class="hint" style="margin:0">密钥由系统生成，绑定当前分组，仅在生成后明文显示一次。</p>
-          <div class="dialog-foot"><button class="btn btn-ghost" @click="closeDlg">取消</button><button class="btn" @click="saveKey"><Icon name="plus" :size="16" />生成</button></div>
+          <div class="dialog-foot"><button class="btn btn-ghost" :disabled="dialogSaving" @click="closeDlg">取消</button><button class="btn" :disabled="dialogSaving" @click="saveKey"><Icon :name="dialogSaving ? 'loader' : 'plus'" :class="{ spin: dialogSaving }" :size="16" />{{ dialogSaving ? '生成中…' : '生成' }}</button></div>
         </template>
 
         <template v-else-if="dlg.type === 'upstream'">
           <h3>{{ dlg.form.id ? '编辑上游' : '新增上游' }}</h3>
-          <div class="field"><label>名称</label><input v-model="dlg.form.name" /></div>
-          <div class="field"><label>主标签</label><FancySelect v-model="dlg.form.primary_tag_id" :options="primaryTagOptions" /></div>
-          <div class="field">
-            <label class="field-label-row"><span>普通标签</span><small>{{ upstreamFormSelectedTags.length }} 个已选</small></label>
-            <div class="tag-picker-panel">
-              <div v-if="upstreamFormSelectedTags.length" class="tag-picker-selected">
-                <button v-for="tag in upstreamFormSelectedTags" :key="tag.id" type="button" class="manage-tag selected" :class="`tag-${tag.color}`" :title="`移除 ${tag.name}`" @click="toggleUpstreamFormTag(tag.id)">
-                  {{ tag.name }}<Icon name="x" :size="12" />
-                </button>
-              </div>
-              <div class="tag-picker-search"><Icon name="search" :size="15" /><input v-model="upstreamFormTagSearch" placeholder="搜索普通标签" /></div>
-              <div class="tag-picker-options">
-                <button v-for="tag in upstreamFormAvailableTags" :key="tag.id" type="button" class="tag-picker-option" @click="toggleUpstreamFormTag(tag.id)">
-                  <span class="tag-color-dot" :class="`tag-${tag.color}`"></span><span>{{ tag.name }}</span><Icon name="plus" :size="14" />
-                </button>
-                <span v-if="!tags.length" class="tag-picker-empty">请先在标签管理中创建标签</span>
-                <span v-else-if="!upstreamFormAvailableTags.length" class="tag-picker-empty">没有可添加的标签</span>
+          <div class="upstream-form-grid">
+            <div class="field"><label>名称</label><input v-model="dlg.form.name" /></div>
+            <div class="field"><label>主标签</label><FancySelect v-model="dlg.form.primary_tag_id" :options="primaryTagOptions" /></div>
+            <div class="field upstream-form-tags">
+              <label class="field-label-row"><span>普通标签</span><small>{{ upstreamFormSelectedTags.length }} 个已选</small></label>
+              <div class="tag-picker-panel">
+                <div v-if="upstreamFormSelectedTags.length" class="tag-picker-selected">
+                  <button v-for="tag in upstreamFormSelectedTags" :key="tag.id" type="button" class="manage-tag selected" :class="`tag-${tag.color}`" :title="`移除 ${tag.name}`" @click="toggleUpstreamFormTag(tag.id)">
+                    {{ tag.name }}<Icon name="x" :size="12" />
+                  </button>
+                </div>
+                <div class="tag-picker-search"><Icon name="search" :size="15" /><input v-model="upstreamFormTagSearch" placeholder="搜索普通标签" /></div>
+                <div class="tag-picker-options">
+                  <button v-for="tag in upstreamFormAvailableTags" :key="tag.id" type="button" class="tag-picker-option" @click="toggleUpstreamFormTag(tag.id)">
+                    <span class="tag-color-dot" :class="`tag-${tag.color}`"></span><span>{{ tag.name }}</span><Icon name="plus" :size="14" />
+                  </button>
+                  <span v-if="!tags.length" class="tag-picker-empty">请先在标签管理中创建标签</span>
+                  <span v-else-if="!upstreamFormAvailableTags.length" class="tag-picker-empty">没有可添加的标签</span>
+                </div>
               </div>
             </div>
+            <div class="field"><label>base_url</label><input v-model="dlg.form.base_url" placeholder="https://..." /></div>
+            <div class="field"><label>协议</label><FancySelect v-model="dlg.form.protocol" :options="protocolOptions" /></div>
+            <div class="field"><label>计费平台</label><FancySelect v-model="dlg.form.billing_type" :options="billingTypeOptions" /></div>
+            <div class="field"><label>储值倍率</label><input v-model="dlg.form.credit_ratio" type="number" step="any" min="0" placeholder="充1得N积分时填 N；默认 1" /></div>
+            <div class="field"><label>api_key</label><input v-model="dlg.form.api_key" :placeholder="dlg.form.id ? '留空则不修改' : 'sk-...'" /></div>
+            <div class="field"><label>代理</label><input v-model="dlg.form.proxy" placeholder="留空=直连/环境变量；如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></div>
           </div>
-          <div class="field"><label>base_url</label><input v-model="dlg.form.base_url" placeholder="https://..." /></div>
-          <div class="field"><label>协议</label><FancySelect v-model="dlg.form.protocol" :options="protocolOptions" /></div>
-          <div class="field"><label>计费平台</label><FancySelect v-model="dlg.form.billing_type" :options="billingTypeOptions" /></div>
-          <div class="field"><label>储值倍率</label><input v-model="dlg.form.credit_ratio" type="number" step="any" min="0" placeholder="充1得N积分时填 N；默认 1" /></div>
-          <div class="field"><label>api_key</label><input v-model="dlg.form.api_key" :placeholder="dlg.form.id ? '留空则不修改' : 'sk-...'" /></div>
-          <div class="field"><label>代理</label><input v-model="dlg.form.proxy" placeholder="留空=直连/环境变量；如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></div>
           <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>
-          <div class="dialog-foot"><button class="btn btn-ghost" @click="closeDlg">取消</button><button class="btn" @click="saveUpstream">保存</button></div>
+          <div class="dialog-foot"><button class="btn btn-ghost" :disabled="dialogSaving" @click="closeDlg">取消</button><button class="btn" :disabled="dialogSaving" @click="saveUpstream"><Icon :name="dialogSaving ? 'loader' : 'check'" :class="{ spin: dialogSaving }" :size="16" />{{ dialogSaving ? '保存中…' : '保存' }}</button></div>
         </template>
 
         <template v-else-if="dlg.type === 'tags'">
@@ -2421,11 +2673,11 @@ function logout() {
                 <button v-if="tagDraft.id" class="btn btn-danger btn-sm" @click="delTag(tagDraft)"><Icon name="trash" :size="14" />删除</button>
                 <span class="hspacer"></span>
                 <button v-if="tagDraft.id" class="btn btn-ghost btn-sm" @click="resetTagDraft">新建</button>
-                <button class="btn btn-sm" :disabled="!tagDraft.name.trim()" @click="saveTag">{{ tagDraft.id ? '保存' : '创建' }}</button>
+                <button class="btn btn-sm" :disabled="dialogSaving || !tagDraft.name.trim()" @click="saveTag"><Icon :name="dialogSaving ? 'loader' : (tagDraft.id ? 'check' : 'plus')" :class="{ spin: dialogSaving }" :size="14" />{{ dialogSaving ? '保存中…' : (tagDraft.id ? '保存' : '创建') }}</button>
               </div>
             </div>
           </div>
-          <div class="dialog-foot"><button class="btn btn-ghost" @click="closeDlg">关闭</button></div>
+          <div class="dialog-foot"><button class="btn btn-ghost" :disabled="dialogSaving" @click="closeDlg">关闭</button></div>
         </template>
 
         <template v-else-if="dlg.type === 'monitor'">
@@ -2448,7 +2700,7 @@ function logout() {
           <div class="field"><label>探测消息</label><input v-model="dlg.form.probe_text" placeholder="留空用默认「hi」" /></div>
           <label class="check"><input type="checkbox" v-model="dlg.form.stream" /> 流式探测（请求体加 stream:true）</label>
           <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>
-          <div class="dialog-foot"><button class="btn btn-ghost" @click="closeDlg">取消</button><button class="btn" @click="saveMonitor">保存</button></div>
+          <div class="dialog-foot"><button class="btn btn-ghost" :disabled="dialogSaving" @click="closeDlg">取消</button><button class="btn" :disabled="dialogSaving" @click="saveMonitor"><Icon :name="dialogSaving ? 'loader' : 'check'" :class="{ spin: dialogSaving }" :size="16" />{{ dialogSaving ? '保存中…' : '保存' }}</button></div>
         </template>
 
         <template v-else-if="dlg.type === 'upstream-monitors'">
@@ -2478,8 +2730,8 @@ function logout() {
             <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>
           </template>
           <div class="dialog-foot">
-            <button class="btn btn-ghost" @click="closeDlg">取消</button>
-            <button class="btn" :disabled="batchPickedCount === 0" @click="saveBatchMonitors">为选中 {{ batchPickedCount }} 个模型创建监控</button>
+            <button class="btn btn-ghost" :disabled="dialogSaving" @click="closeDlg">取消</button>
+            <button class="btn" :disabled="dialogSaving || batchPickedCount === 0" @click="saveBatchMonitors"><Icon :name="dialogSaving ? 'loader' : 'check'" :class="{ spin: dialogSaving }" :size="16" />{{ dialogSaving ? '创建中…' : `为选中 ${batchPickedCount} 个模型创建监控` }}</button>
           </div>
         </template>
 
@@ -2495,7 +2747,7 @@ function logout() {
             <div class="field" style="flex:1"><label>权重</label><input type="number" v-model.number="dlg.form.weight" /></div>
           </div>
           <p class="hint" style="margin:0">优先级越小越先用；同优先级按权重分流。</p>
-          <div class="dialog-foot"><button class="btn btn-ghost" @click="closeDlg">取消</button><button class="btn" :disabled="!dlg.form.upstream_id" @click="saveMember">保存</button></div>
+          <div class="dialog-foot"><button class="btn btn-ghost" :disabled="dialogSaving" @click="closeDlg">取消</button><button class="btn" :disabled="dialogSaving || !dlg.form.upstream_id" @click="saveMember"><Icon :name="dialogSaving ? 'loader' : 'check'" :class="{ spin: dialogSaving }" :size="16" />{{ dialogSaving ? '保存中…' : '保存' }}</button></div>
         </template>
       </div>
     </div>

@@ -31,7 +31,8 @@ func LookupOverviewTrendWindow(key string) OverviewTrendWindow {
 	return overviewTrendWindows[1]
 }
 
-// OverviewBalancePoint is the total known balance at one point in time.
+// OverviewBalancePoint is the known paid-value balance at one point in time.
+// Provider credits are divided by the upstream credit ratio before aggregation.
 // Remaining stays nil until there is a successful billing snapshot for that currency.
 type OverviewBalancePoint struct {
 	Ts            int64    `json:"ts"`
@@ -45,7 +46,7 @@ type OverviewBalanceSeries struct {
 	Points   []OverviewBalancePoint `json:"points"`
 }
 
-// OverviewUpstreamBalanceSeries is one channel's balance history in the selected scope.
+// OverviewUpstreamBalanceSeries is one channel's credit-ratio-adjusted balance history.
 type OverviewUpstreamBalanceSeries struct {
 	UpstreamID int64                  `json:"upstream_id"`
 	Name       string                 `json:"name"`
@@ -78,8 +79,9 @@ type OverviewTrends struct {
 }
 
 type overviewBillingUpstream struct {
-	ID   int64
-	Name string
+	ID          int64
+	Name        string
+	CreditRatio float64
 }
 
 // OverviewTrends builds two charts with one scope: available balance and request success rate.
@@ -115,7 +117,7 @@ func (s *Store) overviewTrends(groupID, tagID int64, window OverviewTrendWindow,
 	if err != nil {
 		return nil, err
 	}
-	balances, unlimited := aggregateOverviewBalances(snapshots, start, pointCount, window.Bucket)
+	balances, unlimited := aggregateOverviewBalances(snapshots, billingUpstreams, start, pointCount, window.Bucket)
 	upstreamBalances := aggregateOverviewUpstreamBalances(snapshots, billingUpstreams, start, pointCount, window.Bucket)
 	success, err := s.overviewSuccessTrend(groupID, tagID, start, pointCount, window.Bucket)
 	if err != nil {
@@ -129,7 +131,7 @@ func (s *Store) overviewTrends(groupID, tagID int64, window OverviewTrendWindow,
 }
 
 func (s *Store) overviewBillingUpstreams(groupID, tagID int64) ([]overviewBillingUpstream, error) {
-	query := `SELECT DISTINCT u.id,u.name FROM upstreams u`
+	query := `SELECT DISTINCT u.id,u.name,u.credit_ratio FROM upstreams u`
 	args := []any{}
 	if groupID > 0 {
 		query += ` JOIN group_upstreams gu ON gu.upstream_id=u.id`
@@ -152,7 +154,7 @@ func (s *Store) overviewBillingUpstreams(groupID, tagID int64) ([]overviewBillin
 	upstreams := []overviewBillingUpstream{}
 	for rows.Next() {
 		var item overviewBillingUpstream
-		if err := rows.Scan(&item.ID, &item.Name); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.CreditRatio); err != nil {
 			return nil, err
 		}
 		upstreams = append(upstreams, item)
@@ -188,7 +190,8 @@ func (s *Store) overviewBillingSnapshots(upstreamIDs []int64) ([]BillingSnapshot
 	return snapshots, rows.Err()
 }
 
-func aggregateOverviewBalances(snapshots []BillingSnapshot, start time.Time, pointCount int, bucket time.Duration) ([]OverviewBalanceSeries, int) {
+func aggregateOverviewBalances(snapshots []BillingSnapshot, upstreams []overviewBillingUpstream, start time.Time, pointCount int, bucket time.Duration) ([]OverviewBalanceSeries, int) {
+	creditRatios := overviewCreditRatios(upstreams)
 	currencySet := make(map[string]struct{})
 	for _, snapshot := range snapshots {
 		currency := snapshot.Currency
@@ -234,7 +237,7 @@ func aggregateOverviewBalances(snapshots []BillingSnapshot, start time.Time, poi
 			if snapshot.Remaining == nil {
 				continue
 			}
-			totals[currency] += *snapshot.Remaining
+			totals[currency] += overviewBalanceValue(*snapshot.Remaining, creditRatios[snapshot.UpstreamID])
 			counts[currency]++
 		}
 		for _, currency := range currencies {
@@ -257,6 +260,7 @@ func aggregateOverviewUpstreamBalances(snapshots []BillingSnapshot, upstreams []
 	if len(snapshots) == 0 || len(upstreams) == 0 {
 		return []OverviewUpstreamBalanceSeries{}
 	}
+	creditRatios := overviewCreditRatios(upstreams)
 	seen := make(map[int64]bool, len(snapshots))
 	latestByUpstream := make(map[int64]BillingSnapshot, len(upstreams))
 	for _, snapshot := range snapshots {
@@ -287,7 +291,7 @@ func aggregateOverviewUpstreamBalances(snapshots []BillingSnapshot, upstreams []
 			}
 			point := OverviewBalancePoint{Ts: at}
 			if snapshot, ok := current[upstream.ID]; ok && !snapshot.Unlimited && snapshot.Remaining != nil {
-				value := *snapshot.Remaining
+				value := overviewBalanceValue(*snapshot.Remaining, creditRatios[upstream.ID])
 				point.Remaining = &value
 			}
 			item.Points = append(item.Points, point)
@@ -295,6 +299,21 @@ func aggregateOverviewUpstreamBalances(snapshots []BillingSnapshot, upstreams []
 		series = append(series, item)
 	}
 	return series
+}
+
+func overviewCreditRatios(upstreams []overviewBillingUpstream) map[int64]float64 {
+	ratios := make(map[int64]float64, len(upstreams))
+	for _, item := range upstreams {
+		ratios[item.ID] = item.CreditRatio
+	}
+	return ratios
+}
+
+func overviewBalanceValue(remaining, creditRatio float64) float64 {
+	if creditRatio <= 0 {
+		creditRatio = 1
+	}
+	return remaining / creditRatio
 }
 
 func (s *Store) overviewSuccessTrend(groupID, tagID int64, start time.Time, pointCount int, bucket time.Duration) ([]OverviewSuccessPoint, error) {

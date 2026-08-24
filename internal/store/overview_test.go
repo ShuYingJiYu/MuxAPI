@@ -19,7 +19,7 @@ func TestOverviewTrendsScopesBalancesAndSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := &upstream.Upstream{Name: "first", BaseURL: "http://first", APIKey: "k1", BillingType: upstream.BillingSub2API, Enabled: true}
+	first := &upstream.Upstream{Name: "first", BaseURL: "http://first", APIKey: "k1", BillingType: upstream.BillingSub2API, CreditRatio: 2, Enabled: true}
 	second := &upstream.Upstream{Name: "second", BaseURL: "http://second", APIKey: "k2", BillingType: upstream.BillingSub2API, Enabled: true}
 	if err := st.Create(first); err != nil {
 		t.Fatal(err)
@@ -59,8 +59,12 @@ func TestOverviewTrendsScopesBalancesAndSuccess(t *testing.T) {
 		t.Fatalf("unexpected upstream balance series: %+v", trend.UpstreamBalances[0])
 	}
 	last := trend.Balances[0].Points[len(trend.Balances[0].Points)-1]
-	if last.Remaining == nil || *last.Remaining != 8 {
-		t.Fatalf("latest balance should be 8, got %+v", last.Remaining)
+	if last.Remaining == nil || *last.Remaining != 4 {
+		t.Fatalf("latest balance should apply credit ratio: want 4, got %+v", last.Remaining)
+	}
+	upstreamLast := trend.UpstreamBalances[0].Points[len(trend.UpstreamBalances[0].Points)-1]
+	if upstreamLast.Remaining == nil || *upstreamLast.Remaining != 4 {
+		t.Fatalf("upstream balance should apply credit ratio: want 4, got %+v", upstreamLast.Remaining)
 	}
 	if len(trend.Success) != 25 || trend.Success[len(trend.Success)-1].Rate != nil {
 		t.Fatalf("unexpected empty success trend: %+v", trend.Success[len(trend.Success)-1])

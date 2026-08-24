@@ -20,7 +20,7 @@ func TestHandlerServesEmbeddedSPAHistoryRoute(t *testing.T) {
 	if contentType := response.Header().Get("Content-Type"); !strings.Contains(contentType, "text/html") {
 		t.Fatalf("GET /settings content-type = %q", contentType)
 	}
-	if !strings.Contains(response.Body.String(), `<div id="app"></div>`) {
+	if !strings.Contains(response.Body.String(), `<div id="app">`) || !strings.Contains(response.Body.String(), `boot-screen`) {
 		t.Fatal("GET /settings did not serve the embedded frontend entry")
 	}
 }

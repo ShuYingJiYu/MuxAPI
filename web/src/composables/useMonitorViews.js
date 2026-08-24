@@ -1,5 +1,7 @@
 import { computed, reactive, ref } from 'vue'
 
+const CHANNEL_STATE_RANK = { DOWN: 0, DEGRADED: 1, NODATA: 2, OK: 3, DISABLED: 4 }
+
 // 组装监控页与总览页共享的只读视图状态。
 export function useMonitorViews({ monitors, upstreams, tags, probeOne }) {
   const primaryTagFor = upstream => upstream?.tags?.find(tag => tag.is_primary) || null
@@ -30,10 +32,10 @@ export function useMonitorViews({ monitors, upstreams, tags, probeOne }) {
   const collapsedMonitorTags = reactive(new Set())
   const monitorStatusOptions = [
     { value: '', label: '状态：全部' },
-    { value: 'DOWN', label: '故障' },
-    { value: 'DEGRADED', label: '降级' },
-    { value: 'OK', label: '正常' },
-    { value: 'NODATA', label: '待探测' },
+    { value: 'OK', label: '可用' },
+    { value: 'DEGRADED', label: '波动' },
+    { value: 'DOWN', label: '不可用' },
+    { value: 'NODATA', label: '待检测' },
     { value: 'DISABLED', label: '已停用' },
   ]
   const monitorTagOptions = computed(() => [
@@ -41,45 +43,108 @@ export function useMonitorViews({ monitors, upstreams, tags, probeOne }) {
     { value: 'untagged', label: '未分类' },
     ...tags.value.map(tag => ({ value: `tag-${tag.id}`, label: tag.name })),
   ])
+  function aggregateChannelTrend(items) {
+    const buckets = new Map()
+    for (const item of items) {
+      for (const point of item.snapshot?.trend || []) {
+        const ts = Number(point.ts) || 0
+        if (!ts) continue
+        if (!buckets.has(ts)) buckets.set(ts, { ts, total: 0, succ: 0 })
+        const bucket = buckets.get(ts)
+        bucket.total += Number(point.total) || 0
+        bucket.succ += Number(point.succ) || 0
+      }
+    }
+    return [...buckets.values()].sort((a, b) => a.ts - b.ts).map(point => {
+      const succRate = point.total ? point.succ / point.total : 0
+      const status = !point.total ? 0 : succRate >= .95 ? 1 : succRate >= .8 ? 2 : 3
+      return { ...point, succ_rate: succRate, status }
+    })
+  }
+
+  // 渠道是监控页的主实体；模型探测只用于组成渠道的当前状态和历史可用率。
+  const monitorChannels = computed(() => {
+    const upstreamOrder = new Map(upstreams.value.map((item, index) => [Number(item.id), index]))
+    const grouped = new Map()
+    for (const item of monitorItems.value) {
+      const id = Number(item.upstream_id)
+      if (!grouped.has(id)) grouped.set(id, [])
+      grouped.get(id).push(item)
+    }
+    return [...grouped.entries()].map(([id, items]) => {
+      const upstream = items[0].upstream
+      const enabled = items.filter(item => item.state !== 'DISABLED')
+      const states = enabled.map(item => item.state)
+      let state = 'DISABLED'
+      if (enabled.length) {
+        if (states.every(value => value === 'DOWN')) state = 'DOWN'
+        else if (states.every(value => value === 'NODATA')) state = 'NODATA'
+        else if (states.some(value => value !== 'OK')) state = 'DEGRADED'
+        else state = 'OK'
+      }
+      const reqs = enabled.reduce((sum, item) => sum + (Number(item.snapshot?.reqs) || 0), 0)
+      const success = enabled.reduce((sum, item) => sum + (Number(item.snapshot?.reqs) || 0) * (Number(item.snapshot?.succ_rate) || 0), 0)
+      const latencyWeight = enabled.reduce((sum, item) => sum + ((Number(item.snapshot?.avg_ms) || 0) > 0 ? (Number(item.snapshot?.reqs) || 1) : 0), 0)
+      const latencyTotal = enabled.reduce((sum, item) => {
+        const avg = Number(item.snapshot?.avg_ms) || 0
+        return sum + (avg > 0 ? avg * (Number(item.snapshot?.reqs) || 1) : 0)
+      }, 0)
+      const latest = enabled.reduce((result, item) => Number(item.snapshot?.last_ts) > Number(result?.snapshot?.last_ts || 0) ? item : result, null)
+      const primaryTag = primaryTagFor(upstream)
+      return {
+        id, upstream, primaryTag, groupKey: tagGroupKey(primaryTag), monitors: items,
+        enabledCount: enabled.length, state, reqs, rate: reqs ? success / reqs : 0,
+        avgMs: latencyWeight ? Math.round(latencyTotal / latencyWeight) : 0,
+        lastTS: Number(latest?.snapshot?.last_ts) || 0,
+        lastMs: Number(latest?.snapshot?.last_ms) || 0,
+        trend: aggregateChannelTrend(enabled), order: upstreamOrder.get(id) ?? Number.MAX_SAFE_INTEGER,
+      }
+    }).sort((a, b) => a.order - b.order)
+  })
+
   const monitorSections = computed(() => {
     const query = monitorSearch.value.trim().toLowerCase()
     const tagOrder = new Map(tags.value.map((tag, index) => [tag.id, index]))
-    const filtered = monitorItems.value.filter(item => {
-      if (monitorStatusFilter.value && item.state !== monitorStatusFilter.value) return false
-      if (monitorTagFilter.value && item.groupKey !== monitorTagFilter.value) return false
+    const filtered = monitorChannels.value.filter(channel => {
+      if (monitorStatusFilter.value && channel.state !== monitorStatusFilter.value) return false
+      if (monitorTagFilter.value && channel.groupKey !== monitorTagFilter.value) return false
       if (!query) return true
-      return [item.upstream.name, item.upstream.base_url, item.model, ...(item.upstream.tags || []).map(tag => tag.name)]
+      return [channel.upstream.name, channel.upstream.base_url, ...channel.monitors.map(item => item.model), ...(channel.upstream.tags || []).map(tag => tag.name)]
         .some(value => String(value || '').toLowerCase().includes(query))
     })
     const sections = new Map()
-    for (const item of filtered) {
-      if (!sections.has(item.groupKey)) sections.set(item.groupKey, { tag: item.primaryTag, items: [] })
-      sections.get(item.groupKey).items.push(item)
+    for (const channel of filtered) {
+      if (!sections.has(channel.groupKey)) sections.set(channel.groupKey, { tag: channel.primaryTag, items: [] })
+      sections.get(channel.groupKey).items.push(channel)
     }
     return [...sections.entries()].map(([key, section]) => {
       const items = section.items
-      const down = items.filter(item => item.state === 'DOWN').length
-      const degraded = items.filter(item => item.state === 'DEGRADED').length
-      const nodata = items.filter(item => item.state === 'NODATA').length
-      const enabled = items.filter(item => item.state !== 'DISABLED')
-      const reqs = enabled.reduce((sum, item) => sum + (Number(item.snapshot?.reqs) || 0), 0)
-      const success = enabled.reduce((sum, item) => sum + (Number(item.snapshot?.reqs) || 0) * (Number(item.snapshot?.succ_rate) || 0), 0)
-      const state = !enabled.length ? 'DISABLED' : down ? 'DOWN' : degraded ? 'DEGRADED' : nodata ? 'NODATA' : 'OK'
-      return { key, tag: section.tag, name: tagGroupName(section.tag), items, down, degraded, nodata, enabled: enabled.length, state, rate: reqs ? success / reqs : 0, reqs }
+      const enabled = items.filter(channel => channel.state !== 'DISABLED')
+      const reqs = enabled.reduce((sum, channel) => sum + channel.reqs, 0)
+      const success = enabled.reduce((sum, channel) => sum + channel.reqs * channel.rate, 0)
+      return {
+        key, tag: section.tag, name: tagGroupName(section.tag),
+        items: [...items].sort((a, b) => (CHANNEL_STATE_RANK[a.state] ?? 5) - (CHANNEL_STATE_RANK[b.state] ?? 5) || a.order - b.order),
+        up: items.filter(channel => channel.state === 'OK').length,
+        down: items.filter(channel => channel.state === 'DOWN').length,
+        degraded: items.filter(channel => channel.state === 'DEGRADED').length,
+        nodata: items.filter(channel => channel.state === 'NODATA').length,
+        enabled: enabled.length, rate: reqs ? success / reqs : 0, reqs,
+      }
     }).sort((a, b) => (tagOrder.get(a.tag?.id) ?? Number.MAX_SAFE_INTEGER) - (tagOrder.get(b.tag?.id) ?? Number.MAX_SAFE_INTEGER))
   })
 
   const monitorVisibleCount = computed(() => monitorSections.value.reduce((sum, section) => sum + section.items.length, 0))
   const summary = computed(() => {
-    const items = monitorItems.value.filter(item => item.state !== 'DISABLED')
-    const down = items.filter(item => item.state === 'DOWN').length
-    const degraded = items.filter(item => item.state === 'DEGRADED').length
-    const nodata = items.filter(item => item.state === 'NODATA').length
-    const reqs = items.reduce((sum, item) => sum + (Number(item.snapshot?.reqs) || 0), 0)
-    const success = items.reduce((sum, item) => sum + (Number(item.snapshot?.reqs) || 0) * (Number(item.snapshot?.succ_rate) || 0), 0)
+    const items = monitorChannels.value.filter(channel => channel.state !== 'DISABLED')
+    const down = items.filter(channel => channel.state === 'DOWN').length
+    const degraded = items.filter(channel => channel.state === 'DEGRADED').length
+    const nodata = items.filter(channel => channel.state === 'NODATA').length
+    const reqs = items.reduce((sum, channel) => sum + channel.reqs, 0)
+    const success = items.reduce((sum, channel) => sum + channel.reqs * channel.rate, 0)
     return {
       total: items.length, down, degraded, nodata,
-      up: items.filter(item => item.state === 'OK').length,
+      up: items.filter(channel => channel.state === 'OK').length,
       rate: reqs ? success / reqs : 0,
       probeReqs: reqs,
       allOk: items.length > 0 && down === 0 && degraded === 0 && nodata === 0,
@@ -154,7 +219,7 @@ export function useMonitorViews({ monitors, upstreams, tags, probeOne }) {
   }
   return {
     primaryTagFor, auxiliaryTagsFor, tagGroupKey, tagGroupName,
-    monitorItems, monitorSearch, monitorStatusFilter,
+    monitorItems, monitorChannels, monitorSearch, monitorStatusFilter,
     monitorTagFilter, collapsedMonitorTags, monitorStatusOptions, monitorTagOptions,
     monitorSections, monitorVisibleCount, summary, toggleMonitorTag, matrix, ovSummary,
     cellDrawerId, cellDrawer, openCell, closeCell, probeCell,
