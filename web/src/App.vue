@@ -268,7 +268,7 @@ function activatePage(p) {
     else if (p === 'upstreams') { await loadTags(); await loadGroups(); await loadUpstreams(); startRtPoll(loadUpstreams) }
     else if (p === 'monitors') { await loadTags(); await loadUpstreams(); await loadMonitors(); startMonPoll() }
     else if (p === 'logs') { await loadLogOptions(); await loadLogs(true); startLogPoll() }
-    else if (p === 'settings') { await loadSettings(); await Promise.all([loadBackupConfig(), loadBackupSchedule(), loadBackups()]) }
+    else if (p === 'settings') { await loadSettings(); await Promise.all([loadBackupConfig(), loadBackupSchedule(), loadBackups(), loadUpstreams(), loadMappings()]) }
   }).finally(() => {
     if (epoch === pageLoadEpoch) pageLoading.value = false
   })
@@ -1134,6 +1134,29 @@ function startBackupPoll() {
   }, 4000)
 }
 function stopBackupPoll() { clearInterval(_backupPollTimer); _backupPollTimer = null }
+
+// 模型映射
+const mappings = ref([])
+const mappingsLoading = ref(false)
+const showNewMapping = ref(false)
+const newMappingForm = reactive({ upstream_id: '', source_model: '', target_model: '' })
+async function loadMappings() {
+  mappingsLoading.value = true
+  try { mappings.value = (await api.modelMappings()) || [] }
+  finally { mappingsLoading.value = false }
+}
+async function saveNewMapping() {
+  if (!newMappingForm.source_model.trim() || !newMappingForm.target_model.trim()) return
+  await api.createModelMapping({
+    upstream_id: Number(newMappingForm.upstream_id) || 0,
+    source_model: newMappingForm.source_model.trim(),
+    target_model: newMappingForm.target_model.trim(),
+    mapping_type: 'static',
+  })
+  showNewMapping.value = false
+  Object.assign(newMappingForm, { upstream_id: '', source_model: '', target_model: '' })
+  await loadMappings()
+}
 
 async function loadBackupConfig() {
   backupConfig.value = (await api.backupConfig()) || { endpoint: '', region: '', bucket: '', access_key_id: '', secret_key: '', prefix: '', force_path_style: false }
@@ -2537,6 +2560,8 @@ function logout() {
               <button type="button" class="set-navitem" :class="{ active: settingsSection === 'alert' }" @click="gotoSection('alert')"><Icon name="alert" :size="16" />健康告警</button>
               <button type="button" class="set-navitem" :class="{ active: settingsSection === 'endpoint' }" @click="gotoSection('endpoint')"><Icon name="link" :size="16" />接入地址</button>
               <button type="button" class="set-navitem" :class="{ active: settingsSection === 'backup' }" @click="gotoSection('backup')"><Icon name="refresh" :size="16" />数据备份</button>
+              <button type="button" class="set-navitem" :class="{ active: settingsSection === 'mappings' }" @click="gotoSection('mappings')"><Icon name="link" :size="16" />模型映射</button>
+              <p class="set-navhint">探测间隔 / 路径已下放到各监控项，在「监控看板」逐项配置。</p>
             </aside>
             <div class="settings-body">
               <section id="set-logs" v-show="settingsSection === 'logs'" class="card settings-card">
@@ -2674,6 +2699,41 @@ function logout() {
                 </div>
                 <div v-if="backupRecords.some(r => r.error)" class="backup-errors">
                   <div v-for="r in backupRecords.filter(r => r.error)" :key="r.id+'e'" class="hint backup-error">{{ r.file_name }}：{{ r.error }}</div>
+                </div>
+              </section>
+
+              <!-- 模型映射 -->
+              <section id="set-mappings" v-show="settingsSection === 'mappings'" class="card settings-card">
+                <div class="settings-title"><h3>模型映射</h3><p>管理请求模型名到上游实际模型名的映射规则。自动学习的映射由前缀匹配产生,可手动覆盖或删除。</p></div>
+                <div class="settings-actions" style="margin-bottom:12px">
+                  <button class="btn btn-sm" @click="loadMappings"><Icon name="refresh" :size="14" />刷新</button>
+                  <button class="btn btn-sm" @click="showNewMapping = true"><Icon name="plus" :size="14" />手动添加</button>
+                </div>
+                <div v-if="showNewMapping" class="mapping-form">
+                  <FancySelect v-model="newMappingForm.upstream_id" :options="upstreamSelectOptions" />
+                  <input v-model="newMappingForm.source_model" placeholder="请求模型名" />
+                  <span style="color:var(--g400)">→</span>
+                  <input v-model="newMappingForm.target_model" placeholder="上游实际模型名" />
+                  <button class="btn btn-sm" @click="saveNewMapping">保存</button>
+                  <button class="btn btn-ghost btn-sm" @click="showNewMapping = false">取消</button>
+                </div>
+                <div v-if="!mappings.length && !mappingsLoading" class="hint">暂无模型映射规则</div>
+                <div v-else-if="mappingsLoading" class="hint">加载中…</div>
+                <div v-else class="mapping-table-wrap">
+                  <table class="backup-table">
+                    <thead><tr><th>上游</th><th>请求模型</th><th></th><th>实际模型</th><th>类型</th><th>过期</th><th>操作</th></tr></thead>
+                    <tbody>
+                      <tr v-for="m in mappings" :key="m.id">
+                        <td>{{ upName(m.upstream_id) }}</td>
+                        <td><code>{{ m.source_model }}</code></td>
+                        <td style="color:var(--g400)">→</td>
+                        <td><code>{{ m.target_model }}</code></td>
+                        <td><span class="tag" :class="m.mapping_type === 'auto' ? 'on' : ''">{{ m.mapping_type === 'auto' ? '自动' : '手动' }}</span></td>
+                        <td style="font-size:11px;color:var(--g400)">{{ m.expires_at ? new Date(m.expires_at).toLocaleDateString() : '永久' }}</td>
+                        <td><button class="icon-btn danger" @click="guard(async () => { await api.deleteModelMapping(m.id); await loadMappings() })"><Icon name="trash" :size="16" /></button></td>
+                      </tr>
+                    </tbody>
+                  </table>
                 </div>
               </section>
             </div>

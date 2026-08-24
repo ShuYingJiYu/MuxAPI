@@ -112,10 +112,23 @@ function perReqCandidateCost(c, detail) {
                   </div>
                 </div>
                 <span class="bar-cost">{{ fmtCost(perReqCandidateCost(c, detail)) }}</span>
+                <span v-if="c.estimated_ttft_ms" class="bar-ttft">{{ Math.round(c.estimated_ttft_ms) }}ms</span>
+                <span v-if="c.success_rate" class="bar-rate" :class="c.success_rate >= 0.95 ? 'ok' : c.success_rate >= 0.8 ? 'warn' : 'bad'">{{ (c.success_rate * 100).toFixed(0) }}%</span>
+                <span v-if="c.cache_hit_rate && c.cache_supported" class="bar-cache">命中{{ (c.cache_hit_rate * 100).toFixed(0) }}%</span>
                 <span v-if="c.selected" class="bar-note accent-text">✓ 已选</span>
                 <span v-else-if="c.cache_supported" class="bar-note">有缓存</span>
                 <span v-else class="bar-note">无缓存</span>
               </div>
+            </div>
+          </div>
+
+          <!-- Rejected candidates -->
+          <div v-if="detail.candidates && detail.candidates.filter(x => !x.eligible).length" class="routing-section routing-rejected">
+            <h4>被排除渠道 ({{ detail.candidates.filter(x => !x.eligible).length }})</h4>
+            <div class="rejected-list">
+              <span v-for="c in detail.candidates.filter(x => !x.eligible)" :key="c.upstream_id" class="rejected-item">
+                {{ c.upstream_name }}<em>{{ c.rejection_reason || '未知' }}</em>
+              </span>
             </div>
           </div>
 
@@ -136,8 +149,8 @@ function perReqCandidateCost(c, detail) {
             <h4>决策上下文</h4>
             <dl class="routing-dl">
               <div><dt>策略</dt><dd>{{ detail.strategy || 'cost' }}</dd></div>
-              <div><dt>置信度</dt><dd>{{ (detail.confidence * 100).toFixed(0) }}%</dd></div>
               <div><dt>前缀复用</dt><dd>{{ ((detail.reusable_prefix_tokens || 0) / 1000).toFixed(0) }}K / {{ ((detail.estimated_input_tokens || 0) / 1000).toFixed(0) }}K</dd></div>
+              <div v-if="detail.estimated_output_tokens"><dt>预估输出</dt><dd>{{ detail.estimated_output_tokens }} tokens</dd></div>
               <div v-if="detail.exploration"><dt>探索</dt><dd>是（非最优采样）</dd></div>
             </dl>
           </div>
@@ -191,6 +204,17 @@ function perReqCandidateCost(c, detail) {
 .bar-cost { width: 64px; flex: none; text-align: right; font-variant-numeric: tabular-nums; color: var(--g600); }
 .bar-note { flex: none; font-size: 11px; color: var(--g400); width: 64px; }
 .bar-note.accent-text { color: var(--p700); font-weight: 700; }
+.bar-ttft { flex: none; font-size: 11px; color: var(--g500); width: 48px; text-align: right; font-variant-numeric: tabular-nums; }
+.bar-rate { flex: none; font-size: 11px; font-weight: 600; width: 36px; text-align: right; font-variant-numeric: tabular-nums; }
+.bar-rate.ok { color: #059669; }
+.bar-rate.warn { color: #d97706; }
+.bar-rate.bad { color: #dc2626; }
+.bar-cache { flex: none; font-size: 11px; color: #0891b2; width: 52px; text-align: right; }
+
+.routing-rejected h4 { color: var(--g400); }
+.rejected-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.rejected-item { font-size: 11px; background: var(--g50); border: 1px solid var(--g100); border-radius: 6px; padding: 2px 8px; color: var(--g500); }
+.rejected-item em { font-style: normal; color: var(--g400); margin-left: 4px; }
 
 .routing-section { margin-top: 14px; }
 .routing-dl { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 6px 20px; }

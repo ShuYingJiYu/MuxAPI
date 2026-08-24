@@ -260,4 +260,9 @@ export const api = {
   listBackups: () => req('GET', '/backup'),
   deleteBackup: id => req('DELETE', '/backup/records/' + id),
   backupDownloadURL: id => req('GET', '/backup/records/' + id + '/download'),
+
+  // 模型映射
+  modelMappings: (upstreamId) => req('GET', '/model-mappings' + (upstreamId ? '?upstream_id=' + upstreamId : '')),
+  createModelMapping: payload => req('POST', '/model-mappings', payload),
+  deleteModelMapping: id => req('DELETE', '/model-mappings/' + id),
 }
