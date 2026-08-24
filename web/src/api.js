@@ -107,6 +107,11 @@ export const api = {
   recoverUpstreamModel: (id, model) => req('POST', `/upstreams/${id}/models/recover`, { model }),
   refreshUpstreamBilling: id => req('POST', `/upstreams/${id}/billing/refresh`),
   upstreamBillingAudit: (id, window) => req('GET', `/upstreams/${id}/billing/audit?window=${encodeURIComponent(window || '')}`),
+  overviewTrends: ({ window = '24h', tag_id = 0 } = {}) => {
+    const p = new URLSearchParams({ window, _ts: String(Date.now()) })
+    if (Number(tag_id) > 0) p.set('tag_id', String(tag_id))
+    return req('GET', `/overview/trends?${p.toString()}`)
+  },
   createMonitorsBatch: (id, payload) => req('POST', `/upstreams/${id}/monitors`, payload),
   // 管理标签
   tags: () => req('GET', '/tags'),

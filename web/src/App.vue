@@ -7,6 +7,7 @@ import Icon from './Icon.vue'
 import Fence from './Fence.vue'
 import FancySelect from './FancySelect.vue'
 import UpstreamPicker from './UpstreamPicker.vue'
+import Chart from './Chart.vue'
 import { api } from './api.js'
 import { useLogs } from './composables/useLogs.js'
 import { useMonitorViews } from './composables/useMonitorViews.js'
@@ -26,11 +27,64 @@ const tags = ref([])              // 上游管理标签
 const err = ref('')
 const loggedIn = ref(!!api.getToken())
 const loginForm = reactive({ token: api.getToken() })
+const overviewStats = ref({})
+const overviewLoading = ref(false)
+const overviewTrendWindow = ref('24h')
+const overviewTrendTagID = ref(0)
+const overviewTrends = ref(null)
+const overviewTrendLoading = ref(false)
+const overviewTrendError = ref('')
+const overviewBalanceCurrency = ref('')
+let overviewTrendEpoch = 0
 
 async function loadGroups() { groups.value = (await api.groups()) || [] }
 async function loadUpstreams() { upstreams.value = (await api.upstreams()) || [] }
 async function loadMonitors() { monitors.value = (await api.monitors()) || [] }
 async function loadTags() { tags.value = (await api.tags()) || [] }
+
+async function loadOverviewTrends() {
+  const epoch = ++overviewTrendEpoch
+  overviewTrendLoading.value = true
+  overviewTrendError.value = ''
+  try {
+    const data = await api.overviewTrends({ window: overviewTrendWindow.value, tag_id: overviewTrendTagID.value })
+    if (epoch !== overviewTrendEpoch) return
+    overviewTrends.value = data || null
+    const currencies = (data?.balances || []).map(series => series.currency)
+    if (!currencies.includes(overviewBalanceCurrency.value)) overviewBalanceCurrency.value = currencies[0] || ''
+  } catch (e) {
+    if (epoch === overviewTrendEpoch) {
+      overviewTrendError.value = e.status === 404
+        ? '当前服务端版本不含趋势接口，请重新编译并重启 MuxAPI'
+        : String(e.message || e)
+    }
+  } finally {
+    if (epoch === overviewTrendEpoch) overviewTrendLoading.value = false
+  }
+}
+
+function changeOverviewTag(value) {
+  overviewTrendTagID.value = Number(value) || 0
+  guard(loadOverviewTrends)
+}
+
+// 总览只读取需要处理的运行数据；不复用请求记录页的筛选状态。
+async function loadOverview() {
+  overviewLoading.value = true
+  const since = Math.floor(Date.now() / 1000) - 24 * 60 * 60
+  try {
+    const [list, monitorList, stats, tagList] = await Promise.all([
+      api.upstreams(), api.monitors(), api.logStats({ since }), api.tags(),
+    ])
+    upstreams.value = list || []
+    monitors.value = monitorList || []
+    tags.value = tagList || []
+    overviewStats.value = stats || {}
+    await loadOverviewTrends()
+  } finally {
+    overviewLoading.value = false
+  }
+}
 
 // 单项「立即探测」：探完用返回的快照原地更新该卡片
 // 用 Set 记录正在探测的卡片 id，支持多卡并发互不串台
@@ -103,6 +157,12 @@ function startMonPoll() {
   monTimer = setInterval(() => { loadMonitors().catch(() => {}) }, 60000)
 }
 function stopMonPoll() { if (monTimer) { clearInterval(monTimer); monTimer = null } }
+let overviewTimer = null
+function startOverviewPoll() {
+  stopOverviewPoll()
+  overviewTimer = setInterval(() => { loadOverview().catch(() => {}) }, 60000)
+}
+function stopOverviewPoll() { if (overviewTimer) { clearInterval(overviewTimer); overviewTimer = null } }
 
 // 运行时状态轮询：分组列表/分组详情/上游池页，每 8s 刷新健康，离开即停。
 let rtTimer = null
@@ -111,7 +171,7 @@ function startRtPoll(fn) {
   rtTimer = setInterval(() => { fn().catch(() => {}) }, 8000)
 }
 function stopRtPoll() { if (rtTimer) { clearInterval(rtTimer); rtTimer = null } }
-function stopAllPoll() { stopMonPoll(); stopRtPoll(); stopLogPoll() }
+function stopAllPoll() { stopMonPoll(); stopOverviewPoll(); stopRtPoll(); stopLogPoll() }
 onUnmounted(() => { stopAllPoll() })
 
 function activatePage(p) {
@@ -121,7 +181,7 @@ function activatePage(p) {
   loadEpoch++   // 离开详情，作废在途的 members/keys 加载
   stopAllPoll()
   guard(async () => {
-    if (p === 'overview') { await loadUpstreams(); await loadMonitors(); startMonPoll() }
+    if (p === 'overview') { await loadOverview(); startOverviewPoll() }
     else if (p === 'groups') { await loadGroups(); startRtPoll(loadGroups) }
     else if (p === 'upstreams') { await loadTags(); await loadUpstreams(); startRtPoll(loadUpstreams) }
     else if (p === 'monitors') { await loadTags(); await loadUpstreams(); await loadMonitors(); startMonPoll() }
@@ -148,7 +208,7 @@ const memberIds = computed(() => new Set(members.value.map(m => m.upstream_id)))
 const addable = computed(() => upstreams.value.filter(u => !memberIds.value.has(u.id)))
 
 const pages = {
-  overview: { title: '总览', desc: '上游 × 模型健康矩阵，一屏看全所有渠道的实时状态' },
+  overview: { title: '总览', desc: '优先处理余额、计费与服务异常' },
   groups: { title: '分组管理', desc: '每个分组是一个独立的调度池，拥有自己的上游与接入密钥' },
   upstreams: { title: '上游池', desc: '按主标签管理全局渠道，并用普通标签快速筛选' },
   monitors: { title: '监控看板', desc: '按主标签组织模型探测卡片与运行时健康' },
@@ -1083,6 +1143,152 @@ const sinceText = ts => {
   return Math.floor(s / 3600) + ' 小时前'
 }
 
+// 总览按照处理优先级聚合现有接口数据，正常渠道不进入此视图。
+const overviewLevelRank = { critical: 0, warning: 1, info: 2 }
+const overviewBillingAlerts = computed(() => {
+  const now = Math.floor(Date.now() / 1000)
+  const alerts = []
+  for (const upstream of upstreams.value) {
+    const billing = upstream.billing
+    if (!billing) continue
+    const remaining = Number(billing.remaining)
+    const hasRemaining = billing.remaining !== null && billing.remaining !== undefined && Number.isFinite(remaining)
+    const base = { upstream, name: upstream.name, to: 'upstreams', kind: 'billing' }
+
+    if (!billing.unlimited && hasRemaining && remaining < 0) {
+      alerts.push({ ...base, key: `balance-debt-${upstream.id}`, level: 'critical', title: '上游已欠费', detail: billingAmount(upstream) })
+    } else if (!billing.unlimited && hasRemaining && remaining === 0) {
+      alerts.push({ ...base, key: `balance-empty-${upstream.id}`, level: 'critical', title: '余额已耗尽', detail: billingAmount(upstream) })
+    } else if (!billing.unlimited && hasRemaining && remaining <= 1) {
+      alerts.push({ ...base, key: `balance-low-${upstream.id}`, level: 'warning', title: '余额偏低', detail: `当前 ${billingAmount(upstream)}` })
+    }
+
+    if (billing.status === 'error') {
+      alerts.push({ ...base, key: `billing-error-${upstream.id}`, level: 'warning', title: '计费采集失败', detail: billing.error || '等待下次自动采集', action: 'refresh-billing' })
+    } else if (billing.status === 'partial') {
+      alerts.push({ ...base, key: `billing-partial-${upstream.id}`, level: 'warning', title: '计费数据不完整', detail: billing.error || '上游未返回完整计费数据' })
+    }
+
+    const refreshedAt = Number(billing.last_success_at || billing.refreshed_at)
+    if (refreshedAt && now - refreshedAt > 30 * 60 && billing.status !== 'error') {
+      alerts.push({ ...base, key: `billing-stale-${upstream.id}`, level: 'warning', title: '计费数据已过期', detail: `最近成功采集于 ${sinceText(refreshedAt)}` })
+    }
+
+    const audit = billing.audit
+    if (audit?.status === 'warning') {
+      alerts.push({ ...base, key: `audit-warning-${upstream.id}`, level: 'critical', title: '费用核对异常', detail: billingAuditReasons[audit.reason] || billingAuditText(upstream) })
+    } else if (audit?.multiplier_changed) {
+      alerts.push({ ...base, key: `multiplier-changed-${upstream.id}`, level: 'info', title: '计费倍率已变更', detail: billingMultiplier(upstream) })
+    }
+  }
+  return alerts
+})
+const overviewServiceAlerts = computed(() => {
+  const alerts = []
+  for (const upstream of upstreams.value) {
+    if (!upstream.enabled || !upstream.health) continue
+    if (upstream.health.state === 'OPEN') {
+      alerts.push({ key: `upstream-open-${upstream.id}`, level: 'critical', title: '渠道已熔断', detail: rtRate(upstream.health), name: upstream.name, upstream, to: 'upstreams', kind: 'runtime', action: 'recover-upstream' })
+    } else if (upstream.health.state === 'HALF_OPEN') {
+      alerts.push({ key: `upstream-half-${upstream.id}`, level: 'warning', title: '渠道恢复验证中', detail: rtRate(upstream.health), name: upstream.name, upstream, to: 'upstreams', kind: 'runtime', action: 'recover-upstream' })
+    }
+  }
+  for (const monitor of monitorItems.value) {
+    if (!monitor.enabled || !monitor.upstream?.enabled || ['OPEN', 'HALF_OPEN'].includes(monitor.upstream.health?.state)) continue
+    const state = monitor.snapshot?.state
+    if (state !== 'DOWN' && state !== 'DEGRADED') continue
+    alerts.push({
+      key: `monitor-${monitor.id}`, level: state === 'DOWN' ? 'critical' : 'warning',
+      title: state === 'DOWN' ? '模型监控故障' : '模型监控降级',
+      detail: monitor.model, name: monitor.upstream.name, to: 'monitors', kind: 'monitor', monitor,
+    })
+  }
+  const failed = Number(overviewStats.value.failed) || 0
+  const partial = Number(overviewStats.value.partial) || 0
+  if (failed + partial > 0) {
+    alerts.push({
+      key: 'request-failures', level: failed > 0 ? 'critical' : 'warning', title: '近期请求异常',
+      detail: `${failed} 次失败${partial ? ` · ${partial} 次流中断` : ''}`, name: '近 24 小时', to: 'logs', kind: 'request',
+    })
+  }
+  return alerts
+})
+const overviewIssues = computed(() => [...overviewBillingAlerts.value, ...overviewServiceAlerts.value]
+  .sort((a, b) => overviewLevelRank[a.level] - overviewLevelRank[b.level] || a.name.localeCompare(b.name)))
+const overviewVisibleIssues = computed(() => overviewIssues.value.slice(0, 6))
+const overviewMoreIssueCount = computed(() => Math.max(0, overviewIssues.value.length - overviewVisibleIssues.value.length))
+
+const overviewWindowOptions = [
+  { value: '24h', label: '24 小时' },
+  { value: '7d', label: '7 天' },
+  { value: '30d', label: '30 天' },
+]
+const overviewTrendTagOptions = computed(() => {
+  const used = new Set(upstreams.value.filter(item => item.enabled && item.primary_tag_id > 0)
+    .map(item => Number(item.primary_tag_id)))
+  return [
+    { value: 0, label: '全部标签', color: 'all' },
+    ...tags.value
+      .filter(tag => used.has(Number(tag.id)))
+      .map(tag => ({ value: tag.id, label: tag.name, color: tag.color })),
+  ]
+})
+const overviewSelectedTag = computed(() => tags.value.find(tag => Number(tag.id) === Number(overviewTrendTagID.value)))
+const overviewTrendScopeDescription = computed(() => overviewSelectedTag.value
+  ? `主标签「${overviewSelectedTag.value.name}」 · 余额按币种分别统计，成功率按请求记录统计`
+  : '全部标签 · 余额按币种分别统计，成功率按请求记录统计')
+const overviewCurrencyOptions = computed(() => (overviewTrends.value?.balances || [])
+  .map(series => ({ value: series.currency, label: series.currency })))
+const overviewSelectedBalance = computed(() => {
+  const list = overviewTrends.value?.balances || []
+  return list.find(series => series.currency === overviewBalanceCurrency.value) || list[0] || null
+})
+const overviewChartLabels = computed(() => {
+  const points = overviewSelectedBalance.value?.points || overviewTrends.value?.success || []
+  return points.map(point => {
+    const date = new Date(Number(point.ts) * 1000)
+    return overviewTrendWindow.value === '24h'
+      ? date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+      : date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
+  })
+})
+const overviewBalanceData = computed(() => (overviewSelectedBalance.value?.points || [])
+  .map(point => point.remaining == null ? null : Number(point.remaining)))
+const overviewBalanceChannelColors = ['#e46f86', '#d39b35', '#36b99d', '#5598d9', '#9270d6', '#df709e', '#70a84a', '#c97bba', '#7c8bd6', '#d77b4b']
+const overviewBalanceDatasets = computed(() => (overviewTrends.value?.upstream_balances || [])
+  .filter(series => series.currency === (overviewSelectedBalance.value?.currency || 'USD'))
+  .filter(series => series.points?.some(point => point.remaining != null))
+  .map((series, index) => ({
+    label: series.name || `上游 #${series.upstream_id}`,
+    data: series.points.map(point => point.remaining == null ? null : Number(point.remaining)),
+    color: overviewBalanceChannelColors[index % overviewBalanceChannelColors.length],
+    fill: false,
+  })))
+const overviewSuccessData = computed(() => (overviewTrends.value?.success || [])
+  .map(point => point.rate == null ? null : Number(point.rate) * 100))
+const overviewBalanceHasData = computed(() => overviewBalanceDatasets.value.length > 0)
+const overviewSuccessHasData = computed(() => overviewSuccessData.value.some(value => value != null))
+const overviewLatestBalance = computed(() => {
+  for (let index = overviewBalanceData.value.length - 1; index >= 0; index--) {
+    if (overviewBalanceData.value[index] != null) return overviewBalanceData.value[index]
+  }
+  return null
+})
+const overviewSuccessSummary = computed(() => {
+  const points = overviewTrends.value?.success || []
+  const total = points.reduce((sum, point) => sum + Number(point.total || 0), 0)
+  const success = points.reduce((sum, point) => sum + Number(point.success || 0), 0)
+  return { total, success, rate: total ? success / total * 100 : null }
+})
+function overviewBalanceText(value) {
+  if (value == null) return '—'
+  const currency = overviewSelectedBalance.value?.currency || 'USD'
+  try {
+    return new Intl.NumberFormat('zh-CN', { style: 'currency', currency, currencyDisplay: 'narrowSymbol', maximumFractionDigits: 2 }).format(value)
+  } catch { return `${Number(value).toFixed(2)} ${currency}` }
+}
+function overviewPercentText(value) { return value == null ? '—' : `${Number(value).toFixed(1)}%` }
+
 const {
   logs, logPageSize, logCurrentPage, logLoading, logDetail, logDetailLoading, logStats,
   logCacheStats, logCacheExpanded, logCacheSummary,
@@ -1246,11 +1452,13 @@ function logout() {
     <aside class="sidebar">
       <div class="logo"><Icon name="bolt" :size="22" /><span class="logo-text">MuxAPI</span></div>
       <nav class="nav">
+        <span class="nav-section-label">运行</span>
         <RouterLink class="nav-item" :class="{ active: page === 'overview' }" :to="{ name: 'overview' }"><Icon class="ic" name="bolt" :size="18" />总览</RouterLink>
-        <RouterLink class="nav-item" :class="{ active: page === 'groups' }" :to="{ name: 'groups' }" @click.exact="detailGroup && backToGroups()"><Icon class="ic" name="cube" :size="18" />分组管理</RouterLink>
-        <RouterLink class="nav-item" :class="{ active: page === 'upstreams' }" :to="{ name: 'upstreams' }"><Icon class="ic" name="server" :size="18" />上游池</RouterLink>
         <RouterLink class="nav-item" :class="{ active: page === 'monitors' }" :to="{ name: 'monitors' }"><Icon class="ic" name="heart" :size="18" />监控看板</RouterLink>
         <RouterLink class="nav-item" :class="{ active: page === 'logs' }" :to="{ name: 'logs' }"><Icon class="ic" name="refresh" :size="18" />请求记录</RouterLink>
+        <span class="nav-section-label">配置</span>
+        <RouterLink class="nav-item" :class="{ active: page === 'groups' }" :to="{ name: 'groups' }" @click.exact="detailGroup && backToGroups()"><Icon class="ic" name="cube" :size="18" />分组管理</RouterLink>
+        <RouterLink class="nav-item" :class="{ active: page === 'upstreams' }" :to="{ name: 'upstreams' }"><Icon class="ic" name="server" :size="18" />上游池</RouterLink>
         <RouterLink class="nav-item" :class="{ active: page === 'settings' }" :to="{ name: 'settings' }"><Icon class="ic" name="cog" :size="18" />设置</RouterLink>
       </nav>
       <div class="sidebar-version" v-if="appVersion">{{ appVersion }}</div>
@@ -1271,39 +1479,62 @@ function logout() {
         <p v-if="err" class="err-banner">{{ err }}</p>
         <p v-if="notice" class="ok-banner">{{ notice }}</p>
 
-        <!-- 总览：上游 × 模型健康矩阵 -->
+        <!-- 总览：趋势先于文字，异常只保留需要处理的提示。 -->
         <template v-if="page === 'overview'">
-          <div class="ov-stats">
-            <div class="ov-stat mint"><div class="ov-num">{{ ovSummary.healthy }}</div><div class="ov-lbl">正常组合</div></div>
-            <div class="ov-stat amber"><div class="ov-num">{{ ovSummary.degraded }}</div><div class="ov-lbl">降级</div></div>
-            <div class="ov-stat pink"><div class="ov-num">{{ ovSummary.down }}</div><div class="ov-lbl">故障</div></div>
-            <div class="ov-stat violet"><div class="ov-num">{{ (ovSummary.rate * 100).toFixed(0) }}<small>%</small></div><div class="ov-lbl">平均成功率</div></div>
-            <div class="ov-stat blue"><div class="ov-num">{{ ovSummary.avgLat || '—' }}<small v-if="ovSummary.avgLat">ms</small></div><div class="ov-lbl">平均延迟</div></div>
-          </div>
-
-          <div class="ov-meta">{{ ovSummary.upstreams }} 个上游 · {{ ovSummary.models }} 个模型 · {{ ovSummary.combos }} 个监控组合 · 点芯片看详情</div>
-
-          <div v-if="!matrix.rows.length" class="empty">还没有监控项，去「监控看板」为渠道+模型建监控，这里就会亮起来 ✨</div>
-
-          <div v-else class="ov-groups">
-            <section class="ov-group" v-for="g in matrix.rows" :key="g.id">
-              <header class="ovg-head">
-                <span class="ovg-dot" :class="dotClass(g.down ? 'DOWN' : g.degraded ? 'DEGRADED' : 'OK')"></span>
-                <span class="ovg-name" :title="g.name">{{ g.name }}</span>
-                <span class="ovg-meta">{{ g.items.length }} 模型<template v-if="g.down"> · {{ g.down }} 故障</template><template v-if="g.degraded"> · {{ g.degraded }} 降级</template></span>
-              </header>
-              <div class="ovg-chips">
-                <button v-for="m in g.items" :key="m.id" class="ov-chip"
-                  :class="[dotClass(m.snapshot.state), { off: !m.enabled }]"
-                  :title="m.model + ' · ' + (m.enabled ? stateLabel(m.snapshot.state) : '已停用') + (m.snapshot.avg_ms ? ' · ' + m.snapshot.avg_ms + 'ms' : '')"
-                  @click="openCell(m)">
-                  <span class="ovc-led" :class="dotClass(m.snapshot.state)"></span>
-                  <span class="ovc-name">{{ m.model }}</span>
-                  <span class="ovc-lat" v-if="m.snapshot.avg_ms || m.snapshot.last_ms">{{ m.snapshot.avg_ms || m.snapshot.last_ms }}ms</span>
-                </button>
+          <section class="ov-trends">
+            <header class="ov-trends-head">
+              <div>
+                <h2>余额与成功率</h2>
+                <p>{{ overviewTrendScopeDescription }}</p>
               </div>
-            </section>
-          </div>
+              <div class="ov-trend-controls">
+                <FancySelect v-model="overviewTrendTagID" variant="tag" searchable :options="overviewTrendTagOptions" :disabled="overviewTrendLoading" @change="changeOverviewTag" />
+                <div class="ov-segmented" role="tablist" aria-label="趋势时间范围">
+                  <button v-for="option in overviewWindowOptions" :key="option.value" type="button" :class="{ active: overviewTrendWindow === option.value }" :disabled="overviewTrendLoading" @click="overviewTrendWindow = option.value; guard(loadOverviewTrends)">{{ option.label }}</button>
+                </div>
+                <button class="icon-btn" :disabled="overviewLoading || overviewTrendLoading" title="刷新总览" @click="guard(loadOverview)"><Icon name="refresh" :size="16" /></button>
+              </div>
+            </header>
+
+            <div v-if="overviewTrendLoading && !overviewTrends" class="ov-trend-loading"><Icon name="loader" :size="17" />正在读取趋势</div>
+            <div v-else-if="overviewTrendError" class="ov-trend-empty"><Icon name="alert" :size="17" /><span>趋势暂时不可用：{{ overviewTrendError }}</span></div>
+            <div v-else class="ov-chart-grid">
+              <section class="ov-chart-card">
+                <header class="ov-chart-head">
+                  <div><span class="ov-chart-kicker">余额总额</span><strong>{{ overviewBalanceText(overviewLatestBalance) }}</strong></div>
+                  <FancySelect v-if="overviewCurrencyOptions.length > 1" v-model="overviewBalanceCurrency" :options="overviewCurrencyOptions" />
+                  <span v-else class="ov-chart-meta">{{ overviewSelectedBalance?.currency || '暂无币种' }}</span>
+                </header>
+                <div v-if="overviewBalanceHasData" class="ov-chart"><Chart :key="`balance-${overviewTrendTagID}-${overviewTrends?.to_at || 0}`" :labels="overviewChartLabels" :datasets="overviewBalanceDatasets" color="#d39b35" axis-labels :fmt="overviewBalanceText" /></div>
+                <div v-else class="ov-chart-empty"><Icon name="server" :size="18" />暂无余额历史</div>
+                <p class="ov-chart-foot">{{ overviewTrends?.upstream_count || 0 }} 个渠道 · {{ overviewTrends?.unlimited_count || 0 }} 个无限额度</p>
+              </section>
+
+              <section class="ov-chart-card">
+                <header class="ov-chart-head">
+                  <div><span class="ov-chart-kicker">请求成功率</span><strong>{{ overviewPercentText(overviewSuccessSummary.rate) }}</strong></div>
+                  <span class="ov-chart-meta">{{ overviewSuccessSummary.total }} 次请求</span>
+                </header>
+                <div v-if="overviewSuccessHasData" class="ov-chart"><Chart :key="`success-${overviewTrendTagID}-${overviewTrends?.to_at || 0}`" :labels="overviewChartLabels" :data="overviewSuccessData" color="#36b99d" fill :max="100" axis-labels :fmt="overviewPercentText" /></div>
+                <div v-else class="ov-chart-empty"><Icon name="heart" :size="18" />暂无请求历史</div>
+                <p class="ov-chart-foot">成功 {{ overviewSuccessSummary.success }} 次 · 按 {{ overviewTrendWindow === '24h' ? '小时' : overviewTrendWindow === '7d' ? '6 小时' : '天' }} 聚合</p>
+              </section>
+            </div>
+          </section>
+
+          <section class="ov-alert-strip">
+            <div class="ov-alert-strip-head"><div><h2>需要处理</h2><p>仅显示余额、计费和服务异常</p></div><span v-if="overviewIssues.length" class="ov-issue-count">{{ overviewIssues.length }}</span></div>
+            <div v-if="!overviewIssues.length" class="ov-alert-clear"><Icon name="check" :size="15" />暂无异常</div>
+            <div v-else class="ov-alert-items">
+              <article v-for="issue in overviewVisibleIssues.slice(0, 4)" :key="issue.key" class="ov-alert-item" :class="issue.level">
+                <span class="ov-alert-dot"></span><div><strong>{{ issue.title }}</strong><span>{{ issue.name }}<template v-if="issue.detail"> · {{ issue.detail }}</template></span></div>
+                <button v-if="issue.action === 'refresh-billing'" class="icon-btn" :disabled="refreshingBilling.has(issue.upstream.id)" title="刷新计费数据" @click="guard(() => refreshUpstreamBilling(issue.upstream))"><Icon name="refresh" :size="15" /></button>
+                <button v-else-if="issue.action === 'recover-upstream'" class="icon-btn" :disabled="recoveringUpstreams.has(issue.upstream.id)" title="手动恢复渠道" @click="guard(() => recoverUpstream(issue.upstream))"><Icon name="refresh" :size="15" /></button>
+                <RouterLink v-else class="ov-alert-link" :to="{ name: issue.to }" :title="`查看${issue.name}`"><Icon name="chevron-right" :size="15" /></RouterLink>
+              </article>
+              <span v-if="overviewMoreIssueCount" class="ov-alert-more">另有 {{ overviewMoreIssueCount }} 项</span>
+            </div>
+          </section>
         </template>
 
         <!-- 分组列表 -->

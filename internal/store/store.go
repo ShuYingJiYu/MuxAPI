@@ -144,6 +144,14 @@ func (s *Store) hourExpr(column string) string {
 	return "(" + column + "/3600)*3600"
 }
 
+// bucketExpr returns a Unix bucket start expression shared by overview charts.
+func (s *Store) bucketExpr(column string, seconds int64) string {
+	if s.db.postgres {
+		return fmt.Sprintf("CAST(FLOOR(EXTRACT(EPOCH FROM %s)/%d)*%d AS BIGINT)", column, seconds, seconds)
+	}
+	return fmt.Sprintf("(%s/%d)*%d", column, seconds, seconds)
+}
+
 // Open 根据连接串选择数据库；PostgreSQL 会在返回前执行嵌入式迁移。
 func Open(databaseURL string) (*Store, error) {
 	if strings.HasPrefix(databaseURL, "postgres://") || strings.HasPrefix(databaseURL, "postgresql://") {

@@ -30,6 +30,7 @@ func (s *Server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/logs/cache-stats", s.auth(s.adminLogCacheStats)) // GET 按渠道汇总缓存命中率
 	mux.HandleFunc("/admin/logs/options", s.auth(s.adminLogOptions))        // GET 筛选下拉选项(全量去重)
 	mux.HandleFunc("/admin/logs/", s.auth(s.adminLogItem))                  // GET 单条请求完整尝试链
+	mux.HandleFunc("/admin/overview/trends", s.auth(s.adminOverviewTrends)) // GET 总览余额/成功率趋势
 	mux.HandleFunc("/admin/settings", s.auth(s.adminSettings))              // GET/PUT 运行时设置
 	mux.HandleFunc("/admin/backup", s.auth(s.adminBackup))                  // GET 列表 / POST 触发
 	mux.HandleFunc("/admin/backup/", s.auth(s.adminBackup))                 // config / schedule / records/{id}

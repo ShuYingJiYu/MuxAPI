@@ -7,6 +7,8 @@ const props = defineProps({
   modelValue: { type: [String, Number, Boolean], default: '' },
   options: { type: Array, default: () => [] },
   disabled: { type: Boolean, default: false },
+  variant: { type: String, default: '' },
+  searchable: { type: Boolean, default: false },
 })
 
 const emit = defineEmits(['update:modelValue', 'change'])
@@ -14,27 +16,41 @@ const open = ref(false)
 const root = ref(null)
 const trigger = ref(null)
 const menu = ref(null)
+const searchInput = ref(null)
 const menuStyle = ref({})
+const searchText = ref('')
 
 const selected = computed(() => props.options.find(o => String(o.value) === String(props.modelValue)))
 const label = computed(() => selected.value?.label ?? '请选择')
+const filteredOptions = computed(() => {
+  const query = searchText.value.trim().toLocaleLowerCase()
+  if (!query) return props.options
+  return props.options.filter(option => String(option.label || '').toLocaleLowerCase().includes(query))
+})
 
 function toggle() {
   if (props.disabled) return
   open.value = !open.value
-  if (open.value) nextTick(positionMenu)
+  if (open.value) nextTick(() => { positionMenu(); searchInput.value?.focus() })
 }
 function pick(opt) {
   if (opt.disabled) return
   emit('update:modelValue', opt.value)
   emit('change', opt.value)
   open.value = false
+  searchText.value = ''
 }
 function onDocClick(e) {
-  if (root.value && !root.value.contains(e.target) && !menu.value?.contains(e.target)) open.value = false
+  if (root.value && !root.value.contains(e.target) && !menu.value?.contains(e.target)) {
+    open.value = false
+    searchText.value = ''
+  }
 }
 function onKey(e) {
-  if (e.key === 'Escape') open.value = false
+  if (e.key === 'Escape') {
+    open.value = false
+    searchText.value = ''
+  }
 }
 function positionMenu() {
   if (!open.value || !trigger.value) return
@@ -74,16 +90,17 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div ref="root" class="fancy-select" :class="{ open, disabled }">
+  <div ref="root" class="fancy-select" :class="[{ open, disabled }, variant ? `variant-${variant}` : '']">
     <button ref="trigger" type="button" class="fancy-select-btn" :disabled="disabled" aria-haspopup="listbox" :aria-expanded="open" @click="toggle">
-      <span>{{ label }}</span>
+      <span class="fancy-selected-label"><i v-if="variant === 'tag'" class="fancy-tag-dot" :class="selected?.color || 'all'"></i><span>{{ label }}</span></span>
       <Icon name="chevron-right" :size="15" class="fancy-select-arrow" />
     </button>
     <Teleport to="body">
       <Transition name="fancy-pop">
-        <div v-if="open" ref="menu" class="fancy-select-menu fancy-select-portal" role="listbox" :style="menuStyle">
+        <div v-if="open" ref="menu" class="fancy-select-menu fancy-select-portal" :class="variant ? `fancy-select-menu-${variant}` : ''" role="listbox" :style="menuStyle">
+        <div v-if="searchable" class="fancy-select-search"><Icon name="search" :size="14" /><input ref="searchInput" v-model="searchText" type="search" placeholder="搜索标签" @click.stop /></div>
         <button
-          v-for="opt in options"
+          v-for="opt in filteredOptions"
           :key="String(opt.value)"
           type="button"
           class="fancy-select-item"
@@ -93,9 +110,10 @@ onUnmounted(() => {
           :aria-selected="String(opt.value) === String(modelValue)"
           @click="pick(opt)"
         >
-          <span>{{ opt.label }}</span>
+          <span class="fancy-option-main"><i v-if="variant === 'tag'" class="fancy-tag-dot" :class="opt.color || 'all'"></i><span>{{ opt.label }}</span></span>
           <Icon v-if="String(opt.value) === String(modelValue)" name="check" :size="14" />
         </button>
+        <div v-if="searchable && !filteredOptions.length" class="fancy-select-empty">没有匹配标签</div>
         </div>
       </Transition>
     </Teleport>

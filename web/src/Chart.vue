@@ -13,10 +13,12 @@ const props = defineProps({
   type: { type: String, default: 'line' }, // line | bar
   labels: { type: Array, default: () => [] },
   data: { type: Array, default: () => [] },
+  datasets: { type: Array, default: null },
   color: { type: String, default: '#8b5cf6' },
   sparkline: Boolean,      // 迷你模式：隐藏坐标轴/图例
   fill: Boolean,           // 面积填充
   max: Number,             // y 轴上限（如成功率固定 1）
+  axisLabels: Boolean,     // 显示横轴标签；迷你图默认关闭
   fmt: { type: Function, default: v => v }, // tooltip 数值格式化
 })
 
@@ -25,32 +27,48 @@ let chart
 
 function cfg() {
   const c = props.color
-  const ds = {
-    data: props.data,
-    borderColor: c,
-    backgroundColor: props.type === 'bar' ? c + '99' : (props.fill ? c + '22' : c),
-    borderWidth: 2,
-    borderRadius: props.type === 'bar' ? 6 : 0,
-    pointRadius: 0,
-    tension: 0.35,
-    fill: props.fill,
-  }
+  const source = props.datasets?.length ? props.datasets : [{ data: props.data, color: c }]
+  const datasets = source.map((item, index) => {
+    const color = item.color || c
+    const fill = item.fill ?? props.fill
+    return {
+      label: item.label || '',
+      data: item.data || [],
+      borderColor: color,
+      backgroundColor: props.type === 'bar' ? color + '99' : (fill ? color + '22' : color),
+      borderWidth: item.borderWidth ?? (source.length > 1 ? 1.6 : 2),
+      borderRadius: props.type === 'bar' ? 6 : 0,
+      pointRadius: item.pointRadius ?? 0,
+      pointHoverRadius: item.pointHoverRadius ?? (source.length > 1 ? 4 : 3),
+      tension: item.tension ?? 0.35,
+      fill: item.fill ?? props.fill,
+      spanGaps: true,
+      order: index,
+    }
+  })
   return {
     type: props.type,
-    data: { labels: props.labels, datasets: [ds] },
+    data: { labels: props.labels, datasets },
     options: {
       responsive: true, maintainAspectRatio: false,
       animation: { duration: 300 },
+      interaction: { mode: source.length > 1 ? 'index' : 'nearest', intersect: false },
       plugins: {
         legend: { display: false },
         tooltip: {
           enabled: !props.sparkline,
-          displayColors: false,
-          callbacks: { label: ctx => props.fmt(ctx.parsed.y) },
+          displayColors: source.length > 1,
+          callbacks: {
+            title: items => items.length ? items[0].label : '',
+            label: ctx => {
+              const value = props.fmt(ctx.parsed.y)
+              return source.length > 1 && ctx.dataset.label ? `${ctx.dataset.label}: ${value}` : value
+            },
+          },
         },
       },
       scales: {
-        x: { display: !props.sparkline, grid: { display: false }, ticks: { display: false }, border: { display: false } },
+        x: { display: !props.sparkline, grid: { display: false }, ticks: { display: props.axisLabels && !props.sparkline, color: '#9ca3af', font: { size: 10 }, maxTicksLimit: 6, maxRotation: 0 }, border: { display: false } },
         y: {
           display: !props.sparkline, beginAtZero: true, max: props.max,
           grid: { color: '#f1f1f4' }, border: { display: false },
@@ -64,10 +82,21 @@ function cfg() {
 onMounted(() => { chart = new Chart(el.value, cfg()) })
 onBeforeUnmount(() => chart?.destroy())
 // 数据变化时复用 Chart 实例，避免轮询刷新导致 canvas 和监听器重复创建。
-watch(() => [props.labels, props.data], () => {
+watch(() => [props.labels, props.data, props.datasets], () => {
   if (!chart) return
   chart.data.labels = props.labels
-  chart.data.datasets[0].data = props.data
+  const source = props.datasets?.length ? props.datasets : [{ data: props.data }]
+  if (chart.data.datasets.length !== source.length) {
+    chart.destroy()
+    chart = new Chart(el.value, cfg())
+    return
+  }
+  source.forEach((item, index) => {
+    if (chart.data.datasets[index]) {
+      chart.data.datasets[index].data = item.data || []
+      if (item.label != null) chart.data.datasets[index].label = item.label
+    }
+  })
   chart.update()
 }, { deep: true })
 </script>
