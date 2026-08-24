@@ -213,7 +213,7 @@ func (s *Store) SaveRouteDecision(record RouteDecisionRecord) (int64, error) {
 	if err := normalizeDecisionRecord(&record); err != nil {
 		return 0, err
 	}
-	tx, err := s.db.Begin()
+	tx, err := s.beginTx()
 	if err != nil {
 		return 0, err
 	}
@@ -285,7 +285,7 @@ func (s *Store) CompleteRouteDecision(requestID string, outcome RouteDecisionOut
 	if outcome.CompletedAt.IsZero() {
 		outcome.CompletedAt = time.Now()
 	}
-	result, err := s.db.Exec(`UPDATE route_decisions SET
+	result, err := s.exec(`UPDATE route_decisions SET
 		actual_cost=COALESCE(?,actual_cost),actual_input_tokens=COALESCE(?,actual_input_tokens),
 		actual_output_tokens=COALESCE(?,actual_output_tokens),actual_cached_tokens=COALESCE(?,actual_cached_tokens),
 		actual_cache_creation_tokens=COALESCE(?,actual_cache_creation_tokens),
@@ -326,7 +326,7 @@ func scanRouteDecision(scanner rowScanner) (*RouteDecisionEntry, error) {
 }
 
 func (s *Store) GetRouteDecisionByRequestID(requestID string) (*RouteDecisionEntry, error) {
-	entry, err := scanRouteDecision(s.db.QueryRow(s.routeDecisionSelect(" WHERE rd.request_id=?"), requestID))
+	entry, err := scanRouteDecision(s.queryRow(s.routeDecisionSelect(" WHERE rd.request_id=?"), requestID))
 	if err != nil {
 		return nil, err
 	}
@@ -335,7 +335,7 @@ func (s *Store) GetRouteDecisionByRequestID(requestID string) (*RouteDecisionEnt
 }
 
 func (s *Store) GetRouteDecision(id int64) (*RouteDecisionEntry, error) {
-	entry, err := scanRouteDecision(s.db.QueryRow(s.routeDecisionSelect(" WHERE rd.id=?"), id))
+	entry, err := scanRouteDecision(s.queryRow(s.routeDecisionSelect(" WHERE rd.id=?"), id))
 	if err != nil {
 		return nil, err
 	}
@@ -344,7 +344,7 @@ func (s *Store) GetRouteDecision(id int64) (*RouteDecisionEntry, error) {
 }
 
 func (s *Store) listRouteCandidates(decisionID int64) ([]RouteCandidateEntry, error) {
-	rows, err := s.db.Query(`SELECT id,upstream_id,api_key_hash,upstream_name,protocol,priority,eligible,
+	rows, err := s.query(`SELECT id,upstream_id,api_key_hash,upstream_name,protocol,priority,eligible,
 		selected,rejection_reason,pricing_source,pricing_confidence,cache_supported,cache_existing,
 		cache_selected,cache_hit_rate,forecast_total_cost,forecast_no_cache_cost,forecast_cache_cost,
 		estimated_savings,break_even_requests,expected_hits,expected_misses,expected_creates,
@@ -419,7 +419,7 @@ func (s *Store) ListRouteDecisions(filter RouteDecisionFilter) ([]*RouteDecision
 	}
 	query := s.routeDecisionSelect(where.String()) + " ORDER BY rd.id DESC LIMIT ?"
 	args = append(args, limit)
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.query(query, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -54,7 +54,7 @@ func (s *Store) PruneBillingSnapshots(keepDays int) (int64, error) {
 		return 0, nil
 	}
 	cutoff := time.Now().AddDate(0, 0, -keepDays)
-	result, err := s.db.Exec(`DELETE FROM upstream_billing_snapshots WHERE id IN (
+	result, err := s.exec(`DELETE FROM upstream_billing_snapshots WHERE id IN (
 		SELECT id FROM (
 			SELECT id,observed_at,
 				ROW_NUMBER() OVER (PARTITION BY upstream_id ORDER BY observed_at DESC,id DESC) AS snapshot_rank
@@ -78,7 +78,7 @@ func (s *Store) ListBillingSnapshotsSince(upstreamID, sinceAt int64) ([]BillingS
 		effective_multiplier,reported_list_cost,reported_actual_cost,` + s.billingTimeExpr("observed_at") +
 		` FROM upstream_billing_snapshots WHERE upstream_id=? AND observed_at>=?
 		ORDER BY observed_at ASC,id ASC`
-	rows, err := s.db.Query(query, upstreamID, s.timeValue(time.Unix(sinceAt, 0)))
+	rows, err := s.query(query, upstreamID, s.timeValue(time.Unix(sinceAt, 0)))
 	if err != nil {
 		return nil, err
 	}

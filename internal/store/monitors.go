@@ -3,6 +3,8 @@ package store
 import (
 	"database/sql"
 	"strings"
+
+	"gorm.io/gorm"
 )
 
 // Monitor 监控项：对某渠道的某个模型主动探测。凭证用渠道自带的 api_key。
@@ -15,16 +17,16 @@ type Monitor struct {
 	Model        string `json:"model"`
 	Name         string `json:"name"`
 	Enabled      bool   `json:"enabled"`
-	Stream       bool   `json:"stream"`       // 探测是否走流式（请求体加 stream:true）
-	ProbeText    string `json:"probe_text"`   // 探测消息内容，空=默认 "hi"
-	MaxTokens    int    `json:"max_tokens"`   // 探测 max_tokens，0=默认 1
-	IntervalSec  int    `json:"interval_sec"` // 该项探测周期(秒)，0=用全局
-	Path         string `json:"path"`         // 该项探测端点，空=用全局
+	Stream       bool   `json:"stream"`
+	ProbeText    string `json:"probe_text"`
+	MaxTokens    int    `json:"max_tokens"`
+	IntervalSec  int    `json:"interval_sec"`
+	Path         string `json:"path"`
 	UpstreamName string `json:"upstream_name,omitempty"`
 	BaseURL      string `json:"-"`
 	APIKey       string `json:"-"`
 	Proxy        string `json:"-"`
-	ChannelProbe bool   `json:"-"` // 兼容旧数据；运行时不再改变熔断粒度
+	ChannelProbe bool   `json:"-"`
 }
 
 // --- 监控项 ---
@@ -54,7 +56,7 @@ func (s *Store) ListMonitors(enabledOnly bool) ([]*Monitor, error) {
 	if enabledOnly {
 		q += ` WHERE m.enabled=TRUE AND u.enabled=TRUE`
 	}
-	rows, err := s.db.Query(q + ` ORDER BY m.sort, m.id`)
+	rows, err := s.query(q + ` ORDER BY m.sort, m.id`)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +64,7 @@ func (s *Store) ListMonitors(enabledOnly bool) ([]*Monitor, error) {
 }
 
 func (s *Store) GetMonitor(id int64) (*Monitor, error) {
-	rows, err := s.db.Query(monitorJoin+` WHERE m.id=?`, id)
+	rows, err := s.query(monitorJoin+` WHERE m.id=?`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -74,46 +76,52 @@ func (s *Store) GetMonitor(id int64) (*Monitor, error) {
 }
 
 func (s *Store) CreateMonitor(m *Monitor) (int64, error) {
-	var id int64
-	err := s.db.QueryRow(`INSERT INTO monitors(upstream_id,model,name,enabled,stream,probe_text,max_tokens,interval_sec,path,sort)
-		VALUES(?,?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM monitors)) RETURNING id`,
-		m.UpstreamID, m.Model, m.Name, m.Enabled, m.Stream, m.ProbeText, m.MaxTokens, m.IntervalSec, m.Path).Scan(&id)
-	return id, err
+	// 取当前最大 sort 值
+	var maxSort int
+	s.gormDB.Model(&MonitorModel{}).Select("COALESCE(MAX(sort),0)").Scan(&maxSort)
+	model := MonitorModel{
+		UpstreamID:  m.UpstreamID,
+		Model:       m.Model,
+		Name:        m.Name,
+		Enabled:     m.Enabled,
+		Stream:      m.Stream,
+		ProbeText:   m.ProbeText,
+		MaxTokens:   m.MaxTokens,
+		IntervalSec: m.IntervalSec,
+		Path:        m.Path,
+		Sort:        maxSort + 1,
+	}
+	if err := s.gormDB.Create(&model).Error; err != nil {
+		return 0, err
+	}
+	return model.ID, nil
 }
 
 // ReorderMonitors 按给定 id 顺序写入 sort 权重（从 1 起，下标即权重）。
-// 一次事务内全量更新；未出现在 ids 中的监控项保持原 sort，会排在已排项之后或之间。
 func (s *Store) ReorderMonitors(ids []int64) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	for i, id := range ids {
-		if _, err := tx.Exec(`UPDATE monitors SET sort=? WHERE id=?`, i+1, id); err != nil {
-			return err
+	return s.gormDB.Transaction(func(tx *gorm.DB) error {
+		for i, id := range ids {
+			if err := tx.Model(&MonitorModel{}).Where("id = ?", id).Update("sort", i+1).Error; err != nil {
+				return err
+			}
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
+
 func (s *Store) MonitoredModels(upstreamID int64) (map[string]bool, error) {
-	rows, err := s.db.Query(`SELECT model FROM monitors WHERE upstream_id=?`, upstreamID)
-	if err != nil {
+	var models []string
+	if err := s.gormDB.Model(&MonitorModel{}).Where("upstream_id = ?", upstreamID).Pluck("model", &models).Error; err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	set := make(map[string]bool)
-	for rows.Next() {
-		var m string
-		if err := rows.Scan(&m); err == nil {
-			set[m] = true
-		}
+	set := make(map[string]bool, len(models))
+	for _, m := range models {
+		set[m] = true
 	}
-	return set, rows.Err()
+	return set, nil
 }
 
 // BatchCreateMonitors 为某上游的一批模型批量建监控，已存在 (upstream,model) 的跳过。
-// tmpl 提供共享探测参数（model 字段被逐个模型覆盖）。返回 (created, skipped)。
 func (s *Store) BatchCreateMonitors(upstreamID int64, models []string, tmpl Monitor) (int, int, error) {
 	existing, err := s.MonitoredModels(upstreamID)
 	if err != nil {
@@ -126,25 +134,32 @@ func (s *Store) BatchCreateMonitors(upstreamID int64, models []string, tmpl Moni
 			skipped++
 			continue
 		}
-		m := tmpl // 复制模板
+		m := tmpl
 		m.UpstreamID = upstreamID
 		m.Model = model
 		if _, err := s.CreateMonitor(&m); err != nil {
 			return created, skipped, err
 		}
-		existing[model] = true // 防同批重复
+		existing[model] = true
 		created++
 	}
 	return created, skipped, nil
 }
 
 func (s *Store) UpdateMonitor(m *Monitor) error {
-	_, err := s.db.Exec(`UPDATE monitors SET upstream_id=?,model=?,name=?,enabled=?,stream=?,probe_text=?,max_tokens=?,interval_sec=?,path=? WHERE id=?`,
-		m.UpstreamID, m.Model, m.Name, m.Enabled, m.Stream, m.ProbeText, m.MaxTokens, m.IntervalSec, m.Path, m.ID)
-	return err
+	return s.gormDB.Model(&MonitorModel{}).Where("id = ?", m.ID).Updates(map[string]any{
+		"upstream_id":  m.UpstreamID,
+		"model":        m.Model,
+		"name":         m.Name,
+		"enabled":      m.Enabled,
+		"stream":       m.Stream,
+		"probe_text":   m.ProbeText,
+		"max_tokens":   m.MaxTokens,
+		"interval_sec": m.IntervalSec,
+		"path":         m.Path,
+	}).Error
 }
 
 func (s *Store) DeleteMonitor(id int64) error {
-	_, err := s.db.Exec(`DELETE FROM monitors WHERE id=?`, id)
-	return err
+	return s.gormDB.Delete(&MonitorModel{}, id).Error
 }

@@ -28,7 +28,7 @@ type PricingCatalogStatus struct {
 
 // ReplaceModelPricing atomically installs one complete catalog version.
 func (s *Store) ReplaceModelPricing(prices []ModelPricing, status PricingCatalogStatus) error {
-	tx, err := s.db.Begin()
+	tx, err := s.beginTx()
 	if err != nil {
 		return err
 	}
@@ -67,7 +67,7 @@ func (s *Store) ReplaceModelPricing(prices []ModelPricing, status PricingCatalog
 // SavePricingCatalogFailure records a refresh failure without changing cached prices.
 func (s *Store) SavePricingCatalogFailure(message string, checkedAt int64) error {
 	checked := billingTimestamp(checkedAt, time.Now())
-	_, err := s.db.Exec(`INSERT INTO pricing_catalog_status(
+	_, err := s.exec(`INSERT INTO pricing_catalog_status(
 		id,source,version,model_count,last_checked_at,error_text) VALUES(1,'','',0,?,?)
 		ON CONFLICT(id) DO UPDATE SET last_checked_at=excluded.last_checked_at,
 		error_text=excluded.error_text`, s.timeValue(checked), message)
@@ -77,7 +77,7 @@ func (s *Store) SavePricingCatalogFailure(message string, checkedAt int64) error
 // GetPricingCatalogStatus returns the currently installed catalog metadata.
 func (s *Store) GetPricingCatalogStatus() (PricingCatalogStatus, error) {
 	var status PricingCatalogStatus
-	err := s.db.QueryRow(`SELECT source,version,model_count,`+
+	err := s.queryRow(`SELECT source,version,model_count,`+
 		s.billingTimeExpr("last_checked_at")+`,`+s.billingTimeExpr("last_success_at")+`,error_text
 		FROM pricing_catalog_status WHERE id=1`).Scan(&status.Source, &status.Version,
 		&status.ModelCount, &status.LastCheckedAt, &status.LastSuccessAt, &status.Error)
@@ -111,7 +111,7 @@ func pricingModelCandidates(model string) []string {
 func (s *Store) LookupModelPricing(model string) (ModelPricing, error) {
 	for _, candidate := range pricingModelCandidates(model) {
 		var price ModelPricing
-		err := s.db.QueryRow(`SELECT model,input_cost_per_token,output_cost_per_token,
+		err := s.queryRow(`SELECT model,input_cost_per_token,output_cost_per_token,
 			cache_read_input_token_cost,cache_creation_input_token_cost
 			FROM model_pricing WHERE model=?`, candidate).Scan(&price.Model,
 			&price.InputCostPerToken, &price.OutputCostPerToken,
@@ -173,7 +173,7 @@ func (s *Store) ListBillingWindowUsage(upstreamID, fromAt, toAt int64) ([]Billin
 		WHERE a.upstream_id=? AND a.outcome IN (` + outcomes + `)
 			AND a.completed_at>? AND a.completed_at<=?
 		GROUP BY r.model,` + protocolExpr + ` ORDER BY r.model`
-	rows, err := s.db.Query(query, upstreamID, s.timeValue(time.Unix(fromAt, 0)),
+	rows, err := s.query(query, upstreamID, s.timeValue(time.Unix(fromAt, 0)),
 		s.timeValue(time.Unix(toAt, 0)))
 	if err != nil {
 		return nil, err

@@ -202,7 +202,7 @@ func (s *Store) runRequestWriter() {
 }
 
 func (s *Store) writeRequest(record RequestRecord) error {
-	tx, err := s.db.Begin()
+	tx, err := s.beginTx()
 	if err != nil {
 		return err
 	}
