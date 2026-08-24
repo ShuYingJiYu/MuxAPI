@@ -90,7 +90,9 @@ async function guard(fn) {
   }
 }
 
+const appVersion = ref('')
 onMounted(() => {
+  fetch('/admin/version').then(r => r.json()).then(d => { appVersion.value = d.version || 'dev' }).catch(() => {})
   if (loggedIn.value) activatePage(page.value)
 })
 
@@ -1251,6 +1253,7 @@ function logout() {
         <RouterLink class="nav-item" :class="{ active: page === 'logs' }" :to="{ name: 'logs' }"><Icon class="ic" name="refresh" :size="18" />请求记录</RouterLink>
         <RouterLink class="nav-item" :class="{ active: page === 'settings' }" :to="{ name: 'settings' }"><Icon class="ic" name="cog" :size="18" />设置</RouterLink>
       </nav>
+      <div class="sidebar-version" v-if="appVersion">{{ appVersion }}</div>
     </aside>
 
     <div class="main-wrap">
@@ -1260,7 +1263,6 @@ function logout() {
           <p class="header-desc">{{ detailGroup ? '管理该分组的上游成员与接入密钥' : pages[page].desc }}</p>
         </div>
         <div class="header-actions">
-          <span class="header-badge">v0.1.0</span>
           <button class="btn-link sm" @click="logout">退出</button>
         </div>
       </header>
