@@ -105,8 +105,9 @@ type UpstreamRoutingStats struct {
 func (s *Store) CacheCoverageRatio(upstreamID int64) (float64, error) {
 	var ratio float64
 	err := s.queryRow(`SELECT AVG(cached_tokens::float / NULLIF(cached_tokens + input_tokens + cache_creation_tokens, 0))
-		FROM request_attempts WHERE upstream_id=? AND status=200 AND cached_tokens > 0
-		ORDER BY id DESC LIMIT 50`, upstreamID).Scan(&ratio)
+		FROM (SELECT cached_tokens, input_tokens, cache_creation_tokens
+			FROM request_attempts WHERE upstream_id=? AND status=200 AND cached_tokens > 0
+			ORDER BY id DESC LIMIT 50) sub`, upstreamID).Scan(&ratio)
 	if err != nil {
 		return 0, err
 	}
