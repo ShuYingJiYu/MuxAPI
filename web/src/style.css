@@ -698,6 +698,9 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .dw-stream-tag { margin-left: 6px; }
 .dialog .test-dialog-hint { margin: 0 0 10px; }
 .test-model-error { margin: 0 0 8px; }
+.mapping-form { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.mapping-form input { font-size: 13px; padding: 6px 10px; border: 1px solid var(--g200); border-radius: 8px; min-width: 140px; }
+.mapping-table-wrap { overflow-x: auto; border-radius: 8px; border: 1px solid var(--g100); }
 
 /* 新增 */
 .count { font-size: 13px; color: var(--g500); font-weight: 500; }
