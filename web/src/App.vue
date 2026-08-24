@@ -579,6 +579,10 @@ function billingAuditText(item) {
   if (audit.status === 'pending') return '费用比对 · 待采集'
   if (audit.theoretical_cost == null) return `理论 — · 实际 ${billingCost(item, audit.actual_cost)}`
   const prefix = audit.status === 'warning' ? '异常 · ' : ''
+  // catalog_cost_exceeded 是价目轨道告警（本地估算 vs 上游报价），不是计费轨道
+  if (audit.reason === 'catalog_cost_exceeded' && audit.list_cost != null && audit.reported_list_cost != null) {
+    return `${prefix}本地 ${billingCost(item, audit.list_cost)} · 报价 ${billingCost(item, audit.reported_list_cost)}`
+  }
   // 标签跟随实际基准：reported=平台自报原价，local=本地价目表（降级）
   const label = audit.billing_basis === 'local' ? '理论(本地)' : '理论'
   return `${prefix}${label} ${billingCost(item, audit.theoretical_cost)} · 实际 ${billingCost(item, audit.actual_cost)}`
