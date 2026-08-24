@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math/rand"
 	"sort"
+	"time"
 
 	"github.com/mirainya/muxapi/internal/routing"
 	"github.com/mirainya/muxapi/internal/store"
@@ -176,4 +177,20 @@ func weightedPick(tier []*upstream.Upstream) *upstream.Upstream {
 		draw -= weight
 	}
 	return tier[0]
+}
+
+// EstimateTTFT returns the P95 TTFT (ms) and sample count for a given upstream
+// and model. Used by the forwarder's adaptive timeout. Returns zero values when
+// intelligent routing is not configured or stats are unavailable.
+func (s *Scheduler) EstimateTTFT(upstreamID int64, model string) (p95Ms float64, samples int64) {
+	if s.routing == nil {
+		return 0, 0
+	}
+	now := time.Now()
+	cfg := s.routing.config()
+	stats, err := s.routing.upstreamStats(upstreamID, model, cfg.Window, now)
+	if err != nil {
+		return 0, 0
+	}
+	return float64(stats.P95TTFTMs), stats.Requests
 }
