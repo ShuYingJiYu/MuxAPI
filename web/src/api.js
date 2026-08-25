@@ -1,25 +1,36 @@
 // 轻量 admin API 封装：所有请求经 vite proxy /admin → 后端 8080。
 // adminToken 存在 localStorage（后端 AdminToken 为空时鉴权跳过，本地调试免填）。
 const token = () => localStorage.getItem('muxapi_token') || ''
+const REQUEST_TIMEOUT_MS = 15000
 
 async function req(method, path, body) {
   const headers = { 'Content-Type': 'application/json' }
   const t = token()
   if (t) headers.Authorization = 'Bearer ' + t
-  const res = await fetch('/admin' + path, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  })
-  // 保留状态码供页面统一处理 401，响应文本作为具体错误信息。
-  if (!res.ok) {
-    const e = new Error((await res.text()) || String(res.status))
-    e.status = res.status
+  const controller = new AbortController()
+  const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  try {
+    const res = await fetch('/admin' + path, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+    })
+    // 保留状态码供页面统一处理 401，响应文本作为具体错误信息。
+    if (!res.ok) {
+      const e = new Error((await res.text()) || String(res.status))
+      e.status = res.status
+      throw e
+    }
+    // DELETE/PUT 可能返回空正文，只对 JSON 响应调用解析器。
+    const ct = res.headers.get('content-type') || ''
+    return ct.includes('json') ? res.json() : null
+  } catch (e) {
+    if (controller.signal.aborted) throw new Error('服务器响应超时，请重新加载。')
     throw e
+  } finally {
+    window.clearTimeout(timeout)
   }
-  // DELETE/PUT 可能返回空正文，只对 JSON 响应调用解析器。
-  const ct = res.headers.get('content-type') || ''
-  return ct.includes('json') ? res.json() : null
 }
 
 function groupTestRequest(protocol, model) {
@@ -112,6 +123,7 @@ export const api = {
     if (Number(tag_id) > 0) p.set('tag_id', String(tag_id))
     return req('GET', `/overview/trends?${p.toString()}`)
   },
+  overviewSummary: () => req('GET', `/overview/summary?_ts=${Date.now()}`),
   createMonitorsBatch: (id, payload) => req('POST', `/upstreams/${id}/monitors`, payload),
   // 管理标签
   tags: () => req('GET', '/tags'),

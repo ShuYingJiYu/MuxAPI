@@ -6,8 +6,145 @@ import {
   PointElement, LinearScale, CategoryScale, Tooltip, Filler,
 } from 'chart.js'
 
+const thresholdLinePlugin = {
+  id: 'thresholdLine',
+  afterDraw(activeChart, _args, options) {
+    const value = Number(options?.value)
+    const yScale = activeChart.scales?.y
+    if (!Number.isFinite(value) || !yScale) return
+    const y = yScale.getPixelForValue(value)
+    const { left, right, top, bottom } = activeChart.chartArea
+    if (y < top || y > bottom) return
+
+    const { ctx } = activeChart
+    ctx.save()
+    ctx.strokeStyle = options.color || '#d39b35'
+    ctx.lineWidth = 1
+    ctx.setLineDash([4, 4])
+    ctx.beginPath()
+    ctx.moveTo(left, y)
+    ctx.lineTo(right, y)
+    ctx.stroke()
+    if (options.label) {
+      ctx.fillStyle = options.color || '#a56f1f'
+      ctx.font = '600 10px "Noto Sans SC", sans-serif'
+      ctx.textAlign = 'right'
+      ctx.textBaseline = 'bottom'
+      ctx.fillText(options.label, right, Math.max(top + 10, y - 4))
+    }
+    ctx.restore()
+  },
+}
+
+function fitCanvasText(ctx, text, maxWidth) {
+  const source = String(text || '')
+  if (ctx.measureText(source).width <= maxWidth) return source
+  let result = source
+  while (result.length > 1 && ctx.measureText(`${result}…`).width > maxWidth) result = result.slice(0, -1)
+  return `${result}…`
+}
+
+function roundedRectPath(ctx, x, y, width, height, radius) {
+  const right = x + width
+  const bottom = y + height
+  ctx.beginPath()
+  ctx.moveTo(x + radius, y)
+  ctx.lineTo(right - radius, y)
+  ctx.quadraticCurveTo(right, y, right, y + radius)
+  ctx.lineTo(right, bottom - radius)
+  ctx.quadraticCurveTo(right, bottom, right - radius, bottom)
+  ctx.lineTo(x + radius, bottom)
+  ctx.quadraticCurveTo(x, bottom, x, bottom - radius)
+  ctx.lineTo(x, y + radius)
+  ctx.quadraticCurveTo(x, y, x + radius, y)
+  ctx.closePath()
+}
+
+function rectanglesOverlap(a, b) {
+  return a.x < b.x + b.width + 4 && a.x + a.width + 4 > b.x
+    && a.y < b.y + b.height + 4 && a.y + a.height + 4 > b.y
+}
+
+const inlineLabelsPlugin = {
+  id: 'inlineLabels',
+  afterDatasetsDraw(activeChart, _args, options) {
+    if (!options?.display || activeChart.config.type !== 'line') return
+    const { ctx, chartArea } = activeChart
+    const occupied = []
+    const preferredFractions = [0.68, 0.56, 0.78, 0.46, 0.86]
+
+    ctx.save()
+    ctx.font = '600 9px "Noto Sans SC", sans-serif'
+    ctx.textAlign = 'left'
+    ctx.textBaseline = 'middle'
+    activeChart.data.datasets.forEach((dataset, datasetIndex) => {
+      const meta = activeChart.getDatasetMeta(datasetIndex)
+      if (meta.hidden || !dataset.label) return
+      const validIndexes = (dataset.data || []).flatMap((value, index) => {
+        const point = meta.data[index]
+        return value != null && Number.isFinite(Number(value)) && point && Number.isFinite(point.x) && Number.isFinite(point.y)
+          ? [index]
+          : []
+      })
+      if (!validIndexes.length) return
+
+      const label = fitCanvasText(ctx, dataset.lineLabel || dataset.label, options.maxWidth || 72)
+      const width = Math.ceil(ctx.measureText(label).width) + 15
+      const height = 17
+      const fractions = preferredFractions.map((_, index) => preferredFractions[(index + datasetIndex) % preferredFractions.length])
+      let placement
+      for (const fraction of fractions) {
+        const pointIndex = validIndexes[Math.round((validIndexes.length - 1) * fraction)]
+        const point = meta.data[pointIndex]
+        for (const direction of [-1, 1]) {
+          const x = Math.max(chartArea.left + 2, Math.min(point.x - width / 2, chartArea.right - width - 2))
+          const y = direction < 0 ? point.y - height - 8 : point.y + 8
+          const rect = { x, y, width, height }
+          const inside = rect.y >= chartArea.top + 2 && rect.y + rect.height <= chartArea.bottom - 2
+          if (inside && !occupied.some(item => rectanglesOverlap(rect, item))) {
+            placement = { point, rect, direction, label }
+            break
+          }
+        }
+        if (placement) break
+      }
+      if (!placement) return
+      occupied.push(placement.rect)
+
+      const color = dataset.borderColor || '#938995'
+      const connectorY = placement.direction < 0 ? placement.rect.y + placement.rect.height : placement.rect.y
+      ctx.strokeStyle = color
+      ctx.lineWidth = 1
+      ctx.setLineDash([])
+      ctx.globalAlpha = 0.68
+      ctx.beginPath()
+      ctx.moveTo(placement.point.x, placement.point.y)
+      ctx.lineTo(placement.point.x, connectorY)
+      ctx.stroke()
+      ctx.globalAlpha = 1
+      ctx.fillStyle = color
+      ctx.beginPath()
+      ctx.arc(placement.point.x, placement.point.y, 2.5, 0, Math.PI * 2)
+      ctx.fill()
+
+      roundedRectPath(ctx, placement.rect.x, placement.rect.y, placement.rect.width, placement.rect.height, 4)
+      ctx.fillStyle = 'rgba(255,254,251,.94)'
+      ctx.fill()
+      ctx.strokeStyle = color
+      ctx.globalAlpha = 0.72
+      ctx.stroke()
+      ctx.globalAlpha = 1
+      ctx.fillStyle = color
+      ctx.fillRect(placement.rect.x + 5, placement.rect.y + 5, 2, 7)
+      ctx.fillStyle = '#625964'
+      ctx.fillText(placement.label, placement.rect.x + 10, placement.rect.y + placement.rect.height / 2)
+    })
+    ctx.restore()
+  },
+}
+
 Chart.register(LineController, BarController, LineElement, BarElement,
-  PointElement, LinearScale, CategoryScale, Tooltip, Filler)
+  PointElement, LinearScale, CategoryScale, Tooltip, Filler, thresholdLinePlugin, inlineLabelsPlugin)
 
 const props = defineProps({
   type: { type: String, default: 'line' }, // line | bar
@@ -17,7 +154,11 @@ const props = defineProps({
   color: { type: String, default: '#8b5cf6' },
   sparkline: Boolean,      // 迷你模式：隐藏坐标轴/图例
   fill: Boolean,           // 面积填充
+  min: Number,             // y 轴下限
   max: Number,             // y 轴上限（如成功率固定 1）
+  threshold: Number,       // 水平参考线
+  thresholdLabel: String,
+  lineLabels: Boolean,     // 在折线中段直接标注数据集名称
   axisLabels: Boolean,     // 显示横轴标签；迷你图默认关闭
   showLegend: Boolean,     // 多线图显示可滚动图例
   fmt: { type: Function, default: v => v }, // tooltip 数值格式化
@@ -53,7 +194,7 @@ const legendGroups = computed(() => {
 })
 
 function yBounds(source) {
-  if (props.max != null) return { min: 0, max: props.max }
+  if (props.min != null || props.max != null) return { min: props.min ?? 0, max: props.max }
   const values = source.flatMap(item => item.data || [])
     .filter(value => value != null)
     .map(Number)
@@ -314,6 +455,7 @@ function cfg() {
     const fill = item.fill ?? props.fill
     return {
       label: item.label || '',
+      lineLabel: item.lineLabel || item.label || '',
       group: item.group || '未设置主标签',
       groupColor: item.groupColor || 'gray',
       data: item.data || [],
@@ -323,6 +465,9 @@ function cfg() {
       borderRadius: props.type === 'bar' ? 6 : 0,
       pointRadius: item.pointRadius ?? 0,
       pointHoverRadius: item.pointHoverRadius ?? (source.length > 1 ? 4 : 3),
+      pointBackgroundColor: item.pointBackgroundColor ?? color,
+      pointBorderColor: item.pointBorderColor ?? color,
+      pointBorderWidth: item.pointBorderWidth ?? 1,
       tension: item.tension ?? 0.35,
       fill: item.fill ?? props.fill,
       spanGaps: true,
@@ -338,6 +483,15 @@ function cfg() {
       interaction: { mode: source.length > 1 ? 'index' : 'nearest', intersect: false },
       plugins: {
         legend: { display: false },
+        thresholdLine: {
+          value: props.threshold,
+          label: props.thresholdLabel,
+          color: '#d39b35',
+        },
+        inlineLabels: {
+          display: props.lineLabels,
+          maxWidth: 72,
+        },
         tooltip: {
           enabled: !props.sparkline && source.length <= 1,
           external: source.length > 1 && !props.sparkline ? renderExternalTooltip : undefined,
@@ -386,27 +540,26 @@ onBeforeUnmount(() => {
   tooltipCaretY = undefined
 })
 // 数据变化时复用 Chart 实例，避免轮询刷新导致 canvas 和监听器重复创建。
-watch(() => [props.labels, props.data, props.datasets, props.max], () => {
+watch(() => [props.labels, props.data, props.datasets, props.min, props.max, props.threshold, props.thresholdLabel, props.lineLabels], () => {
   if (!chart) return
-  chart.data.labels = props.labels
   const source = props.datasets?.length ? props.datasets : [{ data: props.data }]
+  const next = cfg()
+  chart.data.labels = props.labels
   if (chart.data.datasets.length !== source.length) {
     chart.destroy()
     ensureExternalTooltip(source.length > 1 && !props.sparkline)
     chart = new Chart(el.value, cfg())
     return
   }
-  source.forEach((item, index) => {
+  next.data.datasets.forEach((item, index) => {
     if (chart.data.datasets[index]) {
-      chart.data.datasets[index].data = item.data || []
-      if (item.label != null) chart.data.datasets[index].label = item.label
-      chart.data.datasets[index].group = item.group || '未设置主标签'
-      chart.data.datasets[index].groupColor = item.groupColor || 'gray'
+      Object.assign(chart.data.datasets[index], item)
     }
   })
-  const bounds = yBounds(source)
-  chart.options.scales.y.min = bounds.min
-  chart.options.scales.y.max = bounds.max
+  chart.options.scales.y.min = next.options.scales.y.min
+  chart.options.scales.y.max = next.options.scales.y.max
+  chart.options.plugins.thresholdLine = next.options.plugins.thresholdLine
+  chart.options.plugins.inlineLabels = next.options.plugins.inlineLabels
   chart.update()
 }, { deep: true })
 </script>
@@ -414,16 +567,19 @@ watch(() => [props.labels, props.data, props.datasets, props.max], () => {
 <template>
   <div class="chart-shell">
     <div class="chart-box" :class="{ spark: sparkline }"><canvas ref="el" /></div>
-    <div v-if="showLegend && legendItems.length" class="chart-legend" role="list">
+    <div v-if="showLegend && legendItems.length" class="chart-legend" role="list" aria-label="标签汇总">
       <section v-for="group in legendGroups" :key="group.name" class="chart-legend-group">
         <div class="chart-legend-group-title">
           <i class="chart-legend-group-dot tag-color-dot" :class="`tag-${group.color}`"></i>
-          <strong>{{ group.name }}</strong><small>{{ group.items.length }}</small>
+          <span><strong>{{ group.name }}</strong><small>{{ group.items.length }} 项</small></span>
         </div>
         <div class="chart-legend-items">
           <span v-for="item in group.items" :key="`${group.name}-${item.label}`" class="chart-legend-item" role="listitem" :title="item.label">
             <i class="chart-legend-dot" :style="{ backgroundColor: item.color || color }"></i>
-            <span>{{ item.label }}</span>
+            <span class="chart-legend-copy">
+              <strong>{{ item.legendLabel || item.label }}</strong>
+              <small v-if="item.legendMeta">{{ item.legendMeta }}</small>
+            </span>
           </span>
         </div>
       </section>
@@ -436,35 +592,38 @@ watch(() => [props.labels, props.data, props.datasets, props.max], () => {
 .chart-box { position: relative; height: 180px; }
 .chart-box.spark { height: 40px; }
 .chart-legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px 12px;
-  max-height: 60px;
+  max-height: 94px;
   overflow-y: auto;
-  padding: 7px 5px 0 2px;
+  margin-top: 7px;
+  padding: 9px 2px 0;
+  border-top: 1px solid rgba(70,63,73,.09);
   box-sizing: border-box;
   scrollbar-width: none;
 }
 .chart-legend::-webkit-scrollbar { width: 0; height: 0; }
-.chart-legend-group + .chart-legend-group { margin-top: 6px; }
-.chart-legend-group-title { display: flex; align-items: center; gap: 6px; min-height: 20px; padding: 2px 6px; border: 1px solid rgba(190,168,96,.25); border-radius: 5px; background: rgba(255,255,255,.72); color: #5d5362; font-size: 11px; }
-.chart-legend-group-title strong { font-weight: 800; }
-.chart-legend-group-title small { margin-left: auto; padding: 1px 5px; border-radius: 9px; background: #fff1bf; color: #8a6312; font-size: 9px; font-weight: 800; }
+.chart-legend-group { display: grid; grid-template-columns: minmax(82px, 108px) minmax(0, 1fr); align-items: start; gap: 12px; width: 100%; }
+.chart-legend-group + .chart-legend-group { margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(70,63,73,.07); }
+.chart-legend-group-title { display: flex; align-items: flex-start; gap: 7px; min-width: 0; padding-top: 3px; color: #625964; }
+.chart-legend-group-title > span { min-width: 0; }
+.chart-legend-group-title strong, .chart-legend-group-title small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chart-legend-group-title strong { font-size: 11px; font-weight: 700; }
+.chart-legend-group-title small { margin-top: 1px; color: #938995; font-size: 9px; font-weight: 500; }
 .chart-legend-group-dot { width: 8px; height: 8px; flex: 0 0 8px; }
-.chart-legend-items { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 3px 0 0 5px; padding-left: 9px; border-left: 2px solid rgba(190,168,96,.18); }
+.chart-legend-items { display: grid; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); gap: 3px 14px; min-width: 0; }
 .chart-legend-item {
-  display: inline-flex;
+  display: grid;
+  grid-template-columns: 15px minmax(0, 1fr);
   align-items: center;
   gap: 5px;
   min-width: 0;
-  max-width: 100%;
+  min-height: 25px;
   color: #756d7c;
-  font-size: 11px;
-  line-height: 16px;
-  white-space: nowrap;
+  font-size: 10px;
 }
-.chart-legend-item span { overflow: hidden; text-overflow: ellipsis; }
-.chart-legend-dot { width: 9px; height: 9px; flex: 0 0 9px; border-radius: 2px; }
+.chart-legend-copy { display: flex; align-items: baseline; gap: 5px; min-width: 0; }
+.chart-legend-copy strong { min-width: 0; overflow: hidden; color: #625964; font-size: 10px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.chart-legend-copy small { flex: none; color: #938995; font-size: 8.5px; white-space: nowrap; }
+.chart-legend-dot { width: 14px; height: 2px; border-radius: 1px; }
 :global(.chart-tooltip) {
   position: fixed;
   left: 0;

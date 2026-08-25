@@ -1,7 +1,7 @@
 <script setup>
 // 管理后台页面壳：集中管理页面状态、轮询、表单动作和管理 API 调用。
 // 大型派生视图使用 computed，跨页面异步请求使用 epoch 防止旧响应覆盖新状态。
-import { ref, reactive, onMounted, onUnmounted, computed, watch } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, computed, watch, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import Icon from './Icon.vue'
 import Fence from './Fence.vue'
@@ -25,6 +25,23 @@ const keys = ref([])              // 当前详情分组的密钥
 const monitors = ref([])          // 监控项（含探测快照）
 const tags = ref([])              // 上游管理标签
 const err = ref('')
+const errStatus = ref(0)
+const errorInfo = computed(() => {
+  const raw = String(err.value || '').trim()
+  const status = errStatus.value || (/^\d{3}$/.test(raw) ? Number(raw) : 0)
+  if (status === 401) return { title: '登录已失效', detail: '请重新输入管理 Token。', code: 'HTTP 401' }
+  if (status === 403) return { title: '当前操作无权限', detail: '请检查管理 Token 的权限。', code: 'HTTP 403' }
+  if (status === 404) return { title: '请求的资源不存在', detail: '页面数据可能已被删除或移动。', code: 'HTTP 404' }
+  if (status >= 500) return { title: '服务暂时不可用', detail: '无法读取最新数据，请稍后重试。', code: `HTTP ${status}` }
+  if (/服务器响应超时|请求超时/i.test(raw)) {
+    return { title: '服务器响应较慢', detail: '本次读取已停止，请重新加载。', code: '' }
+  }
+  if (/failed to fetch|networkerror|network request failed/i.test(raw)) {
+    return { title: '无法连接服务', detail: '请检查网络或服务运行状态后重试。', code: '' }
+  }
+  return { title: '操作未完成', detail: raw || '请求未能完成，请稍后重试。', code: status ? `HTTP ${status}` : '' }
+})
+function clearError() { err.value = ''; errStatus.value = 0 }
 const loggedIn = ref(!!api.getToken())
 const loginForm = reactive({ token: api.getToken() })
 // 页面级加载状态：首次进入或切换页面时保留稳定布局，避免慢查询期间出现大片空白。
@@ -33,12 +50,15 @@ const pageLoadingLabel = ref('正在加载页面')
 let pageLoadEpoch = 0
 const overviewStats = ref({})
 const overviewLoading = ref(false)
+const overviewSummary = ref(null)
+const overviewSummaryLoading = ref(false)
 const overviewTrendWindow = ref('24h')
 const overviewTrendTagID = ref(0)
 const overviewTrends = ref(null)
 const overviewTrendLoading = ref(false)
 const overviewTrendError = ref('')
 const overviewBalanceCurrency = ref('')
+let overviewSummaryEpoch = 0
 let overviewTrendEpoch = 0
 
 async function loadGroups() { groups.value = (await api.groups()) || [] }
@@ -67,6 +87,33 @@ async function loadOverviewTrends() {
   }
 }
 
+async function loadOverviewSummary() {
+  const epoch = ++overviewSummaryEpoch
+  overviewSummaryLoading.value = true
+  try {
+    const data = await api.overviewSummary()
+    if (epoch === overviewSummaryEpoch) overviewSummary.value = data || null
+  } catch (e) {
+    if (epoch !== overviewSummaryEpoch) return
+    if (e.status === 404) {
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      try {
+        const stats = await api.logStats({ since: Math.floor(today.getTime() / 1000) })
+        if (epoch === overviewSummaryEpoch) {
+          overviewSummary.value = { today_requests: Number(stats?.total) || 0, week_cost: null }
+        }
+      } catch {
+        if (epoch === overviewSummaryEpoch) overviewSummary.value = null
+      }
+    } else if (!overviewSummary.value) {
+      overviewSummary.value = null
+    }
+  } finally {
+    if (epoch === overviewSummaryEpoch) overviewSummaryLoading.value = false
+  }
+}
+
 function changeOverviewTag(value) {
   overviewTrendTagID.value = Number(value) || 0
   guard(loadOverviewTrends)
@@ -84,10 +131,16 @@ async function loadOverview() {
     monitors.value = monitorList || []
     tags.value = tagList || []
     overviewStats.value = stats || {}
-    await loadOverviewTrends()
+    // 趋势查询较重，不阻塞总览基础内容显示；趋势区域保留自己的加载状态。
+    void loadOverviewTrends()
+    void loadOverviewSummary()
   } finally {
     overviewLoading.value = false
   }
+}
+
+async function refreshOverviewData() {
+  await Promise.all([loadOverviewTrends(), loadOverviewSummary()])
 }
 
 // 单项「立即探测」：探完用返回的快照原地更新该卡片
@@ -153,8 +206,9 @@ async function loadDetail(gid) {
 
 // guard 统一展示接口错误，并在管理凭证失效时返回登录页。
 async function guard(fn) {
-  err.value = ''
+  clearError()
   try { await fn() } catch (e) {
+    errStatus.value = Number(e.status) || 0
     if (e.status === 401) {
       loggedIn.value = false
       api.clearToken()
@@ -214,6 +268,11 @@ function activatePage(p) {
   }).finally(() => {
     if (epoch === pageLoadEpoch) pageLoading.value = false
   })
+}
+function retryCurrentView() {
+  if (pageLoading.value) return
+  if (detailGroup.value) openDetail(detailGroup.value)
+  else activatePage(page.value)
 }
 watch(() => route.name, () => {
   if (loggedIn.value) activatePage(page.value)
@@ -1262,6 +1321,8 @@ const overviewIssues = computed(() => [...overviewBillingAlerts.value, ...overvi
   .sort((a, b) => overviewLevelRank[a.level] - overviewLevelRank[b.level] || a.name.localeCompare(b.name)))
 const overviewIssuesExpanded = ref(false)
 const overviewIssueFilter = ref('all')
+const overviewAlertTable = ref(null)
+const overviewIssueScrollPositions = new Map()
 const overviewIssueFilterDefinitions = [
   { key: 'debt', label: '欠费' },
   { key: 'low-balance', label: '余额偏低' },
@@ -1299,13 +1360,25 @@ const overviewFilteredIssues = computed(() => overviewIssueFilter.value === 'all
 const overviewVisibleIssues = computed(() => overviewIssuesExpanded.value ? overviewFilteredIssues.value : overviewFilteredIssues.value.slice(0, 5))
 const overviewMoreIssueCount = computed(() => Math.max(0, overviewFilteredIssues.value.length - 5))
 const overviewIssueSummary = computed(() => ({
-  critical: overviewFilteredIssues.value.filter(issue => issue.level === 'critical').length,
-  warning: overviewFilteredIssues.value.filter(issue => issue.level === 'warning').length,
-  info: overviewFilteredIssues.value.filter(issue => issue.level === 'info').length,
+  critical: overviewIssues.value.filter(issue => issue.level === 'critical').length,
+  warning: overviewIssues.value.filter(issue => issue.level === 'warning').length,
+  info: overviewIssues.value.filter(issue => issue.level === 'info').length,
 }))
-function selectOverviewIssueFilter(key) {
+async function selectOverviewIssueFilter(key) {
+  if (overviewIssueFilter.value === key) return
+  if (overviewAlertTable.value) {
+    overviewIssueScrollPositions.set(overviewIssueFilter.value, overviewAlertTable.value.scrollTop)
+  }
   overviewIssueFilter.value = key
-  overviewIssuesExpanded.value = false
+  await nextTick()
+  if (overviewAlertTable.value) overviewAlertTable.value.scrollTop = overviewIssueScrollPositions.get(key) || 0
+}
+async function toggleOverviewIssues() {
+  const table = overviewAlertTable.value
+  const keepBottom = table && table.scrollTop + table.clientHeight >= table.scrollHeight - 32
+  overviewIssuesExpanded.value = !overviewIssuesExpanded.value
+  await nextTick()
+  if (keepBottom && overviewAlertTable.value) overviewAlertTable.value.scrollTop = overviewAlertTable.value.scrollHeight
 }
 const overviewIssueKindText = kind => ({ billing: '计费', runtime: '渠道', monitor: '监控', request: '请求' }[kind] || '系统')
 const overviewIssueLevelText = level => ({ critical: '紧急', warning: '警告', info: '提示' }[level] || '提示')
@@ -1350,15 +1423,16 @@ const overviewSelectedBalance = computed(() => {
   const list = overviewTrends.value?.balances || []
   return list.find(series => series.currency === overviewBalanceCurrency.value) || list[0] || null
 })
-const overviewChartLabels = computed(() => {
-  const points = overviewSelectedBalance.value?.points || overviewTrends.value?.success || []
+function overviewPointLabels(points) {
   return points.map(point => {
     const date = new Date(Number(point.ts) * 1000)
     return overviewTrendWindow.value === '24h'
       ? date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
       : date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
   })
-})
+}
+const overviewBalanceChartLabels = computed(() => overviewPointLabels(overviewSelectedBalance.value?.points || []))
+const overviewSuccessChartLabels = computed(() => overviewPointLabels(overviewTrends.value?.success || []))
 const overviewBalanceData = computed(() => (overviewSelectedBalance.value?.points || [])
   .map(point => point.remaining == null ? null : Number(point.remaining)))
 const overviewBalanceChannelColors = ['#e46f86', '#d39b35', '#36b99d', '#5598d9', '#9270d6', '#df709e', '#70a84a', '#c97bba', '#7c8bd6', '#d77b4b']
@@ -1372,6 +1446,8 @@ const overviewRawBalanceDatasets = computed(() => (overviewTrends.value?.upstrea
     const tag = overviewTagByID.value.get(Number(upstream?.primary_tag_id))
     return {
       label: series.name || `上游 #${series.upstream_id}`,
+      lineLabel: series.name || `上游 #${series.upstream_id}`,
+      legendLabel: series.name || `上游 #${series.upstream_id}`,
       data: series.points.map(point => point.remaining == null ? null : Number(point.remaining)),
       color: overviewBalanceChannelColors[index % overviewBalanceChannelColors.length],
       group: tag?.name || '未设置主标签',
@@ -1388,7 +1464,7 @@ const overviewBalanceDatasets = computed(() => {
     if (!groups.has(series.group)) {
       groups.set(series.group, {
         label: series.group,
-        group: '主标签汇总',
+        group: '标签汇总',
         groupColor: 'gray',
         tagColor: series.groupColor,
         channelCount: 0,
@@ -1406,11 +1482,31 @@ const overviewBalanceDatasets = computed(() => {
   return [...groups.values()].map((series, index) => ({
     ...series,
     label: `${series.label}（${series.channelCount}）`,
+    lineLabel: series.label,
+    legendLabel: series.label,
+    legendMeta: `${series.channelCount} 渠道`,
     color: overviewBalanceChannelColors[index % overviewBalanceChannelColors.length],
   }))
 })
 const overviewSuccessData = computed(() => (overviewTrends.value?.success || [])
   .map(point => point.rate == null ? null : Number(point.rate) * 100))
+const overviewSuccessDatasets = computed(() => [{
+  label: '成功率',
+  data: overviewSuccessData.value,
+  color: '#45b9a8',
+  fill: true,
+  borderWidth: 2,
+  pointRadius: overviewSuccessData.value.map(value => value != null && value < 99 ? 4 : 0),
+  pointHoverRadius: overviewSuccessData.value.map(value => value != null && value < 99 ? 5 : 3),
+  pointBackgroundColor: overviewSuccessData.value.map(value => value != null && value < 99 ? '#df667d' : '#45b9a8'),
+  pointBorderColor: '#fffefb',
+  pointBorderWidth: 2,
+}])
+const overviewSuccessChartMin = computed(() => {
+  const values = overviewSuccessData.value.filter(value => value != null && Number.isFinite(value))
+  if (!values.length) return 95
+  return Math.max(0, Math.min(95, Math.floor(Math.min(...values) - 1)))
+})
 const overviewBalanceHasData = computed(() => overviewBalanceDatasets.value.length > 0)
 const overviewSuccessHasData = computed(() => overviewSuccessData.value.some(value => value != null))
 const overviewLatestBalance = computed(() => {
@@ -1419,12 +1515,36 @@ const overviewLatestBalance = computed(() => {
   }
   return null
 })
+const overviewBalanceChange = computed(() => {
+  const values = overviewBalanceData.value.filter(value => value != null && Number.isFinite(value))
+  if (values.length < 2) return { amount: null, percent: null }
+  const first = values[0]
+  const amount = values[values.length - 1] - first
+  return {
+    amount,
+    percent: first === 0 ? null : amount / Math.abs(first) * 100,
+  }
+})
 const overviewSuccessSummary = computed(() => {
   const points = overviewTrends.value?.success || []
   const total = points.reduce((sum, point) => sum + Number(point.total || 0), 0)
   const success = points.reduce((sum, point) => sum + Number(point.success || 0), 0)
-  return { total, success, rate: total ? success / total * 100 : null }
+  const failed = Math.max(0, total - success)
+  const anomalies = points.filter(point => point.rate != null && Number(point.rate) * 100 < 99).length
+  return { total, success, failed, anomalies, rate: total ? success / total * 100 : null }
 })
+const overviewAvailability = computed(() => {
+  const enabled = upstreams.value.filter(item => item.enabled)
+  const routable = enabled.filter(item => !['OPEN', 'HALF_OPEN'].includes(item.health?.state)).length
+  return { total: enabled.length, routable, rate: enabled.length ? routable / enabled.length * 100 : null }
+})
+const overviewWeekCost = computed(() => overviewSummary.value?.week_cost || null)
+const overviewWeekCostCoverage = computed(() => {
+  const coverage = Number(overviewWeekCost.value?.coverage)
+  return Number.isFinite(coverage) ? `${Math.round(coverage * 100)}%` : '—'
+})
+const overviewShowPartial = computed(() => overviewTrendWindow.value === '24h' && Number(overviewTrendTagID.value) === 0)
+const overviewPartialCount = computed(() => Number(overviewStats.value.partial) || 0)
 function overviewBalanceText(value) {
   if (value == null) return '—'
   const currency = overviewSelectedBalance.value?.currency || 'USD'
@@ -1432,7 +1552,27 @@ function overviewBalanceText(value) {
     return new Intl.NumberFormat('zh-CN', { style: 'currency', currency, currencyDisplay: 'narrowSymbol', maximumFractionDigits: 2 }).format(value)
   } catch { return `${Number(value).toFixed(2)} ${currency}` }
 }
+function overviewSignedBalanceText(value) {
+  if (value == null) return '—'
+  const text = overviewBalanceText(value)
+  return Number(value) > 0 ? `+${text}` : text
+}
+function overviewSignedPercentText(value) {
+  if (value == null) return ''
+  const number = Number(value)
+  return `${number > 0 ? '+' : ''}${number.toFixed(1)}%`
+}
 function overviewPercentText(value) { return value == null ? '—' : `${Number(value).toFixed(1)}%` }
+function overviewCountText(value) { return Number(value || 0).toLocaleString('zh-CN') }
+function overviewMetricCountText(value) { return value == null ? '—' : Number(value).toLocaleString('zh-CN') }
+function overviewUSDText(value) {
+  if (value == null || !Number.isFinite(Number(value))) return '—'
+  const amount = Number(value)
+  return new Intl.NumberFormat('zh-CN', {
+    style: 'currency', currency: 'USD', currencyDisplay: 'narrowSymbol',
+    minimumFractionDigits: 2, maximumFractionDigits: Math.abs(amount) < 1 ? 4 : 2,
+  }).format(amount)
+}
 
 const {
   logs, logPageSize, logCurrentPage, logLoading, logDetail, logDetailLoading, logStats,
@@ -1617,7 +1757,7 @@ function monitorGroupLeave(el, done) {
 }
 
 function login() {
-  if (!loginForm.token.trim()) { err.value = '请输入管理 Token'; return }
+  if (!loginForm.token.trim()) { clearError(); err.value = '请输入管理 Token'; return }
   api.setToken(loginForm.token.trim())
   loggedIn.value = true
   activatePage(page.value)
@@ -1630,6 +1770,7 @@ function logout() {
   stopBackupPoll()
   stopAllPoll()
   pageLoading.value = false
+  clearError()
 }
 </script>
 
@@ -1640,57 +1781,69 @@ function logout() {
       <h1>管理后台登录</h1>
       <p>输入服务器环境变量 <code>MUXAPI_TOKEN</code>。</p>
       <div class="field"><label>Token</label><input v-model="loginForm.token" type="password" placeholder="MUXAPI_TOKEN" @keyup.enter="login" autofocus /></div>
-      <p v-if="err" class="err-banner">{{ err }}</p>
+      <p v-if="err" class="err-banner">{{ errorInfo.detail }}</p>
       <button class="btn login-btn" @click="login"><Icon name="check" :size="16" />进入后台</button>
     </div>
   </div>
 
   <div v-else class="layout">
-    <aside class="sidebar">
-      <div class="logo"><Icon name="bolt" :size="22" /><span class="logo-text">MuxAPI</span></div>
-      <nav class="nav">
-        <span class="nav-section-label">运行</span>
-        <RouterLink class="nav-item" :class="{ active: page === 'overview' }" :to="{ name: 'overview' }"><Icon class="ic" name="bolt" :size="18" />总览</RouterLink>
-        <RouterLink class="nav-item" :class="{ active: page === 'monitors' }" :to="{ name: 'monitors' }"><Icon class="ic" name="heart" :size="18" />监控看板</RouterLink>
-        <RouterLink class="nav-item" :class="{ active: page === 'logs' }" :to="{ name: 'logs' }"><Icon class="ic" name="refresh" :size="18" />请求记录</RouterLink>
-        <span class="nav-section-label">配置</span>
-        <RouterLink class="nav-item" :class="{ active: page === 'groups' }" :to="{ name: 'groups' }" @click.exact="detailGroup && backToGroups()"><Icon class="ic" name="cube" :size="18" />分组管理</RouterLink>
-        <RouterLink class="nav-item" :class="{ active: page === 'upstreams' }" :to="{ name: 'upstreams' }"><Icon class="ic" name="server" :size="18" />上游池</RouterLink>
-        <RouterLink class="nav-item" :class="{ active: page === 'settings' }" :to="{ name: 'settings' }"><Icon class="ic" name="cog" :size="18" />设置</RouterLink>
+    <header class="app-topbar">
+      <div class="app-brand"><span class="app-mark"><Icon name="bolt" :size="20" /></span><span class="logo-text">MuxAPI</span></div>
+      <div class="app-page-context">
+        <h1 class="app-page-title">{{ detailGroup ? detailGroup.name : pages[page].title }}</h1>
+        <p class="app-page-desc">{{ detailGroup ? '管理该分组的上游成员与接入密钥' : pages[page].desc }}</p>
+      </div>
+      <div class="app-topbar-actions"><span v-if="appVersion" class="app-version">{{ appVersion }}</span><button class="btn-link sm" @click="logout">退出</button></div>
+    </header>
+
+    <aside class="subnav-rail">
+      <nav class="subnav" aria-label="主导航">
+        <RouterLink class="subnav-item" :class="{ active: page === 'overview' }" :to="{ name: 'overview' }" aria-label="总览" data-label="总览"><Icon name="bolt" :size="18" /><span>总览</span></RouterLink>
+        <RouterLink class="subnav-item" :class="{ active: page === 'monitors' }" :to="{ name: 'monitors' }" aria-label="渠道监控" data-label="渠道监控"><Icon name="heart" :size="18" /><span>渠道监控</span></RouterLink>
+        <RouterLink class="subnav-item" :class="{ active: page === 'logs' }" :to="{ name: 'logs' }" aria-label="请求记录" data-label="请求记录"><Icon name="refresh" :size="18" /><span>请求记录</span></RouterLink>
+        <RouterLink class="subnav-item" :class="{ active: page === 'groups' }" :to="{ name: 'groups' }" aria-label="分组管理" data-label="分组管理" @click.exact="detailGroup && backToGroups()"><Icon name="cube" :size="18" /><span>分组管理</span></RouterLink>
+        <RouterLink class="subnav-item" :class="{ active: page === 'upstreams' }" :to="{ name: 'upstreams' }" aria-label="上游池" data-label="上游池"><Icon name="server" :size="18" /><span>上游池</span></RouterLink>
+        <RouterLink class="subnav-item" :class="{ active: page === 'settings' }" :to="{ name: 'settings' }" aria-label="系统设置" data-label="系统设置"><Icon name="cog" :size="18" /><span>系统设置</span></RouterLink>
       </nav>
-      <div class="sidebar-version" v-if="appVersion">{{ appVersion }}</div>
     </aside>
 
     <div class="main-wrap">
-      <header class="header">
-        <div class="header-left">
-          <h1 class="header-title">{{ detailGroup ? detailGroup.name : pages[page].title }}</h1>
-          <p class="header-desc">{{ detailGroup ? '管理该分组的上游成员与接入密钥' : pages[page].desc }}</p>
-        </div>
-        <div class="header-actions">
-          <button class="btn-link sm" @click="logout">退出</button>
-        </div>
-      </header>
-
       <main class="main">
-        <p v-if="err" class="err-banner">{{ err }}</p>
+        <section v-if="err" class="error-toast" role="alert" aria-live="assertive">
+          <span class="error-toast-icon"><Icon name="alert" :size="17" /></span>
+          <span class="error-toast-copy">
+            <strong>{{ errorInfo.title }}</strong>
+            <span>{{ errorInfo.detail }}<small v-if="errorInfo.code">{{ errorInfo.code }}</small></span>
+          </span>
+          <span class="error-toast-actions">
+            <button class="icon-btn error-toast-retry" type="button" :disabled="pageLoading" title="重新加载当前页" aria-label="重新加载当前页" @click="retryCurrentView"><Icon :name="pageLoading ? 'loader' : 'refresh'" :class="{ spin: pageLoading }" :size="15" /></button>
+            <button class="icon-btn error-toast-close" type="button" title="关闭提示" aria-label="关闭错误提示" @click="clearError"><Icon name="x" :size="15" /></button>
+          </span>
+        </section>
         <p v-if="notice" class="ok-banner">{{ notice }}</p>
 
         <section v-if="pageLoading" class="page-loading" aria-live="polite" aria-busy="true">
           <div class="page-loading-status">
-            <span class="page-loading-icon"><Icon name="loader" :size="17" /></span>
-            <div><strong>{{ pageLoadingLabel }}</strong><span>数据准备完成后将自动显示</span></div>
+            <span class="page-loading-icon"><Icon name="loader" :size="16" /></span>
+            <div><strong>{{ pageLoadingLabel }}</strong><span>正在同步服务器数据</span></div>
           </div>
-          <div class="page-loading-toolbar">
-            <span class="loading-line loading-line-short"></span>
-            <span class="loading-button"></span>
+          <div class="page-loading-charts" aria-hidden="true">
+            <section v-for="item in 2" :key="`loading-chart-${item}`" class="loading-chart-card">
+              <header class="loading-chart-head">
+                <span class="loading-line loading-line-label"></span>
+                <span class="loading-chip"></span>
+              </header>
+              <span class="loading-line loading-line-value"></span>
+              <div class="loading-chart-bars">
+                <i v-for="bar in 10" :key="`loading-chart-${item}-${bar}`"></i>
+              </div>
+            </section>
           </div>
-          <div class="page-loading-stats">
-            <span v-for="item in 4" :key="`loading-stat-${item}`" class="loading-stat"></span>
-          </div>
-          <div class="page-loading-panel">
+          <div class="page-loading-list" aria-hidden="true">
             <span class="loading-line loading-line-title"></span>
-            <span v-for="item in 5" :key="`loading-row-${item}`" class="loading-row"></span>
+            <div v-for="item in 3" :key="`loading-row-${item}`" class="loading-row">
+              <i></i><span></span><small></small>
+            </div>
           </div>
         </section>
 
@@ -1701,7 +1854,7 @@ function logout() {
           <section class="ov-trends">
             <header class="ov-trends-head">
               <div>
-                <h2>余额与成功率</h2>
+                <h2>运行趋势</h2>
                 <p>{{ overviewTrendScopeDescription }}</p>
               </div>
               <div class="ov-trend-controls">
@@ -1709,43 +1862,90 @@ function logout() {
                 <div class="ov-segmented" role="tablist" aria-label="趋势时间范围">
                   <button v-for="option in overviewWindowOptions" :key="option.value" type="button" :class="{ active: overviewTrendWindow === option.value }" :disabled="overviewTrendLoading" @click="overviewTrendWindow = option.value; guard(loadOverviewTrends)">{{ option.label }}</button>
                 </div>
-                <button class="icon-btn" :disabled="overviewLoading || overviewTrendLoading" title="刷新总览" @click="guard(loadOverview)"><Icon name="refresh" :size="16" /></button>
+                <button class="icon-btn" :disabled="overviewTrendLoading || overviewSummaryLoading" title="刷新运行数据" @click="guard(refreshOverviewData)"><Icon name="refresh" :class="{ spin: overviewTrendLoading || overviewSummaryLoading }" :size="16" /></button>
               </div>
             </header>
+
+            <div class="ov-summary-band" aria-label="运行指标" :aria-busy="overviewSummaryLoading">
+              <section class="ov-summary-item request">
+                <span class="ov-summary-label"><i></i>今日请求<Icon v-if="overviewSummaryLoading && !overviewSummary" name="loader" :size="12" /></span>
+                <strong class="ov-summary-value">{{ overviewMetricCountText(overviewSummary?.today_requests) }}</strong>
+                <small>从 00:00 起</small>
+              </section>
+              <section class="ov-summary-item cost">
+                <span class="ov-summary-label"><i></i>本周预估费用<Icon v-if="overviewSummaryLoading && !overviewSummary" name="loader" :size="12" /></span>
+                <strong class="ov-summary-value">{{ overviewUSDText(overviewWeekCost?.amount) }}</strong>
+                <small>LiteLLM 价目 · 覆盖 {{ overviewWeekCostCoverage }}</small>
+              </section>
+              <section class="ov-summary-item availability">
+                <span class="ov-summary-label"><i></i>上游可用性</span>
+                <strong class="ov-summary-value">{{ overviewPercentText(overviewAvailability.rate) }}</strong>
+                <small>{{ overviewAvailability.routable }} / {{ overviewAvailability.total }} 个渠道可路由</small>
+              </section>
+            </div>
 
             <div v-if="overviewTrendLoading && !overviewTrends" class="ov-trend-loading"><Icon name="loader" :size="17" />正在读取趋势</div>
             <div v-else-if="overviewTrendError" class="ov-trend-empty"><Icon name="alert" :size="17" /><span>趋势暂时不可用：{{ overviewTrendError }}</span></div>
             <div v-else class="ov-chart-grid">
-              <section class="ov-chart-card">
+              <section class="ov-chart-panel ov-chart-panel-primary">
                 <header class="ov-chart-head">
-                  <div><span class="ov-chart-kicker">折算余额总额</span><strong>{{ overviewBalanceText(overviewLatestBalance) }}</strong></div>
+                  <div class="ov-chart-heading">
+                    <h3>上游余额趋势</h3>
+                    <div class="ov-chart-value-row">
+                      <strong>{{ overviewBalanceText(overviewLatestBalance) }}</strong>
+                      <span class="ov-balance-change" :class="{ positive: overviewBalanceChange.amount > 0, negative: overviewBalanceChange.amount < 0 }">
+                        <small>区间变化</small>
+                        <b>{{ overviewSignedBalanceText(overviewBalanceChange.amount) }}</b>
+                        <em v-if="overviewBalanceChange.percent != null">{{ overviewSignedPercentText(overviewBalanceChange.percent) }}</em>
+                      </span>
+                    </div>
+                  </div>
                   <FancySelect v-if="overviewCurrencyOptions.length > 1" v-model="overviewBalanceCurrency" :options="overviewCurrencyOptions" />
                   <span v-else class="ov-chart-meta">{{ overviewSelectedBalance?.currency || '暂无币种' }}</span>
                 </header>
-                <div v-if="overviewBalanceHasData" class="ov-chart"><Chart :key="`balance-${overviewTrendTagID}-${overviewTrends?.to_at || 0}`" :labels="overviewChartLabels" :datasets="overviewBalanceDatasets" color="#d39b35" axis-labels show-legend :fmt="overviewBalanceText" /></div>
+                <div v-if="overviewBalanceHasData" class="ov-chart"><Chart :key="`balance-${overviewTrendTagID}-${overviewTrends?.to_at || 0}`" :labels="overviewBalanceChartLabels" :datasets="overviewBalanceDatasets" color="#d39b35" axis-labels show-legend line-labels :fmt="overviewBalanceText" /></div>
                 <div v-else class="ov-chart-empty"><Icon name="server" :size="18" />暂无余额历史</div>
-                <p class="ov-chart-foot">{{ overviewTrends?.upstream_count || 0 }} 个渠道 · {{ overviewTrends?.unlimited_count || 0 }} 个无限额度</p>
+                <footer class="ov-chart-foot">
+                  <span><b>{{ overviewCountText(overviewTrends?.upstream_count) }}</b> 个渠道</span>
+                  <span><b>{{ overviewCountText(overviewTrends?.unlimited_count) }}</b> 个无限额度</span>
+                </footer>
               </section>
 
-              <section class="ov-chart-card">
+              <section class="ov-chart-panel ov-chart-panel-secondary">
                 <header class="ov-chart-head">
-                  <div><span class="ov-chart-kicker">请求成功率</span><strong>{{ overviewPercentText(overviewSuccessSummary.rate) }}</strong></div>
-                  <span class="ov-chart-meta">{{ overviewSuccessSummary.total }} 次请求</span>
+                  <div class="ov-chart-heading">
+                    <h3>请求成功率趋势</h3>
+                    <div class="ov-chart-value-row">
+                      <strong>{{ overviewPercentText(overviewSuccessSummary.rate) }}</strong>
+                      <span class="ov-chart-goal"><i></i>目标 99%</span>
+                    </div>
+                  </div>
                 </header>
-                <div v-if="overviewSuccessHasData" class="ov-chart"><Chart :key="`success-${overviewTrendTagID}-${overviewTrends?.to_at || 0}`" :labels="overviewChartLabels" :data="overviewSuccessData" color="#36b99d" fill :max="100" axis-labels :fmt="overviewPercentText" /></div>
+                <dl class="ov-success-metrics">
+                  <div><dt>请求数</dt><dd>{{ overviewCountText(overviewSuccessSummary.total) }}</dd></div>
+                  <div><dt>失败数</dt><dd :class="{ alert: overviewSuccessSummary.failed > 0 }">{{ overviewCountText(overviewSuccessSummary.failed) }}</dd></div>
+                  <div v-if="overviewShowPartial"><dt>流中断</dt><dd :class="{ alert: overviewPartialCount > 0 }">{{ overviewCountText(overviewPartialCount) }}</dd></div>
+                </dl>
+                <div v-if="overviewSuccessHasData" class="ov-chart"><Chart :key="`success-${overviewTrendTagID}-${overviewTrends?.to_at || 0}`" :labels="overviewSuccessChartLabels" :datasets="overviewSuccessDatasets" :min="overviewSuccessChartMin" :max="100" :threshold="99" threshold-label="99%" axis-labels :fmt="overviewPercentText" /></div>
                 <div v-else class="ov-chart-empty"><Icon name="heart" :size="18" />暂无请求历史</div>
-                <p class="ov-chart-foot">成功 {{ overviewSuccessSummary.success }} 次 · 按 {{ overviewTrendWindow === '24h' ? '小时' : overviewTrendWindow === '7d' ? '6 小时' : '天' }} 聚合</p>
+                <footer class="ov-chart-foot">
+                  <span :class="{ alert: overviewSuccessSummary.anomalies > 0 }">{{ overviewSuccessSummary.anomalies > 0 ? `${overviewSuccessSummary.anomalies} 个时段低于目标` : '各时段均达目标' }}</span>
+                  <span>按 {{ overviewTrendWindow === '24h' ? '小时' : overviewTrendWindow === '7d' ? '6 小时' : '天' }}聚合</span>
+                </footer>
               </section>
             </div>
           </section>
 
           <section class="ov-alert-strip">
             <header class="ov-alert-head">
-              <div><h2>需要处理</h2><p>按紧急度排列，显示余额、计费和服务异常</p></div>
+              <div class="ov-alert-heading">
+                <div class="ov-alert-title-row"><h2>需要处理</h2><span v-if="overviewIssues.length" class="ov-alert-total">{{ overviewIssues.length }}</span></div>
+                <p>{{ overviewIssues.length ? '按紧急度排列，优先显示影响路由与计费的事项' : '余额、计费与服务状态均正常' }}</p>
+              </div>
               <div v-if="overviewIssues.length" class="ov-alert-summary">
-                <span v-if="overviewIssueSummary.critical" class="critical"><i></i>紧急 {{ overviewIssueSummary.critical }}</span>
-                <span v-if="overviewIssueSummary.warning" class="warning"><i></i>警告 {{ overviewIssueSummary.warning }}</span>
-                <span v-if="overviewIssueSummary.info" class="info"><i></i>提示 {{ overviewIssueSummary.info }}</span>
+                <span class="critical"><i></i><em>紧急</em><b>{{ overviewIssueSummary.critical }}</b></span>
+                <span class="warning"><i></i><em>警告</em><b>{{ overviewIssueSummary.warning }}</b></span>
+                <span class="info"><i></i><em>提示</em><b>{{ overviewIssueSummary.info }}</b></span>
               </div>
             </header>
             <div v-if="overviewIssues.length" class="ov-alert-filters" role="tablist" aria-label="待处理类型">
@@ -1753,27 +1953,28 @@ function logout() {
                 {{ option.label }}<small>{{ option.count }}</small>
               </button>
             </div>
-            <div v-if="!overviewIssues.length" class="ov-alert-clear"><Icon name="check" :size="15" />暂无异常</div>
-            <div v-else-if="!overviewFilteredIssues.length" class="ov-alert-clear"><Icon name="check" :size="15" />当前类型暂无待处理事项</div>
-            <div v-else class="ov-alert-table" role="table" aria-label="待处理事项">
-              <div class="ov-alert-row ov-alert-row-head" role="row">
-                <span>级别</span><span>事项</span><span>详情</span><span>时间</span><span>操作</span>
+            <div v-if="!overviewIssues.length" class="ov-alert-clear"><span><Icon name="check" :size="17" /></span><div><strong>当前无需处理</strong><small>未发现余额、计费或服务异常</small></div></div>
+            <div v-else-if="!overviewFilteredIssues.length" class="ov-alert-clear"><span><Icon name="check" :size="17" /></span><div><strong>当前类型无需处理</strong><small>该分类暂未发现异常</small></div></div>
+            <div v-else ref="overviewAlertTable" class="ov-alert-table" role="list" aria-label="待处理事项">
+              <div :key="overviewIssueFilter" class="ov-alert-list">
+                <article v-for="issue in overviewVisibleIssues" :key="issue.key" class="ov-alert-row" :class="issue.level" role="listitem">
+                  <span class="ov-alert-level"><i></i>{{ overviewIssueLevelText(issue.level) }}</span>
+                  <div class="ov-alert-body">
+                    <span class="ov-alert-subject"><strong>{{ issue.title }}</strong><small>{{ overviewIssueKindText(issue.kind) }} · {{ issue.name }}</small></span>
+                    <span class="ov-alert-detail" :title="issue.detail || ''">{{ issue.detail || '—' }}</span>
+                  </div>
+                  <span class="ov-alert-time">{{ overviewIssueTime(issue) }}</span>
+                  <span class="ov-alert-operation">
+                    <button v-if="issue.action === 'refresh-billing'" class="ov-alert-action" :disabled="refreshingBilling.has(issue.upstream.id)" @click="guard(() => refreshUpstreamBilling(issue.upstream))"><Icon name="refresh" :size="14" />刷新</button>
+                    <button v-else-if="issue.action === 'recover-upstream'" class="ov-alert-action" :disabled="recoveringUpstreams.has(issue.upstream.id)" @click="guard(() => recoverUpstream(issue.upstream))"><Icon name="refresh" :size="14" />恢复</button>
+                    <RouterLink v-else class="ov-alert-action" :to="{ name: issue.to }">查看<Icon name="chevron-right" :size="14" /></RouterLink>
+                  </span>
+                </article>
+                <button v-if="overviewMoreIssueCount" class="ov-alert-expand" type="button" @click="toggleOverviewIssues">
+                  {{ overviewIssuesExpanded ? '收起事项' : ('查看全部 ' + overviewFilteredIssues.length + ' 项') }}
+                  <Icon name="chevron-right" :size="14" :class="{ rotated: overviewIssuesExpanded }" />
+                </button>
               </div>
-              <article v-for="issue in overviewVisibleIssues" :key="issue.key" class="ov-alert-row" :class="issue.level" role="row">
-                <span class="ov-alert-level"><i></i>{{ overviewIssueLevelText(issue.level) }}</span>
-                <span class="ov-alert-subject"><strong>{{ issue.title }}</strong><small>{{ overviewIssueKindText(issue.kind) }} · {{ issue.name }}</small></span>
-                <span class="ov-alert-detail" :title="issue.detail || ''">{{ issue.detail || '—' }}</span>
-                <span class="ov-alert-time">{{ overviewIssueTime(issue) }}</span>
-                <span class="ov-alert-operation">
-                  <button v-if="issue.action === 'refresh-billing'" class="ov-alert-action" :disabled="refreshingBilling.has(issue.upstream.id)" @click="guard(() => refreshUpstreamBilling(issue.upstream))"><Icon name="refresh" :size="14" />刷新</button>
-                  <button v-else-if="issue.action === 'recover-upstream'" class="ov-alert-action" :disabled="recoveringUpstreams.has(issue.upstream.id)" @click="guard(() => recoverUpstream(issue.upstream))"><Icon name="refresh" :size="14" />恢复</button>
-                  <RouterLink v-else class="ov-alert-action" :to="{ name: issue.to }">查看<Icon name="chevron-right" :size="14" /></RouterLink>
-                </span>
-              </article>
-              <button v-if="overviewMoreIssueCount" class="ov-alert-expand" type="button" @click="overviewIssuesExpanded = !overviewIssuesExpanded">
-                {{ overviewIssuesExpanded ? '收起事项' : ('查看全部 ' + overviewFilteredIssues.length + ' 项') }}
-                <Icon name="chevron-right" :size="14" :class="{ rotated: overviewIssuesExpanded }" />
-              </button>
             </div>
           </section>
         </template>
@@ -2241,18 +2442,16 @@ function logout() {
           </div>
         </template>
 
-        <!-- 设置页：左锚点菜单 + 右内容 -->
+        <!-- 设置页：页面内配置分类 -->
         <template v-else-if="page === 'settings'">
           <div class="settings-layout">
             <aside class="settings-nav">
-              <div class="set-navitem" :class="{ active: settingsSection === 'logs' }" @click="gotoSection('logs')"><Icon name="refresh" :size="16" />日志清理</div>
-              <div class="set-navitem" :class="{ active: settingsSection === 'route' }" @click="gotoSection('route')"><Icon name="link" :size="16" />渠道路由</div>
-              <div class="set-navitem" :class="{ active: settingsSection === 'alert' }" @click="gotoSection('alert')"><Icon name="alert" :size="16" />健康告警</div>
-              <div class="set-navitem" :class="{ active: settingsSection === 'endpoint' }" @click="gotoSection('endpoint')"><Icon name="link" :size="16" />接入地址</div>
-              <div class="set-navitem" :class="{ active: settingsSection === 'backup' }" @click="gotoSection('backup')"><Icon name="refresh" :size="16" />数据备份</div>
-              <p class="set-navhint">探测间隔 / 路径已下放到各监控项，在「监控看板」逐项配置。</p>
+              <button type="button" class="set-navitem" :class="{ active: settingsSection === 'logs' }" @click="gotoSection('logs')"><Icon name="refresh" :size="16" />日志清理</button>
+              <button type="button" class="set-navitem" :class="{ active: settingsSection === 'route' }" @click="gotoSection('route')"><Icon name="link" :size="16" />渠道路由</button>
+              <button type="button" class="set-navitem" :class="{ active: settingsSection === 'alert' }" @click="gotoSection('alert')"><Icon name="alert" :size="16" />健康告警</button>
+              <button type="button" class="set-navitem" :class="{ active: settingsSection === 'endpoint' }" @click="gotoSection('endpoint')"><Icon name="link" :size="16" />接入地址</button>
+              <button type="button" class="set-navitem" :class="{ active: settingsSection === 'backup' }" @click="gotoSection('backup')"><Icon name="refresh" :size="16" />数据备份</button>
             </aside>
-
             <div class="settings-body">
               <section id="set-logs" v-show="settingsSection === 'logs'" class="card settings-card">
                 <div class="settings-title"><h3>日志清理</h3><p>按完成时间保留请求记录，过期记录与尝试链自动删除。</p></div>

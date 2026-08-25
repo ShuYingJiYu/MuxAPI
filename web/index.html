@@ -7,18 +7,55 @@
   </head>
   <body>
     <div id="app">
-      <div class="boot-screen" aria-label="MuxAPI 正在启动">
-        <span class="boot-mark"></span>
+      <div class="boot-screen" role="status" aria-live="polite" aria-label="MuxAPI 正在启动">
+        <span class="boot-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M13 2 4.1 12.7h7.1L11 22l8.9-10.7h-7.1L13 2Z" /></svg>
+        </span>
         <strong>MuxAPI</strong>
-        <span>正在启动</span>
+        <span class="boot-status">正在准备控制台</span>
+        <span class="boot-progress" aria-hidden="true"><i></i></span>
       </div>
     </div>
     <style>
-      .boot-screen { min-height: 100vh; display: grid; place-content: center; justify-items: center; gap: 10px; background: #fffbea; color: #7d6e80; font: 14px system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
-      .boot-screen strong { color: #463c4a; font-size: 19px; }
-      .boot-mark { width: 30px; height: 30px; border: 3px solid rgba(211, 155, 53, .22); border-top-color: #d39b35; border-radius: 50%; animation: boot-spin 1s linear infinite; }
-      @keyframes boot-spin { to { transform: rotate(360deg); } }
-      @media (prefers-reduced-motion: reduce) { .boot-mark { animation: none; } }
+      html, body, #app { width: 100%; height: 100%; margin: 0; }
+      body { background: #fffaf2; }
+      .boot-screen {
+        min-height: 100%; display: grid; place-content: center; justify-items: center;
+        grid-template-columns: minmax(0, 220px); gap: 8px; padding: 24px; box-sizing: border-box;
+        background: #fffaf2; color: #938995;
+        font: 13px/1.5 "Noto Sans SC", "Microsoft YaHei UI", "Segoe UI", sans-serif;
+      }
+      .boot-mark {
+        position: relative; width: 48px; height: 48px; display: grid; place-items: center;
+        margin-bottom: 5px; border-radius: 50%; color: #fff;
+        background: linear-gradient(135deg, #f58daf, #85c8e5);
+        box-shadow: 0 7px 20px rgba(151, 126, 151, .20);
+        animation: boot-mark-in .35s ease-out both;
+      }
+      .boot-mark::after {
+        content: ''; position: absolute; inset: -6px; border: 1px solid rgba(108, 216, 201, .34);
+        border-radius: 50%; animation: boot-ring 1.7s ease-in-out infinite;
+      }
+      .boot-mark svg { width: 23px; height: 23px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linejoin: round; }
+      .boot-screen strong {
+        color: #f58daf; font: 650 20px/1.25 "Bahnschrift", "Noto Sans SC", "Microsoft YaHei UI", sans-serif;
+        background: linear-gradient(120deg, #f58daf, #63a9cd); background-clip: text;
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      }
+      .boot-status { color: #938995; font-size: 12px; }
+      .boot-progress { width: 136px; height: 3px; overflow: hidden; margin-top: 8px; border-radius: 3px; background: #f1eade; }
+      .boot-progress i {
+        display: block; width: 38%; height: 100%; border-radius: inherit;
+        background: linear-gradient(90deg, #f58daf, #85c8e5, #45c9b6);
+        animation: boot-progress 1.35s ease-in-out infinite;
+      }
+      @keyframes boot-mark-in { from { opacity: 0; transform: translateY(4px) scale(.94); } to { opacity: 1; transform: none; } }
+      @keyframes boot-ring { 0%, 100% { opacity: .35; transform: scale(.94); } 50% { opacity: .9; transform: scale(1.04); } }
+      @keyframes boot-progress { from { transform: translateX(-105%); } to { transform: translateX(270%); } }
+      @media (prefers-reduced-motion: reduce) {
+        .boot-mark, .boot-mark::after, .boot-progress i { animation: none; }
+        .boot-progress i { width: 100%; }
+      }
     </style>
     <script type="module" src="/src/main.js"></script>
   </body>
