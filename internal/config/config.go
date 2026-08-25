@@ -41,6 +41,7 @@ type Config struct {
 	Cooldown      time.Duration // 熔断冷却时长
 	MaxRetries    int           // 单次下游请求最多尝试的上游数
 	MaxBody       int64         // 请求体最大字节数（防 DoS），默认 32MB
+	ModelAliases  string        // 模型别名映射 "from=to,from=to"，转发前重写模型名
 }
 
 // Load 返回带默认值的启动配置；同名系统环境变量优先于 .env。
@@ -55,7 +56,8 @@ func Load() *Config {
 		Cooldown:      envDur("MUXAPI_COOLDOWN", 30*time.Second),
 		MaxRetries:    envInt("MUXAPI_MAX_RETRIES", 6),
 		// 请求体上限：防 io.ReadAll 无限读导致 OOM/DoS。默认 32MB，单位字节。
-		MaxBody: envInt64("MUXAPI_MAX_BODY", 32<<20),
+		MaxBody:      envInt64("MUXAPI_MAX_BODY", 32<<20),
+		ModelAliases: env("MUXAPI_MODEL_ALIASES", ""),
 	}
 }
 

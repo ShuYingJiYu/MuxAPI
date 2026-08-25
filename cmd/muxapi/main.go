@@ -128,6 +128,11 @@ func main() {
 	maxAttemptsValue.Store(int64(maxUpstreamAttempts()))
 	fwd := forward.New(sched, hm, int(maxAttemptsValue.Load()))
 	fwd.SetMaxAttemptsProvider(func() int { return int(maxAttemptsValue.Load()) })
+	// 模型名归一化：别名表来自环境变量，上下文后缀剥离为内置行为。
+	if aliases := forward.ParseModelAliases(cfg.ModelAliases); len(aliases) > 0 {
+		fwd.SetModelAliases(aliases)
+		slog.Info("model aliases loaded", "count", len(aliases))
+	}
 	mon := monitor.New(st)
 	// 首个响应或流中连续无数据达到阈值时取消上游；每收到字节都会重置计时器。
 	firstResponseTimeoutMs := settingInt("first_response_timeout_ms", 120000)
