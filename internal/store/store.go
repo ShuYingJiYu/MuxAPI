@@ -113,6 +113,12 @@ type Store struct {
 	closeOnce    sync.Once
 }
 
+// OpenOptions controls startup behavior for an existing database.
+// ReadOnly skips PostgreSQL migrations; callers must ensure the schema exists.
+type OpenOptions struct {
+	ReadOnly bool
+}
+
 func newStore(db *dbAdapter) *Store {
 	s := &Store{
 		db:           db,
@@ -154,6 +160,11 @@ func (s *Store) bucketExpr(column string, seconds int64) string {
 
 // Open 根据连接串选择数据库；PostgreSQL 会在返回前执行嵌入式迁移。
 func Open(databaseURL string) (*Store, error) {
+	return OpenWithOptions(databaseURL, OpenOptions{})
+}
+
+// OpenWithOptions opens a store and optionally avoids startup schema writes.
+func OpenWithOptions(databaseURL string, options OpenOptions) (*Store, error) {
 	if strings.HasPrefix(databaseURL, "postgres://") || strings.HasPrefix(databaseURL, "postgresql://") {
 		db, err := sql.Open("pgx", databaseURL)
 		if err != nil {
@@ -168,9 +179,11 @@ func Open(databaseURL string) (*Store, error) {
 			db.Close()
 			return nil, fmt.Errorf("connect PostgreSQL: %w", err)
 		}
-		if err := runPostgresMigrations(ctx, db); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("migrate PostgreSQL: %w", err)
+		if !options.ReadOnly {
+			if err := runPostgresMigrations(ctx, db); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("migrate PostgreSQL: %w", err)
+			}
 		}
 		return newStore(&dbAdapter{DB: db, postgres: true}), nil
 	}

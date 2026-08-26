@@ -2,13 +2,15 @@
 // adminToken 存在 localStorage（后端 AdminToken 为空时鉴权跳过，本地调试免填）。
 const token = () => localStorage.getItem('muxapi_token') || ''
 const REQUEST_TIMEOUT_MS = 15000
+// 生产库通过 SSH 隧道访问时，管理列表查询可能需要几十秒；页面不应过早中断。
+const HEAVY_REQUEST_TIMEOUT_MS = 90000
 
-async function req(method, path, body) {
+async function req(method, path, body, timeoutMs = REQUEST_TIMEOUT_MS) {
   const headers = { 'Content-Type': 'application/json' }
   const t = token()
   if (t) headers.Authorization = 'Bearer ' + t
   const controller = new AbortController()
-  const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs)
   try {
     const res = await fetch('/admin' + path, {
       method,
@@ -107,7 +109,8 @@ export const api = {
   setToken: t => localStorage.setItem('muxapi_token', t),
   clearToken: () => localStorage.removeItem('muxapi_token'),
   // 上游全局池
-  upstreams: () => req('GET', '/upstreams'),
+  upstreams: () => req('GET', '/upstreams', undefined, HEAVY_REQUEST_TIMEOUT_MS),
+  overviewUpstreams: () => req('GET', '/upstreams?view=overview', undefined, HEAVY_REQUEST_TIMEOUT_MS),
   createUpstream: u => req('POST', '/upstreams', u),
   updateUpstream: (id, u) => req('PUT', '/upstreams/' + id, u),
   deleteUpstream: id => req('DELETE', '/upstreams/' + id),
@@ -121,9 +124,9 @@ export const api = {
   overviewTrends: ({ window = '24h', tag_id = 0 } = {}) => {
     const p = new URLSearchParams({ window, _ts: String(Date.now()) })
     if (Number(tag_id) > 0) p.set('tag_id', String(tag_id))
-    return req('GET', `/overview/trends?${p.toString()}`)
+    return req('GET', `/overview/trends?${p.toString()}`, undefined, HEAVY_REQUEST_TIMEOUT_MS)
   },
-  overviewSummary: () => req('GET', `/overview/summary?_ts=${Date.now()}`),
+  overviewSummary: () => req('GET', `/overview/summary?_ts=${Date.now()}`, undefined, HEAVY_REQUEST_TIMEOUT_MS),
   createMonitorsBatch: (id, payload) => req('POST', `/upstreams/${id}/monitors`, payload),
   // 管理标签
   tags: () => req('GET', '/tags'),
@@ -180,7 +183,7 @@ export const api = {
   setKeyEnabled: (id, enabled) => req('PUT', '/keys/' + id, { enabled }),
   deleteKey: id => req('DELETE', '/keys/' + id),
   // 监控项（渠道+模型，主动探测）
-  monitors: () => req('GET', '/monitors'),
+  monitors: () => req('GET', '/monitors', undefined, HEAVY_REQUEST_TIMEOUT_MS),
   createMonitor: m => req('POST', '/monitors', m),
   updateMonitor: (id, m) => req('PUT', '/monitors/' + id, m),
   deleteMonitor: id => req('DELETE', '/monitors/' + id),

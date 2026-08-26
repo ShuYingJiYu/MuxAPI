@@ -66,7 +66,15 @@ func (s *Store) OverviewUsageCost(fromAt, toAt int64) (OverviewCostEstimate, err
 	}
 
 	// SQLite tests use a single connection, so release the aggregate cursor
-	// before looking up prices for each model.
+	// before loading the complete price set.
+	models := make([]string, 0, len(usages))
+	for _, usage := range usages {
+		models = append(models, usage.Model)
+	}
+	prices, err := s.listModelPricing(models)
+	if err != nil {
+		return estimate, err
+	}
 	var amount float64
 	for _, usage := range usages {
 		estimate.RequestCount += usage.RequestCount
@@ -74,12 +82,9 @@ func (s *Store) OverviewUsageCost(fromAt, toAt int64) (OverviewCostEstimate, err
 		if eligible <= 0 {
 			continue
 		}
-		price, err := s.LookupModelPricing(usage.Model)
-		if errors.Is(err, sql.ErrNoRows) {
+		price, found := lookupModelPricing(prices, usage.Model)
+		if !found {
 			continue
-		}
-		if err != nil {
-			return estimate, err
 		}
 		cost, complete := usageListCost(usage, price)
 		if !complete {

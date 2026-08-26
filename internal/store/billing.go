@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"errors"
 	"math"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -291,29 +293,42 @@ func usageListCost(usage BillingWindowUsage, price ModelPricing) (float64, bool)
 // 只影响价目核对轨道，计费核对（实际扣费 vs 上游自报原价×倍率）完全不依赖它。
 // 早期版本在这里直接判 unavailable，导致上游账目明明精确吻合却什么结论都不给。
 func (s *Store) applyLocalPricing(audit *BillingAudit, upstreamID int64) error {
-	status, err := s.GetPricingCatalogStatus()
-	if err == nil {
-		audit.PricingSource = status.Source
-		audit.PricingVersion = status.Version
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
+	status, statusErr := s.GetPricingCatalogStatus()
 	usageGroups, err := s.ListBillingWindowUsage(upstreamID, audit.FromAt, audit.ToAt)
 	if err != nil {
 		return err
+	}
+	models := make([]string, 0, len(usageGroups))
+	for _, usage := range usageGroups {
+		models = append(models, usage.Model)
+	}
+	prices, err := s.listModelPricing(models)
+	if err != nil {
+		return err
+	}
+	return applyLocalPricingData(audit, status, statusErr, usageGroups, prices)
+}
+
+// applyLocalPricingData keeps the audit calculation independent from the way
+// usage and prices were loaded. The batch path uses this to avoid one query per
+// upstream and one query per model.
+func applyLocalPricingData(audit *BillingAudit, status PricingCatalogStatus, statusErr error,
+	usageGroups []BillingWindowUsage, prices map[string]ModelPricing) error {
+	if statusErr == nil {
+		audit.PricingSource = status.Source
+		audit.PricingVersion = status.Version
+	} else if !errors.Is(statusErr, sql.ErrNoRows) {
+		return statusErr
 	}
 	var listCost float64
 	for _, usage := range usageGroups {
 		audit.RequestCount += usage.RequestCount
 		audit.MissingUsageCount += usage.MissingUsageCount
 		eligibleRequests := usage.RequestCount - usage.MissingUsageCount
-		price, lookupErr := s.LookupModelPricing(usage.Model)
-		if lookupErr != nil {
-			if errors.Is(lookupErr, sql.ErrNoRows) {
-				audit.MissingModels = appendMissingModel(audit.MissingModels, usage.Model)
-				continue
-			}
-			return lookupErr
+		price, found := lookupModelPricing(prices, usage.Model)
+		if !found {
+			audit.MissingModels = appendMissingModel(audit.MissingModels, usage.Model)
+			continue
 		}
 		cost, complete := usageListCost(usage, price)
 		if !complete {
@@ -341,16 +356,87 @@ func (s *Store) applyLocalPricing(audit *BillingAudit, upstreamID int64) error {
 	return nil
 }
 
+func lookupModelPricing(prices map[string]ModelPricing, model string) (ModelPricing, bool) {
+	for _, candidate := range pricingModelCandidates(model) {
+		if price, ok := prices[candidate]; ok {
+			return price, true
+		}
+	}
+	return ModelPricing{}, false
+}
+
+// listModelPricing loads all candidates needed by one audit batch in a single
+// round trip. Candidate ordering is still resolved in lookupModelPricing, so
+// exact model matches keep precedence over provider and bare-name fallbacks.
+func (s *Store) listModelPricing(models []string) (map[string]ModelPricing, error) {
+	seen := make(map[string]struct{})
+	var candidates []string
+	for _, model := range models {
+		for _, candidate := range pricingModelCandidates(model) {
+			if _, ok := seen[candidate]; ok {
+				continue
+			}
+			seen[candidate] = struct{}{}
+			candidates = append(candidates, candidate)
+		}
+	}
+	prices := make(map[string]ModelPricing, len(candidates))
+	if len(candidates) == 0 {
+		return prices, nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(candidates)), ",")
+	rows, err := s.db.Query(`SELECT model,input_cost_per_token,output_cost_per_token,
+		cache_read_input_token_cost,cache_creation_input_token_cost
+		FROM model_pricing WHERE model IN (`+placeholders+`)`, stringSliceToAny(candidates)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var price ModelPricing
+		if err := rows.Scan(&price.Model, &price.InputCostPerToken, &price.OutputCostPerToken,
+			&price.CacheReadInputTokenCost, &price.CacheWriteInputTokenCost); err != nil {
+			return nil, err
+		}
+		prices[price.Model] = price
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return prices, nil
+}
+
+func stringSliceToAny(values []string) []any {
+	args := make([]any, len(values))
+	for i, value := range values {
+		args[i] = value
+	}
+	return args
+}
+
 func (s *Store) billingAuditFromSnapshots(snapshots []BillingSnapshot) BillingAudit {
 	audit := billingAuditBaseFromSnapshots(snapshots)
-	if status, err := s.GetPricingCatalogStatus(); err == nil {
+	status, statusErr := s.GetPricingCatalogStatus()
+	if statusErr == nil {
 		audit.PricingSource = status.Source
 		audit.PricingVersion = status.Version
 	}
 	if len(snapshots) < 2 {
 		return audit
 	}
-	if err := s.applyLocalPricing(&audit, snapshots[0].UpstreamID); err != nil {
+	usageGroups, err := s.ListBillingWindowUsage(snapshots[0].UpstreamID, audit.FromAt, audit.ToAt)
+	if err == nil {
+		models := make([]string, 0, len(usageGroups))
+		for _, usage := range usageGroups {
+			models = append(models, usage.Model)
+		}
+		var prices map[string]ModelPricing
+		prices, err = s.listModelPricing(models)
+		if err == nil {
+			err = applyLocalPricingData(&audit, status, statusErr, usageGroups, prices)
+		}
+	}
+	if err != nil {
 		audit.Status = "unavailable"
 		audit.Reason = "pricing_query_failed"
 		return audit
@@ -376,14 +462,7 @@ func scanBillingSnapshot(scanner interface{ Scan(...any) error }) (BillingSnapsh
 }
 
 func (s *Store) latestBillingAudits() (map[int64]BillingAudit, error) {
-	query := `SELECT id,upstream_id,currency,remaining,unlimited,billing_group,group_multiplier,
-		effective_multiplier,reported_list_cost,reported_actual_cost,observed_unix FROM (
-			SELECT id,upstream_id,currency,remaining,unlimited,billing_group,group_multiplier,
-				effective_multiplier,reported_list_cost,reported_actual_cost,` +
-		s.billingTimeExpr("observed_at") + ` AS observed_unix,
-				ROW_NUMBER() OVER (PARTITION BY upstream_id ORDER BY observed_at DESC,id DESC) AS snapshot_rank
-			FROM upstream_billing_snapshots
-		) ranked WHERE snapshot_rank<=2 ORDER BY upstream_id,snapshot_rank`
+	query := s.latestBillingAuditsQuery()
 	rows, err := s.db.Query(query)
 	if err != nil {
 		return nil, err
@@ -400,11 +479,124 @@ func (s *Store) latestBillingAudits() (map[int64]BillingAudit, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	windows := make(map[int64]billingAuditWindow)
+	for upstreamID, snapshots := range byUpstream {
+		if len(snapshots) >= 2 {
+			windows[upstreamID] = billingAuditWindow{FromAt: snapshots[1].ObservedAt, ToAt: snapshots[0].ObservedAt}
+		}
+	}
+	status, statusErr := s.GetPricingCatalogStatus()
+	usageByUpstream, usageErr := s.listBillingWindowUsageBatch(windows)
+	var models []string
+	for _, usages := range usageByUpstream {
+		for _, usage := range usages {
+			models = append(models, usage.Model)
+		}
+	}
+	prices, pricingErr := s.listModelPricing(models)
 	audits := make(map[int64]BillingAudit, len(byUpstream))
 	for upstreamID, snapshots := range byUpstream {
-		audits[upstreamID] = s.billingAuditFromSnapshots(snapshots)
+		audit := billingAuditBaseFromSnapshots(snapshots)
+		if statusErr == nil {
+			audit.PricingSource = status.Source
+			audit.PricingVersion = status.Version
+		}
+		if len(snapshots) >= 2 {
+			if usageErr != nil {
+				audit.Status = "unavailable"
+				audit.Reason = "pricing_query_failed"
+			} else if pricingErr != nil {
+				audit.Status = "unavailable"
+				audit.Reason = "pricing_query_failed"
+			} else if err := applyLocalPricingData(&audit, status, statusErr,
+				usageByUpstream[upstreamID], prices); err != nil {
+				audit.Status = "unavailable"
+				audit.Reason = "pricing_query_failed"
+			} else {
+				latestMultiplier := snapshotMultiplier(snapshots[0])
+				previousMultiplier := snapshotMultiplier(snapshots[1])
+				if latestMultiplier != nil && previousMultiplier != nil &&
+					math.Abs(*previousMultiplier-*latestMultiplier) > 1e-9 {
+					audit.MultiplierChanged = true
+				}
+				audit.SnapshotCount = len(snapshots)
+				evaluateBillingAudit(&audit, latestMultiplier)
+			}
+		}
+		audits[upstreamID] = audit
 	}
 	return audits, nil
+}
+
+type billingAuditWindow struct {
+	FromAt int64
+	ToAt   int64
+}
+
+// listBillingWindowUsageBatch combines all audit windows into one aggregate
+// query. This removes the per-upstream network round trips in ListBillingStatuses.
+func (s *Store) listBillingWindowUsageBatch(windows map[int64]billingAuditWindow) (map[int64][]BillingWindowUsage, error) {
+	out := make(map[int64][]BillingWindowUsage)
+	if len(windows) == 0 {
+		return out, nil
+	}
+	protocolExpr := `COALESCE(NULLIF(a.protocol,''),u.protocol,'')`
+	outcomes := "'success','partial'"
+	if billingCountsCanceled {
+		outcomes = "'success','partial','canceled'"
+	}
+	clauses := make([]string, 0, len(windows))
+	args := make([]any, 0, len(windows)*3)
+	ids := make([]int64, 0, len(windows))
+	for upstreamID := range windows {
+		ids = append(ids, upstreamID)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, upstreamID := range ids {
+		window := windows[upstreamID]
+		clauses = append(clauses, `(a.upstream_id=? AND a.completed_at>? AND a.completed_at<=?)`)
+		args = append(args, upstreamID, s.timeValue(time.Unix(window.FromAt, 0)), s.timeValue(time.Unix(window.ToAt, 0)))
+	}
+	query := `SELECT a.upstream_id,r.model,` + protocolExpr + `,COUNT(*),
+		COALESCE(SUM(CASE WHEN (a.input_tokens=0 AND a.output_tokens=0 AND a.cached_tokens=0
+			AND a.cache_creation_tokens=0) OR (a.outcome<>'success' AND a.output_tokens=0)
+			THEN 1 ELSE 0 END),0),COALESCE(SUM(a.input_tokens),0),
+		COALESCE(SUM(a.output_tokens),0),COALESCE(SUM(a.cached_tokens),0),
+		COALESCE(SUM(a.cache_creation_tokens),0)
+		FROM request_attempts a
+		JOIN requests r ON r.request_id=a.request_id
+		LEFT JOIN upstreams u ON u.id=a.upstream_id
+		WHERE a.outcome IN (` + outcomes + `) AND (` + strings.Join(clauses, " OR ") + `)
+		GROUP BY a.upstream_id,r.model,` + protocolExpr + ` ORDER BY a.upstream_id,r.model`
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var upstreamID int64
+		var usage BillingWindowUsage
+		if err := rows.Scan(&upstreamID, &usage.Model, &usage.Protocol, &usage.RequestCount,
+			&usage.MissingUsageCount, &usage.InputTokens, &usage.OutputTokens,
+			&usage.CachedTokens, &usage.CacheCreationTokens); err != nil {
+			return nil, err
+		}
+		out[upstreamID] = append(out[upstreamID], usage)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) latestBillingAuditsQuery() string {
+	// 先按全表窗口计算每个渠道的最近两条快照。生产库的实际执行计划
+	// 对该形态明显优于逐渠道 LATERAL 扫描，尤其是在索引未及时建立时。
+	return `SELECT id,upstream_id,currency,remaining,unlimited,billing_group,group_multiplier,
+		effective_multiplier,reported_list_cost,reported_actual_cost,observed_unix FROM (
+			SELECT id,upstream_id,currency,remaining,unlimited,billing_group,group_multiplier,
+				effective_multiplier,reported_list_cost,reported_actual_cost,` +
+		s.billingTimeExpr("observed_at") + ` AS observed_unix,
+				ROW_NUMBER() OVER (PARTITION BY upstream_id ORDER BY observed_at DESC,id DESC) AS snapshot_rank
+			FROM upstream_billing_snapshots
+		) ranked WHERE snapshot_rank<=2 ORDER BY upstream_id,snapshot_rank`
 }
 
 // GetBillingStatus returns the latest state. A missing row is reported as sql.ErrNoRows.
@@ -428,6 +620,17 @@ func (s *Store) GetBillingStatus(upstreamID int64) (BillingStatus, error) {
 
 // ListBillingStatuses returns the latest state indexed by upstream ID.
 func (s *Store) ListBillingStatuses() (map[int64]BillingStatus, error) {
+	return s.listBillingStatuses(false)
+}
+
+// ListBillingStatusesLite returns current billing states without historical
+// audit calculation. It is used by the overview, where the latest balance is
+// enough and the audit window can be loaded only on the upstream detail page.
+func (s *Store) ListBillingStatusesLite() (map[int64]BillingStatus, error) {
+	return s.listBillingStatuses(true)
+}
+
+func (s *Store) listBillingStatuses(skipAudits bool) (map[int64]BillingStatus, error) {
 	query := `SELECT upstream_id,currency,remaining,unlimited,billing_group,group_multiplier,effective_multiplier,
 		reported_list_cost,reported_actual_cost,status,error_text,` +
 		s.billingTimeExpr("observed_at") + `,` + s.billingTimeExpr("last_success_at") + `,` +
@@ -447,6 +650,9 @@ func (s *Store) ListBillingStatuses() (map[int64]BillingStatus, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	if skipAudits {
+		return out, nil
 	}
 	audits, err := s.latestBillingAudits()
 	if err != nil {

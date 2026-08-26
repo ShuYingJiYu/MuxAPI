@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -103,6 +104,14 @@ func TestBillingStatusAndSnapshots(t *testing.T) {
 	statuses, err := st.ListBillingStatuses()
 	if err != nil || statuses[u.ID].Status != "error" {
 		t.Fatalf("unexpected billing status map: %+v, err=%v", statuses, err)
+	}
+}
+
+func TestLatestBillingAuditsPostgresQueryUsesBoundedLookup(t *testing.T) {
+	st := &Store{db: &dbAdapter{postgres: true}}
+	query := st.latestBillingAuditsQuery()
+	if !strings.Contains(query, "ROW_NUMBER()") || !strings.Contains(query, "snapshot_rank<=2") {
+		t.Fatalf("latest audit query must keep only the newest two snapshots: %s", query)
 	}
 }
 

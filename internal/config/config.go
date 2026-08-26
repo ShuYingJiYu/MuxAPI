@@ -36,6 +36,7 @@ type Config struct {
 	Addr          string        // 监听地址
 	DatabaseURL   string        // PostgreSQL 连接串
 	AdminToken    string        // 接入层鉴权 token（sub2api upstream key）
+	ReadOnly      bool          // 只读调试模式：不迁移、不写库、不启动后台写任务
 	FailThreshold int           // 连续失败多少次熔断
 	Cooldown      time.Duration // 熔断冷却时长
 	MaxRetries    int           // 单次下游请求最多尝试的上游数
@@ -49,6 +50,7 @@ func Load() *Config {
 		Addr:          env("MUXAPI_ADDR", ":8080"),
 		DatabaseURL:   env("MUXAPI_DATABASE_URL", ""),
 		AdminToken:    env("MUXAPI_TOKEN", ""),
+		ReadOnly:      envBool("MUXAPI_READ_ONLY", false),
 		FailThreshold: envInt("MUXAPI_FAIL_THRESHOLD", 3),
 		Cooldown:      envDur("MUXAPI_COOLDOWN", 30*time.Second),
 		MaxRetries:    envInt("MUXAPI_MAX_RETRIES", 6),
@@ -76,6 +78,18 @@ func envInt64(k string, def int64) int64 {
 		return v
 	}
 	return def
+}
+
+func envBool(k string, def bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(k)))
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
 }
 
 func envDur(k string, def time.Duration) time.Duration {

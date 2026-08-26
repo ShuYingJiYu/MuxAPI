@@ -52,7 +52,12 @@ func (s *Server) adminUpstreams(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		billingStates, err := s.store.ListBillingStatuses()
+		var billingStates map[int64]store.BillingStatus
+		if r.URL.Query().Get("view") == "overview" {
+			billingStates, err = s.store.ListBillingStatusesLite()
+		} else {
+			billingStates, err = s.store.ListBillingStatuses()
+		}
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return

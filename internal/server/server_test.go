@@ -303,3 +303,38 @@ func TestAdminAuthRejectsWrongToken(t *testing.T) {
 		t.Fatalf("x-api-key 正确 token 不应 401")
 	}
 }
+
+func TestReadOnlyRejectsMutatingRequests(t *testing.T) {
+	st, _ := store.Open(":memory:")
+	defer st.Close()
+	hm := health.New(1, time.Hour)
+	sched := scheduler.New(func(int64) []*upstream.Upstream { return nil }, hm)
+	fwd := forward.New(sched, hm, 3)
+
+	srv := New(fwd, "admin-token", st, hm, monitor.New(st), nil, 32<<20)
+	srv.SetReadOnly(true)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	request, _ := http.NewRequest(http.MethodPost, ts.URL+"/admin/groups", strings.NewReader(`{"name":"blocked"}`))
+	request.Header.Set("Authorization", "Bearer admin-token")
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusLocked {
+		t.Fatalf("read-only admin mutation status = %d, want %d", response.StatusCode, http.StatusLocked)
+	}
+
+	forwardRequest, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/messages", strings.NewReader(`{}`))
+	forwardResponse, err := http.DefaultClient.Do(forwardRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forwardResponse.Body.Close()
+	if forwardResponse.StatusCode != http.StatusLocked {
+		t.Fatalf("read-only forwarding status = %d, want %d", forwardResponse.StatusCode, http.StatusLocked)
+	}
+}

@@ -49,6 +49,7 @@ type Server struct {
 	maxBody         int64 // 请求体字节上限（<=0 表示不限制）
 	maxBodyProvider func() int64
 	settingsChanged func()
+	readOnly        bool
 
 	modelMu     sync.Mutex                // 保护 modelCache 与 modelFlight
 	modelCache  map[int64]modelCacheEntry // 按 upstream_id 缓存其 /v1/models 结果，TTL=modelsTTL
@@ -71,6 +72,9 @@ func (s *Server) SetBackupService(svc *backup.Service) { s.backupSvc = svc }
 // SetMaxBodyProvider supplies the current request body limit without requiring
 // a process restart after a settings update.
 func (s *Server) SetMaxBodyProvider(provider func() int64) { s.maxBodyProvider = provider }
+
+// SetReadOnly disables mutating API calls for local inspection of a remote database.
+func (s *Server) SetReadOnly(readOnly bool) { s.readOnly = readOnly }
 
 // SetSettingsChanged registers the runtime policy refresh hook used after the
 // admin settings endpoint persists a new breaker policy.
@@ -176,6 +180,10 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 		}
+		if s.readOnly && r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "read-only mode", http.StatusLocked)
+			return
+		}
 		next(w, r)
 	}
 }
@@ -233,6 +241,10 @@ func requestUserAgent(r *http.Request) string {
 
 // messages 转发入口：按接入 key 找到分组，在组内调度转发。
 func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
+	if s.readOnly {
+		http.Error(w, "read-only mode", http.StatusLocked)
+		return
+	}
 	started := time.Now()
 	requestID := uuid.NewString()
 	w.Header().Set("X-Request-ID", requestID)

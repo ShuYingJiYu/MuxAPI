@@ -1,6 +1,5 @@
 <script setup>
-// uptime 状态栅栏：trend 采样渲染成一排竖条，按状态染色。
-// 不足 cap 根时左侧用「无数据」灰条补齐，宽度恒定（PAST → NOW）。
+// uptime 梭子时间带：每格代表一小时，梭子高度表示请求量，颜色表示成功率状态。
 import { computed } from 'vue'
 
 const props = defineProps({
@@ -9,7 +8,7 @@ const props = defineProps({
   unit: { type: String, default: '请求' },   // 计数口径文案：分组="请求"，监控="探测"
 })
 
-const COLORS = { 0: 'var(--g200)', 1: '#10b981', 2: '#f59e0b', 3: '#ef4444' }
+const COLORS = { 0: 'var(--g100)', 1: '#68bfae', 2: '#d9b463', 3: '#e18495' }
 const LABEL = { 0: '无数据', 1: '正常', 2: '降级', 3: '熔断' }
 
 // 固定输出 cap 个格子，避免不同数据量导致卡片宽度变化。
@@ -17,13 +16,20 @@ const bars = computed(() => {
   const pts = props.trend.slice(-props.cap)
   const pad = Math.max(0, props.cap - pts.length)
   const all = [...Array(pad).fill({ status: 0, _pad: true }), ...pts]
-  return all.map((b) => ({ ...b, tip: tip(b) })) // 预计算 tooltip，模板只读不重算
+  const maxTotal = Math.max(0, ...all.map((point) => Number(point.total) || 0))
+  return all.map((b) => ({
+    ...b,
+    height: b._pad || (Number(b.total) || 0) <= 0
+      ? 0
+      : Math.max(7, Math.round(Math.sqrt(Number(b.total) / maxTotal) * 30)),
+    tip: tip(b),
+  })) // 预计算梭子高度和 tooltip，模板只读不重算
 })
 
 // 该格代表的小时区间 "HH:MM–HH:MM"（ts 为整点起始）
-function hourRange(ts) {
+function hourRange(ts, endTs) {
   const a = new Date(ts * 1000)
-  const b = new Date((ts + 3600) * 1000)
+  const b = new Date((endTs || ts + 3600) * 1000)
   const hm = (d) => `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
   return `${hm(a)}–${hm(b)}`
 }
@@ -31,7 +37,7 @@ function hourRange(ts) {
 // tooltip 结构化内容：标题(时间段+状态) + 明细行 + 成功率
 function tip(b) {
   if (b._pad || !b.ts) return { title: '无数据', rows: [] }
-  const t = { title: hourRange(b.ts), label: LABEL[b.status] || '', status: b.status, rows: [] }
+  const t = { title: hourRange(b.ts, b.end_ts), label: LABEL[b.status] || '', status: b.status, rows: [] }
   if (b.total > 0) {
     const succ = b.succ != null ? b.succ : Math.round(b.total * (b.succ_rate || 0))
     t.rows.push(`${b.total} 次${props.unit}，${succ} 次成功`)
@@ -47,7 +53,7 @@ function tip(b) {
   <div class="fence">
     <div class="fence-bars">
       <span v-for="(b, i) in bars" :key="i" class="bar-wrap">
-        <span class="bar" :style="{ background: COLORS[b.status] }" />
+        <span class="bar" :class="{ empty: !b.height }" :style="{ height: `${b.height}px`, background: COLORS[b.status] }" />
         <span class="tip" :data-edge="i < 4 ? 'l' : (i > bars.length - 5 ? 'r' : '')">
           <span class="tip-head">
             <i class="tip-dot" :style="{ background: COLORS[b.tip.status ?? 0] }" />
@@ -59,16 +65,21 @@ function tip(b) {
         </span>
       </span>
     </div>
-    <div class="fence-axis"><span>较早</span><span>现在</span></div>
   </div>
 </template>
 
 <style scoped>
-.fence { margin: 14px 0 2px; }
-.fence-bars { display: flex; gap: 4px; align-items: stretch; height: 36px; }
-.bar-wrap { position: relative; flex: 1; min-width: 0; display: flex; }
-.bar { flex: 1; border-radius: 3px; transition: opacity .12s; }
-.bar-wrap:hover .bar { opacity: .6; }
+.fence { margin: 14px 0 10px; }
+.fence-bars { display: flex; align-items: flex-end; gap: 2px; height: 34px; padding-inline: 1px; }
+.bar-wrap { position: relative; flex: 1; min-width: 0; height: 32px; display: flex; align-items: flex-end; justify-content: center; }
+.bar {
+  flex: none; width: 7px; border-radius: 1px; opacity: .9;
+  clip-path: polygon(50% 0, 100% 18%, 100% 82%, 50% 100%, 0 82%, 0 18%);
+  transform-origin: center bottom;
+  transition: transform .12s ease, opacity .12s;
+}
+.bar.empty { display: none; }
+.bar-wrap:hover .bar { transform: scaleX(1.25); opacity: 1; }
 
 /* 自定义 tooltip：默认隐藏，hover 格子时上方弹出 */
 .tip {
@@ -101,5 +112,4 @@ function tip(b) {
 .tip-rate { color: rgba(255, 255, 255, .82); }
 .tip-rate b { color: #fff; font-weight: 600; }
 
-.fence-axis { display: flex; justify-content: space-between; font-size: 10px; color: var(--g400); margin-top: 5px; letter-spacing: .03em; }
 </style>

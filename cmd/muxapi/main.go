@@ -34,7 +34,7 @@ func main() {
 		slog.Warn("MUXAPI_TOKEN 未设置：管理后台无鉴权，切勿对外暴露")
 	}
 
-	st, err := store.Open(cfg.DatabaseURL)
+	st, err := store.OpenWithOptions(cfg.DatabaseURL, store.OpenOptions{ReadOnly: cfg.ReadOnly})
 	if err != nil {
 		slog.Error("open store failed", "err", err)
 		return
@@ -53,13 +53,15 @@ func main() {
 		"max_upstream_attempts": strconv.Itoa(initialMaxAttempts),
 		"max_body_bytes":        strconv.FormatInt(cfg.MaxBody, 10),
 	}
-	for key, value := range runtimeDefaults {
-		if st.GetSetting(key, "") != "" {
-			continue
-		}
-		if err := st.SetSetting(key, value); err != nil {
-			slog.Error("seed runtime setting failed", "key", key, "err", err)
-			return
+	if !cfg.ReadOnly {
+		for key, value := range runtimeDefaults {
+			if st.GetSetting(key, "") != "" {
+				continue
+			}
+			if err := st.SetSetting(key, value); err != nil {
+				slog.Error("seed runtime setting failed", "key", key, "err", err)
+				return
+			}
 		}
 	}
 	settingDuration := func(key string, def time.Duration) func() time.Duration {
@@ -159,6 +161,7 @@ func main() {
 	var maxBodyValue atomic.Int64
 	maxBodyValue.Store(maxBodyBytes())
 	srv := server.New(fwd, cfg.AdminToken, st, hm, mon, monProber, maxBodyValue.Load())
+	srv.SetReadOnly(cfg.ReadOnly)
 	srv.SetVersion(Version)
 	srv.SetMaxBodyProvider(maxBodyValue.Load)
 	srv.SetSettingsChanged(func() {
@@ -175,31 +178,35 @@ func main() {
 	// 后台 goroutine 用 WaitGroup 跟踪：Shutdown 后等它们退出再 st.Close()，
 	// 消除退出期探测/清理仍在写库而 DB 已关的竞态。
 	var wg sync.WaitGroup
-	// 监控项级主动探测：记看板(成功率/延迟/趋势) + 驱动路由熔断器。
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		monProber.Run(ctx)
-	}()
-	// Provider billing collection is low-frequency and isolated from forwarding.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		billingMgr.Run(ctx)
-	}()
-	// Backup scheduler: runs cron jobs and waits for ctx cancellation.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		backupSvc.Run(ctx)
-	}()
-	// 请求审计按天保留，默认 7 天；每 10 分钟分批删除过期请求及其尝试链。
-	requestRetentionDays := settingInt("request_retention_days", 7)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		runLogJanitor(ctx, st, requestRetentionDays)
-	}()
+	if !cfg.ReadOnly {
+		// 监控、计费、备份和清理任务都会写库；只读调试模式全部停用。
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			monProber.Run(ctx)
+		}()
+		// Provider billing collection is low-frequency and isolated from forwarding.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			billingMgr.Run(ctx)
+		}()
+		// Backup scheduler: runs cron jobs and waits for ctx cancellation.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			backupSvc.Run(ctx)
+		}()
+		// 请求审计按天保留，默认 7 天；每 10 分钟分批删除过期请求及其尝试链。
+		requestRetentionDays := settingInt("request_retention_days", 7)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runLogJanitor(ctx, st, requestRetentionDays)
+		}()
+	} else {
+		slog.Info("read-only mode enabled: background writers disabled")
+	}
 
 	// 防 slowloris：仅限制读 header 的时长，不设全局 ReadTimeout——
 	// 否则会误杀慢上传/流式上传。MaxHeaderBytes 限制 header 体积。

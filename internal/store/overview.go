@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -113,16 +114,31 @@ func (s *Store) overviewTrends(groupID, tagID int64, window OverviewTrendWindow,
 	for _, item := range billingUpstreams {
 		upstreamIDs = append(upstreamIDs, item.ID)
 	}
-	snapshots, err := s.overviewBillingSnapshots(upstreamIDs)
-	if err != nil {
-		return nil, err
+	// 两个趋势查询互不依赖：并行执行可减少远程数据库往返的串行等待。
+	var (
+		snapshots               []BillingSnapshot
+		success                 []OverviewSuccessPoint
+		snapshotErr, successErr error
+		wg                      sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		snapshots, snapshotErr = s.overviewBillingSnapshots(upstreamIDs, start, end)
+	}()
+	go func() {
+		defer wg.Done()
+		success, successErr = s.overviewSuccessTrend(groupID, tagID, start, pointCount, window.Bucket)
+	}()
+	wg.Wait()
+	if snapshotErr != nil {
+		return nil, snapshotErr
+	}
+	if successErr != nil {
+		return nil, successErr
 	}
 	balances, unlimited := aggregateOverviewBalances(snapshots, billingUpstreams, start, pointCount, window.Bucket)
 	upstreamBalances := aggregateOverviewUpstreamBalances(snapshots, billingUpstreams, start, pointCount, window.Bucket)
-	success, err := s.overviewSuccessTrend(groupID, tagID, start, pointCount, window.Bucket)
-	if err != nil {
-		return nil, err
-	}
 	return &OverviewTrends{
 		Window: window.Key, GroupID: groupID, TagID: tagID, FromAt: start.Unix(), ToAt: end.Unix(),
 		BucketSeconds: int64(window.Bucket / time.Second), UpstreamCount: len(upstreamIDs),
@@ -162,19 +178,42 @@ func (s *Store) overviewBillingUpstreams(groupID, tagID int64) ([]overviewBillin
 	return upstreams, rows.Err()
 }
 
-func (s *Store) overviewBillingSnapshots(upstreamIDs []int64) ([]BillingSnapshot, error) {
+func (s *Store) overviewBillingSnapshots(upstreamIDs []int64, start, end time.Time) ([]BillingSnapshot, error) {
 	if len(upstreamIDs) == 0 {
 		return []BillingSnapshot{}, nil
 	}
 	placeholders := strings.TrimRight(strings.Repeat("?,", len(upstreamIDs)), ",")
-	args := make([]any, len(upstreamIDs))
-	for index, id := range upstreamIDs {
-		args[index] = id
+	// 只取窗口内的快照，以及窗口起点之前每个渠道最后一条快照。
+	// 后者用于在窗口第一格延续余额，避免读取整张历史表。
+	columns := `id,upstream_id,currency,remaining,unlimited,billing_group,group_multiplier,
+		effective_multiplier,reported_list_cost,reported_actual_cost,` + s.billingTimeExpr("observed_at") + ` AS observed_at`
+	query := `WITH before_window AS (
+		SELECT ` + columns + `,
+			ROW_NUMBER() OVER (PARTITION BY upstream_id ORDER BY observed_at DESC,id DESC) AS snapshot_rank
+		FROM upstream_billing_snapshots
+		WHERE upstream_id IN (` + placeholders + `) AND observed_at<=?
+	), selected AS (
+		SELECT id,upstream_id,currency,remaining,unlimited,billing_group,group_multiplier,
+			effective_multiplier,reported_list_cost,reported_actual_cost,observed_at
+		FROM before_window WHERE snapshot_rank=1
+		UNION ALL
+		SELECT ` + columns + `
+		FROM upstream_billing_snapshots
+		WHERE upstream_id IN (` + placeholders + `) AND observed_at>? AND observed_at<=?
+	)
+	SELECT id,upstream_id,currency,remaining,unlimited,billing_group,group_multiplier,
+		effective_multiplier,reported_list_cost,reported_actual_cost,observed_at
+	FROM selected ORDER BY observed_at ASC,id ASC`
+	queryArgs := make([]any, 0, len(upstreamIDs)*2+2)
+	for _, id := range upstreamIDs {
+		queryArgs = append(queryArgs, id)
 	}
-	query := `SELECT id,upstream_id,currency,remaining,unlimited,billing_group,group_multiplier,
-		effective_multiplier,reported_list_cost,reported_actual_cost,` + s.billingTimeExpr("observed_at") +
-		` FROM upstream_billing_snapshots WHERE upstream_id IN (` + placeholders + `) ORDER BY observed_at ASC,id ASC`
-	rows, err := s.db.Query(query, args...)
+	queryArgs = append(queryArgs, s.timeValue(start))
+	for _, id := range upstreamIDs {
+		queryArgs = append(queryArgs, id)
+	}
+	queryArgs = append(queryArgs, s.timeValue(start), s.timeValue(end))
+	rows, err := s.db.Query(query, queryArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -321,8 +360,8 @@ func (s *Store) overviewSuccessTrend(groupID, tagID int64, start time.Time, poin
 	buckets := make(map[int64]aggregate, pointCount)
 	seconds := int64(bucket / time.Second)
 	query := fmt.Sprintf(`SELECT %s AS bucket,COUNT(*),COALESCE(SUM(CASE WHEN outcome='success' THEN 1 ELSE 0 END),0)
-		FROM requests WHERE created_at>=?`, s.bucketExpr("created_at", seconds))
-	args := []any{s.timeValue(start)}
+		FROM requests WHERE created_at>=? AND created_at<=?`, s.bucketExpr("created_at", seconds))
+	args := []any{s.timeValue(start), s.timeValue(start.Add(time.Duration(pointCount-1) * bucket))}
 	if groupID > 0 {
 		query += ` AND group_id=?`
 		args = append(args, groupID)

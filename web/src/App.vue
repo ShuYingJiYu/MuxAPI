@@ -63,6 +63,7 @@ let overviewTrendEpoch = 0
 
 async function loadGroups() { groups.value = (await api.groups()) || [] }
 async function loadUpstreams() { upstreams.value = (await api.upstreams()) || [] }
+async function loadOverviewUpstreams() { upstreams.value = (await api.overviewUpstreams()) || [] }
 async function loadMonitors() { monitors.value = (await api.monitors()) || [] }
 async function loadTags() { tags.value = (await api.tags()) || [] }
 
@@ -124,13 +125,14 @@ async function loadOverview() {
   overviewLoading.value = true
   const since = Math.floor(Date.now() / 1000) - 24 * 60 * 60
   try {
-    const [list, monitorList, stats, tagList] = await Promise.all([
-      api.upstreams(), api.monitors(), api.logStats({ since }), api.tags(),
+    // 统计与标签很快返回，先结束页面级加载；上游和监控列表经远程库查询，完成后再渐进填充。
+    const [stats, tagList] = await Promise.all([
+      api.logStats({ since }), api.tags(),
     ])
-    upstreams.value = list || []
-    monitors.value = monitorList || []
-    tags.value = tagList || []
     overviewStats.value = stats || {}
+    tags.value = tagList || []
+    void loadOverviewUpstreams().catch(() => {})
+    void loadMonitors().catch(() => {})
     // 趋势查询较重，不阻塞总览基础内容显示；趋势区域保留自己的加载状态。
     void loadOverviewTrends()
     void loadOverviewSummary()
@@ -1221,20 +1223,24 @@ const rtRate = h => (h && h.reqs) ? (h.succ_rate * 100).toFixed(0) + '%' : '—'
 const mhClass = mh => mh?.state === 'UNSUPPORTED' ? 'open' : 'nodata'
 const visibleDots = item => item?.model_health || []
 
-// 分组卡片：生效渠道文本 + 健康概览文本
+// 分组卡片：只展示路由摘要；完整成员名称在分组详情页查看。
 const effText = rt => (rt && rt.effective && rt.effective.length) ? rt.effective.join(' / ') : '无可用'
+const groupRouteState = rt => {
+  if (!rt || !rt.total) return { key: 'empty', label: '无可用渠道', detail: '没有启用成员' }
+  if (!rt.effective?.length) return { key: 'down', label: '无可用渠道', detail: '当前没有可路由成员' }
+  const issues = []
+  if (rt.open) issues.push(`${rt.open} 个熔断`)
+  if (rt.half_open) issues.push(`${rt.half_open} 个半开`)
+  if (rt.multiplier_blocked) issues.push(`${rt.multiplier_blocked} 个倍率拦截`)
+  if (issues.length) return { key: 'partial', label: '部分可用', detail: `生效 ${rt.effective.length} 个渠道 · ${issues.join(' · ')}` }
+  return { key: 'ok', label: '可路由', detail: `生效 ${rt.effective.length} 个渠道` }
+}
+const resourceWidth = (enabled, total) => total ? `${Math.max(3, Math.min(100, (Number(enabled) || 0) / Number(total) * 100))}%` : '0%'
 // 分组卡片成功率数值配色，阈值与栅栏一致：绿≥95 / 黄≥80 / 红<80
 function rateClass(g) {
   if (!g.recent_total) return 'rate-none'
   const r = Number(g.success_rate) || 0
   return r >= 95 ? 'rate-ok' : r >= 80 ? 'rate-warn' : 'rate-bad'
-}
-const healthSummary = rt => {
-  if (!rt || !rt.total) return '无成员'
-  const parts = [`${rt.normal} 正常`]
-  if (rt.half_open) parts.push(`${rt.half_open} 半开`)
-  if (rt.open) parts.push(`${rt.open} 熔断`)
-  return parts.join(' · ')
 }
 const upName = id => upstreams.value.find(u => u.id === id)?.name || ('#' + id)
 const monTitle = m => m.name || (m.upstream_name + ' · ' + m.model)
@@ -2004,24 +2010,40 @@ function logout() {
                 </div>
               </div>
 
-              <div class="gc-body">
-                <div class="gc-stat">
-                  <b :class="rateClass(g)">{{ g.recent_total ? g.success_rate + '%' : '—' }}</b>
+              <div class="gc-route-state" :class="`is-${groupRouteState(g.runtime).key}`">
+                <span class="gc-route-dot"><i></i></span>
+                <span><strong>{{ groupRouteState(g.runtime).label }}</strong><small>{{ groupRouteState(g.runtime).detail }}</small></span>
+              </div>
+
+              <div class="gc-metrics">
+                <div class="gc-success-metric">
                   <span>近 24h 成功率</span>
+                  <b :class="rateClass(g)">{{ g.recent_total ? g.success_rate + '%' : '—' }}</b>
                 </div>
-                <div class="gc-stat-sub">
-                  <div><span>调用</span><b>{{ g.recent_total || 0 }}</b></div>
-                  <div><span>延迟</span><b>{{ g.recent_total ? g.avg_latency_ms + 'ms' : '—' }}</b></div>
+                <div><span>调用</span><b>{{ g.recent_total || 0 }}</b></div>
+                <div><span>延迟</span><b>{{ g.recent_total ? g.avg_latency_ms + 'ms' : '—' }}</b></div>
+              </div>
+
+              <div class="gc-resources">
+                <div class="gc-resource">
+                  <div><span>上游池</span><b>{{ g.enabled_upstream_count || 0 }}/{{ g.upstream_count || 0 }}</b></div>
+                  <span class="gc-resource-track"><i :style="{ width: resourceWidth(g.enabled_upstream_count, g.upstream_count) }"></i></span>
+                </div>
+                <div class="gc-resource">
+                  <div><span>接入密钥</span><b>{{ g.enabled_key_count || 0 }}/{{ g.key_count || 0 }}</b></div>
+                  <span class="gc-resource-track"><i :style="{ width: resourceWidth(g.enabled_key_count, g.key_count) }"></i></span>
                 </div>
               </div>
-              <Fence :trend="g.trend || []" />
-              <div class="gc-fence-cap">每格 = 最近 1 小时成功率</div>
-              <div class="gc-pills">
-                <span class="gc-pill mint"><i></i>{{ healthSummary(g.runtime) }}</span>
-                <span class="gc-pill blue">上游 {{ g.enabled_upstream_count || 0 }}/{{ g.upstream_count || 0 }}</span>
-                <span class="gc-pill violet">密钥 {{ g.enabled_key_count || 0 }}/{{ g.key_count || 0 }}</span>
-                <span v-if="g.max_multiplier" class="gc-pill amber">倍率 ≤ {{ formatMultiplier(g.max_multiplier) }}<template v-if="g.runtime?.multiplier_blocked"> · 拦截 {{ g.runtime.multiplier_blocked }}</template></span>
-                <span class="gc-pill" :class="g.runtime?.effective?.length ? 'amber' : 'gray'">生效 {{ effText(g.runtime) }}</span>
+
+              <div class="gc-policy">
+                <span v-if="g.max_multiplier" class="gc-policy-item">倍率 ≤ {{ formatMultiplier(g.max_multiplier) }}</span>
+                <span v-if="g.runtime?.multiplier_blocked" class="gc-policy-item blocked">拦截 {{ g.runtime.multiplier_blocked }} 次</span>
+                <span class="gc-policy-item effective" :title="effText(g.runtime)">生效 {{ g.runtime?.effective?.length || 0 }} 个渠道</span>
+              </div>
+
+              <div class="gc-trend">
+                <div class="gc-trend-head"><span>24h 请求分布</span><b>{{ g.recent_total ? `${g.recent_total} 次` : '暂无请求' }}</b></div>
+                <Fence :trend="g.trend || []" />
               </div>
 
               <div class="card-foot"><span>点击管理上游与密钥</span><Icon name="chevron-right" :size="15" /></div>
@@ -2305,15 +2327,19 @@ function logout() {
                     <span>{{ channel.enabledCount }} 个启用模型</span>
                     <span>路由 <b :class="rtClass(channel.upstream.health)">{{ channel.upstream.enabled ? rtLabel(channel.upstream.health) : '已停用' }}</b></span>
                   </div>
-                  <div class="card-metrics availability-metrics">
-                    <div class="metric-item"><span class="metric-label">可用率<small class="mh">24h</small></span><span class="metric-value" :class="channel.reqs && channel.rate < .95 ? 'warn' : ''">{{ channel.reqs ? (channel.rate * 100).toFixed(1) + '%' : '—' }}</span></div>
-                    <div class="metric-item"><span class="metric-label">平均延迟<small class="mh">24h</small></span><span class="metric-value">{{ channel.avgMs || channel.lastMs || '—' }}<small v-if="channel.avgMs || channel.lastMs">ms</small></span></div>
-                    <div class="metric-item"><span class="metric-label">最近检测</span><span class="metric-value sm">{{ sinceText(channel.lastTS) }}</span></div>
+                  <div class="channel-primary-metric">
+                    <div class="channel-primary-head"><span>24h 可用率</span><b :class="channel.reqs && channel.rate < .95 ? 'warn' : ''">{{ channel.reqs ? (channel.rate * 100).toFixed(1) + '%' : '—' }}</b></div>
+                    <div class="channel-rate-track" role="progressbar" :aria-valuenow="channel.reqs ? Math.round(channel.rate * 1000) / 10 : 0" aria-valuemin="0" aria-valuemax="100"><i :class="dotClass(channel.state)" :style="{ width: channel.reqs ? Math.max(2, Math.min(100, channel.rate * 100)) + '%' : '0%' }"></i></div>
+                  </div>
+                  <div class="channel-secondary-metrics">
+                    <div><span>请求</span><b>{{ channel.reqs || '—' }}</b></div>
+                    <div><span>平均延迟</span><b>{{ channel.avgMs || channel.lastMs || '—' }}<small v-if="channel.avgMs || channel.lastMs">ms</small></b></div>
+                    <div><span>最近检测</span><b>{{ sinceText(channel.lastTS) }}</b></div>
                   </div>
                   <Fence :trend="channel.trend" unit="探测" />
                   <div class="tag-chip-row monitor-card-tags"><span v-for="tag in auxiliaryTagsFor(channel.upstream)" :key="tag.id" class="manage-tag" :class="`tag-${tag.color}`">{{ tag.name }}</span></div>
                   <div class="mon-foot availability-channel-foot">
-                    <button class="btn-link sm" :disabled="probingChannels.has(channel.id) || !channel.enabledCount" @click="guard(() => probeChannel(channel))">{{ probingChannels.has(channel.id) ? '检测中…' : '立即检测' }}</button>
+                    <button class="btn-link sm channel-detect-button" :disabled="probingChannels.has(channel.id) || !channel.enabledCount" @click="guard(() => probeChannel(channel))"><Icon :name="probingChannels.has(channel.id) ? 'loader' : 'play'" :class="{ spin: probingChannels.has(channel.id) }" :size="13" />{{ probingChannels.has(channel.id) ? '检测中…' : '立即检测' }}</button>
                     <span class="availability-detail-hint">{{ channel.monitors.length }} 个监控项</span>
                   </div>
                     </article>
