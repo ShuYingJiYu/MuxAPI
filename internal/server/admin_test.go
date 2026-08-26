@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -543,4 +544,60 @@ func itoa(n int64) string {
 		b[i] = '-'
 	}
 	return string(b[i:])
+}
+
+// 创建上游时可通过 group_ids 同时加入多个分组（可留空）。
+func TestCreateUpstreamWithGroupIDs(t *testing.T) {
+	ts, st, tok := newAdminTestServer(t)
+
+	// 建两个分组
+	for _, name := range []string{"g1", "g2"} {
+		resp := adminReq(t, http.MethodPost, ts.URL+"/admin/groups", tok, `{"name":"`+name+`"}`)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create group %s: status = %d", name, resp.StatusCode)
+		}
+	}
+	groups, err := st.ListGroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("groups = %d, want 2", len(groups))
+	}
+
+	body := fmt.Sprintf(`{"name":"u1","base_url":"https://api.example.com","protocol":"openai","group_ids":[%d,%d]}`,
+		groups[0].ID, groups[1].ID)
+	resp := adminReq(t, http.MethodPost, ts.URL+"/admin/upstreams", tok, body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create upstream with groups: status = %d", resp.StatusCode)
+	}
+	upstreams, err := st.List()
+	if err != nil || len(upstreams) != 1 {
+		t.Fatalf("upstreams len = %d err = %v", len(upstreams), err)
+	}
+	for _, g := range groups {
+		members, err := st.ListGroupMembers(g.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(members) != 1 || members[0].UpstreamID != upstreams[0].ID {
+			t.Fatalf("group %d members = %+v, want upstream %d", g.ID, members, upstreams[0].ID)
+		}
+	}
+
+	// 不带 group_ids 的创建保持原行为
+	ok := adminReq(t, http.MethodPost, ts.URL+"/admin/upstreams", tok, `{"name":"u2","base_url":"https://api.example.com"}`)
+	ok.Body.Close()
+	if ok.StatusCode != http.StatusCreated {
+		t.Fatalf("create without groups: status = %d", ok.StatusCode)
+	}
+
+	// 非法 group_id 被忽略而非报错
+	bad := adminReq(t, http.MethodPost, ts.URL+"/admin/upstreams", tok, `{"name":"u3","base_url":"https://api.example.com","group_ids":[0,-5]}`)
+	bad.Body.Close()
+	if bad.StatusCode != http.StatusCreated {
+		t.Fatalf("create with invalid group ids: status = %d", bad.StatusCode)
+	}
 }

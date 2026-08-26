@@ -23,6 +23,7 @@ type Upstream struct {
 	TagIDs       []int64
 	Tags         []Tag
 	TagsSet      bool
+	GroupIDs     []int64 // 创建请求附带：要同时加入的分组 id（仅 admin 创建路径使用）
 	BaseURL      string // 中转站地址
 	APIKey       string // 透传凭证
 	Proxy        string // 转发/探测走的代理出口(空=按环境变量或直连)

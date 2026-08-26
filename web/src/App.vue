@@ -263,7 +263,7 @@ function activatePage(p) {
   guard(async () => {
     if (p === 'overview') { await loadOverview(); startOverviewPoll() }
     else if (p === 'groups') { await loadGroups(); startRtPoll(loadGroups) }
-    else if (p === 'upstreams') { await loadTags(); await loadUpstreams(); startRtPoll(loadUpstreams) }
+    else if (p === 'upstreams') { await loadTags(); await loadGroups(); await loadUpstreams(); startRtPoll(loadUpstreams) }
     else if (p === 'monitors') { await loadTags(); await loadUpstreams(); await loadMonitors(); startMonPoll() }
     else if (p === 'logs') { await loadLogOptions(); await loadLogs(true); startLogPoll() }
     else if (p === 'settings') { await loadSettings(); await Promise.all([loadBackupConfig(), loadBackupSchedule(), loadBackups()]) }
@@ -317,8 +317,15 @@ const pages = {
 const dlg = reactive({ type: '', form: {} })
 const dialogSaving = ref(false)
 const upstreamFormTagSearch = ref('')
+const upstreamVendor = ref('')
+const upstreamFormGroupSearch = ref('')
+const upstreamFormGroupChoices = computed(() => {
+  const selected = new Set(upstreamFormGroupIDs.value)
+  const query = upstreamFormGroupSearch.value.trim().toLowerCase()
+  return groups.value.filter(g => !selected.has(g.id) && (!query || g.name.toLowerCase().includes(query)))
+})
 const tagManagerSearch = ref('')
-function closeDlg() { dlg.type = ''; upstreamFormTagSearch.value = ''; tagManagerSearch.value = '' }
+function closeDlg() { dlg.type = ''; upstreamFormTagSearch.value = ''; upstreamVendor.value = ''; upstreamFormGroupSearch.value = ''; tagManagerSearch.value = '' }
 
 // 表单保存统一显示进行中状态，避免重复点击和无反馈等待。
 async function guardDialogSave(fn) {
@@ -353,6 +360,33 @@ const protocolOptions = [
   { value: 'claude', label: 'Anthropic Messages' },
   { value: 'codex', label: 'Codex Responses' },
 ]
+// 厂商预设：选中后自动填 base_url 与协议；custom 表示手动输入。
+const vendorPresets = [
+  { value: 'openrouter', label: 'OpenRouter', base_url: 'https://openrouter.ai/api', protocol: 'openai' },
+  { value: 'deepseek', label: 'DeepSeek', base_url: 'https://api.deepseek.com', protocol: 'openai' },
+  { value: 'xai', label: 'Grok (xAI)', base_url: 'https://api.x.ai', protocol: 'openai' },
+  { value: 'gemini', label: 'Gemini (Google AI Studio)', base_url: 'https://generativelanguage.googleapis.com', protocol: 'openai' },
+  { value: 'moonshot', label: 'Moonshot (Kimi)', base_url: 'https://api.moonshot.cn', protocol: 'openai' },
+  { value: 'dashscope', label: '阿里百炼 (Qwen)', base_url: 'https://dashscope.aliyuncs.com/compatible-mode', protocol: 'openai' },
+  { value: 'zhipu', label: '智谱 (GLM)', base_url: 'https://open.bigmodel.cn/api/paas', protocol: 'openai' },
+  { value: 'openai', label: 'OpenAI', base_url: 'https://api.openai.com', protocol: 'openai' },
+  { value: 'anthropic', label: 'Anthropic', base_url: 'https://api.anthropic.com', protocol: 'claude' },
+  { value: 'codex', label: 'Codex (OpenAI Responses)', base_url: 'https://api.openai.com', protocol: 'codex' },
+  { value: 'custom', label: '自定义…', base_url: '', protocol: '' },
+]
+function applyVendorPreset(value) {
+  const preset = vendorPresets.find(p => p.value === value)
+  if (!preset || dlg.form.id) return // 编辑已有上游时不覆盖
+  if (preset.base_url) dlg.form.base_url = preset.base_url
+  if (preset.protocol) dlg.form.protocol = preset.protocol
+}
+const upstreamFormGroupIDs = ref([])
+const upstreamFormGroupOptions = computed(() => groups.value.map(g => ({ value: g.id, label: g.name })))
+function toggleUpstreamFormGroup(id) {
+  const selected = new Set(upstreamFormGroupIDs.value)
+  selected.has(id) ? selected.delete(id) : selected.add(id)
+  upstreamFormGroupIDs.value = [...selected]
+}
 const protocolLabels = Object.fromEntries(protocolOptions.map(option => [option.value, option.label]))
 function protocolLabel(protocol) { return protocolLabels[protocol || 'passthrough'] || protocol }
 const billingTypeOptions = [
@@ -550,11 +584,17 @@ const upstreamFormAvailableTags = computed(() => {
 })
 function newUpstream() {
   upstreamFormTagSearch.value = ''
+  upstreamFormGroupIDs.value = []
+  upstreamFormGroupSearch.value = ''
+  upstreamVendor.value = ''
   dlg.type = 'upstream'
   dlg.form = { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', billing_type: 'none', credit_ratio: 1, enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] }
 }
 function editUpstream(u) {
   upstreamFormTagSearch.value = ''
+  upstreamFormGroupIDs.value = []
+  upstreamFormGroupSearch.value = ''
+  upstreamVendor.value = ''
   dlg.type = 'upstream'
   dlg.form = { ...u, protocol: u.protocol || 'passthrough', billing_type: u.billing_type || 'none', credit_ratio: u.credit_ratio || 1, api_key: '', primary_tag_id: u.primary_tag_id || 0, tag_ids: [...(u.tag_ids || [])] }
 }
@@ -564,7 +604,10 @@ function saveUpstream() {
     const tagIDs = [...new Set((dlg.form.tag_ids || []).map(Number).filter(id => id && id !== primaryTagID))]
     const f = { ...dlg.form, primary_tag_id: primaryTagID, tag_ids: tagIDs, credit_ratio: Number(dlg.form.credit_ratio) || 1 }
     if (f.id) await api.updateUpstream(f.id, f)
-    else await api.createUpstream(f)
+    else {
+      if (upstreamFormGroupIDs.value.length) f.group_ids = upstreamFormGroupIDs.value.map(Number).filter(Boolean)
+      await api.createUpstream(f)
+    }
     closeDlg(); await loadUpstreams()
   })
 }
@@ -2848,6 +2891,7 @@ function logout() {
           <h3>{{ dlg.form.id ? '编辑上游' : '新增上游' }}</h3>
           <div class="upstream-form-grid">
             <div class="field"><label>名称</label><input v-model="dlg.form.name" /></div>
+            <div class="field" v-if="!dlg.form.id"><label>厂商</label><FancySelect v-model="upstreamVendor" :options="vendorPresets.map(p => ({ value: p.value, label: p.label }))" @change="applyVendorPreset" /></div>
             <div class="field"><label>主标签</label><FancySelect v-model="dlg.form.primary_tag_id" :options="primaryTagOptions" /></div>
             <div class="field upstream-form-tags">
               <label class="field-label-row"><span>普通标签</span><small>{{ upstreamFormSelectedTags.length }} 个已选</small></label>
@@ -2872,6 +2916,24 @@ function logout() {
             <div class="field"><label>计费平台</label><FancySelect v-model="dlg.form.billing_type" :options="billingTypeOptions" /></div>
             <div class="field"><label>储值倍率</label><input v-model="dlg.form.credit_ratio" type="number" step="any" min="0" placeholder="充1得N积分时填 N；默认 1" /></div>
             <div class="field"><label>api_key</label><input v-model="dlg.form.api_key" :placeholder="dlg.form.id ? '留空则不修改' : 'sk-...'" /></div>
+            <div class="field" v-if="!dlg.form.id">
+              <label class="field-label-row"><span>加入分组</span><small>{{ upstreamFormGroupIDs.length }} 个已选</small></label>
+              <div class="tag-picker-panel">
+                <div v-if="upstreamFormGroupIDs.length" class="tag-picker-selected">
+                  <button v-for="gid in upstreamFormGroupIDs" :key="gid" type="button" class="manage-tag selected" :title="'移除该分组'" @click="toggleUpstreamFormGroup(gid)">
+                    {{ groups.find(g => g.id === gid)?.name || gid }}<Icon name="x" :size="12" />
+                  </button>
+                </div>
+                <div class="tag-picker-search"><Icon name="search" :size="15" /><input v-model="upstreamFormGroupSearch" placeholder="搜索分组（可多选，可留空）" /></div>
+                <div class="tag-picker-options">
+                  <button v-for="g in upstreamFormGroupChoices" :key="g.id" type="button" class="tag-picker-option" @click="toggleUpstreamFormGroup(g.id)">
+                    <span>{{ g.name }}</span><Icon name="plus" :size="14" />
+                  </button>
+                  <span v-if="!groups.length" class="tag-picker-empty">还没有分组，可稍后在分组页添加成员</span>
+                  <span v-else-if="!upstreamFormGroupChoices.length" class="tag-picker-empty">没有匹配的分组</span>
+                </div>
+              </div>
+            </div>
             <div class="field"><label>代理</label><input v-model="dlg.form.proxy" placeholder="留空=直连/环境变量；如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></div>
           </div>
           <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>
