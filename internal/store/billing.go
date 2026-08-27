@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"math"
+	"strings"
 	"time"
 )
 
@@ -357,6 +358,61 @@ func (s *Store) applyLocalPricing(audit *BillingAudit, upstreamID int64) error {
 	return nil
 }
 
+func lookupModelPricing(prices map[string]ModelPricing, model string) (ModelPricing, bool) {
+	for _, candidate := range pricingModelCandidates(model) {
+		if price, ok := prices[candidate]; ok {
+			return price, true
+		}
+	}
+	return ModelPricing{}, false
+}
+
+func (s *Store) listModelPricing(models []string) (map[string]ModelPricing, error) {
+	seen := make(map[string]struct{})
+	var candidates []string
+	for _, model := range models {
+		for _, candidate := range pricingModelCandidates(model) {
+			if _, ok := seen[candidate]; ok {
+				continue
+			}
+			seen[candidate] = struct{}{}
+			candidates = append(candidates, candidate)
+		}
+	}
+	prices := make(map[string]ModelPricing, len(candidates))
+	if len(candidates) == 0 {
+		return prices, nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(candidates)), ",")
+	rows, err := s.sqlDB.Query(`SELECT model,input_cost_per_token,output_cost_per_token,
+		cache_read_input_token_cost,cache_creation_input_token_cost
+		FROM model_pricing WHERE model IN (`+placeholders+`)`, stringSliceToAny(candidates)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var price ModelPricing
+		if err := rows.Scan(&price.Model, &price.InputCostPerToken, &price.OutputCostPerToken,
+			&price.CacheReadInputTokenCost, &price.CacheWriteInputTokenCost); err != nil {
+			return nil, err
+		}
+		prices[price.Model] = price
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return prices, nil
+}
+
+func stringSliceToAny(values []string) []any {
+	args := make([]any, len(values))
+	for i, value := range values {
+		args[i] = value
+	}
+	return args
+}
+
 func (s *Store) billingAuditFromSnapshots(snapshots []BillingSnapshot) BillingAudit {
 	audit := billingAuditBaseFromSnapshots(snapshots)
 	if status, err := s.GetPricingCatalogStatus(); err == nil {
@@ -444,6 +500,15 @@ func (s *Store) GetBillingStatus(upstreamID int64) (BillingStatus, error) {
 
 // ListBillingStatuses returns the latest state indexed by upstream ID.
 func (s *Store) ListBillingStatuses() (map[int64]BillingStatus, error) {
+	return s.listBillingStatuses(false)
+}
+
+// ListBillingStatusesLite returns statuses without computing audits (faster for list views).
+func (s *Store) ListBillingStatusesLite() (map[int64]BillingStatus, error) {
+	return s.listBillingStatuses(true)
+}
+
+func (s *Store) listBillingStatuses(skipAudits bool) (map[int64]BillingStatus, error) {
 	query := `SELECT upstream_id,currency,remaining,unlimited,billing_group,group_multiplier,effective_multiplier,
 		reported_list_cost,reported_actual_cost,status,error_text,` +
 		s.billingTimeExpr("observed_at") + `,` + s.billingTimeExpr("last_success_at") + `,` +
@@ -463,6 +528,9 @@ func (s *Store) ListBillingStatuses() (map[int64]BillingStatus, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	if skipAudits {
+		return out, nil
 	}
 	audits, err := s.latestBillingAudits()
 	if err != nil {
