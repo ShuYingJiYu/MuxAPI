@@ -106,11 +106,21 @@ func allModels() []any {
 	}
 }
 
+// OpenOptions controls startup behavior for an existing database.
+type OpenOptions struct {
+	ReadOnly bool
+}
+
 // Open 根据连接串选择数据库，通过 GORM AutoMigrate 管理 schema。
 // 设置环境变量 MUXAPI_SKIP_MIGRATE=1 跳过 AutoMigrate（用于已有数据库）。
 func Open(databaseURL string) (*Store, error) {
+	return OpenWithOptions(databaseURL, OpenOptions{})
+}
+
+// OpenWithOptions opens a store with configurable startup behavior.
+func OpenWithOptions(databaseURL string, options OpenOptions) (*Store, error) {
 	if strings.HasPrefix(databaseURL, "postgres://") || strings.HasPrefix(databaseURL, "postgresql://") {
-		return openPostgres(databaseURL)
+		return openPostgres(databaseURL, options)
 	}
 	if databaseURL == "" {
 		return nil, errors.New("MUXAPI_DATABASE_URL is required")
@@ -118,7 +128,7 @@ func Open(databaseURL string) (*Store, error) {
 	return openSQLite(databaseURL)
 }
 
-func openPostgres(databaseURL string) (*Store, error) {
+func openPostgres(databaseURL string, options OpenOptions) (*Store, error) {
 	gormDB, err := gorm.Open(postgres.New(postgres.Config{
 		DSN:                  databaseURL,
 		PreferSimpleProtocol: true,
@@ -141,7 +151,7 @@ func openPostgres(databaseURL string) (*Store, error) {
 		sqlDB.Close()
 		return nil, fmt.Errorf("connect PostgreSQL: %w", err)
 	}
-	if os.Getenv("MUXAPI_SKIP_MIGRATE") != "1" {
+	if !options.ReadOnly && os.Getenv("MUXAPI_SKIP_MIGRATE") != "1" {
 		if err := gormDB.AutoMigrate(allModels()...); err != nil {
 			sqlDB.Close()
 			return nil, fmt.Errorf("migrate PostgreSQL: %w", err)
