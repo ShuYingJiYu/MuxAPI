@@ -212,6 +212,7 @@ type upstreamInput struct {
 	ChannelProbe bool     `json:"channel_probe"`
 	PrimaryTagID *int64   `json:"primary_tag_id"`
 	TagIDs       *[]int64 `json:"tag_ids"`
+	GroupIDs     *[]int64 `json:"group_ids"` // 创建时同时加入的分组（可空）
 }
 
 // decodeUpstream 在系统边界校验 URL、协议和标签字段。
@@ -260,6 +261,13 @@ func decodeUpstream(r *http.Request) (*upstream.Upstream, error) {
 		}
 		if d.TagIDs != nil {
 			result.TagIDs = *d.TagIDs
+		}
+	}
+	if d.GroupIDs != nil {
+		for _, gid := range *d.GroupIDs {
+			if gid > 0 {
+				result.GroupIDs = append(result.GroupIDs, gid)
+			}
 		}
 	}
 	return result, nil

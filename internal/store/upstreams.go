@@ -205,6 +205,12 @@ func (s *Store) Create(u *upstream.Upstream) error {
 			return err
 		}
 	}
+	for _, gid := range u.GroupIDs {
+		if _, err := tx.Exec(`INSERT INTO group_upstreams(group_id,upstream_id,priority,weight)
+			VALUES(?,?,50,1) ON CONFLICT(group_id,upstream_id) DO NOTHING`, gid, u.ID); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
