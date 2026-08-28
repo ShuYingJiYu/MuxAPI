@@ -136,11 +136,11 @@ onUnmounted(() => {
 .upstream-picker { position: relative; width: 100%; }
 .upstream-picker-trigger {
   width: 100%; min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 10px;
-  padding: 7px 12px; border: 1px solid var(--g200); border-radius: 8px; background: #fff; color: var(--g900);
+  padding: 7px 12px; border: 1px solid var(--g200); border-radius: var(--r-cell); background: var(--surface-raised); color: var(--g900);
   text-align: left; cursor: pointer; transition: border-color .16s, box-shadow .16s;
 }
 .upstream-picker-trigger:hover, .upstream-picker.open .upstream-picker-trigger {
-  border-color: var(--p500); box-shadow: 0 0 0 3px rgba(95, 211, 192, .2);
+  border-color: var(--p500); box-shadow: 0 0 0 3px var(--focus-ring);
 }
 .upstream-picker-trigger:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .upstream-picker-selected { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
@@ -151,7 +151,7 @@ onUnmounted(() => {
 .upstream-picker.open .upstream-picker-arrow { transform: rotate(-90deg); }
 .upstream-picker-menu {
   position: absolute; z-index: 120; top: calc(100% + 7px); left: 0; right: 0; overflow: hidden;
-  border: 1px solid var(--g200); border-radius: 8px; background: #fff; box-shadow: 0 18px 46px rgba(70, 60, 74, .2);
+  border: 1px solid var(--g200); border-radius: var(--r-cell); background: var(--surface-raised); box-shadow: var(--sh-glass);
 }
 .upstream-picker-search { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 9px 10px; border-bottom: 1px solid var(--g100); color: var(--g400); }
 .upstream-picker-search input { min-width: 0; height: 30px; border: 0; outline: 0; background: transparent; color: var(--g900); font-size: 12px; }
@@ -162,7 +162,7 @@ onUnmounted(() => {
   padding: 9px; border: 0; border-radius: 6px; background: transparent; color: var(--g700); text-align: left; cursor: pointer;
 }
 .upstream-picker-option:hover { background: var(--g50); }
-.upstream-picker-option.selected { background: rgba(95, 211, 192, .14); }
+.upstream-picker-option.selected { background: var(--selection-soft); }
 .upstream-picker-server { margin-top: 1px; color: var(--p600); }
 .upstream-picker-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .upstream-picker-name { display: flex; align-items: center; gap: 5px; min-width: 0; }
@@ -170,13 +170,13 @@ onUnmounted(() => {
 .upstream-picker-name em { flex: none; padding: 1px 5px; border-radius: 4px; background: var(--g100); color: var(--g500); font-size: 9px; font-style: normal; }
 .upstream-picker-copy > small { overflow: hidden; color: var(--g400); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .upstream-picker-tags { display: flex; flex-wrap: wrap; gap: 4px; }
-.upstream-picker-tags i { padding: 1px 5px; border-left: 2px solid #8c8490; border-radius: 3px; background: var(--g50); color: var(--g500); font-size: 9px; font-style: normal; }
-.upstream-picker-tags .tag-green { border-left-color: #42b883; }
-.upstream-picker-tags .tag-amber { border-left-color: #e9a23b; }
-.upstream-picker-tags .tag-red { border-left-color: #db6278; }
-.upstream-picker-tags .tag-blue { border-left-color: #5598d9; }
-.upstream-picker-tags .tag-purple { border-left-color: #9270d6; }
-.upstream-picker-tags .tag-pink { border-left-color: #df709e; }
+.upstream-picker-tags i { padding: 1px 5px; border-left: 2px solid var(--tag-gray); border-radius: 3px; background: var(--g50); color: var(--g500); font-size: 9px; font-style: normal; }
+.upstream-picker-tags .tag-green { border-left-color: var(--tag-green); }
+.upstream-picker-tags .tag-amber { border-left-color: var(--tag-amber); }
+.upstream-picker-tags .tag-red { border-left-color: var(--tag-red); }
+.upstream-picker-tags .tag-blue { border-left-color: var(--tag-blue); }
+.upstream-picker-tags .tag-purple { border-left-color: var(--tag-purple); }
+.upstream-picker-tags .tag-pink { border-left-color: var(--tag-pink); }
 .upstream-picker-check { align-self: center; color: var(--p600); }
 .upstream-picker-empty { min-height: 90px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; color: var(--g400); font-size: 12px; }
 .picker-pop-enter-active, .picker-pop-leave-active { transition: opacity .13s, transform .13s; transform-origin: top; }

@@ -5,6 +5,7 @@ import {
   Chart, LineController, BarController, LineElement, BarElement,
   PointElement, LinearScale, CategoryScale, Tooltip, Filler,
 } from 'chart.js'
+import { canvasColor, colorWithAlpha, themeValue } from './theme.js'
 
 const thresholdLinePlugin = {
   id: 'thresholdLine',
@@ -18,7 +19,7 @@ const thresholdLinePlugin = {
 
     const { ctx } = activeChart
     ctx.save()
-    ctx.strokeStyle = options.color || '#d39b35'
+    ctx.strokeStyle = options.color || themeValue('--chart-threshold')
     ctx.lineWidth = 1
     ctx.setLineDash([4, 4])
     ctx.beginPath()
@@ -26,8 +27,8 @@ const thresholdLinePlugin = {
     ctx.lineTo(right, y)
     ctx.stroke()
     if (options.label) {
-      ctx.fillStyle = options.color || '#a56f1f'
-      ctx.font = '600 10px "Noto Sans SC", sans-serif'
+      ctx.fillStyle = options.textColor || themeValue('--chart-threshold-text')
+      ctx.font = `600 10px ${themeValue('--font-body', 'sans-serif')}`
       ctx.textAlign = 'right'
       ctx.textBaseline = 'bottom'
       ctx.fillText(options.label, right, Math.max(top + 10, y - 4))
@@ -74,7 +75,7 @@ const inlineLabelsPlugin = {
     const preferredFractions = [0.68, 0.56, 0.78, 0.46, 0.86]
 
     ctx.save()
-    ctx.font = '600 9px "Noto Sans SC", sans-serif'
+    ctx.font = `600 9px ${themeValue('--font-body', 'sans-serif')}`
     ctx.textAlign = 'left'
     ctx.textBaseline = 'middle'
     activeChart.data.datasets.forEach((dataset, datasetIndex) => {
@@ -111,7 +112,7 @@ const inlineLabelsPlugin = {
       if (!placement) return
       occupied.push(placement.rect)
 
-      const color = dataset.borderColor || '#938995'
+      const color = dataset.borderColor || themeValue('--chart-axis')
       const connectorY = placement.direction < 0 ? placement.rect.y + placement.rect.height : placement.rect.y
       ctx.strokeStyle = color
       ctx.lineWidth = 1
@@ -128,7 +129,7 @@ const inlineLabelsPlugin = {
       ctx.fill()
 
       roundedRectPath(ctx, placement.rect.x, placement.rect.y, placement.rect.width, placement.rect.height, 4)
-      ctx.fillStyle = 'rgba(255,254,251,.94)'
+      ctx.fillStyle = themeValue('--chart-label-bg')
       ctx.fill()
       ctx.strokeStyle = color
       ctx.globalAlpha = 0.72
@@ -136,7 +137,7 @@ const inlineLabelsPlugin = {
       ctx.globalAlpha = 1
       ctx.fillStyle = color
       ctx.fillRect(placement.rect.x + 5, placement.rect.y + 5, 2, 7)
-      ctx.fillStyle = '#625964'
+      ctx.fillStyle = themeValue('--g600')
       ctx.fillText(placement.label, placement.rect.x + 10, placement.rect.y + placement.rect.height / 2)
     })
     ctx.restore()
@@ -151,7 +152,7 @@ const props = defineProps({
   labels: { type: Array, default: () => [] },
   data: { type: Array, default: () => [] },
   datasets: { type: Array, default: null },
-  color: { type: String, default: '#8b5cf6' },
+  color: { type: String, default: 'var(--chart-primary)' },
   sparkline: Boolean,      // 迷你模式：隐藏坐标轴/图例
   fill: Boolean,           // 面积填充
   min: Number,             // y 轴下限
@@ -447,11 +448,11 @@ function renderExternalTooltip({ chart: activeChart, tooltip }) {
 }
 
 function cfg() {
-  const c = props.color
+  const c = canvasColor(props.color)
   const source = props.datasets?.length ? props.datasets : [{ data: props.data, color: c }]
   const bounds = yBounds(source)
   const datasets = source.map((item, index) => {
-    const color = item.color || c
+    const color = canvasColor(item.color || c)
     const fill = item.fill ?? props.fill
     return {
       label: item.label || '',
@@ -460,13 +461,13 @@ function cfg() {
       groupColor: item.groupColor || 'gray',
       data: item.data || [],
       borderColor: color,
-      backgroundColor: props.type === 'bar' ? color + '99' : (fill ? color + '22' : color),
+      backgroundColor: props.type === 'bar' ? colorWithAlpha(color, .6) : (fill ? colorWithAlpha(color, .13) : color),
       borderWidth: item.borderWidth ?? (source.length > 1 ? 1.6 : 2),
       borderRadius: props.type === 'bar' ? 6 : 0,
       pointRadius: item.pointRadius ?? 0,
       pointHoverRadius: item.pointHoverRadius ?? (source.length > 1 ? 4 : 3),
-      pointBackgroundColor: item.pointBackgroundColor ?? color,
-      pointBorderColor: item.pointBorderColor ?? color,
+      pointBackgroundColor: canvasColor(item.pointBackgroundColor ?? color),
+      pointBorderColor: canvasColor(item.pointBorderColor ?? color),
       pointBorderWidth: item.pointBorderWidth ?? 1,
       tension: item.tension ?? 0.35,
       fill: item.fill ?? props.fill,
@@ -486,7 +487,8 @@ function cfg() {
         thresholdLine: {
           value: props.threshold,
           label: props.thresholdLabel,
-          color: '#d39b35',
+          color: themeValue('--chart-threshold'),
+          textColor: themeValue('--chart-threshold-text'),
         },
         inlineLabels: {
           display: props.lineLabels,
@@ -506,11 +508,11 @@ function cfg() {
         },
       },
       scales: {
-        x: { display: !props.sparkline, grid: { display: false }, ticks: { display: props.axisLabels && !props.sparkline, color: '#9ca3af', font: { size: 10 }, maxTicksLimit: 6, maxRotation: 0 }, border: { display: false } },
+        x: { display: !props.sparkline, grid: { display: false }, ticks: { display: props.axisLabels && !props.sparkline, color: themeValue('--chart-axis'), font: { size: 10 }, maxTicksLimit: 6, maxRotation: 0 }, border: { display: false } },
         y: {
           display: !props.sparkline, beginAtZero: false, min: bounds.min, max: bounds.max,
-          grid: { color: '#f1f1f4' }, border: { display: false },
-          ticks: { font: { size: 10 }, color: '#9ca3af', maxTicksLimit: 4 },
+          grid: { color: themeValue('--chart-grid') }, border: { display: false },
+          ticks: { font: { size: 10 }, color: themeValue('--chart-axis'), maxTicksLimit: 4 },
         },
       },
     },
@@ -596,18 +598,18 @@ watch(() => [props.labels, props.data, props.datasets, props.min, props.max, pro
   overflow-y: auto;
   margin-top: 7px;
   padding: 9px 2px 0;
-  border-top: 1px solid rgba(70,63,73,.09);
+  border-top: 1px solid var(--line);
   box-sizing: border-box;
   scrollbar-width: none;
 }
 .chart-legend::-webkit-scrollbar { width: 0; height: 0; }
 .chart-legend-group { display: grid; grid-template-columns: minmax(82px, 108px) minmax(0, 1fr); align-items: start; gap: 12px; width: 100%; }
-.chart-legend-group + .chart-legend-group { margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(70,63,73,.07); }
-.chart-legend-group-title { display: flex; align-items: flex-start; gap: 7px; min-width: 0; padding-top: 3px; color: #625964; }
+.chart-legend-group + .chart-legend-group { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+.chart-legend-group-title { display: flex; align-items: flex-start; gap: 7px; min-width: 0; padding-top: 3px; color: var(--g600); }
 .chart-legend-group-title > span { min-width: 0; }
 .chart-legend-group-title strong, .chart-legend-group-title small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chart-legend-group-title strong { font-size: 11px; font-weight: 700; }
-.chart-legend-group-title small { margin-top: 1px; color: #938995; font-size: 9px; font-weight: 500; }
+.chart-legend-group-title small { margin-top: 1px; color: var(--g400); font-size: 9px; font-weight: 500; }
 .chart-legend-group-dot { width: 8px; height: 8px; flex: 0 0 8px; }
 .chart-legend-items { display: grid; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); gap: 3px 14px; min-width: 0; }
 .chart-legend-item {
@@ -617,12 +619,12 @@ watch(() => [props.labels, props.data, props.datasets, props.min, props.max, pro
   gap: 5px;
   min-width: 0;
   min-height: 25px;
-  color: #756d7c;
+  color: var(--g500);
   font-size: 10px;
 }
 .chart-legend-copy { display: flex; align-items: baseline; gap: 5px; min-width: 0; }
-.chart-legend-copy strong { min-width: 0; overflow: hidden; color: #625964; font-size: 10px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
-.chart-legend-copy small { flex: none; color: #938995; font-size: 8.5px; white-space: nowrap; }
+.chart-legend-copy strong { min-width: 0; overflow: hidden; color: var(--g600); font-size: 10px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.chart-legend-copy small { flex: none; color: var(--g400); font-size: 8.5px; white-space: nowrap; }
 .chart-legend-dot { width: 14px; height: 2px; border-radius: 1px; }
 :global(.chart-tooltip) {
   position: fixed;
@@ -640,12 +642,12 @@ watch(() => [props.labels, props.data, props.datasets, props.min, props.max, pro
   overflow: auto;
   box-sizing: border-box;
   padding: 8px 10px;
-  border: 1px solid rgba(190,168,96,.38);
+  border: 1px solid var(--chart-tooltip-border);
   border-radius: 7px;
-  background: rgba(255,253,239,.96);
+  background: var(--chart-tooltip-bg);
   backdrop-filter: blur(14px) saturate(115%);
-  box-shadow: 0 8px 24px rgba(120,95,30,.16);
-  color: #5d5060;
+  box-shadow: var(--chart-tooltip-shadow);
+  color: var(--chart-tooltip-text);
   font-size: 11px;
   line-height: 1.35;
   overscroll-behavior: contain;
@@ -653,13 +655,13 @@ watch(() => [props.labels, props.data, props.datasets, props.min, props.max, pro
   scrollbar-width: none;
 }
 :global(.chart-tooltip-panel::-webkit-scrollbar) { width: 0; height: 0; }
-:global(.chart-tooltip-title) { padding-bottom: 5px; color: #2a2330; font-weight: 800; }
+:global(.chart-tooltip-title) { padding-bottom: 5px; color: var(--chart-tooltip-title); font-weight: 800; }
 :global(.chart-tooltip-group + .chart-tooltip-group) { margin-top: 7px; }
-:global(.chart-tooltip-group-title) { display: flex; align-items: center; gap: 6px; min-height: 21px; padding: 2px 6px; border-left: 3px solid rgba(190,168,96,.65); border-radius: 3px; background: rgba(255,241,191,.76); color: #5d5060; font-size: 11px; font-weight: 800; }
+:global(.chart-tooltip-group-title) { display: flex; align-items: center; gap: 6px; min-height: 21px; padding: 2px 6px; border-left: 3px solid var(--chart-tooltip-accent); border-radius: 3px; background: var(--chart-tooltip-group-bg); color: var(--chart-tooltip-text); font-size: 11px; font-weight: 800; }
 :global(.chart-tooltip-group-title span) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 :global(.chart-tooltip-group-dot) { width: 8px; height: 8px; flex: 0 0 8px; }
-:global(.chart-tooltip-list) { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px 12px; margin: 3px 0 0 5px; padding-left: 8px; border-left: 2px solid rgba(190,168,96,.22); }
+:global(.chart-tooltip-list) { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px 12px; margin: 3px 0 0 5px; padding-left: 8px; border-left: 2px solid var(--chart-tooltip-line); }
 :global(.chart-tooltip-row) { display: flex; align-items: center; min-width: 0; gap: 5px; }
-:global(.chart-tooltip-row span) { min-width: 0; overflow: hidden; color: #756d7c; text-overflow: ellipsis; white-space: nowrap; }
+:global(.chart-tooltip-row span) { min-width: 0; overflow: hidden; color: var(--g500); text-overflow: ellipsis; white-space: nowrap; }
 :global(.chart-tooltip-swatch) { width: 9px; height: 9px; flex: 0 0 9px; border-radius: 2px; }
 </style>

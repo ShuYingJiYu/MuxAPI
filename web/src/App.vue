@@ -365,10 +365,8 @@ const vendorPresets = [
   { value: 'openrouter', label: 'OpenRouter', base_url: 'https://openrouter.ai/api', protocol: 'openai' },
   { value: 'deepseek', label: 'DeepSeek', base_url: 'https://api.deepseek.com', protocol: 'openai' },
   { value: 'xai', label: 'Grok (xAI)', base_url: 'https://api.x.ai', protocol: 'openai' },
-  { value: 'gemini', label: 'Gemini (Google AI Studio)', base_url: 'https://generativelanguage.googleapis.com', protocol: 'openai' },
   { value: 'moonshot', label: 'Moonshot (Kimi)', base_url: 'https://api.moonshot.cn', protocol: 'openai' },
   { value: 'dashscope', label: '阿里百炼 (Qwen)', base_url: 'https://dashscope.aliyuncs.com/compatible-mode', protocol: 'openai' },
-  { value: 'zhipu', label: '智谱 (GLM)', base_url: 'https://open.bigmodel.cn/api/paas', protocol: 'openai' },
   { value: 'openai', label: 'OpenAI', base_url: 'https://api.openai.com', protocol: 'openai' },
   { value: 'anthropic', label: 'Anthropic', base_url: 'https://api.anthropic.com', protocol: 'claude' },
   { value: 'codex', label: 'Codex (OpenAI Responses)', base_url: 'https://api.openai.com', protocol: 'codex' },
@@ -381,7 +379,6 @@ function applyVendorPreset(value) {
   if (preset.protocol) dlg.form.protocol = preset.protocol
 }
 const upstreamFormGroupIDs = ref([])
-const upstreamFormGroupOptions = computed(() => groups.value.map(g => ({ value: g.id, label: g.name })))
 function toggleUpstreamFormGroup(id) {
   const selected = new Set(upstreamFormGroupIDs.value)
   selected.has(id) ? selected.delete(id) : selected.add(id)
@@ -1484,7 +1481,7 @@ const overviewBalanceChartLabels = computed(() => overviewPointLabels(overviewSe
 const overviewSuccessChartLabels = computed(() => overviewPointLabels(overviewTrends.value?.success || []))
 const overviewBalanceData = computed(() => (overviewSelectedBalance.value?.points || [])
   .map(point => point.remaining == null ? null : Number(point.remaining)))
-const overviewBalanceChannelColors = ['#e46f86', '#d39b35', '#36b99d', '#5598d9', '#9270d6', '#df709e', '#70a84a', '#c97bba', '#7c8bd6', '#d77b4b']
+const overviewBalanceChannelColors = Array.from({ length: 10 }, (_, index) => `var(--chart-channel-${index + 1})`)
 const overviewUpstreamByID = computed(() => new Map(upstreams.value.map(item => [Number(item.id), item])))
 const overviewTagByID = computed(() => new Map(tags.value.map(item => [Number(item.id), item])))
 const overviewRawBalanceDatasets = computed(() => (overviewTrends.value?.upstream_balances || [])
@@ -1542,13 +1539,13 @@ const overviewSuccessData = computed(() => (overviewTrends.value?.success || [])
 const overviewSuccessDatasets = computed(() => [{
   label: '成功率',
   data: overviewSuccessData.value,
-  color: '#45b9a8',
+  color: 'var(--chart-primary)',
   fill: true,
   borderWidth: 2,
   pointRadius: overviewSuccessData.value.map(value => value != null && value < 99 ? 4 : 0),
   pointHoverRadius: overviewSuccessData.value.map(value => value != null && value < 99 ? 5 : 3),
-  pointBackgroundColor: overviewSuccessData.value.map(value => value != null && value < 99 ? '#df667d' : '#45b9a8'),
-  pointBorderColor: '#fffefb',
+  pointBackgroundColor: overviewSuccessData.value.map(value => value != null && value < 99 ? 'var(--chart-danger)' : 'var(--chart-primary)'),
+  pointBorderColor: 'var(--surface)',
   pointBorderWidth: 2,
 }])
 const overviewSuccessChartMin = computed(() => {
@@ -1952,7 +1949,7 @@ function logout() {
                   <FancySelect v-if="overviewCurrencyOptions.length > 1" v-model="overviewBalanceCurrency" :options="overviewCurrencyOptions" />
                   <span v-else class="ov-chart-meta">{{ overviewSelectedBalance?.currency || '暂无币种' }}</span>
                 </header>
-                <div v-if="overviewBalanceHasData" class="ov-chart"><Chart :key="`balance-${overviewTrendTagID}-${overviewTrends?.to_at || 0}`" :labels="overviewBalanceChartLabels" :datasets="overviewBalanceDatasets" color="#d39b35" axis-labels show-legend line-labels :fmt="overviewBalanceText" /></div>
+                <div v-if="overviewBalanceHasData" class="ov-chart"><Chart :key="`balance-${overviewTrendTagID}-${overviewTrends?.to_at || 0}`" :labels="overviewBalanceChartLabels" :datasets="overviewBalanceDatasets" color="var(--chart-threshold)" axis-labels show-legend line-labels :fmt="overviewBalanceText" /></div>
                 <div v-else class="ov-chart-empty"><Icon name="server" :size="18" />暂无余额历史</div>
                 <footer class="ov-chart-foot">
                   <span><b>{{ overviewCountText(overviewTrends?.upstream_count) }}</b> 个渠道</span>
@@ -2142,7 +2139,7 @@ function logout() {
             </table>
           </div>
 
-          <div class="section-head" style="margin-top:28px">
+          <div class="section-head section-head-spaced">
             <h3 class="section-title">接入密钥</h3>
             <button class="btn btn-sm" @click="createKey"><Icon name="plus" :size="14" />生成密钥</button>
           </div>
@@ -2153,7 +2150,7 @@ function logout() {
               <tbody>
                 <tr v-for="k in keys" :key="k.id">
                   <td>{{ k.name || '—' }}</td>
-                  <td><code class="key-cell" title="点击复制" @click="copyText(k.key, k.id)">{{ k.key }}</code><span v-if="copied === k.id" style="color:#16a34a;font-size:12px;margin-left:6px">已复制 ✓</span></td>
+                  <td><code class="key-cell" title="点击复制" @click="copyText(k.key, k.id)">{{ k.key }}</code><span v-if="copied === k.id" class="copy-feedback">已复制 ✓</span></td>
                   <td><span class="tag" :class="k.enabled ? 'on' : 'off'">{{ k.enabled ? '启用' : '停用' }}</span></td>
                   <td>
                     <button class="icon-btn" :disabled="!k.enabled" :title="k.enabled ? '使用此密钥测试分组' : '启用密钥后可测试'" aria-label="测试分组" @click="openGroupTest(k)"><Icon name="play" :size="16" /></button>
@@ -2236,7 +2233,7 @@ function logout() {
                               <button v-for="tag in tags" :key="tag.id"
                                 class="inline-tag-option manage-tag" :class="[`tag-${tag.color}`, { active: (u.tag_ids||[]).includes(tag.id) || u.primary_tag_id === tag.id, 'is-primary': u.primary_tag_id === tag.id }]"
                                 @click="toggleInlineTag(u, tag.id)">{{ tag.name }}</button>
-                              <div v-if="!tags.length" style="font-size:11px;color:var(--g400);padding:4px">暂无标签</div>
+                              <div v-if="!tags.length" class="inline-tag-empty">暂无标签</div>
                             </div>
                           </Teleport>
                         </div>
@@ -2589,7 +2586,7 @@ function logout() {
               <section id="set-backup" v-show="settingsSection === 'backup'" class="card settings-card">
                 <div class="settings-title"><h3>数据备份</h3><p>将 PostgreSQL 数据库自动备份至 S3/R2 对象存储。</p></div>
 
-                <h4 style="margin:0 0 8px;font-size:13px;color:var(--text2)">对象存储配置</h4>
+                <h4 class="settings-subtitle">对象存储配置</h4>
                 <div class="settings-fields">
                   <div class="field"><label>Endpoint</label><input v-model="backupConfig.endpoint" placeholder="https://xxx.r2.cloudflarestorage.com" /></div>
                   <div class="field"><label>Region</label><input v-model="backupConfig.region" placeholder="auto" /></div>
@@ -2598,25 +2595,25 @@ function logout() {
                   <div class="field"><label>Secret Key</label><input v-model="backupConfig.secret_key" type="password" placeholder="已配置时显示占位符" /></div>
                   <div class="field"><label>前缀 (Prefix)</label><input v-model="backupConfig.prefix" placeholder="muxapi/backups/" /></div>
                   <div class="field"><label>Path Style</label>
-                    <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
-                      <input type="checkbox" v-model="backupConfig.force_path_style" style="width:auto" />
+                    <label class="settings-check">
+                      <input type="checkbox" v-model="backupConfig.force_path_style" />
                       Force Path Style（部分私有部署需要）
                     </label>
                   </div>
                 </div>
                 <div class="settings-actions">
                   <button class="btn btn-ghost" :disabled="backupTesting" @click="guard(testS3)">{{ backupTesting ? '测试中…' : '测试连接' }}</button>
-                  <span v-if="backupTestResult === 'ok'" style="color:#1b8c75;font-size:13px;font-weight:500">✓ 连接成功</span>
-                  <span v-if="backupTestResult === 'err'" style="color:#d6536f;font-size:13px;font-weight:500;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" :title="backupTestMsg">✗ {{ backupTestMsg }}</span>
+                  <span v-if="backupTestResult === 'ok'" class="backup-test-result ok">✓ 连接成功</span>
+                  <span v-if="backupTestResult === 'err'" class="backup-test-result fail" :title="backupTestMsg">✗ {{ backupTestMsg }}</span>
                   <span class="save-status" :class="{ show: settingsSaved }">已保存 ✓</span>
                   <button class="btn" @click="guard(saveBackupConfig)"><Icon name="check" :size="16" />保存配置</button>
                 </div>
 
-                <h4 style="margin:16px 0 8px;font-size:13px;color:var(--text2)">定时备份</h4>
+                <h4 class="settings-subtitle spaced">定时备份</h4>
                 <div class="settings-fields">
                   <div class="field"><label>启用</label>
-                    <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
-                      <input type="checkbox" v-model="backupSchedule.enabled" style="width:auto" />
+                    <label class="settings-check">
+                      <input type="checkbox" v-model="backupSchedule.enabled" />
                       启用定时备份
                     </label>
                   </div>
@@ -2629,8 +2626,8 @@ function logout() {
                   <button class="btn" @click="guard(saveBackupSchedule)"><Icon name="check" :size="16" />保存计划</button>
                 </div>
 
-                <h4 style="margin:16px 0 8px;font-size:13px;color:var(--text2)">备份记录</h4>
-                <div class="settings-actions" style="margin-bottom:8px">
+                <h4 class="settings-subtitle spaced">备份记录</h4>
+                <div class="settings-actions backup-record-actions">
                   <button class="btn" :disabled="backupTriggering" @click="guard(triggerBackup)">{{ backupTriggering ? '备份中…' : '立即备份' }}</button>
                   <button class="btn btn-ghost" @click="guard(loadBackups)">刷新</button>
                 </div>
@@ -2643,19 +2640,19 @@ function logout() {
                       <tr v-for="r in backupRecords" :key="r.id">
                         <td><span :class="backupStatusClass(r.status)">{{ backupStatusText(r.status) }}</span></td>
                         <td class="col-file" :title="r.file_name">{{ r.file_name }}</td>
-                        <td style="white-space:nowrap">{{ r.size_bytes ? fmtFileSize(r.size_bytes) : '—' }}</td>
+                        <td class="nowrap">{{ r.size_bytes ? fmtFileSize(r.size_bytes) : '—' }}</td>
                         <td>{{ r.triggered_by === 'scheduled' ? '定时' : '手动' }}</td>
-                        <td style="white-space:nowrap">{{ r.started_at ? new Date(r.started_at * 1000).toLocaleString() : '—' }}</td>
+                        <td class="nowrap">{{ r.started_at ? new Date(r.started_at * 1000).toLocaleString() : '—' }}</td>
                         <td class="col-ops">
-                          <button v-if="r.status === 'completed'" class="btn btn-ghost" style="padding:2px 8px;font-size:11px" @click="guard(() => downloadBackup(r.id))">下载</button>
-                          <button class="btn btn-ghost" style="padding:2px 8px;font-size:11px;color:var(--red)" @click="deleteBackup(r.id)">删除</button>
+                          <button v-if="r.status === 'completed'" class="btn btn-ghost btn-table" @click="guard(() => downloadBackup(r.id))">下载</button>
+                          <button class="btn btn-ghost btn-table btn-table-danger" @click="deleteBackup(r.id)">删除</button>
                         </td>
                       </tr>
                     </tbody>
                   </table>
                 </div>
-                <div v-if="backupRecords.some(r => r.error)" style="margin-top:8px">
-                  <div v-for="r in backupRecords.filter(r => r.error)" :key="r.id+'e'" class="hint" style="color:var(--red)">{{ r.file_name }}：{{ r.error }}</div>
+                <div v-if="backupRecords.some(r => r.error)" class="backup-errors">
+                  <div v-for="r in backupRecords.filter(r => r.error)" :key="r.id+'e'" class="hint backup-error">{{ r.file_name }}：{{ r.error }}</div>
                 </div>
               </section>
             </div>
@@ -2672,7 +2669,7 @@ function logout() {
           <span class="mx-dot lg" :class="dotClass(cellDrawer.snapshot.state)"></span>
           <div class="dw-id">
             <div class="dw-title">{{ cellDrawer.model }}</div>
-            <div class="dw-sub">{{ cellDrawer.upstream_name }}<span v-if="cellDrawer.stream" class="tag on" style="margin-left:6px">流式</span></div>
+            <div class="dw-sub">{{ cellDrawer.upstream_name }}<span v-if="cellDrawer.stream" class="tag on dw-stream-tag">流式</span></div>
           </div>
           <button class="icon-btn" @click="closeCell"><Icon name="x" :size="18" /></button>
         </div>
@@ -2829,7 +2826,7 @@ function logout() {
     <div class="mask" v-if="testState.show" @click.self="testState.show = false">
       <div class="dialog">
         <h3>测试上游 · {{ testState.name }}</h3>
-        <p class="hint" style="margin:0 0 10px">发一条真实对话请求，验证能否端到端跑通并查看回复。</p>
+        <p class="hint test-dialog-hint">发一条真实对话请求，验证能否端到端跑通并查看回复。</p>
 
         <div class="test-row">
           <FancySelect v-model="testState.model" :options="testModelOptions" :disabled="testState.modelsLoading || testState.running" />
@@ -2837,7 +2834,7 @@ function logout() {
             <Icon :name="testState.running ? 'loader' : 'play'" :size="16" />{{ testState.running ? '测试中…' : '开始测试' }}
           </button>
         </div>
-        <p v-if="testState.modelsErr" class="test-err" style="margin:0 0 8px">列模型失败：{{ testState.modelsErr }}（仍可手动测试默认模型）</p>
+        <p v-if="testState.modelsErr" class="test-err test-model-error">列模型失败：{{ testState.modelsErr }}（仍可手动测试默认模型）</p>
 
         <div v-if="testState.running || testState.output || testState.status" class="test-output">
           <span v-if="testState.output">{{ testState.output }}</span>
@@ -2883,7 +2880,7 @@ function logout() {
         <template v-else-if="dlg.type === 'keygen'">
           <h3>生成接入密钥</h3>
           <div class="field"><label>名称</label><input v-model="dlg.form.name" placeholder="备注用，如「客户端A」，可留空" @keyup.enter="saveKey" /></div>
-          <p class="hint" style="margin:0">密钥由系统生成，绑定当前分组，仅在生成后明文显示一次。</p>
+          <p class="hint hint-flush">密钥由系统生成，绑定当前分组，仅在生成后明文显示一次。</p>
           <div class="dialog-foot"><button class="btn btn-ghost" :disabled="dialogSaving" @click="closeDlg">取消</button><button class="btn" :disabled="dialogSaving" @click="saveKey"><Icon :name="dialogSaving ? 'loader' : 'plus'" :class="{ spin: dialogSaving }" :size="16" />{{ dialogSaving ? '生成中…' : '生成' }}</button></div>
         </template>
 
@@ -3030,10 +3027,10 @@ function logout() {
           </div>
           <div class="field" v-else><label>上游</label><input :value="upName(dlg.form.upstream_id)" disabled /></div>
           <div class="field-row">
-            <div class="field" style="flex:1"><label>组内优先级</label><input type="number" v-model.number="dlg.form.priority" /></div>
-            <div class="field" style="flex:1"><label>权重</label><input type="number" v-model.number="dlg.form.weight" /></div>
+            <div class="field field-grow"><label>组内优先级</label><input type="number" v-model.number="dlg.form.priority" /></div>
+            <div class="field field-grow"><label>权重</label><input type="number" v-model.number="dlg.form.weight" /></div>
           </div>
-          <p class="hint" style="margin:0">优先级越小越先用；同优先级按权重分流。</p>
+          <p class="hint hint-flush">优先级越小越先用；同优先级按权重分流。</p>
           <div class="dialog-foot"><button class="btn btn-ghost" :disabled="dialogSaving" @click="closeDlg">取消</button><button class="btn" :disabled="dialogSaving || !dlg.form.upstream_id" @click="saveMember"><Icon :name="dialogSaving ? 'loader' : 'check'" :class="{ spin: dialogSaving }" :size="16" />{{ dialogSaving ? '保存中…' : '保存' }}</button></div>
         </template>
       </div>

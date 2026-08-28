@@ -29,7 +29,7 @@ const deferredClaudeRequest = `{"model":"stealth/ox-alpha","stream":true,
   ]}`
 
 type toolProbe struct {
-	Name     string         `json:"name"`
+	Name     string `json:"name"`
 	Function *struct {
 		Name string `json:"name"`
 	} `json:"function"`
@@ -70,9 +70,9 @@ func TestSanitizeOpenAIInjectsMissingDeferredTools(t *testing.T) {
 	}
 	names := upstreamToolNames(t, exchange.UpstreamRequest)
 	want := map[string]bool{
-		"Bash":                            false,
-		"ToolSearch":                      false,
-		"mcp__ghidra__connect_instance":   false,
+		"Bash":                          false,
+		"ToolSearch":                    false,
+		"mcp__ghidra__connect_instance": false,
 	}
 	for _, name := range names {
 		if _, ok := want[name]; ok {
@@ -117,7 +117,7 @@ func TestSanitizePassthroughClaudeStripsDeferral(t *testing.T) {
 		t.Fatalf("passthrough tools missing injected stub: %v\n%s", names, body)
 	}
 	var probe struct {
-		Model  string `json:"model"`
+		Model  string          `json:"model"`
 		System json.RawMessage `json:"system"`
 	}
 	if err := json.Unmarshal(exchange.UpstreamRequest, &probe); err != nil {
@@ -174,5 +174,27 @@ func TestSanitizeDoesNotDuplicateDefinedTools(t *testing.T) {
 	}
 	if strings.Contains(string(exchange.UpstreamRequest), stubToolDescription) {
 		t.Fatalf("unexpected stub for a defined tool: %s", exchange.UpstreamRequest)
+	}
+}
+
+func TestStubToolUsesTargetProtocolShape(t *testing.T) {
+	openAI := stubTool("lookup", OpenAI)
+	if _, ok := openAI["function"]; !ok {
+		t.Fatalf("OpenAI stub must wrap its definition in function: %#v", openAI)
+	}
+
+	for _, target := range []Format{OpenAIResponses, Codex} {
+		responses := stubTool("lookup", target)
+		if responses["name"] != "lookup" || responses["type"] != "function" || responses["parameters"] == nil {
+			t.Fatalf("%s stub has invalid Responses shape: %#v", target, responses)
+		}
+		if responses["input_schema"] != nil || responses["function"] != nil {
+			t.Fatalf("%s stub mixes protocol shapes: %#v", target, responses)
+		}
+	}
+
+	claude := stubTool("lookup", Claude)
+	if claude["name"] != "lookup" || claude["input_schema"] == nil {
+		t.Fatalf("Claude stub has invalid shape: %#v", claude)
 	}
 }

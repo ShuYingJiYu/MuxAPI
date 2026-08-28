@@ -1,0 +1,128 @@
+:root {
+  /* Foundations */
+  --canvas: #fffaf2;
+  --surface: #fffefb;
+  --surface-raised: #ffffff;
+  --surface-glass: rgba(255, 254, 251, .94);
+  --surface-hover: #faf8f4;
+  --surface-muted: #faf7f3;
+  --text-on-accent: #ffffff;
+  --dialog-surface: #fffdfa;
+  --dialog-border: #e8e1d9;
+  --control-border: #ded7ce;
+  --control-border-muted: #e2dbd3;
+  --control-border-hover: #d2c9bf;
+  --divider: #eee8e1;
+
+  /* Brand and neutral palette */
+  --brand-pink: #f58daf;
+  --brand-blue: #85c8e5;
+  --p50: #effcf9;
+  --p100: #d8f7f0;
+  --p400: #6cd8c9;
+  --p500: #45c9b6;
+  --p600: #29b7a4;
+  --p700: #198d80;
+  --g50: #faf7f3;
+  --g100: #f1eade;
+  --g150: #ebe3d9;
+  --g200: #e5dcd0;
+  --g300: #c8bdc9;
+  --g400: #938995;
+  --g500: #746b77;
+  --g600: #625964;
+  --g700: #463f49;
+  --g800: #342e37;
+  --g900: #241f27;
+  --green: #29b7a4;
+  --amber: #dfa73b;
+  --red: #df667d;
+  --purple: #a98bd5;
+  --blue: #68afd0;
+
+  /* Semantic states */
+  --state-success: #087f5b;
+  --state-success-soft: #e9fbf2;
+  --state-warning: #935f05;
+  --state-warning-soft: #fff6d8;
+  --state-danger: #b4233c;
+  --state-danger-soft: #fff0f2;
+  --state-danger-line: #ffc4ce;
+  --state-info: #4689bd;
+  --state-info-soft: #e7f3ff;
+
+  /* Charts and compact status visuals */
+  --chart-primary: #45b9a8;
+  --chart-danger: #df667d;
+  --chart-threshold: #d39b35;
+  --chart-threshold-text: #a56f1f;
+  --chart-axis: #938995;
+  --chart-grid: #f1f1f4;
+  --chart-label-bg: rgba(255, 254, 251, .94);
+  --chart-tooltip-bg: rgba(255, 253, 239, .96);
+  --chart-tooltip-border: rgba(190, 168, 96, .38);
+  --chart-tooltip-group-bg: rgba(255, 241, 191, .76);
+  --chart-tooltip-accent: rgba(190, 168, 96, .65);
+  --chart-tooltip-line: rgba(190, 168, 96, .22);
+  --chart-tooltip-text: #5d5060;
+  --chart-tooltip-title: #2a2330;
+  --chart-tooltip-shadow: 0 8px 24px rgba(120, 95, 30, .16);
+  --chart-channel-1: #e46f86;
+  --chart-channel-2: #d39b35;
+  --chart-channel-3: #36b99d;
+  --chart-channel-4: #5598d9;
+  --chart-channel-5: #9270d6;
+  --chart-channel-6: #df709e;
+  --chart-channel-7: #70a84a;
+  --chart-channel-8: #c97bba;
+  --chart-channel-9: #7c8bd6;
+  --chart-channel-10: #d77b4b;
+  --fence-empty: var(--g100);
+  --fence-success: #68bfae;
+  --fence-warning: #d9b463;
+  --fence-danger: #e18495;
+
+  /* User-selectable tag colors */
+  --tag-green: #42b883;
+  --tag-teal: #299f91;
+  --tag-cyan: #2e9ec4;
+  --tag-amber: #e9a23b;
+  --tag-orange: #e98532;
+  --tag-lime: #76a82f;
+  --tag-red: #db6278;
+  --tag-blue: #5598d9;
+  --tag-indigo: #6174d6;
+  --tag-purple: #9270d6;
+  --tag-pink: #df709e;
+  --tag-gray: #8c8490;
+  --tag-rose: #f43f5e;
+  --tag-emerald: #059669;
+  --tag-sky: #0284c7;
+  --tag-violet: #7c3aed;
+  --tag-fuchsia: #c026d3;
+  --tag-yellow: #ca8a04;
+
+  /* Shared component geometry */
+  --line: rgba(70, 63, 73, .12);
+  --line-strong: rgba(70, 63, 73, .18);
+  --focus-ring: rgba(69, 201, 182, .18);
+  --selection-soft: rgba(69, 201, 182, .14);
+  --tooltip-bg: var(--g900);
+  --tooltip-text-muted: rgba(255, 255, 255, .82);
+  --tooltip-shadow: 0 8px 24px rgba(0, 0, 0, .22);
+  --font-heading: "Bahnschrift", "Noto Sans SC", "Microsoft YaHei UI", sans-serif;
+  --font-body: "Noto Sans SC", "Microsoft YaHei UI", "Segoe UI", sans-serif;
+  --font-data: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  --r-shell: 24px;
+  --r-card: 18px;
+  --r-action: 21px;
+  --r-control: 11px;
+  --r-nav: 12px;
+  --r-rail: 29px;
+  --r-pill: 999px;
+  --r-cell: 8px;
+  --sh-card: 0 4px 18px rgba(49, 42, 52, .07);
+  --sh-card-hover: 0 7px 22px rgba(49, 42, 52, .10);
+  --sh-glass: 0 12px 36px rgba(49, 42, 52, .12);
+  --sh-dialog: 0 22px 60px rgba(49, 42, 52, .22), 0 3px 12px rgba(49, 42, 52, .08);
+}

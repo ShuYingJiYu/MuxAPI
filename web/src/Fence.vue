@@ -8,7 +8,12 @@ const props = defineProps({
   unit: { type: String, default: '请求' },   // 计数口径文案：分组="请求"，监控="探测"
 })
 
-const COLORS = { 0: 'var(--g100)', 1: '#68bfae', 2: '#d9b463', 3: '#e18495' }
+const COLORS = {
+  0: 'var(--fence-empty)',
+  1: 'var(--fence-success)',
+  2: 'var(--fence-warning)',
+  3: 'var(--fence-danger)',
+}
 const LABEL = { 0: '无数据', 1: '正常', 2: '降级', 3: '熔断' }
 
 // 固定输出 cap 个格子，避免不同数据量导致卡片宽度变化。
@@ -85,10 +90,10 @@ function tip(b) {
 .tip {
   position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%) translateY(4px);
   display: flex; flex-direction: column; gap: 3px; width: max-content; max-width: 200px;
-  padding: 8px 10px; border-radius: 8px; background: var(--g900, #1f2937); color: #fff;
+  padding: 8px 10px; border-radius: 8px; background: var(--tooltip-bg); color: var(--text-on-accent);
   font-size: 11px; line-height: 1.45; white-space: nowrap; pointer-events: none; z-index: 40;
   opacity: 0; visibility: hidden; transition: opacity .14s, transform .14s;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, .22);
+  box-shadow: var(--tooltip-shadow);
 }
 .bar-wrap:hover .tip { opacity: 1; visibility: visible; transform: translateX(-50%) translateY(0); }
 /* 边缘格子贴边对齐，避免溢出裁剪 */
@@ -99,7 +104,7 @@ function tip(b) {
 /* 小箭头 */
 .tip::after {
   content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
-  border: 5px solid transparent; border-top-color: var(--g900, #1f2937);
+  border: 5px solid transparent; border-top-color: var(--tooltip-bg);
 }
 .tip[data-edge="l"]::after { left: 14px; }
 .tip[data-edge="r"]::after { left: auto; right: 14px; }
@@ -108,8 +113,8 @@ function tip(b) {
 .tip-head b { font-weight: 600; font-variant-numeric: tabular-nums; }
 .tip-head em { margin-left: auto; font-style: normal; font-size: 10px; opacity: .7; }
 .tip-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
-.tip-row { color: rgba(255, 255, 255, .82); font-variant-numeric: tabular-nums; }
-.tip-rate { color: rgba(255, 255, 255, .82); }
-.tip-rate b { color: #fff; font-weight: 600; }
+.tip-row { color: var(--tooltip-text-muted); font-variant-numeric: tabular-nums; }
+.tip-rate { color: var(--tooltip-text-muted); }
+.tip-rate b { color: var(--text-on-accent); font-weight: 600; }
 
 </style>

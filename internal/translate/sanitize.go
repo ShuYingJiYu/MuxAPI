@@ -131,7 +131,14 @@ func stubTool(name string, target Format) map[string]any {
 				"parameters":  map[string]any{"type": "object"},
 			},
 		}
-	default: // passthrough claude 及其他目标：anthropic 工具形状
+	case OpenAIResponses, Codex:
+		return map[string]any{
+			"type":        "function",
+			"name":        name,
+			"description": stubToolDescription,
+			"parameters":  map[string]any{"type": "object"},
+		}
+	default: // passthrough / Claude 目标使用 Anthropic 工具形状
 		return map[string]any{
 			"name":         name,
 			"description":  stubToolDescription,
