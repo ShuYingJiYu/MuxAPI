@@ -17,6 +17,7 @@ import (
 
 	"github.com/mirainya/muxapi/internal/translate"
 	"github.com/mirainya/muxapi/internal/upstream"
+	"github.com/tidwall/sjson"
 )
 
 const defaultFirstResponseTimeout = 120 * time.Second
@@ -44,6 +45,7 @@ type Picker interface {
 type Forwarder struct {
 	picker               Picker
 	health               Health
+	modelAliases         map[string]string
 	maxAttempts          int
 	maxAttemptsProvider  func() int
 	firstResponseTimeout func() time.Duration
@@ -61,6 +63,11 @@ func New(p Picker, h Health, maxRetries int) *Forwarder {
 // SetFirstResponseTimeout 设置动态首响应超时读取器，便于运行时修改配置。
 func (f *Forwarder) SetFirstResponseTimeout(timeout func() time.Duration) {
 	f.firstResponseTimeout = timeout
+}
+
+// SetModelAliases 配置模型别名映射，启动时设置一次。
+func (f *Forwarder) SetModelAliases(aliases map[string]string) {
+	f.modelAliases = aliases
 }
 
 // SetMaxAttemptsProvider supplies the current per-request upstream attempt limit.
@@ -208,6 +215,14 @@ func resultFromAttempt(attempt AttemptResult, attempts []AttemptResult) Result {
 // Forward 执行一次请求。只有在响应尚未提交给客户端时，失败才会切换上游。
 func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte, groupID int64, keyName string) Result {
 	model := parseModel(body)
+	if canonical := f.canonicalizeModel(model); canonical != model {
+		// 同步改写请求体：透传路径原样发送 body，翻译路径的 translator 也从
+		// 归一化后的名字取值。请求审计记录的是客户端原始模型名。
+		if rewritten, err := sjson.SetBytes(body, "model", canonical); err == nil {
+			body = rewritten
+		}
+		model = canonical
+	}
 	streamRequested := parseStream(body)
 	sourceFormat, sourceKnown := translate.SourceFromRequest(r.URL.Path, r.Header)
 	if !sourceKnown {
