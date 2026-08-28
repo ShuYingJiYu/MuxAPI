@@ -3,7 +3,21 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#fffaf2" />
     <title>MuxAPI 管理后台</title>
+    <script>
+      (() => {
+        const ids = ['peach-soda', 'sakura-milk', 'mint-salt', 'starlight-candy']
+        try {
+          const stored = localStorage.getItem('muxapi_theme')
+          const theme = ids.includes(stored) ? stored : ids[0]
+          document.documentElement.dataset.theme = theme
+          document.documentElement.style.colorScheme = theme === 'starlight-candy' ? 'dark' : 'light'
+        } catch {
+          document.documentElement.dataset.theme = ids[0]
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="app">
@@ -17,18 +31,34 @@
       </div>
     </div>
     <style>
+      :root {
+        --boot-canvas: #fffaf2; --boot-muted: #938995; --boot-line: #f1eade;
+        --boot-a: #f58daf; --boot-b: #85c8e5; --boot-c: #45c9b6;
+      }
+      :root[data-theme="sakura-milk"] {
+        --boot-canvas: #fff7fb; --boot-muted: #9b8497; --boot-line: #f4e7ef;
+        --boot-a: #f47fa9; --boot-b: #9b9be8; --boot-c: #75c8e8;
+      }
+      :root[data-theme="mint-salt"] {
+        --boot-canvas: #f3fffb; --boot-muted: #7f9693; --boot-line: #e0efec;
+        --boot-a: #36cbb1; --boot-b: #68bfe5; --boot-c: #ff8eaa;
+      }
+      :root[data-theme="starlight-candy"] {
+        --boot-canvas: #1a171f; --boot-muted: #9f96a6; --boot-line: #35303c;
+        --boot-a: #ff87b7; --boot-b: #8bbcf5; --boot-c: #6edfd0;
+      }
       html, body, #app { width: 100%; height: 100%; margin: 0; }
-      body { background: #fffaf2; }
+      body { background: var(--canvas, var(--boot-canvas)); }
       .boot-screen {
         min-height: 100%; display: grid; place-content: center; justify-items: center;
         grid-template-columns: minmax(0, 220px); gap: 8px; padding: 24px; box-sizing: border-box;
-        background: #fffaf2; color: #938995;
+        background: var(--canvas, var(--boot-canvas)); color: var(--boot-muted);
         font: 13px/1.5 "Noto Sans SC", "Microsoft YaHei UI", "Segoe UI", sans-serif;
       }
       .boot-mark {
         position: relative; width: 48px; height: 48px; display: grid; place-items: center;
         margin-bottom: 5px; border-radius: 50%; color: #fff;
-        background: linear-gradient(135deg, #f58daf, #85c8e5);
+        background: linear-gradient(135deg, var(--boot-a), var(--boot-b));
         box-shadow: 0 7px 20px rgba(151, 126, 151, .20);
         animation: boot-mark-in .35s ease-out both;
       }
@@ -38,15 +68,15 @@
       }
       .boot-mark svg { width: 23px; height: 23px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linejoin: round; }
       .boot-screen strong {
-        color: #f58daf; font: 650 20px/1.25 "Bahnschrift", "Noto Sans SC", "Microsoft YaHei UI", sans-serif;
-        background: linear-gradient(120deg, #f58daf, #63a9cd); background-clip: text;
+        color: var(--boot-a); font: 650 20px/1.25 "Bahnschrift", "Noto Sans SC", "Microsoft YaHei UI", sans-serif;
+        background: linear-gradient(120deg, var(--boot-a), var(--boot-b)); background-clip: text;
         -webkit-background-clip: text; -webkit-text-fill-color: transparent;
       }
-      .boot-status { color: #938995; font-size: 12px; }
-      .boot-progress { width: 136px; height: 3px; overflow: hidden; margin-top: 8px; border-radius: 3px; background: #f1eade; }
+      .boot-status { color: var(--boot-muted); font-size: 12px; }
+      .boot-progress { width: 136px; height: 3px; overflow: hidden; margin-top: 8px; border-radius: 3px; background: var(--boot-line); }
       .boot-progress i {
         display: block; width: 38%; height: 100%; border-radius: inherit;
-        background: linear-gradient(90deg, #f58daf, #85c8e5, #45c9b6);
+        background: linear-gradient(90deg, var(--boot-a), var(--boot-b), var(--boot-c));
         animation: boot-progress 1.35s ease-in-out infinite;
       }
       @keyframes boot-mark-in { from { opacity: 0; transform: translateY(4px) scale(.94); } to { opacity: 1; transform: none; } }

@@ -523,9 +523,16 @@ onMounted(() => {
   ensureExternalTooltip(props.datasets?.length > 1 && !props.sparkline)
   el.value.addEventListener('pointermove', handleCanvasPointerMove, { passive: true })
   chart = new Chart(el.value, cfg())
+  window.addEventListener('muxapi-theme-change', handleThemeChange)
 })
+function handleThemeChange() {
+  if (!chart) return
+  chart.destroy()
+  chart = new Chart(el.value, cfg())
+}
 onBeforeUnmount(() => {
   chart?.destroy()
+  window.removeEventListener('muxapi-theme-change', handleThemeChange)
   el.value?.removeEventListener('pointermove', handleCanvasPointerMove)
   cancelAnimationFrame(tooltipFrame)
   cancelAnimationFrame(tooltipScrollFrame)

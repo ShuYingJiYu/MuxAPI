@@ -8,6 +8,7 @@ import Fence from './Fence.vue'
 import FancySelect from './FancySelect.vue'
 import UpstreamPicker from './UpstreamPicker.vue'
 import Chart from './Chart.vue'
+import ThemePicker from './ThemePicker.vue'
 import { api } from './api.js'
 import { useLogs } from './composables/useLogs.js'
 import { useMonitorViews } from './composables/useMonitorViews.js'
@@ -1823,6 +1824,7 @@ function logout() {
 <template>
 <div v-if="!loggedIn" class="login-page">
     <div class="login-card">
+      <ThemePicker class="login-theme-picker" />
       <div class="logo login-logo"><Icon name="bolt" :size="22" /><span class="logo-text">MuxAPI</span></div>
       <h1>管理后台登录</h1>
       <p>输入服务器环境变量 <code>MUXAPI_TOKEN</code>。</p>
@@ -1839,7 +1841,7 @@ function logout() {
         <h1 class="app-page-title">{{ detailGroup ? detailGroup.name : pages[page].title }}</h1>
         <p class="app-page-desc">{{ detailGroup ? '管理该分组的上游成员与接入密钥' : pages[page].desc }}</p>
       </div>
-      <div class="app-topbar-actions"><span v-if="appVersion" class="app-version">{{ appVersion }}</span><button class="btn-link sm" @click="logout">退出</button></div>
+      <div class="app-topbar-actions"><span v-if="appVersion" class="app-version">{{ appVersion }}</span><ThemePicker /><button class="btn-link sm" @click="logout">退出</button></div>
     </header>
 
     <aside class="subnav-rail">
