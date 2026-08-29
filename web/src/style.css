@@ -1159,7 +1159,10 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .channel-runtime-row b.open { color: var(--state-danger); }
 .channel-monitor-card .card-metrics { min-height: 82px; }
 .channel-monitor-card .fence { margin-top: 8px; }
-.availability-channel-grid { grid-template-columns: repeat(auto-fit, minmax(min(18rem, 100%), 1fr)); }
+.availability-channel-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (max-width: 1180px) {
+  .availability-channel-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 .availability-channel-card { padding: 16px 16px 0; overflow: hidden; }
 .availability-channel-head { width: 100%; display: flex; align-items: center; gap: 10px; }
 .availability-channel-id { flex: 1; min-width: 0; }
@@ -1581,6 +1584,7 @@ table.matrix th, table.matrix td { padding: 0; }
   .monitor-source-head strong { max-width: calc(100% - 70px); }
   .monitor-source-head em { width: 100%; margin-left: 35px; }
   .channel-card-grid { grid-template-columns: minmax(0, 1fr); }
+  .availability-channel-grid { grid-template-columns: minmax(0, 1fr); }
   .upstream-form-grid { grid-template-columns: 1fr; }
   .upstream-form-tags { grid-column: auto; }
   .channel-monitor-card { padding: 14px; }
