@@ -317,7 +317,6 @@ const pages = {
 // --- 弹窗状态 ---
 const dlg = reactive({ type: '', form: {} })
 const dialogSaving = ref(false)
-const upstreamFormTagSearch = ref('')
 const upstreamVendor = ref('')
 const upstreamImportText = ref('')
 const upstreamImportMessage = ref('')
@@ -332,7 +331,6 @@ const upstreamFormGroupChoices = computed(() => {
 const tagManagerSearch = ref('')
 function closeDlg() {
   dlg.type = ''
-  upstreamFormTagSearch.value = ''
   upstreamVendor.value = ''
   upstreamImportText.value = ''
   upstreamImportMessage.value = ''
@@ -662,15 +660,11 @@ const upstreamFormSelectedTags = computed(() => {
   const primary = Number(dlg.form.primary_tag_id) || 0
   return tags.value.filter(tag => selected.has(tag.id) && tag.id !== primary)
 })
-const upstreamFormAvailableTags = computed(() => {
-  const selected = new Set(upstreamFormSelectedTags.value.map(tag => tag.id))
+const upstreamFormTagOptions = computed(() => {
   const primary = Number(dlg.form.primary_tag_id) || 0
-  const query = upstreamFormTagSearch.value.trim().toLowerCase()
-  return tags.value.filter(tag => tag.id !== primary && !selected.has(tag.id)
-    && (!query || tag.name.toLowerCase().includes(query)))
+  return tags.value.filter(tag => tag.id !== primary).map(tag => ({ value: tag.id, label: tag.name, color: tag.color }))
 })
 function newUpstream() {
-  upstreamFormTagSearch.value = ''
   upstreamFormGroupIDs.value = []
   upstreamFormGroupSearch.value = ''
   upstreamVendor.value = ''
@@ -682,7 +676,6 @@ function newUpstream() {
   dlg.form = { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', billing_type: 'none', credit_ratio: 1, enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] }
 }
 function editUpstream(u) {
-  upstreamFormTagSearch.value = ''
   upstreamFormGroupIDs.value = []
   upstreamFormGroupSearch.value = ''
   upstreamVendor.value = ''
@@ -855,13 +848,6 @@ function buildPageItems(total, current) {
   items.push({ type: 'page', value: total, key: `page-${total}` })
   return items
 }
-function toggleUpstreamFormTag(id) {
-  const set = new Set(dlg.form.tag_ids || [])
-  if (set.has(id)) set.delete(id)
-  else set.add(id)
-  dlg.form.tag_ids = [...set]
-}
-
 const tagColorChoices = [
   { value: 'gray', label: '灰' }, { value: 'green', label: '绿' },
   { value: 'teal', label: '青绿' }, { value: 'cyan', label: '青' },
@@ -2996,34 +2982,23 @@ function logout() {
             <textarea v-model="upstreamImportText" rows="2" placeholder="例如：OpenRouter | https://openrouter.ai/api | sk-or-..." @keydown.ctrl.enter="importUpstreamConfig"></textarea>
             <p v-if="upstreamImportMessage" class="upstream-import-message" :class="{ error: upstreamImportError }">{{ upstreamImportMessage }}</p>
           </section>
+          <div v-if="!dlg.form.id" class="field upstream-vendor-field">
+            <label>厂商预设</label>
+            <FancySelect v-model="upstreamVendor" :options="vendorPresets.map(p => ({ value: p.value, label: p.label }))" @change="applyVendorPreset" />
+          </div>
           <div class="upstream-form-grid">
             <div class="field"><label>名称</label><input v-model="dlg.form.name" /></div>
-            <div class="field" v-if="!dlg.form.id"><label>厂商</label><FancySelect v-model="upstreamVendor" :options="vendorPresets.map(p => ({ value: p.value, label: p.label }))" @change="applyVendorPreset" /></div>
             <div class="field"><label>base_url <small v-if="upstreamBaseURLDirty" class="field-note">已手动填写</small></label><input v-model="dlg.form.base_url" placeholder="https://..." @input="markUpstreamBaseURLDirty" /></div>
             <div class="field"><label>协议</label><FancySelect v-model="dlg.form.protocol" :options="protocolOptions" /></div>
             <div class="field"><label>api_key</label><input v-model="dlg.form.api_key" :placeholder="dlg.form.id ? '留空则不修改' : 'sk-...'" /></div>
             <div class="field"><label>代理</label><input v-model="dlg.form.proxy" placeholder="留空=直连/环境变量；如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></div>
             <div class="field"><label>计费平台</label><FancySelect v-model="dlg.form.billing_type" :options="billingTypeOptions" /></div>
-            <div class="field"><label>储值倍率</label><input v-model="dlg.form.credit_ratio" type="number" step="any" min="0" placeholder="充1得N积分时填 N；默认 1" /></div>
             <div class="field"><label>主标签</label><FancySelect v-model="dlg.form.primary_tag_id" :options="primaryTagOptions" /></div>
             <div class="field upstream-form-tags">
               <label class="field-label-row"><span>普通标签</span><small>{{ upstreamFormSelectedTags.length }} 个已选</small></label>
-              <div class="tag-picker-panel">
-                <div v-if="upstreamFormSelectedTags.length" class="tag-picker-selected">
-                  <button v-for="tag in upstreamFormSelectedTags" :key="tag.id" type="button" class="manage-tag selected" :class="`tag-${tag.color}`" :title="`移除 ${tag.name}`" @click="toggleUpstreamFormTag(tag.id)">
-                    {{ tag.name }}<Icon name="x" :size="12" />
-                  </button>
-                </div>
-                <div class="tag-picker-search"><Icon name="search" :size="15" /><input v-model="upstreamFormTagSearch" placeholder="搜索普通标签" /></div>
-                <div class="tag-picker-options">
-                  <button v-for="tag in upstreamFormAvailableTags" :key="tag.id" type="button" class="tag-picker-option" @click="toggleUpstreamFormTag(tag.id)">
-                    <span class="tag-color-dot" :class="`tag-${tag.color}`"></span><span>{{ tag.name }}</span><Icon name="plus" :size="14" />
-                  </button>
-                  <span v-if="!tags.length" class="tag-picker-empty">请先在标签管理中创建标签</span>
-                  <span v-else-if="!upstreamFormAvailableTags.length" class="tag-picker-empty">没有可添加的标签</span>
-                </div>
-              </div>
+              <FancySelect v-model="dlg.form.tag_ids" variant="tag" multiple searchable :options="upstreamFormTagOptions" />
             </div>
+            <div class="field"><label>储值倍率</label><input v-model="dlg.form.credit_ratio" type="number" step="any" min="0" placeholder="充1得N积分时填 N；默认 1" /></div>
             <div class="field upstream-form-groups" v-if="!dlg.form.id">
               <label class="field-label-row"><span>加入分组</span><small>{{ upstreamFormGroupIDs.length }} 个已选</small></label>
               <div class="tag-picker-panel">

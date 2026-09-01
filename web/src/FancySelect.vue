@@ -4,11 +4,12 @@ import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import Icon from './Icon.vue'
 
 const props = defineProps({
-  modelValue: { type: [String, Number, Boolean], default: '' },
+  modelValue: { type: [String, Number, Boolean, Array], default: '' },
   options: { type: Array, default: () => [] },
   disabled: { type: Boolean, default: false },
   variant: { type: String, default: '' },
   searchable: { type: Boolean, default: false },
+  multiple: { type: Boolean, default: false },
 })
 
 const emit = defineEmits(['update:modelValue', 'change'])
@@ -21,7 +22,18 @@ const menuStyle = ref({})
 const searchText = ref('')
 
 const selected = computed(() => props.options.find(o => String(o.value) === String(props.modelValue)))
-const label = computed(() => selected.value?.label ?? '请选择')
+const selectedOptions = computed(() => {
+  if (!props.multiple) return selected.value ? [selected.value] : []
+  const selectedValues = new Set((Array.isArray(props.modelValue) ? props.modelValue : []).map(value => String(value)))
+  return props.options.filter(option => selectedValues.has(String(option.value)))
+})
+const label = computed(() => {
+  if (!props.multiple) return selected.value?.label ?? '请选择'
+  if (!selectedOptions.value.length) return '未选择'
+  const names = selectedOptions.value.map(option => option.label)
+  if (names.length <= 2) return names.join('、')
+  return `${names[0]} 等 ${names.length} 个`
+})
 const filteredOptions = computed(() => {
   const query = searchText.value.trim().toLocaleLowerCase()
   if (!query) return props.options
@@ -35,6 +47,14 @@ function toggle() {
 }
 function pick(opt) {
   if (opt.disabled) return
+  if (props.multiple) {
+    const selectedValues = new Set((Array.isArray(props.modelValue) ? props.modelValue : []).map(value => String(value)))
+    selectedValues.has(String(opt.value)) ? selectedValues.delete(String(opt.value)) : selectedValues.add(String(opt.value))
+    const values = props.options.filter(option => selectedValues.has(String(option.value))).map(option => option.value)
+    emit('update:modelValue', values)
+    emit('change', values)
+    return
+  }
   emit('update:modelValue', opt.value)
   emit('change', opt.value)
   open.value = false
@@ -90,28 +110,28 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div ref="root" class="fancy-select" :class="[{ open, disabled }, variant ? `variant-${variant}` : '']">
+  <div ref="root" class="fancy-select" :class="[{ open, disabled, 'fancy-select-multiple': multiple }, variant ? `variant-${variant}` : '']">
     <button ref="trigger" type="button" class="fancy-select-btn" :disabled="disabled" aria-haspopup="listbox" :aria-expanded="open" @click="toggle">
-      <span class="fancy-selected-label"><i v-if="variant === 'tag'" class="fancy-tag-dot" :class="selected?.color || 'all'"></i><span>{{ label }}</span></span>
+      <span class="fancy-selected-label"><i v-if="variant === 'tag'" class="fancy-tag-dot" :class="multiple ? 'all' : (selected?.color || 'all')"></i><span>{{ label }}</span></span>
       <Icon name="chevron-right" :size="15" class="fancy-select-arrow" />
     </button>
     <Teleport to="body">
       <Transition name="fancy-pop">
-        <div v-if="open" ref="menu" class="fancy-select-menu fancy-select-portal" :class="variant ? `fancy-select-menu-${variant}` : ''" role="listbox" :style="menuStyle">
+        <div v-if="open" ref="menu" class="fancy-select-menu fancy-select-portal" :class="variant ? `fancy-select-menu-${variant}` : ''" role="listbox" :aria-multiselectable="multiple || undefined" :style="menuStyle">
         <div v-if="searchable" class="fancy-select-search"><Icon name="search" :size="14" /><input ref="searchInput" v-model="searchText" type="search" placeholder="搜索标签" @click.stop /></div>
         <button
           v-for="opt in filteredOptions"
           :key="String(opt.value)"
           type="button"
           class="fancy-select-item"
-          :class="{ active: String(opt.value) === String(modelValue), disabled: opt.disabled }"
+          :class="{ active: multiple ? selectedOptions.some(item => String(item.value) === String(opt.value)) : String(opt.value) === String(modelValue), disabled: opt.disabled }"
           :disabled="opt.disabled"
           role="option"
-          :aria-selected="String(opt.value) === String(modelValue)"
+          :aria-selected="multiple ? selectedOptions.some(item => String(item.value) === String(opt.value)) : String(opt.value) === String(modelValue)"
           @click="pick(opt)"
         >
           <span class="fancy-option-main"><i v-if="variant === 'tag'" class="fancy-tag-dot" :class="opt.color || 'all'"></i><span>{{ opt.label }}</span></span>
-          <Icon v-if="String(opt.value) === String(modelValue)" name="check" :size="14" />
+          <Icon v-if="multiple ? selectedOptions.some(item => String(item.value) === String(opt.value)) : String(opt.value) === String(modelValue)" name="check" :size="14" />
         </button>
         <div v-if="searchable && !filteredOptions.length" class="fancy-select-empty">没有匹配标签</div>
         </div>

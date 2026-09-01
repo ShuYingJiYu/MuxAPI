@@ -604,7 +604,7 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .dialog.upstream-dialog { width: min(820px, calc(100vw - 24px)); max-height: calc(100vh - 24px); overflow-y: auto; }
 .upstream-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 18px; }
 .upstream-form-grid .field { min-width: 0; margin-bottom: 12px; }
-.upstream-form-tags { grid-column: 1 / -1; }
+.upstream-form-tags { grid-column: auto; }
 .upstream-form-groups { grid-column: 1 / -1; }
 .field label .field-note { display: inline; margin-left: 6px; color: var(--p600); font-size: 10px; font-weight: 600; }
 .upstream-quick-import { margin: -4px 0 18px; padding: 13px 14px 12px; border: 1px solid var(--p100); border-radius: var(--r-control); background: var(--p50); }
@@ -618,6 +618,8 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .upstream-quick-import textarea:focus { border-color: var(--p500); box-shadow: 0 0 0 3px var(--selection-soft); }
 .upstream-import-message { margin: 7px 0 0; color: var(--state-success); font-size: 11px; }
 .upstream-import-message.error { color: var(--state-danger); }
+.upstream-form-tags .fancy-select { min-width: 0; }
+.upstream-form-tags .fancy-select-btn { min-width: 0; }
 .dialog > h3 { display: flex; align-items: center; gap: 10px; margin: 0 0 22px; padding: 0 0 17px; border-bottom: 1px solid var(--divider); font-size: 18px; font-weight: 750; color: var(--g900); letter-spacing: 0; }
 .dialog > h3::before { content: ''; width: 5px; height: 21px; flex: none; border-radius: 4px; background: var(--p500); }
 .dialog-sm::before { background: var(--red); }
