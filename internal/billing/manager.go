@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,11 +39,13 @@ type Manager struct {
 	pricingClient   *http.Client
 	pricingFallback []byte
 
-	// coolDown 记录每个 upstream 下次允许再打计费端点的时刻。上游 429 后写入未来
-	// 时刻，RefreshAll 提前过滤掉命中冷却期的项，避免死撞并把 WARN 日志刷屏。
+	// coolDown 记录每个上游服务(按 base_url)下次允许再打计费端点的时刻。
+	// 用 base_url 而非 upstream_id 是因为限流通常施加在服务端 IP/账号级别：
+	// aws0/aws0ex/aws0sushua 都在 us.oojj.top，其中一把 key 拿到 429，剩下的
+	// 10 分钟内基本也白打。共享冷却避免撞墙 + 打光对方好意的排队额度。
 	// 只有 429 触发冷却；普通错误(网络断/500) 走原节奏重试。
 	coolDownMu sync.Mutex
-	coolDown   map[int64]time.Time
+	coolDown   map[string]time.Time
 }
 
 func NewManager(st *store.Store) *Manager {
@@ -51,27 +55,40 @@ func NewManager(st *store.Store) *Manager {
 		pricingInterval: defaultPricingInterval, pricingTimeout: defaultPricingTimeout,
 		pricingURL: defaultPricingURL, pricingClient: http.DefaultClient,
 		pricingFallback: embeddedPricingCatalog,
-		coolDown:        make(map[int64]time.Time),
+		coolDown:        make(map[string]time.Time),
 	}
 }
 
-func (m *Manager) inCoolDown(upstreamID int64) bool {
+// poolKey normalizes base_url so小写/末尾斜杠差异不产生独立池。
+func poolKey(u *upstream.Upstream) string {
+	return strings.ToLower(strings.TrimRight(strings.TrimSpace(u.BaseURL), "/"))
+}
+
+func (m *Manager) inCoolDown(u *upstream.Upstream) bool {
+	key := poolKey(u)
+	if key == "" {
+		return false
+	}
 	m.coolDownMu.Lock()
 	defer m.coolDownMu.Unlock()
-	until, ok := m.coolDown[upstreamID]
+	until, ok := m.coolDown[key]
 	if !ok {
 		return false
 	}
 	if time.Now().Before(until) {
 		return true
 	}
-	delete(m.coolDown, upstreamID)
+	delete(m.coolDown, key)
 	return false
 }
 
-func (m *Manager) markRateLimited(upstreamID int64) {
+func (m *Manager) markRateLimited(u *upstream.Upstream) {
+	key := poolKey(u)
+	if key == "" {
+		return
+	}
 	m.coolDownMu.Lock()
-	m.coolDown[upstreamID] = time.Now().Add(rateLimitBackoff * m.interval)
+	m.coolDown[key] = time.Now().Add(rateLimitBackoff * m.interval)
 	m.coolDownMu.Unlock()
 }
 
@@ -147,12 +164,43 @@ func (m *Manager) Refresh(ctx context.Context, upstreamID int64) (store.BillingS
 }
 
 // RefreshAll updates every configured billing upstream with a bounded worker pool.
+// 上游按数据陈旧度排序（last_success_at 越老越优先）：一轮刷不完时(冷却/超时)，
+// 最需要更新的余额/倍率先落，路由决策拿到的数字保持最新。
+// base_url 命中冷却池的 upstream 整个跳过，避免撞墙 + 消耗对方限流额度。
 func (m *Manager) RefreshAll(ctx context.Context) {
 	items, err := m.store.List()
 	if err != nil {
 		slog.Warn("list billing upstreams failed", "err", err)
 		return
 	}
+	statuses, err := m.store.ListBillingStatusesLite()
+	if err != nil {
+		// 无历史状态并非致命；退化为无序刷新
+		slog.Warn("load billing statuses for prioritization failed", "err", err)
+		statuses = nil
+	}
+
+	// 过滤 + 排序：先按 base_url 冷却池排除，再按 last_success_at 升序（0=从未成功，最高优）
+	queue := make([]*upstream.Upstream, 0, len(items))
+	skippedCoolDown := 0
+	for _, item := range items {
+		if item.BillingType == upstream.BillingNone || item.BillingType == "" {
+			continue
+		}
+		if m.inCoolDown(item) {
+			skippedCoolDown++
+			continue
+		}
+		queue = append(queue, item)
+	}
+	sort.SliceStable(queue, func(i, j int) bool {
+		return staleness(statuses, queue[i].ID) < staleness(statuses, queue[j].ID)
+	})
+	if skippedCoolDown > 0 {
+		slog.Debug("billing refresh skipped upstreams in cool-down",
+			"count", skippedCoolDown, "queued", len(queue))
+	}
+
 	jobs := make(chan *upstream.Upstream)
 	var workers sync.WaitGroup
 	workers.Add(m.concurrency)
@@ -165,10 +213,10 @@ func (m *Manager) RefreshAll(ctx context.Context) {
 					continue
 				}
 				if errors.Is(err, ErrRateLimited) {
-					m.markRateLimited(item.ID)
-					// 上游限流是常态而非故障，仅记一条 INFO 一次(冷却期内不会再打)
+					m.markRateLimited(item)
+					// 上游限流是常态而非故障，只记 INFO 一次(冷却期内不会再打)
 					slog.Info("billing refresh rate limited, backing off",
-						"upstream_id", item.ID, "name", item.Name,
+						"upstream_id", item.ID, "name", item.Name, "pool", poolKey(item),
 						"backoff", rateLimitBackoff*m.interval)
 					continue
 				}
@@ -176,11 +224,10 @@ func (m *Manager) RefreshAll(ctx context.Context) {
 			}
 		}()
 	}
-	for _, item := range items {
-		if item.BillingType == upstream.BillingNone || item.BillingType == "" {
-			continue
-		}
-		if m.inCoolDown(item.ID) {
+	for _, item := range queue {
+		// 竞态窗口：从进队到 worker 取走之间，如果同池另一个 upstream 撞了 429 并
+		// mark 了冷却，这里再判一次。避免用剩下的 worker 继续消耗同池额度。
+		if m.inCoolDown(item) {
 			continue
 		}
 		select {
@@ -193,6 +240,17 @@ func (m *Manager) RefreshAll(ctx context.Context) {
 	}
 	close(jobs)
 	workers.Wait()
+}
+
+// staleness 返回排序键：越小越优先刷。取 last_success_at；从未成功过(=0)返回最小值。
+func staleness(statuses map[int64]store.BillingStatus, id int64) int64 {
+	if statuses == nil {
+		return 0
+	}
+	if s, ok := statuses[id]; ok {
+		return s.LastSuccessAt
+	}
+	return 0
 }
 
 // Run refreshes billing and pricing independently on fixed low-frequency intervals.
