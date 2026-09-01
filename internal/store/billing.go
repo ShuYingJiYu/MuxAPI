@@ -158,6 +158,30 @@ func (s *Store) SaveBillingFailure(upstreamID int64, message string, refreshedAt
 	return err
 }
 
+// SetBillingMultiplier 手动录入一次倍率(等价于"人工探测")。同时写 effective/group，
+// status 保持 ok；下次 auto-refresh 从上游扣费日志拿到 group_ratio 会自然覆盖，
+// 因此这里不引入新的持久化字段(与 auto-refresh 出的普通值同轨)。
+func (s *Store) SetBillingMultiplier(upstreamID int64, multiplier float64) error {
+	now := time.Now()
+	nowUnix := now.Unix()
+	refreshed := billingTimestamp(nowUnix, now)
+	observed := refreshed
+	_, err := s.exec(`INSERT INTO upstream_billing_status(
+		upstream_id,currency,effective_multiplier,group_multiplier,status,
+		observed_at,last_success_at,refreshed_at)
+		VALUES(?,'USD',?,?,'ok',?,?,?)
+		ON CONFLICT(upstream_id) DO UPDATE SET
+			effective_multiplier=excluded.effective_multiplier,
+			group_multiplier=excluded.group_multiplier,
+			status='ok',error_text='',
+			observed_at=excluded.observed_at,
+			last_success_at=excluded.last_success_at,
+			refreshed_at=excluded.refreshed_at`,
+		upstreamID, multiplier, multiplier,
+		s.timeValue(observed), s.timeValue(observed), s.timeValue(refreshed))
+	return err
+}
+
 // LastKnownMultiplier returns the most recent non-null effective_multiplier
 // from billing snapshots. Used as fallback when the current status has lost
 // its multiplier due to partial/error refreshes.
