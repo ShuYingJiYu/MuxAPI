@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release tag, for example v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+
+jobs:
+  release:
+    name: Build release packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build frontend assets
+        working-directory: web
+        run: npm ci && npm run build
+
+      - name: Validate release version
+        run: |
+          case "${RELEASE_VERSION}" in
+            v*) ;;
+            *) echo "Release version must start with v: ${RELEASE_VERSION}"; exit 1 ;;
+          esac
+
+      - name: Build Linux package
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          mkdir -p dist-release
+          go build -trimpath -ldflags="-s -w -X main.Version=${RELEASE_VERSION}" -o dist-release/muxapi-linux-amd64 ./cmd/muxapi
+          tar -C dist-release -czf "dist-release/muxapi-${RELEASE_VERSION}-linux-amd64.tar.gz" muxapi-linux-amd64
+
+      - name: Build Windows package
+        env:
+          CGO_ENABLED: 0
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          go build -trimpath -ldflags="-s -w -H=windowsgui -X main.Version=${RELEASE_VERSION}" -o dist-release/muxapi-windows-amd64.exe ./cmd/muxapi
+          (cd dist-release && zip -q "muxapi-${RELEASE_VERSION}-windows-amd64.zip" muxapi-windows-amd64.exe)
+
+      - name: Create checksums
+        working-directory: dist-release
+        run: sha256sum "muxapi-${RELEASE_VERSION}-linux-amd64.tar.gz" "muxapi-${RELEASE_VERSION}-windows-amd64.zip" > SHA256SUMS
+
+      - name: Upload release packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: muxapi-${{ env.RELEASE_VERSION }}
+          path: |
+            dist-release/muxapi-${{ env.RELEASE_VERSION }}-linux-amd64.tar.gz
+            dist-release/muxapi-${{ env.RELEASE_VERSION }}-windows-amd64.zip
+            dist-release/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${RELEASE_VERSION}" \
+            "dist-release/muxapi-${RELEASE_VERSION}-linux-amd64.tar.gz" \
+            "dist-release/muxapi-${RELEASE_VERSION}-windows-amd64.zip" \
+            dist-release/SHA256SUMS \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "MuxAPI ${RELEASE_VERSION}" \
+            --generate-notes
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Publish versioned container
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.ci
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/muxapi:${{ env.RELEASE_VERSION }}
+            ghcr.io/${{ github.repository_owner }}/muxapi:latest
+          build-args: VERSION=${{ env.RELEASE_VERSION }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
