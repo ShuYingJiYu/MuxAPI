@@ -19,6 +19,9 @@ const (
 	defaultConcurrency     = 4
 	defaultPricingInterval = 24 * time.Hour
 	defaultPricingTimeout  = 30 * time.Second
+	// rateLimitBackoff 上游 429 后跳过多少个刷新周期。取略大于 interval 的值就够，
+	// 3 倍能覆盖 15-30 分钟窗口的上游限流(us.oojj.top 实测约每 15-20 分钟一次)。
+	rateLimitBackoff = 3
 )
 
 // Manager schedules provider billing collection independently from request forwarding.
@@ -33,6 +36,12 @@ type Manager struct {
 	pricingURL      string
 	pricingClient   *http.Client
 	pricingFallback []byte
+
+	// coolDown 记录每个 upstream 下次允许再打计费端点的时刻。上游 429 后写入未来
+	// 时刻，RefreshAll 提前过滤掉命中冷却期的项，避免死撞并把 WARN 日志刷屏。
+	// 只有 429 触发冷却；普通错误(网络断/500) 走原节奏重试。
+	coolDownMu sync.Mutex
+	coolDown   map[int64]time.Time
 }
 
 func NewManager(st *store.Store) *Manager {
@@ -42,7 +51,28 @@ func NewManager(st *store.Store) *Manager {
 		pricingInterval: defaultPricingInterval, pricingTimeout: defaultPricingTimeout,
 		pricingURL: defaultPricingURL, pricingClient: http.DefaultClient,
 		pricingFallback: embeddedPricingCatalog,
+		coolDown:        make(map[int64]time.Time),
 	}
+}
+
+func (m *Manager) inCoolDown(upstreamID int64) bool {
+	m.coolDownMu.Lock()
+	defer m.coolDownMu.Unlock()
+	until, ok := m.coolDown[upstreamID]
+	if !ok {
+		return false
+	}
+	if time.Now().Before(until) {
+		return true
+	}
+	delete(m.coolDown, upstreamID)
+	return false
+}
+
+func (m *Manager) markRateLimited(upstreamID int64) {
+	m.coolDownMu.Lock()
+	m.coolDown[upstreamID] = time.Now().Add(rateLimitBackoff * m.interval)
+	m.coolDownMu.Unlock()
 }
 
 func (m *Manager) acquire(ctx context.Context) error {
@@ -130,14 +160,27 @@ func (m *Manager) RefreshAll(ctx context.Context) {
 		go func() {
 			defer workers.Done()
 			for item := range jobs {
-				if _, err := m.refreshItem(ctx, item); err != nil && !errors.Is(err, context.Canceled) {
-					slog.Warn("billing refresh failed", "upstream_id", item.ID, "name", item.Name, "err", err)
+				_, err := m.refreshItem(ctx, item)
+				if err == nil || errors.Is(err, context.Canceled) {
+					continue
 				}
+				if errors.Is(err, ErrRateLimited) {
+					m.markRateLimited(item.ID)
+					// 上游限流是常态而非故障，仅记一条 INFO 一次(冷却期内不会再打)
+					slog.Info("billing refresh rate limited, backing off",
+						"upstream_id", item.ID, "name", item.Name,
+						"backoff", rateLimitBackoff*m.interval)
+					continue
+				}
+				slog.Warn("billing refresh failed", "upstream_id", item.ID, "name", item.Name, "err", err)
 			}
 		}()
 	}
 	for _, item := range items {
 		if item.BillingType == upstream.BillingNone || item.BillingType == "" {
+			continue
+		}
+		if m.inCoolDown(item.ID) {
 			continue
 		}
 		select {

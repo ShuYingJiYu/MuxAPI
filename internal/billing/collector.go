@@ -18,7 +18,11 @@ import (
 
 const maxBillingResponse = 2 << 20
 
-var ErrBillingDisabled = errors.New("billing collection is disabled for this upstream")
+var (
+	ErrBillingDisabled = errors.New("billing collection is disabled for this upstream")
+	// ErrRateLimited 上游 429，短期内不可能成功。调用方应指数退避而非按固定节奏死撞。
+	ErrRateLimited = errors.New("billing endpoint rate limited")
+)
 
 // Result is a normalized provider billing snapshot. Nil numbers are unavailable,
 // while zero values from the provider remain distinguishable and meaningful.
@@ -78,6 +82,9 @@ func getJSON(ctx context.Context, item *upstream.Upstream, path string, target a
 		return errors.New("billing response is too large")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return fmt.Errorf("%w: %s returned 429: %s", ErrRateLimited, path, clipMessage(string(body)))
+		}
 		return fmt.Errorf("billing endpoint %s returned %d: %s", path, resp.StatusCode, clipMessage(string(body)))
 	}
 	if err := json.Unmarshal(body, target); err != nil {
