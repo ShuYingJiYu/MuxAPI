@@ -250,7 +250,11 @@ function startRtPoll(fn) {
 }
 function stopRtPoll() { if (rtTimer) { clearInterval(rtTimer); rtTimer = null } }
 function stopAllPoll() { stopMonPoll(); stopOverviewPoll(); stopRtPoll(); stopLogPoll() }
-onUnmounted(() => { stopAllPoll() })
+onUnmounted(() => {
+  stopAllPoll()
+  abortUpstreamTestRequests?.()
+  abortGroupTestRequests?.()
+})
 
 function activatePage(p) {
   const epoch = ++pageLoadEpoch
@@ -1020,35 +1024,68 @@ const testState = reactive({
   modelsLoading: false, models: [], model: '', modelsErr: '',
   running: false, output: '', status: null, // status: {ok,latency_ms,code,error}
 })
+let testAbortController = null
+let testModelsAbortController = null
+function abortUpstreamTestRequests() {
+  testAbortController?.abort()
+  testAbortController = null
+  testModelsAbortController?.abort()
+  testModelsAbortController = null
+}
+function closeTest() {
+  abortUpstreamTestRequests()
+  testState.show = false
+  testState.modelsLoading = false
+  testState.running = false
+}
 // 打开测试弹窗：先拉模型列表供选择
 function testUpstream(u) {
+  abortUpstreamTestRequests()
+  const modelsController = new AbortController()
+  testModelsAbortController = modelsController
   Object.assign(testState, {
     show: true, id: u.id, name: u.name,
     modelsLoading: true, models: [], model: '', modelsErr: '',
     running: false, output: '', status: null,
   })
-  api.testUpstream(u.id)
+  api.testUpstream(u.id, modelsController.signal)
     .then(r => {
+      if (modelsController.signal.aborted || testModelsAbortController !== modelsController) return
       testState.models = r.models || []
       testState.model = testState.models[0] || 'gpt-5.5'
       if (!r.ok && r.error) testState.modelsErr = r.error
     })
-    .catch(e => { testState.modelsErr = String(e.message || e); testState.model = 'gpt-5.5' })
-    .finally(() => { testState.modelsLoading = false })
+    .catch(e => {
+      if (modelsController.signal.aborted || testModelsAbortController !== modelsController) return
+      testState.modelsErr = String(e.message || e); testState.model = 'gpt-5.5'
+    })
+    .finally(() => {
+      if (testModelsAbortController === modelsController) {
+        testModelsAbortController = null
+        testState.modelsLoading = false
+      }
+    })
 }
 // 真实对话测试：流式回显上游回复
 async function runTest() {
   if (!testState.model || testState.running) return
+  testAbortController?.abort()
+  const controller = new AbortController()
+  testAbortController = controller
   testState.running = true; testState.output = ''; testState.status = null
   try {
     await api.testUpstreamStream(testState.id, testState.model, e => {
+      if (controller.signal.aborted || testAbortController !== controller) return
       if (e.type === 'content') testState.output += e.text
       else if (e.type === 'test_complete') testState.status = { ok: true, latency_ms: e.latency_ms }
       else if (e.type === 'error') testState.status = { ok: false, code: e.status, error: e.error, latency_ms: e.latency_ms }
-    })
+    }, controller.signal)
   } catch (e) {
+    if (controller.signal.aborted || testAbortController !== controller) return
     testState.status = { ok: false, error: String(e.message || e) }
   } finally {
+    if (testAbortController !== controller) return
+    testAbortController = null
     testState.running = false
     // 流正常结束但没收到 test_complete：
     //  - 有 content → 视为「部分成功」（连上了且有回复，只是缺收尾事件）
@@ -1071,6 +1108,20 @@ const groupTestState = reactive({
   modelsLoading: false, models: [], model: '', modelsError: '',
   running: false, output: '', error: '', status: 0, requestId: '', result: null,
 })
+let groupTestAbortController = null
+let groupModelsAbortController = null
+function abortGroupTestRequests() {
+  groupTestAbortController?.abort()
+  groupTestAbortController = null
+  groupModelsAbortController?.abort()
+  groupModelsAbortController = null
+}
+function closeGroupTest() {
+  abortGroupTestRequests()
+  groupTestState.show = false
+  groupTestState.modelsLoading = false
+  groupTestState.running = false
+}
 const groupTestProtocolOptions = [
   { value: 'responses', label: 'OpenAI Responses' },
   { value: 'chat', label: 'Chat Completions' },
@@ -1083,36 +1134,51 @@ const groupTestModelOptions = computed(() => {
   return options
 })
 function selectedGroupTestKey() { return keys.value.find(key => key.enabled && key.id === Number(groupTestState.keyId)) }
-async function loadGroupTestModels() {
+async function loadGroupTestModels(controller = new AbortController()) {
   const key = selectedGroupTestKey()
+  groupModelsAbortController?.abort()
+  groupModelsAbortController = controller
   groupTestState.modelsLoading = true
   groupTestState.models = []
   groupTestState.modelsError = ''
   try {
-    groupTestState.models = key ? await api.groupModels(key.key) : []
+    groupTestState.models = key ? await api.groupModels(key.key, controller.signal) : []
+    if (controller.signal.aborted || groupModelsAbortController !== controller) return
     groupTestState.model = groupTestState.models[0] || groupTestState.model || 'gpt-5.5'
   } catch (e) {
+    if (controller.signal.aborted || groupModelsAbortController !== controller) return
     groupTestState.modelsError = String(e.message || e)
     groupTestState.model ||= 'gpt-5.5'
   } finally {
-    groupTestState.modelsLoading = false
+    if (groupModelsAbortController === controller) {
+      groupModelsAbortController = null
+      groupTestState.modelsLoading = false
+    }
   }
 }
 function openGroupTest(key) {
   if (!key?.enabled) return
+  abortGroupTestRequests()
+  const modelsController = new AbortController()
   Object.assign(groupTestState, {
     show: true, groupName: detailGroup.value?.name || '', keyId: key.id, keyName: key.name || key.masked || ('#' + key.id), protocol: 'responses',
     modelsLoading: false, models: [], model: '', modelsError: '',
     running: false, output: '', error: '', status: 0, requestId: '', result: null,
   })
-  loadGroupTestModels()
+  loadGroupTestModels(modelsController)
 }
-async function waitForGroupTestLog(requestId) {
+async function waitForGroupTestLog(requestId, signal) {
   if (!requestId) return null
-  for (let attempt = 0; attempt < 12; attempt++) {
-    const page = await api.logs({ q: requestId, limit: 1 })
-    const entry = (page?.entries || []).find(item => item.request_id === requestId)
-    if (entry) return api.logDetail(entry.id)
+  const deadline = Date.now() + 10000
+  for (let attempt = 0; attempt < 8 && Date.now() < deadline; attempt++) {
+    if (signal?.aborted) return null
+    try {
+      const page = await api.logs({ q: requestId, limit: 1 }, signal, 2000)
+      const entry = (page?.entries || []).find(item => item.request_id === requestId)
+      if (entry) return await api.logDetail(entry.id, signal, 2000)
+    } catch (e) {
+      if (signal?.aborted) return null
+    }
     await new Promise(resolve => setTimeout(resolve, 200))
   }
   return null
@@ -1120,19 +1186,37 @@ async function waitForGroupTestLog(requestId) {
 async function runGroupTest() {
   const key = selectedGroupTestKey()
   if (!key || !groupTestState.model || groupTestState.running) return
+  groupTestAbortController?.abort()
+  const controller = new AbortController()
+  groupTestAbortController = controller
   Object.assign(groupTestState, { running: true, output: '', error: '', status: 0, requestId: '', result: null })
   try {
-    const response = await api.testGroupStream({ key: key.key, protocol: groupTestState.protocol, model: groupTestState.model }, text => { groupTestState.output += text })
+    const response = await api.testGroupStream({ key: key.key, protocol: groupTestState.protocol, model: groupTestState.model }, text => {
+      if (!controller.signal.aborted && groupTestAbortController === controller) groupTestState.output += text
+    }, controller.signal)
+    if (controller.signal.aborted || groupTestAbortController !== controller) return
     groupTestState.status = response.status
     groupTestState.requestId = response.requestId
-    groupTestState.result = await waitForGroupTestLog(response.requestId)
+    groupTestState.running = false
+    const result = await waitForGroupTestLog(response.requestId, controller.signal)
+    if (controller.signal.aborted || groupTestAbortController !== controller) return
+    groupTestState.result = result
   } catch (e) {
+    if (controller.signal.aborted || groupTestAbortController !== controller) return
     groupTestState.error = String(e.message || e)
     groupTestState.status = Number(e.status) || 0
     groupTestState.requestId = e.requestId || ''
-    if (groupTestState.requestId) groupTestState.result = await waitForGroupTestLog(groupTestState.requestId).catch(() => null)
-  } finally {
     groupTestState.running = false
+    if (groupTestState.requestId) {
+      const result = await waitForGroupTestLog(groupTestState.requestId, controller.signal).catch(() => null)
+      if (controller.signal.aborted || groupTestAbortController !== controller) return
+      groupTestState.result = result
+    }
+  } finally {
+    if (groupTestAbortController === controller) {
+      groupTestAbortController = null
+      groupTestState.running = false
+    }
   }
 }
 
@@ -1893,6 +1977,8 @@ function login() {
   activatePage(page.value)
 }
 function logout() {
+  abortUpstreamTestRequests()
+  abortGroupTestRequests()
   api.clearToken()
   loggedIn.value = false
   loginForm.token = ''
@@ -2872,7 +2958,7 @@ function logout() {
       </div>
     </div>
 
-    <div class="mask" v-if="groupTestState.show" @click.self="groupTestState.show = false">
+    <div class="mask" v-if="groupTestState.show" @click.self="closeGroupTest">
       <div class="dialog group-test-dialog">
         <div class="group-test-heading">
           <h3>测试分组 · {{ groupTestState.groupName }}</h3>
@@ -2903,12 +2989,12 @@ function logout() {
           </div>
           <div v-if="groupTestState.requestId" class="group-test-request-id"><span>请求 ID</span><code>{{ groupTestState.requestId }}</code><button class="icon-btn" title="复制请求 ID" @click="copyText(groupTestState.requestId, 'group-test-request')"><Icon :name="copied === 'group-test-request' ? 'check' : 'copy'" :size="14" /></button></div>
         </section>
-        <div class="dialog-foot"><button class="btn btn-ghost" :disabled="groupTestState.running" @click="groupTestState.show = false">关闭</button></div>
+        <div class="dialog-foot"><button class="btn btn-ghost" @click="closeGroupTest">关闭</button></div>
       </div>
     </div>
 
     <!-- 真实对话测试 -->
-    <div class="mask" v-if="testState.show" @click.self="testState.show = false">
+    <div class="mask" v-if="testState.show" @click.self="closeTest">
       <div class="dialog">
         <h3>测试上游 · {{ testState.name }}</h3>
         <p class="hint test-dialog-hint">发一条真实对话请求，验证能否端到端跑通并查看回复。</p>
@@ -2935,7 +3021,7 @@ function logout() {
         </div>
         <p v-if="testState.status && !testState.status.ok && testState.status.error" class="test-err">{{ testState.status.error }}</p>
 
-        <div class="dialog-foot"><button class="btn btn-ghost" @click="testState.show = false">关闭</button></div>
+        <div class="dialog-foot"><button class="btn btn-ghost" @click="closeTest">关闭</button></div>
       </div>
     </div>
 
@@ -2952,7 +3038,7 @@ function logout() {
     </div>
 
     <!-- 表单弹窗 -->
-    <div class="mask" v-if="dlg.type" @click.self.stop>
+    <div class="mask" v-if="dlg.type" @click.self="closeDlg">
       <div class="dialog" :class="[dlg.type === 'tags' ? 'tag-dialog' : (dlg.type === 'upstream' ? 'upstream-dialog' : ''), { 'dialog-saving': dialogSaving }]">
         <template v-if="dlg.type === 'group'">
           <h3>{{ dlg.form.id ? '编辑分组' : '新建分组' }}</h3>
