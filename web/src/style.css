@@ -605,6 +605,19 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .upstream-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 18px; }
 .upstream-form-grid .field { min-width: 0; margin-bottom: 12px; }
 .upstream-form-tags { grid-column: 1 / -1; }
+.upstream-form-groups { grid-column: 1 / -1; }
+.field label .field-note { display: inline; margin-left: 6px; color: var(--p600); font-size: 10px; font-weight: 600; }
+.upstream-quick-import { margin: -4px 0 18px; padding: 13px 14px 12px; border: 1px solid var(--p100); border-radius: var(--r-control); background: var(--p50); }
+.upstream-quick-import-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
+.upstream-quick-import-head > div { min-width: 0; }
+.upstream-quick-import-head strong { display: flex; align-items: center; gap: 6px; color: var(--g800); font-size: 12px; font-weight: 750; }
+.upstream-quick-import-head strong svg { color: var(--p600); }
+.upstream-quick-import-head small { display: block; margin-top: 3px; color: var(--g500); font-size: 10.5px; }
+.upstream-quick-import textarea { display: block; width: 100%; min-height: 58px; resize: vertical; padding: 9px 10px; border: 1px solid var(--control-border); border-radius: var(--r-control); outline: 0; background: var(--surface-raised); color: var(--g900); font: 12px/1.5 var(--font-data); transition: border-color .16s, box-shadow .16s, background .16s; }
+.upstream-quick-import textarea::placeholder { color: var(--g400); }
+.upstream-quick-import textarea:focus { border-color: var(--p500); box-shadow: 0 0 0 3px var(--selection-soft); }
+.upstream-import-message { margin: 7px 0 0; color: var(--state-success); font-size: 11px; }
+.upstream-import-message.error { color: var(--state-danger); }
 .dialog > h3 { display: flex; align-items: center; gap: 10px; margin: 0 0 22px; padding: 0 0 17px; border-bottom: 1px solid var(--divider); font-size: 18px; font-weight: 750; color: var(--g900); letter-spacing: 0; }
 .dialog > h3::before { content: ''; width: 5px; height: 21px; flex: none; border-radius: 4px; background: var(--p500); }
 .dialog-sm::before { background: var(--red); }
@@ -1586,7 +1599,9 @@ table.matrix th, table.matrix td { padding: 0; }
   .channel-card-grid { grid-template-columns: minmax(0, 1fr); }
   .availability-channel-grid { grid-template-columns: minmax(0, 1fr); }
   .upstream-form-grid { grid-template-columns: 1fr; }
-  .upstream-form-tags { grid-column: auto; }
+  .upstream-form-tags, .upstream-form-groups { grid-column: auto; }
+  .upstream-quick-import-head { flex-direction: column; }
+  .upstream-quick-import-head .btn { align-self: flex-start; }
   .channel-monitor-card { padding: 14px; }
   .availability-channel-card { min-height: 310px; padding: 14px 14px 0; }
   .availability-channel-foot { margin-inline: -14px; padding: 10px 14px 12px; }

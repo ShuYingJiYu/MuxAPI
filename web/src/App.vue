@@ -319,6 +319,10 @@ const dlg = reactive({ type: '', form: {} })
 const dialogSaving = ref(false)
 const upstreamFormTagSearch = ref('')
 const upstreamVendor = ref('')
+const upstreamImportText = ref('')
+const upstreamImportMessage = ref('')
+const upstreamImportError = ref(false)
+const upstreamBaseURLDirty = ref(false)
 const upstreamFormGroupSearch = ref('')
 const upstreamFormGroupChoices = computed(() => {
   const selected = new Set(upstreamFormGroupIDs.value)
@@ -326,7 +330,17 @@ const upstreamFormGroupChoices = computed(() => {
   return groups.value.filter(g => !selected.has(g.id) && (!query || g.name.toLowerCase().includes(query)))
 })
 const tagManagerSearch = ref('')
-function closeDlg() { dlg.type = ''; upstreamFormTagSearch.value = ''; upstreamVendor.value = ''; upstreamFormGroupSearch.value = ''; tagManagerSearch.value = '' }
+function closeDlg() {
+  dlg.type = ''
+  upstreamFormTagSearch.value = ''
+  upstreamVendor.value = ''
+  upstreamImportText.value = ''
+  upstreamImportMessage.value = ''
+  upstreamImportError.value = false
+  upstreamBaseURLDirty.value = false
+  upstreamFormGroupSearch.value = ''
+  tagManagerSearch.value = ''
+}
 
 // 表单保存统一显示进行中状态，避免重复点击和无反馈等待。
 async function guardDialogSave(fn) {
@@ -376,8 +390,83 @@ const vendorPresets = [
 function applyVendorPreset(value) {
   const preset = vendorPresets.find(p => p.value === value)
   if (!preset || dlg.form.id) return // 编辑已有上游时不覆盖
-  if (preset.base_url) dlg.form.base_url = preset.base_url
+  // 预设只接管空地址或仍由预设填充的地址，避免覆盖用户已经手动输入的内容。
+  if (preset.base_url && (!String(dlg.form.base_url || '').trim() || !upstreamBaseURLDirty.value)) dlg.form.base_url = preset.base_url
   if (preset.protocol) dlg.form.protocol = preset.protocol
+}
+function markUpstreamBaseURLDirty() { upstreamBaseURLDirty.value = true }
+
+function importedValue(source, keys) {
+  for (const key of keys) {
+    if (source && source[key] != null && String(source[key]).trim() !== '') return String(source[key]).trim()
+  }
+  return ''
+}
+function importedProtocol(value) {
+  const normalized = String(value || '').trim().toLowerCase()
+  return ({
+    'openai-chat': 'openai',
+    'openai_chat': 'openai',
+    chat: 'openai',
+    anthropic: 'claude',
+    claude: 'claude',
+    responses: 'openai-response',
+    'openai-responses': 'openai-response',
+    codex: 'codex',
+    passthrough: 'passthrough',
+    relay: 'passthrough',
+  })[normalized] || (protocolOptions.some(option => option.value === normalized) ? normalized : '')
+}
+function parseUpstreamImport(raw) {
+  const text = String(raw || '').trim()
+  if (!text) throw new Error('请先粘贴上游配置')
+  if (text.startsWith('{') || text.startsWith('[')) {
+    let parsed
+    try { parsed = JSON.parse(text) } catch { throw new Error('JSON 格式无效') }
+    const source = Array.isArray(parsed) ? parsed[0] : parsed
+    if (!source || typeof source !== 'object' || Array.isArray(source)) throw new Error('JSON 需要是上游对象')
+    return source
+  }
+  const lines = text.split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith('#'))
+  const envValues = {}
+  for (const line of lines) {
+    const match = line.match(/^([a-z][a-z0-9_.-]*)\s*=\s*(.*)$/i)
+    if (match) envValues[match[1].toLowerCase()] = match[2].trim().replace(/^['"]|['"]$/g, '')
+  }
+  if (Object.keys(envValues).length) return envValues
+  const parts = lines[0].split(/\s*\|\s*|\t+/).map(value => value.trim()).filter(Boolean)
+  if (parts.length >= 3) return { name: parts[0], base_url: parts[1], api_key: parts.slice(2).join(' | ') }
+  if (parts.length === 2) {
+    return /^https?:\/\//i.test(parts[0])
+      ? { base_url: parts[0], api_key: parts[1] }
+      : { name: parts[0], base_url: parts[1] }
+  }
+  if (/^https?:\/\//i.test(parts[0])) return { base_url: parts[0] }
+  throw new Error('格式无法识别，请使用 名称 | 地址 | API Key')
+}
+function importUpstreamConfig() {
+  upstreamImportError.value = false
+  try {
+    const source = parseUpstreamImport(upstreamImportText.value)
+    const values = {
+      name: importedValue(source, ['name', 'title', 'channel_name']),
+      base_url: importedValue(source, ['base_url', 'baseUrl', 'url', 'endpoint']),
+      api_key: importedValue(source, ['api_key', 'apiKey', 'key', 'token']),
+      proxy: importedValue(source, ['proxy', 'proxy_url', 'proxyUrl']),
+      protocol: importedProtocol(importedValue(source, ['protocol', 'type'])),
+    }
+    const changed = []
+    if (values.name) { dlg.form.name = values.name; changed.push('名称') }
+    if (values.base_url) { dlg.form.base_url = values.base_url; upstreamBaseURLDirty.value = true; changed.push('base_url') }
+    if (values.api_key) { dlg.form.api_key = values.api_key; changed.push('api_key') }
+    if (values.proxy) { dlg.form.proxy = values.proxy; changed.push('代理') }
+    if (values.protocol) { dlg.form.protocol = values.protocol; changed.push('协议') }
+    if (!changed.length) throw new Error('没有找到可导入的名称、地址或密钥字段')
+    upstreamImportMessage.value = `已填充：${changed.join('、')}`
+  } catch (error) {
+    upstreamImportError.value = true
+    upstreamImportMessage.value = error.message || '导入失败'
+  }
 }
 const upstreamFormGroupIDs = ref([])
 function toggleUpstreamFormGroup(id) {
@@ -585,6 +674,10 @@ function newUpstream() {
   upstreamFormGroupIDs.value = []
   upstreamFormGroupSearch.value = ''
   upstreamVendor.value = ''
+  upstreamImportText.value = ''
+  upstreamImportMessage.value = ''
+  upstreamImportError.value = false
+  upstreamBaseURLDirty.value = false
   dlg.type = 'upstream'
   dlg.form = { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', billing_type: 'none', credit_ratio: 1, enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] }
 }
@@ -593,6 +686,10 @@ function editUpstream(u) {
   upstreamFormGroupIDs.value = []
   upstreamFormGroupSearch.value = ''
   upstreamVendor.value = ''
+  upstreamImportText.value = ''
+  upstreamImportMessage.value = ''
+  upstreamImportError.value = false
+  upstreamBaseURLDirty.value = true
   dlg.type = 'upstream'
   dlg.form = { ...u, protocol: u.protocol || 'passthrough', billing_type: u.billing_type || 'none', credit_ratio: u.credit_ratio || 1, api_key: '', primary_tag_id: u.primary_tag_id || 0, tag_ids: [...(u.tag_ids || [])] }
 }
@@ -2869,7 +2966,7 @@ function logout() {
     </div>
 
     <!-- 表单弹窗 -->
-    <div class="mask" v-if="dlg.type" @click.self="closeDlg">
+    <div class="mask" v-if="dlg.type" @click.self.stop>
       <div class="dialog" :class="[dlg.type === 'tags' ? 'tag-dialog' : (dlg.type === 'upstream' ? 'upstream-dialog' : ''), { 'dialog-saving': dialogSaving }]">
         <template v-if="dlg.type === 'group'">
           <h3>{{ dlg.form.id ? '编辑分组' : '新建分组' }}</h3>
@@ -2888,9 +2985,26 @@ function logout() {
 
         <template v-else-if="dlg.type === 'upstream'">
           <h3>{{ dlg.form.id ? '编辑上游' : '新增上游' }}</h3>
+          <section v-if="!dlg.form.id" class="upstream-quick-import">
+            <div class="upstream-quick-import-head">
+              <div>
+                <strong><Icon name="copy" :size="14" />快捷导入</strong>
+                <small>粘贴 JSON，或使用「名称 | 地址 | API Key」</small>
+              </div>
+              <button class="btn btn-ghost btn-sm" type="button" @click="importUpstreamConfig"><Icon name="check" :size="14" />填充表单</button>
+            </div>
+            <textarea v-model="upstreamImportText" rows="2" placeholder="例如：OpenRouter | https://openrouter.ai/api | sk-or-..." @keydown.ctrl.enter="importUpstreamConfig"></textarea>
+            <p v-if="upstreamImportMessage" class="upstream-import-message" :class="{ error: upstreamImportError }">{{ upstreamImportMessage }}</p>
+          </section>
           <div class="upstream-form-grid">
             <div class="field"><label>名称</label><input v-model="dlg.form.name" /></div>
             <div class="field" v-if="!dlg.form.id"><label>厂商</label><FancySelect v-model="upstreamVendor" :options="vendorPresets.map(p => ({ value: p.value, label: p.label }))" @change="applyVendorPreset" /></div>
+            <div class="field"><label>base_url <small v-if="upstreamBaseURLDirty" class="field-note">已手动填写</small></label><input v-model="dlg.form.base_url" placeholder="https://..." @input="markUpstreamBaseURLDirty" /></div>
+            <div class="field"><label>协议</label><FancySelect v-model="dlg.form.protocol" :options="protocolOptions" /></div>
+            <div class="field"><label>api_key</label><input v-model="dlg.form.api_key" :placeholder="dlg.form.id ? '留空则不修改' : 'sk-...'" /></div>
+            <div class="field"><label>代理</label><input v-model="dlg.form.proxy" placeholder="留空=直连/环境变量；如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></div>
+            <div class="field"><label>计费平台</label><FancySelect v-model="dlg.form.billing_type" :options="billingTypeOptions" /></div>
+            <div class="field"><label>储值倍率</label><input v-model="dlg.form.credit_ratio" type="number" step="any" min="0" placeholder="充1得N积分时填 N；默认 1" /></div>
             <div class="field"><label>主标签</label><FancySelect v-model="dlg.form.primary_tag_id" :options="primaryTagOptions" /></div>
             <div class="field upstream-form-tags">
               <label class="field-label-row"><span>普通标签</span><small>{{ upstreamFormSelectedTags.length }} 个已选</small></label>
@@ -2910,12 +3024,7 @@ function logout() {
                 </div>
               </div>
             </div>
-            <div class="field"><label>base_url</label><input v-model="dlg.form.base_url" placeholder="https://..." /></div>
-            <div class="field"><label>协议</label><FancySelect v-model="dlg.form.protocol" :options="protocolOptions" /></div>
-            <div class="field"><label>计费平台</label><FancySelect v-model="dlg.form.billing_type" :options="billingTypeOptions" /></div>
-            <div class="field"><label>储值倍率</label><input v-model="dlg.form.credit_ratio" type="number" step="any" min="0" placeholder="充1得N积分时填 N；默认 1" /></div>
-            <div class="field"><label>api_key</label><input v-model="dlg.form.api_key" :placeholder="dlg.form.id ? '留空则不修改' : 'sk-...'" /></div>
-            <div class="field" v-if="!dlg.form.id">
+            <div class="field upstream-form-groups" v-if="!dlg.form.id">
               <label class="field-label-row"><span>加入分组</span><small>{{ upstreamFormGroupIDs.length }} 个已选</small></label>
               <div class="tag-picker-panel">
                 <div v-if="upstreamFormGroupIDs.length" class="tag-picker-selected">
@@ -2933,7 +3042,6 @@ function logout() {
                 </div>
               </div>
             </div>
-            <div class="field"><label>代理</label><input v-model="dlg.form.proxy" placeholder="留空=直连/环境变量；如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></div>
           </div>
           <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>
           <div class="dialog-foot"><button class="btn btn-ghost" :disabled="dialogSaving" @click="closeDlg">取消</button><button class="btn" :disabled="dialogSaving" @click="saveUpstream"><Icon :name="dialogSaving ? 'loader' : 'check'" :class="{ spin: dialogSaving }" :size="16" />{{ dialogSaving ? '保存中…' : '保存' }}</button></div>
