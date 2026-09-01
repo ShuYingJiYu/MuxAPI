@@ -785,6 +785,26 @@ async function refreshUpstreamBilling(item) {
   }
 }
 
+// setBillingMultiplierPrompt 手动录入倍率，等价于一次人工探测。
+// 下次 auto-refresh(约10分钟)若从扣费日志取到 group_ratio 会覆盖此值。
+async function setBillingMultiplierPrompt(item) {
+  if (!item.id || item.billing_type === 'none') return
+  const current = Number(item.billing?.effective_multiplier ?? item.billing?.group_multiplier ?? 1)
+  const input = window.prompt(
+    `手动录入「${item.name}」倍率(等同一次探测结果，下次自动刷新可能覆盖):`,
+    String(current)
+  )
+  if (input == null) return
+  const value = Number(String(input).trim())
+  if (!Number.isFinite(value) || value <= 0) {
+    flash('倍率必须是大于 0 的数字', 'error')
+    return
+  }
+  const state = await api.setUpstreamBillingMultiplier(item.id, value)
+  item.billing = state
+  flash(`已录入「${item.name}」倍率 ${value}`)
+}
+
 const upstreamRunFilter = ref('')
 const upstreamEnabledFilter = ref('')
 const upstreamTagFilters = reactive(new Set())   // 多选标签筛选（替换旧的两个下拉）
@@ -2479,7 +2499,7 @@ function logout() {
                       <td class="billing-cell">
                         <span v-if="!u.billing_type || u.billing_type === 'none'" class="tag-empty">未采集</span>
                         <div v-else class="billing-summary" :class="`billing-${billingStatusClass(u)}`" :title="billingTitle(u)">
-                          <div class="billing-values"><strong :class="{ 'billing-debt': Number(u.billing?.remaining) < 0 }">{{ billingAmount(u) }}</strong><span>{{ billingMultiplier(u) }}</span><button class="icon-btn billing-refresh" title="刷新计费数据" :disabled="refreshingBilling.has(u.id)" @click="guard(() => refreshUpstreamBilling(u))"><Icon name="refresh" :size="14" /></button></div>
+                          <div class="billing-values"><strong :class="{ 'billing-debt': Number(u.billing?.remaining) < 0 }">{{ billingAmount(u) }}</strong><span>{{ billingMultiplier(u) }}</span><button class="icon-btn billing-refresh" title="手动录入倍率(作为一次探测结果，下次自动刷新可能覆盖)" @click="guard(() => setBillingMultiplierPrompt(u))"><Icon name="pencil" :size="14" /></button><button class="icon-btn billing-refresh" title="刷新计费数据" :disabled="refreshingBilling.has(u.id)" @click="guard(() => refreshUpstreamBilling(u))"><Icon name="refresh" :size="14" /></button></div>
                           <small><i></i>{{ billingMeta(u) }}</small>
                           <div v-if="u.billing?.audit" class="billing-audit" :class="`billing-audit-${u.billing.audit.status}`">{{ billingAuditText(u) }}</div>
                           <div v-if="billingPricingText(u)" class="billing-pricing">{{ billingPricingText(u) }}</div>

@@ -134,6 +134,10 @@ func (s *Server) adminUpstreamItem(w http.ResponseWriter, r *http.Request) {
 		s.refreshUpstreamBilling(w, r, id)
 		return
 	}
+	if len(parts) == 3 && parts[1] == "billing" && parts[2] == "multiplier" && r.Method == http.MethodPut {
+		s.setUpstreamBillingMultiplier(w, r, id)
+		return
+	}
 	if len(parts) == 3 && parts[1] == "billing" && parts[2] == "audit" {
 		s.upstreamBillingAudit(w, r, id)
 		return
@@ -189,6 +193,48 @@ func (s *Server) refreshUpstreamBilling(w http.ResponseWriter, r *http.Request, 
 	}
 	if err != nil && state.UpstreamID == 0 {
 		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, state)
+}
+
+// setUpstreamBillingMultiplier 手动录入一次倍率，等价于"人工探测结果"。
+// 直接改 upstream_billing_status 的 effective_multiplier + group_multiplier，
+// 下次 auto-refresh 若从上游扣费日志拿到 group_ratio 会自然覆盖(那是权威值)。
+// 用途：上游面板显示的公示价 ≠ muxapi 从扣费日志推出的实际倍率时，先手动填正确的
+// 分组价把路由决策拉回正轨，等有真实请求跑过后 auto-refresh 会拿到更准的实际扣费价。
+func (s *Server) setUpstreamBillingMultiplier(w http.ResponseWriter, r *http.Request, id int64) {
+	var body struct {
+		Multiplier float64 `json:"multiplier"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	if body.Multiplier <= 0 {
+		http.Error(w, "multiplier must be greater than zero", http.StatusBadRequest)
+		return
+	}
+	item, err := s.store.Get(id)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "upstream not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if item.BillingType == upstream.BillingNone || item.BillingType == "" {
+		http.Error(w, "billing is disabled for this upstream", http.StatusBadRequest)
+		return
+	}
+	if err := s.store.SetBillingMultiplier(id, body.Multiplier); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	state, err := s.store.GetBillingStatus(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, state)
