@@ -320,6 +320,7 @@ const pages = {
 
 // --- 弹窗状态 ---
 const dlg = reactive({ type: '', form: {} })
+const upstreamDraft = ref(null)
 const dialogSaving = ref(false)
 const upstreamVendor = ref('')
 const upstreamImportText = ref('')
@@ -333,7 +334,21 @@ const upstreamFormGroupChoices = computed(() => {
   return groups.value.filter(g => !selected.has(g.id) && (!query || g.name.toLowerCase().includes(query)))
 })
 const tagManagerSearch = ref('')
-function closeDlg() {
+function closeDlg({ preserveDraft = false } = {}) {
+  const closingType = dlg.type
+  if (preserveDraft && closingType === 'upstream' && !dlg.form.id) {
+    upstreamDraft.value = {
+      form: { ...dlg.form, tag_ids: [...(dlg.form.tag_ids || [])] },
+      groupIDs: [...upstreamFormGroupIDs.value],
+      vendor: upstreamVendor.value,
+      importText: upstreamImportText.value,
+      importMessage: upstreamImportMessage.value,
+      importError: upstreamImportError.value,
+      baseURLDirty: upstreamBaseURLDirty.value,
+    }
+  } else if (!preserveDraft && closingType === 'upstream') {
+    upstreamDraft.value = null
+  }
   dlg.type = ''
   upstreamVendor.value = ''
   upstreamImportText.value = ''
@@ -669,17 +684,22 @@ const upstreamFormTagOptions = computed(() => {
   return tags.value.filter(tag => tag.id !== primary).map(tag => ({ value: tag.id, label: tag.name, color: tag.color }))
 })
 function newUpstream() {
-  upstreamFormGroupIDs.value = []
+  const draft = upstreamDraft.value
+  upstreamDraft.value = null
+  upstreamFormGroupIDs.value = draft?.groupIDs ? [...draft.groupIDs] : []
   upstreamFormGroupSearch.value = ''
-  upstreamVendor.value = ''
-  upstreamImportText.value = ''
-  upstreamImportMessage.value = ''
-  upstreamImportError.value = false
-  upstreamBaseURLDirty.value = false
+  upstreamVendor.value = draft?.vendor || ''
+  upstreamImportText.value = draft?.importText || ''
+  upstreamImportMessage.value = draft?.importMessage || ''
+  upstreamImportError.value = draft?.importError || false
+  upstreamBaseURLDirty.value = draft?.baseURLDirty || false
   dlg.type = 'upstream'
-  dlg.form = { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', billing_type: 'none', credit_ratio: 1, enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] }
+  dlg.form = draft?.form
+    ? { ...draft.form, tag_ids: [...(draft.form.tag_ids || [])] }
+    : { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', billing_type: 'none', credit_ratio: 1, enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] }
 }
 function editUpstream(u) {
+  upstreamDraft.value = null
   upstreamFormGroupIDs.value = []
   upstreamFormGroupSearch.value = ''
   upstreamVendor.value = ''
@@ -3038,7 +3058,7 @@ function logout() {
     </div>
 
     <!-- 表单弹窗 -->
-    <div class="mask" v-if="dlg.type" @click.self="closeDlg">
+    <div class="mask" v-if="dlg.type" @click.self="closeDlg({ preserveDraft: true })">
       <div class="dialog" :class="[dlg.type === 'tags' ? 'tag-dialog' : (dlg.type === 'upstream' ? 'upstream-dialog' : ''), { 'dialog-saving': dialogSaving }]">
         <template v-if="dlg.type === 'group'">
           <h3>{{ dlg.form.id ? '编辑分组' : '新建分组' }}</h3>
