@@ -73,6 +73,31 @@ func TestStoreCRUD(t *testing.T) {
 	}
 }
 
+func TestRetentionMigrationRunsOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "retention.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.GetSetting("request_retention_days", ""); got != "0" {
+		t.Fatalf("initial request retention = %q, want 0", got)
+	}
+	if err := st.SetSetting("request_retention_days", "30"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if got := st.GetSetting("request_retention_days", ""); got != "30" {
+		t.Fatalf("explicit request retention was reset after reopen: %q", got)
+	}
+}
+
 func TestUpstreamSourceAndBatchUpdate(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
@@ -480,7 +505,7 @@ func TestRequestAuditDetailFiltersAndStats(t *testing.T) {
 // 直接按指定时刻插探测行（绕过 InsertProbe 的 now），便于构造跨小时桶。
 func insertProbeAt(t *testing.T, st *Store, monitorID int64, status int, latMs, ts int64) {
 	t.Helper()
-	if _, err := st.db.Exec(`INSERT INTO probe_results(monitor_id,status,latency_ms,created_at) VALUES(?,?,?,?)`,
+	if _, err := st.exec(`INSERT INTO probe_results(monitor_id,status,latency_ms,created_at) VALUES(?,?,?,?)`,
 		monitorID, status, latMs, st.timeValue(time.Unix(ts, 0))); err != nil {
 		t.Fatalf("插探测行失败: %v", err)
 	}
@@ -582,7 +607,7 @@ func TestPruneProbes(t *testing.T) {
 func countRows(t *testing.T, st *Store, table string) int {
 	t.Helper()
 	var n int
-	if err := st.db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&n); err != nil {
+	if err := st.queryRow(`SELECT COUNT(*) FROM ` + table).Scan(&n); err != nil {
 		t.Fatalf("count %s: %v", table, err)
 	}
 	return n

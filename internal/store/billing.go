@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"errors"
 	"math"
-	"sort"
 	"strings"
 	"time"
 )
@@ -114,7 +113,7 @@ func (s *Store) SaveBillingSuccess(state BillingStatus) error {
 	if state.Status == "" {
 		state.Status = "ok"
 	}
-	tx, err := s.db.Begin()
+	tx, err := s.beginTx()
 	if err != nil {
 		return err
 	}
@@ -125,8 +124,10 @@ func (s *Store) SaveBillingSuccess(state BillingStatus) error {
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(upstream_id) DO UPDATE SET
 		currency=excluded.currency,remaining=excluded.remaining,unlimited=excluded.unlimited,
-		billing_group=excluded.billing_group,group_multiplier=excluded.group_multiplier,
-		effective_multiplier=excluded.effective_multiplier,reported_list_cost=excluded.reported_list_cost,
+		billing_group=COALESCE(excluded.billing_group,upstream_billing_status.billing_group),
+		group_multiplier=COALESCE(excluded.group_multiplier,upstream_billing_status.group_multiplier),
+		effective_multiplier=COALESCE(excluded.effective_multiplier,upstream_billing_status.effective_multiplier),
+		reported_list_cost=excluded.reported_list_cost,
 		reported_actual_cost=excluded.reported_actual_cost,status=excluded.status,error_text=excluded.error_text,
 		observed_at=excluded.observed_at,last_success_at=excluded.last_success_at,refreshed_at=excluded.refreshed_at`,
 		state.UpstreamID, state.Currency, state.Remaining, state.Unlimited, state.BillingGroup,
@@ -150,16 +151,54 @@ func (s *Store) SaveBillingSuccess(state BillingStatus) error {
 // SaveBillingFailure records a failed refresh without discarding the last successful values.
 func (s *Store) SaveBillingFailure(upstreamID int64, message string, refreshedAt int64) error {
 	refreshed := billingTimestamp(refreshedAt, time.Now())
-	_, err := s.db.Exec(`INSERT INTO upstream_billing_status(
+	_, err := s.exec(`INSERT INTO upstream_billing_status(
 		upstream_id,currency,status,error_text,refreshed_at) VALUES(?,'USD','error',?,?)
 		ON CONFLICT(upstream_id) DO UPDATE SET status='error',error_text=excluded.error_text,
 		refreshed_at=excluded.refreshed_at`, upstreamID, message, s.timeValue(refreshed))
 	return err
 }
 
+// SetBillingMultiplier 手动录入一次倍率(等价于"人工探测")。同时写 effective/group，
+// status 保持 ok；下次 auto-refresh 从上游扣费日志拿到 group_ratio 会自然覆盖，
+// 因此这里不引入新的持久化字段(与 auto-refresh 出的普通值同轨)。
+func (s *Store) SetBillingMultiplier(upstreamID int64, multiplier float64) error {
+	now := time.Now()
+	nowUnix := now.Unix()
+	refreshed := billingTimestamp(nowUnix, now)
+	observed := refreshed
+	_, err := s.exec(`INSERT INTO upstream_billing_status(
+		upstream_id,currency,effective_multiplier,group_multiplier,status,
+		observed_at,last_success_at,refreshed_at)
+		VALUES(?,'USD',?,?,'ok',?,?,?)
+		ON CONFLICT(upstream_id) DO UPDATE SET
+			effective_multiplier=excluded.effective_multiplier,
+			group_multiplier=excluded.group_multiplier,
+			status='ok',error_text='',
+			observed_at=excluded.observed_at,
+			last_success_at=excluded.last_success_at,
+			refreshed_at=excluded.refreshed_at`,
+		upstreamID, multiplier, multiplier,
+		s.timeValue(observed), s.timeValue(observed), s.timeValue(refreshed))
+	return err
+}
+
+// LastKnownMultiplier returns the most recent non-null effective_multiplier
+// from billing snapshots. Used as fallback when the current status has lost
+// its multiplier due to partial/error refreshes.
+func (s *Store) LastKnownMultiplier(upstreamID int64) (float64, error) {
+	var m float64
+	err := s.queryRow(`SELECT effective_multiplier FROM upstream_billing_snapshots
+		WHERE upstream_id=? AND effective_multiplier IS NOT NULL AND effective_multiplier > 0
+		ORDER BY observed_at DESC LIMIT 1`, upstreamID).Scan(&m)
+	if err != nil {
+		return 0, err
+	}
+	return m, nil
+}
+
 // ResetBillingData removes counters tied to an old provider type, URL, or API key.
 func (s *Store) ResetBillingData(upstreamID int64) error {
-	tx, err := s.db.Begin()
+	tx, err := s.beginTx()
 	if err != nil {
 		return err
 	}
@@ -293,42 +332,29 @@ func usageListCost(usage BillingWindowUsage, price ModelPricing) (float64, bool)
 // 只影响价目核对轨道，计费核对（实际扣费 vs 上游自报原价×倍率）完全不依赖它。
 // 早期版本在这里直接判 unavailable，导致上游账目明明精确吻合却什么结论都不给。
 func (s *Store) applyLocalPricing(audit *BillingAudit, upstreamID int64) error {
-	status, statusErr := s.GetPricingCatalogStatus()
+	status, err := s.GetPricingCatalogStatus()
+	if err == nil {
+		audit.PricingSource = status.Source
+		audit.PricingVersion = status.Version
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	usageGroups, err := s.ListBillingWindowUsage(upstreamID, audit.FromAt, audit.ToAt)
 	if err != nil {
 		return err
-	}
-	models := make([]string, 0, len(usageGroups))
-	for _, usage := range usageGroups {
-		models = append(models, usage.Model)
-	}
-	prices, err := s.listModelPricing(models)
-	if err != nil {
-		return err
-	}
-	return applyLocalPricingData(audit, status, statusErr, usageGroups, prices)
-}
-
-// applyLocalPricingData keeps the audit calculation independent from the way
-// usage and prices were loaded. The batch path uses this to avoid one query per
-// upstream and one query per model.
-func applyLocalPricingData(audit *BillingAudit, status PricingCatalogStatus, statusErr error,
-	usageGroups []BillingWindowUsage, prices map[string]ModelPricing) error {
-	if statusErr == nil {
-		audit.PricingSource = status.Source
-		audit.PricingVersion = status.Version
-	} else if !errors.Is(statusErr, sql.ErrNoRows) {
-		return statusErr
 	}
 	var listCost float64
 	for _, usage := range usageGroups {
 		audit.RequestCount += usage.RequestCount
 		audit.MissingUsageCount += usage.MissingUsageCount
 		eligibleRequests := usage.RequestCount - usage.MissingUsageCount
-		price, found := lookupModelPricing(prices, usage.Model)
-		if !found {
-			audit.MissingModels = appendMissingModel(audit.MissingModels, usage.Model)
-			continue
+		price, lookupErr := s.LookupModelPricing(usage.Model)
+		if lookupErr != nil {
+			if errors.Is(lookupErr, sql.ErrNoRows) {
+				audit.MissingModels = appendMissingModel(audit.MissingModels, usage.Model)
+				continue
+			}
+			return lookupErr
 		}
 		cost, complete := usageListCost(usage, price)
 		if !complete {
@@ -365,9 +391,6 @@ func lookupModelPricing(prices map[string]ModelPricing, model string) (ModelPric
 	return ModelPricing{}, false
 }
 
-// listModelPricing loads all candidates needed by one audit batch in a single
-// round trip. Candidate ordering is still resolved in lookupModelPricing, so
-// exact model matches keep precedence over provider and bare-name fallbacks.
 func (s *Store) listModelPricing(models []string) (map[string]ModelPricing, error) {
 	seen := make(map[string]struct{})
 	var candidates []string
@@ -385,7 +408,7 @@ func (s *Store) listModelPricing(models []string) (map[string]ModelPricing, erro
 		return prices, nil
 	}
 	placeholders := strings.TrimRight(strings.Repeat("?,", len(candidates)), ",")
-	rows, err := s.db.Query(`SELECT model,input_cost_per_token,output_cost_per_token,
+	rows, err := s.query(`SELECT model,input_cost_per_token,output_cost_per_token,
 		cache_read_input_token_cost,cache_creation_input_token_cost
 		FROM model_pricing WHERE model IN (`+placeholders+`)`, stringSliceToAny(candidates)...)
 	if err != nil {
@@ -416,27 +439,14 @@ func stringSliceToAny(values []string) []any {
 
 func (s *Store) billingAuditFromSnapshots(snapshots []BillingSnapshot) BillingAudit {
 	audit := billingAuditBaseFromSnapshots(snapshots)
-	status, statusErr := s.GetPricingCatalogStatus()
-	if statusErr == nil {
+	if status, err := s.GetPricingCatalogStatus(); err == nil {
 		audit.PricingSource = status.Source
 		audit.PricingVersion = status.Version
 	}
 	if len(snapshots) < 2 {
 		return audit
 	}
-	usageGroups, err := s.ListBillingWindowUsage(snapshots[0].UpstreamID, audit.FromAt, audit.ToAt)
-	if err == nil {
-		models := make([]string, 0, len(usageGroups))
-		for _, usage := range usageGroups {
-			models = append(models, usage.Model)
-		}
-		var prices map[string]ModelPricing
-		prices, err = s.listModelPricing(models)
-		if err == nil {
-			err = applyLocalPricingData(&audit, status, statusErr, usageGroups, prices)
-		}
-	}
-	if err != nil {
+	if err := s.applyLocalPricing(&audit, snapshots[0].UpstreamID); err != nil {
 		audit.Status = "unavailable"
 		audit.Reason = "pricing_query_failed"
 		return audit
@@ -462,8 +472,15 @@ func scanBillingSnapshot(scanner interface{ Scan(...any) error }) (BillingSnapsh
 }
 
 func (s *Store) latestBillingAudits() (map[int64]BillingAudit, error) {
-	query := s.latestBillingAuditsQuery()
-	rows, err := s.db.Query(query)
+	query := `SELECT id,upstream_id,currency,remaining,unlimited,billing_group,group_multiplier,
+		effective_multiplier,reported_list_cost,reported_actual_cost,observed_unix FROM (
+			SELECT id,upstream_id,currency,remaining,unlimited,billing_group,group_multiplier,
+				effective_multiplier,reported_list_cost,reported_actual_cost,` +
+		s.billingTimeExpr("observed_at") + ` AS observed_unix,
+				ROW_NUMBER() OVER (PARTITION BY upstream_id ORDER BY observed_at DESC,id DESC) AS snapshot_rank
+			FROM upstream_billing_snapshots
+		) ranked WHERE snapshot_rank<=2 ORDER BY upstream_id,snapshot_rank`
+	rows, err := s.query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -479,124 +496,11 @@ func (s *Store) latestBillingAudits() (map[int64]BillingAudit, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	windows := make(map[int64]billingAuditWindow)
-	for upstreamID, snapshots := range byUpstream {
-		if len(snapshots) >= 2 {
-			windows[upstreamID] = billingAuditWindow{FromAt: snapshots[1].ObservedAt, ToAt: snapshots[0].ObservedAt}
-		}
-	}
-	status, statusErr := s.GetPricingCatalogStatus()
-	usageByUpstream, usageErr := s.listBillingWindowUsageBatch(windows)
-	var models []string
-	for _, usages := range usageByUpstream {
-		for _, usage := range usages {
-			models = append(models, usage.Model)
-		}
-	}
-	prices, pricingErr := s.listModelPricing(models)
 	audits := make(map[int64]BillingAudit, len(byUpstream))
 	for upstreamID, snapshots := range byUpstream {
-		audit := billingAuditBaseFromSnapshots(snapshots)
-		if statusErr == nil {
-			audit.PricingSource = status.Source
-			audit.PricingVersion = status.Version
-		}
-		if len(snapshots) >= 2 {
-			if usageErr != nil {
-				audit.Status = "unavailable"
-				audit.Reason = "pricing_query_failed"
-			} else if pricingErr != nil {
-				audit.Status = "unavailable"
-				audit.Reason = "pricing_query_failed"
-			} else if err := applyLocalPricingData(&audit, status, statusErr,
-				usageByUpstream[upstreamID], prices); err != nil {
-				audit.Status = "unavailable"
-				audit.Reason = "pricing_query_failed"
-			} else {
-				latestMultiplier := snapshotMultiplier(snapshots[0])
-				previousMultiplier := snapshotMultiplier(snapshots[1])
-				if latestMultiplier != nil && previousMultiplier != nil &&
-					math.Abs(*previousMultiplier-*latestMultiplier) > 1e-9 {
-					audit.MultiplierChanged = true
-				}
-				audit.SnapshotCount = len(snapshots)
-				evaluateBillingAudit(&audit, latestMultiplier)
-			}
-		}
-		audits[upstreamID] = audit
+		audits[upstreamID] = s.billingAuditFromSnapshots(snapshots)
 	}
 	return audits, nil
-}
-
-type billingAuditWindow struct {
-	FromAt int64
-	ToAt   int64
-}
-
-// listBillingWindowUsageBatch combines all audit windows into one aggregate
-// query. This removes the per-upstream network round trips in ListBillingStatuses.
-func (s *Store) listBillingWindowUsageBatch(windows map[int64]billingAuditWindow) (map[int64][]BillingWindowUsage, error) {
-	out := make(map[int64][]BillingWindowUsage)
-	if len(windows) == 0 {
-		return out, nil
-	}
-	protocolExpr := `COALESCE(NULLIF(a.protocol,''),u.protocol,'')`
-	outcomes := "'success','partial'"
-	if billingCountsCanceled {
-		outcomes = "'success','partial','canceled'"
-	}
-	clauses := make([]string, 0, len(windows))
-	args := make([]any, 0, len(windows)*3)
-	ids := make([]int64, 0, len(windows))
-	for upstreamID := range windows {
-		ids = append(ids, upstreamID)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	for _, upstreamID := range ids {
-		window := windows[upstreamID]
-		clauses = append(clauses, `(a.upstream_id=? AND a.completed_at>? AND a.completed_at<=?)`)
-		args = append(args, upstreamID, s.timeValue(time.Unix(window.FromAt, 0)), s.timeValue(time.Unix(window.ToAt, 0)))
-	}
-	query := `SELECT a.upstream_id,r.model,` + protocolExpr + `,COUNT(*),
-		COALESCE(SUM(CASE WHEN (a.input_tokens=0 AND a.output_tokens=0 AND a.cached_tokens=0
-			AND a.cache_creation_tokens=0) OR (a.outcome<>'success' AND a.output_tokens=0)
-			THEN 1 ELSE 0 END),0),COALESCE(SUM(a.input_tokens),0),
-		COALESCE(SUM(a.output_tokens),0),COALESCE(SUM(a.cached_tokens),0),
-		COALESCE(SUM(a.cache_creation_tokens),0)
-		FROM request_attempts a
-		JOIN requests r ON r.request_id=a.request_id
-		LEFT JOIN upstreams u ON u.id=a.upstream_id
-		WHERE a.outcome IN (` + outcomes + `) AND (` + strings.Join(clauses, " OR ") + `)
-		GROUP BY a.upstream_id,r.model,` + protocolExpr + ` ORDER BY a.upstream_id,r.model`
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var upstreamID int64
-		var usage BillingWindowUsage
-		if err := rows.Scan(&upstreamID, &usage.Model, &usage.Protocol, &usage.RequestCount,
-			&usage.MissingUsageCount, &usage.InputTokens, &usage.OutputTokens,
-			&usage.CachedTokens, &usage.CacheCreationTokens); err != nil {
-			return nil, err
-		}
-		out[upstreamID] = append(out[upstreamID], usage)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) latestBillingAuditsQuery() string {
-	// 先按全表窗口计算每个渠道的最近两条快照。生产库的实际执行计划
-	// 对该形态明显优于逐渠道 LATERAL 扫描，尤其是在索引未及时建立时。
-	return `SELECT id,upstream_id,currency,remaining,unlimited,billing_group,group_multiplier,
-		effective_multiplier,reported_list_cost,reported_actual_cost,observed_unix FROM (
-			SELECT id,upstream_id,currency,remaining,unlimited,billing_group,group_multiplier,
-				effective_multiplier,reported_list_cost,reported_actual_cost,` +
-		s.billingTimeExpr("observed_at") + ` AS observed_unix,
-				ROW_NUMBER() OVER (PARTITION BY upstream_id ORDER BY observed_at DESC,id DESC) AS snapshot_rank
-			FROM upstream_billing_snapshots
-		) ranked WHERE snapshot_rank<=2 ORDER BY upstream_id,snapshot_rank`
 }
 
 // GetBillingStatus returns the latest state. A missing row is reported as sql.ErrNoRows.
@@ -605,7 +509,7 @@ func (s *Store) GetBillingStatus(upstreamID int64) (BillingStatus, error) {
 		reported_list_cost,reported_actual_cost,status,error_text,` +
 		s.billingTimeExpr("observed_at") + `,` + s.billingTimeExpr("last_success_at") + `,` +
 		s.billingTimeExpr("refreshed_at") + ` FROM upstream_billing_status WHERE upstream_id=?`
-	state, err := scanBillingStatus(s.db.QueryRow(query, upstreamID))
+	state, err := scanBillingStatus(s.queryRow(query, upstreamID))
 	if err != nil {
 		return BillingStatus{}, err
 	}
@@ -623,9 +527,7 @@ func (s *Store) ListBillingStatuses() (map[int64]BillingStatus, error) {
 	return s.listBillingStatuses(false)
 }
 
-// ListBillingStatusesLite returns current billing states without historical
-// audit calculation. It is used by the overview, where the latest balance is
-// enough and the audit window can be loaded only on the upstream detail page.
+// ListBillingStatusesLite returns statuses without computing audits (faster for list views).
 func (s *Store) ListBillingStatusesLite() (map[int64]BillingStatus, error) {
 	return s.listBillingStatuses(true)
 }
@@ -635,7 +537,7 @@ func (s *Store) listBillingStatuses(skipAudits bool) (map[int64]BillingStatus, e
 		reported_list_cost,reported_actual_cost,status,error_text,` +
 		s.billingTimeExpr("observed_at") + `,` + s.billingTimeExpr("last_success_at") + `,` +
 		s.billingTimeExpr("refreshed_at") + ` FROM upstream_billing_status`
-	rows, err := s.db.Query(query)
+	rows, err := s.query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -677,7 +579,7 @@ func (s *Store) ListBillingSnapshots(upstreamID int64, limit int) ([]BillingSnap
 	query := `SELECT id,upstream_id,currency,remaining,unlimited,billing_group,group_multiplier,
 		effective_multiplier,reported_list_cost,reported_actual_cost,` + s.billingTimeExpr("observed_at") +
 		` FROM upstream_billing_snapshots WHERE upstream_id=? ORDER BY observed_at DESC,id DESC LIMIT ?`
-	rows, err := s.db.Query(query, upstreamID, limit)
+	rows, err := s.query(query, upstreamID, limit)
 	if err != nil {
 		return nil, err
 	}

@@ -65,6 +65,8 @@ func TestFetchSub2APIPreservesNegativeBalance(t *testing.T) {
 	}
 }
 
+// groups 表是权威公示价，log 里的 group_ratio 只是历史扣费快照。
+// 站点调价后旧日志的 group_ratio 不再反映当前价，必须以 groups 为准。
 func TestFetchNewAPI(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -73,7 +75,10 @@ func TestFetchNewAPI(t *testing.T) {
 		case "/api/status":
 			w.Write([]byte(`{"success":true,"data":{"quota_per_unit":500000}}`))
 		case "/api/log/token":
-			w.Write([]byte(`{"success":true,"data":[{"group":"OAI-PRO20X","other":"{\"group_ratio\":0.18,\"user_group_ratio\":-1}"}]}`))
+			w.Write([]byte(`{"success":true,"data":[{"group":"OAI-PRO20X","other":"{\"group_ratio\":0.066,\"user_group_ratio\":-1}"}]}`))
+		case "/api/user/groups":
+			// 站点已调价到 0.22，log 里的 0.066 是历史快照
+			w.Write([]byte(`{"success":true,"data":{"OAI-PRO20X":{"ratio":0.22}}}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -87,17 +92,19 @@ func TestFetchNewAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !result.Unlimited || result.Remaining != nil || result.BillingGroup != "OAI-PRO20X" ||
-		result.EffectiveMultiplier == nil || *result.EffectiveMultiplier != 0.18 ||
+		result.EffectiveMultiplier == nil || *result.EffectiveMultiplier != 0.22 ||
+		result.GroupMultiplier == nil || *result.GroupMultiplier != 0.22 ||
 		result.ReportedActualCost == nil || math.Abs(*result.ReportedActualCost-5.728422) > 0.000001 {
 		t.Fatalf("unexpected New API result: %+v", result)
 	}
+	if result.ReportedListCost != nil {
+		t.Fatalf("New API does not report list cost; derived values would hide overcharge: %v", *result.ReportedListCost)
+	}
 }
 
-// 关键回归：New API 的 /api/log/token 把错误日志(type=5)和消费日志(type=2)混在
-// 一起返回，错误日志的 other 里没有 group_ratio。生产上 mosshubs 有 39% 是错误
-// 日志，取「最新一条」会让倍率随机落到分组表的公示价，与实际扣费价不符。
-func TestFetchNewAPISkipsErrorLogsWhenReadingMultiplier(t *testing.T) {
-	var groupsHit int
+// 关键回归：/api/log/token 混错误日志和消费日志。BillingGroup 名字仍取最新一条
+// (错误也带 group)，但倍率一律走 /api/user/groups 拿当前公示价。
+func TestFetchNewAPISkipsErrorLogsForGroupName(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/usage/token/":
@@ -105,14 +112,11 @@ func TestFetchNewAPISkipsErrorLogsWhenReadingMultiplier(t *testing.T) {
 		case "/api/status":
 			w.Write([]byte(`{"data":{"quota_per_unit":500000}}`))
 		case "/api/log/token":
-			// 最新两条是错误日志：带 group 但 other 里只有 error_code/status_code
 			w.Write([]byte(`{"success":true,"data":[
 				{"group":"OAI-PRO20X","other":"{\"error_code\":\"upstream_error\",\"status_code\":503}"},
-				{"group":"OAI-PRO20X","other":"{\"error_code\":\"upstream_error\",\"status_code\":429}"},
 				{"group":"OAI-PRO20X","other":"{\"group_ratio\":0.18,\"user_group_ratio\":-1}"}
 			]}`))
 		case "/api/user/groups":
-			groupsHit++
 			w.Write([]byte(`{"success":true,"data":{"OAI-PRO20X":{"ratio":0.15}}}`))
 		default:
 			http.NotFound(w, r)
@@ -127,21 +131,85 @@ func TestFetchNewAPISkipsErrorLogsWhenReadingMultiplier(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.BillingGroup != "OAI-PRO20X" {
-		t.Fatalf("error logs still carry the group name: %+v", result)
+		t.Fatalf("billing group: %+v", result)
 	}
-	if result.EffectiveMultiplier == nil || *result.EffectiveMultiplier != 0.18 {
-		t.Fatalf("multiplier must come from the newest consumption log, got %v", result.EffectiveMultiplier)
+	// 从 groups 表拿当前价 0.15，不是 log 里的历史 0.18
+	if result.EffectiveMultiplier == nil || *result.EffectiveMultiplier != 0.15 {
+		t.Fatalf("effective must be current group price 0.15, got %v", result.EffectiveMultiplier)
 	}
-	if groupsHit != 0 {
-		t.Fatalf("group table must not be consulted when a consumption log exists")
-	}
-	if result.Warning != "" {
-		t.Fatalf("unexpected warning: %s", result.Warning)
+	if result.GroupMultiplier == nil || *result.GroupMultiplier != 0.15 {
+		t.Fatalf("group must be current group price 0.15, got %v", result.GroupMultiplier)
 	}
 }
 
-// 只有错误日志时才回落到分组公示价，并说明该值未经实际扣费验证。
-func TestFetchNewAPIFallsBackToGroupTableWithoutConsumptionLog(t *testing.T) {
+// user_group_ratio(个人议价) 存在时覆盖 effective，group_multiplier 仍是公示价。
+func TestFetchNewAPIUserGroupRatioOverridesEffective(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/usage/token/":
+			w.Write([]byte(`{"data":{"object":"token_usage","total_used":100,"unlimited_quota":true}}`))
+		case "/api/status":
+			w.Write([]byte(`{"data":{"quota_per_unit":500000}}`))
+		case "/api/log/token":
+			// 有效个人议价 0.08
+			w.Write([]byte(`{"success":true,"data":[
+				{"group":"vip","other":"{\"group_ratio\":0.22,\"user_group_ratio\":0.08}"}
+			]}`))
+		case "/api/user/groups":
+			w.Write([]byte(`{"success":true,"data":{"vip":{"ratio":0.22}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	result, err := Fetch(context.Background(), &upstream.Upstream{
+		BaseURL: server.URL, BillingType: upstream.BillingNewAPI,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.GroupMultiplier == nil || *result.GroupMultiplier != 0.22 {
+		t.Fatalf("group must reflect the public rate 0.22, got %v", result.GroupMultiplier)
+	}
+	if result.EffectiveMultiplier == nil || *result.EffectiveMultiplier != 0.08 {
+		t.Fatalf("effective must reflect the personal discount 0.08, got %v", result.EffectiveMultiplier)
+	}
+}
+
+func TestFetchNewAPISkipsErrorLogBeforePersonalRatio(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/usage/token/":
+			w.Write([]byte(`{"data":{"object":"token_usage","total_used":100,"unlimited_quota":true}}`))
+		case "/api/status":
+			w.Write([]byte(`{"data":{"quota_per_unit":500000}}`))
+		case "/api/log/token":
+			w.Write([]byte(`{"success":true,"data":[
+				{"group":"vip","other":"{\"error_code\":\"upstream_error\",\"status_code\":503}"},
+				{"group":"vip","other":"{\"group_ratio\":0.22,\"user_group_ratio\":0.08}"}
+			]}`))
+		case "/api/user/groups":
+			w.Write([]byte(`{"success":true,"data":{"vip":{"ratio":0.22}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	result, err := Fetch(context.Background(), &upstream.Upstream{
+		BaseURL: server.URL, BillingType: upstream.BillingNewAPI,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.EffectiveMultiplier == nil || *result.EffectiveMultiplier != 0.08 {
+		t.Fatalf("effective must come from the latest charged log, got %v", result.EffectiveMultiplier)
+	}
+}
+
+// groups 表没有当前 group 时(罕见)，回退到扣费日志的历史 group_ratio。
+func TestFetchNewAPIFallsBackWhenGroupsTableMisses(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/usage/token/":
@@ -150,10 +218,10 @@ func TestFetchNewAPIFallsBackToGroupTableWithoutConsumptionLog(t *testing.T) {
 			w.Write([]byte(`{"data":{"quota_per_unit":500000}}`))
 		case "/api/log/token":
 			w.Write([]byte(`{"success":true,"data":[
-				{"group":"claude-kiro","other":"{\"error_code\":\"upstream_error\",\"status_code\":503}"}
+				{"group":"claude-kiro","other":"{\"group_ratio\":0.15,\"user_group_ratio\":-1}"}
 			]}`))
 		case "/api/user/groups":
-			w.Write([]byte(`{"success":true,"data":{"claude-kiro":{"ratio":0.15}}}`))
+			w.Write([]byte(`{"success":true,"data":{"other-group":{"ratio":1.0}}}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -167,10 +235,10 @@ func TestFetchNewAPIFallsBackToGroupTableWithoutConsumptionLog(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.EffectiveMultiplier == nil || *result.EffectiveMultiplier != 0.15 {
-		t.Fatalf("group table must supply the fallback multiplier, got %v", result.EffectiveMultiplier)
+		t.Fatalf("fallback to log group_ratio, got %v", result.EffectiveMultiplier)
 	}
 	if result.Warning == "" {
-		t.Fatal("a list-price multiplier must be reported as unverified")
+		t.Fatal("fallback must be reported as unverified")
 	}
 }
 

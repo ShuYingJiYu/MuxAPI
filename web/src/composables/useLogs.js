@@ -248,7 +248,15 @@ export function useLogs({ page, guard }) {
     request_too_large: '请求体过大', request_read: '请求体读取失败',
   }[kind] || kind || '—')
   const errorSourceText = source => ({ upstream: '上游', client: '客户端', gateway: 'MuxAPI' }[source] || source || '—')
-  const selectionText = reason => ({ initial: '首次选择', failover: '故障切换', recovery_trial: '恢复验证' }[reason] || reason || '—')
+  const selectionText = reason => {
+    const map = { initial: '首次选择', failover: '故障切换', recovery_trial: '恢复验证' }
+    if (map[reason]) return map[reason]
+    if (!reason) return '—'
+    if (reason.includes('provider cache')) return '缓存路由'
+    if (reason.includes('ordinary input')) return '直连最优'
+    if (reason.includes('exploration')) return '探索采样'
+    return reason.split(':')[0] || reason
+  }
   const streamStateText = entry => {
     if (!entry.stream) return '非流式'
     if (entry.stream_completed) return entry.last_event ? `完整 · ${entry.last_event}` : '完整结束'
@@ -269,7 +277,16 @@ export function useLogs({ page, guard }) {
   // 状态展示文案：0=网络失败，否则状态码
   const statusText = s => s === 0 ? '网络失败' : s === 499 ? '客户端取消' : String(s)
   // 端点路径简化展示：去掉 /v1/ 前缀，空则 —
-  const fmtEndpoint = p => !p ? '—' : p.replace(/^\/v1\//, '')
+  const fmtEndpoint = p => {
+    if (!p) return '—'
+    const gemini = p.match(/^\/v1(?:alpha|beta)?\/models\/([^:]+):(streamGenerateContent|generateContent)$/)
+    if (gemini) {
+      let model = gemini[1]
+      try { model = decodeURIComponent(model) } catch {}
+      return `gemini/${model}${gemini[2] === 'streamGenerateContent' ? ' · stream' : ''}`
+    }
+    return p.replace(/^\/v1\//, '')
+  }
   return {
     logs, logPageSize, logCurrentPage, logLoading, logDetail, logDetailLoading, logStats,
     logCacheStats, logCacheExpanded, logCacheSummary,

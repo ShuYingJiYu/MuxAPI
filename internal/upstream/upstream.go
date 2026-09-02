@@ -24,12 +24,13 @@ type Upstream struct {
 	Tags         []Tag
 	TagsSet      bool
 	GroupIDs     []int64 // 创建请求附带：要同时加入的分组 id（仅 admin 创建路径使用）
-	BaseURL      string // 中转站地址
-	APIKey       string // 透传凭证
-	Proxy        string // 转发/探测走的代理出口(空=按环境变量或直连)
+	BaseURL      string  // 中转站地址
+	APIKey       string  // 透传凭证
+	Proxy        string  // 转发/探测走的代理出口(空=按环境变量或直连)
 	Protocol     string  // 上游协议；passthrough 保持客户端请求格式
-	BillingType  string  // 计费接口类型：none/sub2api/newapi
+	BillingType  string  // 计费接口类型：none/auto/sub2api/newapi
 	CreditRatio  float64 // 储值积分倍率（默认 1）：充1元得 N 元积分时填 N；路由倍率 = 上报倍率 / CreditRatio
+	CacheMode    string  // 缓存策略：auto(观察后启用) / enabled / disabled
 	Priority     int     // 组内视图：越小越优先
 	Weight       int     // 组内视图：同优先级层分流权重
 	Enabled      bool
@@ -38,8 +39,12 @@ type Upstream struct {
 
 const (
 	BillingNone    = "none"
+	BillingAuto    = "auto"
 	BillingSub2API = "sub2api"
 	BillingNewAPI  = "newapi"
+	CacheAuto      = "auto"
+	CacheEnabled   = "enabled"
+	CacheDisabled  = "disabled"
 )
 
 // NormalizeBillingType validates the management-facing billing adapter name.
@@ -47,10 +52,26 @@ func NormalizeBillingType(value string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "", BillingNone:
 		return BillingNone, true
+	case BillingAuto:
+		return BillingAuto, true
 	case BillingSub2API:
 		return BillingSub2API, true
 	case BillingNewAPI:
 		return BillingNewAPI, true
+	default:
+		return "", false
+	}
+}
+
+// NormalizeCacheMode validates the per-upstream cache capability policy.
+func NormalizeCacheMode(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", CacheAuto:
+		return CacheAuto, true
+	case CacheEnabled:
+		return CacheEnabled, true
+	case CacheDisabled:
+		return CacheDisabled, true
 	default:
 		return "", false
 	}
@@ -130,7 +151,7 @@ func IsModelUnsupported(code int, model, body string) bool {
 	if model == "" {
 		return false
 	}
-	if code != http.StatusBadRequest && code != http.StatusNotFound {
+	if code != http.StatusBadRequest && code != http.StatusNotFound && code != http.StatusServiceUnavailable {
 		return false
 	}
 	lower := strings.ToLower(body)
@@ -140,6 +161,7 @@ func IsModelUnsupported(code int, model, body string) bool {
 		"model does not exist",
 		"unknown model",
 		"unsupported model",
+		"no available channel",
 		"模型不存在",
 		"不支持该模型",
 		"不支持模型",
@@ -195,6 +217,7 @@ func (u *Upstream) BuildRequest(method, path string, body io.Reader, clientHeade
 	// 覆盖凭证为上游自己的 key（客户端那个是 sub2api 发的，上游不认）
 	req.Header.Set("Authorization", "Bearer "+u.APIKey)
 	req.Header.Set("x-api-key", u.APIKey)
+	req.Header.Set("x-goog-api-key", u.APIKey)
 	return req, nil
 }
 
@@ -212,7 +235,11 @@ func isHopByHopHeader(key string) bool {
 // 返回 (models, status, error)：status 是上游 HTTP 状态码（网络错误为 0）。
 // ctx 让调用方在客户端断开时立即放弃；Transport 走共享池，避免每次拉取都新建连接池。
 func (u *Upstream) FetchModels(ctx context.Context, timeout time.Duration) ([]string, int, error) {
-	req, err := u.BuildRequest(http.MethodGet, "/v1/models", nil, http.Header{})
+	modelsPath := "/v1/models"
+	if strings.EqualFold(strings.TrimSpace(u.Protocol), "gemini") {
+		modelsPath = "/v1beta/models"
+	}
+	req, err := u.BuildRequest(http.MethodGet, modelsPath, nil, http.Header{})
 	if err != nil {
 		return nil, 0, err
 	}
@@ -233,12 +260,20 @@ func (u *Upstream) FetchModels(ctx context.Context, timeout time.Duration) ([]st
 		Data []struct {
 			ID string `json:"id"`
 		} `json:"data"`
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
 	}
 	json.Unmarshal(body, &parsed)
 	models := make([]string, 0, len(parsed.Data))
 	for _, m := range parsed.Data {
 		if m.ID != "" {
 			models = append(models, m.ID)
+		}
+	}
+	for _, m := range parsed.Models {
+		if id := strings.TrimPrefix(strings.TrimSpace(m.Name), "models/"); id != "" {
+			models = append(models, id)
 		}
 	}
 	return models, resp.StatusCode, nil

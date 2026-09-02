@@ -150,7 +150,7 @@ func (s *Store) ListRequestsPage(filter RequestFilter) (*RequestPage, error) {
 		q += " OFFSET ?"
 		args = append(args, filter.Offset)
 	}
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +196,7 @@ func (s *Store) loadRouteSummaries(entries []*RequestEntry) error {
 		LEFT JOIN upstreams u ON u.id=a.upstream_id
 		WHERE CAST(a.request_id AS TEXT) IN (` + strings.Join(placeholders, ",") + `)
 		ORDER BY a.request_id,a.attempt_no`
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.query(q, args...)
 	if err != nil {
 		return err
 	}
@@ -216,7 +216,7 @@ func (s *Store) loadRouteSummaries(entries []*RequestEntry) error {
 }
 
 func (s *Store) GetRequest(id int64) (*RequestEntry, error) {
-	entry, err := scanRequestEntry(s.db.QueryRow(s.requestSelect(" WHERE r.id=?"), id))
+	entry, err := scanRequestEntry(s.queryRow(s.requestSelect(" WHERE r.id=?"), id))
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +225,7 @@ func (s *Store) GetRequest(id int64) (*RequestEntry, error) {
 }
 
 func (s *Store) listRequestAttempts(requestID string) ([]*RequestAttemptEntry, error) {
-	q := fmt.Sprintf(`SELECT a.id,a.attempt_no,a.upstream_id,COALESCE(u.name,''),a.status,a.outcome,
+	q := fmt.Sprintf(`SELECT a.id,a.attempt_no,a.upstream_id,COALESCE(u.name,''),a.mapped_model,a.status,a.outcome,
 		a.ttft_ms,a.duration_ms,%s,%s,a.error_text,a.priority,a.selection_reason,a.health_before,
 		a.health_after,a.response_bytes,a.stream,a.stream_completed,a.last_event,a.input_tokens,
 		a.output_tokens,a.cached_tokens,a.cache_creation_tokens,
@@ -235,7 +235,7 @@ func (s *Store) listRequestAttempts(requestID string) ([]*RequestAttemptEntry, e
 		FROM request_attempts a LEFT JOIN upstreams u ON u.id=a.upstream_id
 		WHERE a.request_id=? ORDER BY a.attempt_no`,
 		s.unixExpr("a.created_at"), s.unixExpr("a.completed_at"))
-	rows, err := s.db.Query(q, requestID)
+	rows, err := s.query(q, requestID)
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +243,7 @@ func (s *Store) listRequestAttempts(requestID string) ([]*RequestAttemptEntry, e
 	out := []*RequestAttemptEntry{}
 	for rows.Next() {
 		e := &RequestAttemptEntry{}
-		if err := rows.Scan(&e.ID, &e.AttemptNo, &e.UpstreamID, &e.UpstreamName, &e.Status,
+		if err := rows.Scan(&e.ID, &e.AttemptNo, &e.UpstreamID, &e.UpstreamName, &e.MappedModel, &e.Status,
 			&e.Outcome, &e.TTFTMs, &e.DurationMs, &e.CreatedAt, &e.CompletedAt, &e.Error,
 			&e.Priority, &e.SelectionReason, &e.HealthBefore, &e.HealthAfter, &e.ResponseBytes,
 			&e.Stream, &e.StreamCompleted, &e.LastEvent, &e.InputTokens, &e.OutputTokens,

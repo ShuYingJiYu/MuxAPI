@@ -20,10 +20,12 @@ type groupRow struct {
 }
 
 type upstreamRow struct {
-	id                                     int64
-	name, baseURL, apiKey, proxy, protocol string
-	enabled, channelProbe                  bool
-	sortOrder                              int
+	id                                             int64
+	name, source, baseURL, apiKey, proxy, protocol string
+	billingType, cacheMode                         string
+	creditRatio                                    float64
+	enabled, channelProbe                          bool
+	sortOrder                                      int
 }
 
 type memberRow struct {
@@ -93,12 +95,13 @@ func main() {
 			row.id, row.name, row.description)
 	}
 	for _, row := range upstreams {
-		mustExec(tx, `INSERT INTO upstreams(id,name,base_url,api_key,proxy,protocol,enabled,channel_probe,sort_order)
-			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(id) DO UPDATE SET
-			name=EXCLUDED.name,base_url=EXCLUDED.base_url,api_key=EXCLUDED.api_key,
-			proxy=EXCLUDED.proxy,protocol=EXCLUDED.protocol,enabled=EXCLUDED.enabled,channel_probe=EXCLUDED.channel_probe,
-			sort_order=EXCLUDED.sort_order`, row.id, row.name, row.baseURL, row.apiKey, row.proxy,
-			row.protocol, row.enabled, row.channelProbe, row.sortOrder)
+		mustExec(tx, `INSERT INTO upstreams(id,name,source,base_url,api_key,proxy,protocol,billing_type,cache_mode,enabled,channel_probe,credit_ratio,sort_order)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT(id) DO UPDATE SET
+			name=EXCLUDED.name,source=EXCLUDED.source,base_url=EXCLUDED.base_url,api_key=EXCLUDED.api_key,
+			proxy=EXCLUDED.proxy,protocol=EXCLUDED.protocol,billing_type=EXCLUDED.billing_type,cache_mode=EXCLUDED.cache_mode,
+			enabled=EXCLUDED.enabled,channel_probe=EXCLUDED.channel_probe,credit_ratio=EXCLUDED.credit_ratio,
+			sort_order=EXCLUDED.sort_order`, row.id, row.name, row.source, row.baseURL, row.apiKey, row.proxy,
+			row.protocol, row.billingType, row.cacheMode, row.enabled, row.channelProbe, row.creditRatio, row.sortOrder)
 	}
 	for _, row := range members {
 		mustExec(tx, `INSERT INTO group_upstreams(group_id,upstream_id,priority,weight,enabled)
@@ -126,8 +129,14 @@ func main() {
 		mustExec(tx, `INSERT INTO settings(key,value) VALUES($1,$2)
 			ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value`, row.key, row.value)
 	}
-	mustExec(tx, `INSERT INTO settings(key,value) VALUES('request_retention_days','7')
-		ON CONFLICT(key) DO UPDATE SET value='7'`)
+	// Request and billing/probe history are retained permanently. A value of
+	// zero disables the janitor; existing request rows are never rewritten.
+	mustExec(tx, `INSERT INTO settings(key,value) VALUES('request_retention_days','0')
+		ON CONFLICT(key) DO UPDATE SET value='0'`)
+	mustExec(tx, `INSERT INTO settings(key,value) VALUES('billing_snapshot_retention_days','0')
+		ON CONFLICT(key) DO UPDATE SET value='0'`)
+	mustExec(tx, `INSERT INTO settings(key,value) VALUES('probe_retention_hours','0')
+		ON CONFLICT(key) DO UPDATE SET value='0'`)
 	// 保留旧 ID 后同步序列，防止迁移后的新记录与现有主键冲突。
 	for _, table := range []string{"groups", "upstreams", "access_keys", "monitors"} {
 		mustExec(tx, fmt.Sprintf(`SELECT setval(pg_get_serial_sequence('%s','id'),
@@ -161,17 +170,25 @@ func loadGroups(db *sql.DB) []groupRow {
 }
 
 func loadUpstreams(db *sql.DB) []upstreamRow {
-	// 兼容尚未增加 protocol 列的旧库，缺失时按透传协议迁移。
-	protocolColumn := `'passthrough'`
-	if sqliteColumnExists(db, "upstreams", "protocol") {
-		protocolColumn = `COALESCE(protocol,'passthrough')`
+	// 兼容尚未增加新字段的旧库，缺失时填入与当前 schema 相同的默认值。
+	column := func(name, fallback string) string {
+		if sqliteColumnExists(db, "upstreams", name) {
+			return fmt.Sprintf("COALESCE(%s,%s)", name, fallback)
+		}
+		return fallback
 	}
-	rows := mustQuery(db, fmt.Sprintf(`SELECT id,name,base_url,api_key,proxy,%s,enabled,channel_probe,sort_order FROM upstreams ORDER BY id`, protocolColumn))
+	rows := mustQuery(db, fmt.Sprintf(`SELECT id,name,%s,base_url,api_key,proxy,%s,%s,%s,enabled,channel_probe,%s,sort_order FROM upstreams ORDER BY id`,
+		column("source", "''"), column("protocol", "'passthrough'"), column("billing_type", "'none'"),
+		column("cache_mode", "'auto'"), column("credit_ratio", "1")))
 	defer rows.Close()
 	var out []upstreamRow
 	for rows.Next() {
 		var row upstreamRow
-		mustScan(rows, &row.id, &row.name, &row.baseURL, &row.apiKey, &row.proxy, &row.protocol, &row.enabled, &row.channelProbe, &row.sortOrder)
+		mustScan(rows, &row.id, &row.name, &row.source, &row.baseURL, &row.apiKey, &row.proxy, &row.protocol,
+			&row.billingType, &row.cacheMode, &row.enabled, &row.channelProbe, &row.creditRatio, &row.sortOrder)
+		if row.creditRatio <= 0 {
+			row.creditRatio = 1
+		}
 		out = append(out, row)
 	}
 	mustRows(rows)

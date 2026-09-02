@@ -54,6 +54,42 @@ func TestForwardAuditsCompressedCodexSSE(t *testing.T) {
 	}
 }
 
+func TestForwardNativeGeminiRequest(t *testing.T) {
+	var gotPath, gotKey string
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.RequestURI()
+		gotKey = r.Header.Get("x-goog-api-key")
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), `"contents"`) || strings.Contains(string(body), `"model"`) {
+			t.Errorf("native Gemini body changed: %s", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":1}}\n\n")
+	}))
+	defer upstreamServer.Close()
+
+	ups := []*upstream.Upstream{{ID: 1, BaseURL: upstreamServer.URL, APIKey: "gemini-key", Protocol: "gemini", Priority: 1, Weight: 1}}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 1)
+	body := []byte(`{"contents":[{"parts":[{"text":"hello"}]}]}`)
+	request := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-test:streamGenerateContent?key=client-key", bytes.NewReader(body))
+	request.Header.Set("x-goog-api-key", "client-key")
+	recorder := httptest.NewRecorder()
+	result := fwd.Forward(recorder, request, body, 1, "")
+	if result.Outcome != OutcomeSuccess || recorder.Code != http.StatusOK {
+		t.Fatalf("native Gemini result status=%d result=%+v body=%s", recorder.Code, result, recorder.Body.String())
+	}
+	if gotPath != "/v1beta/models/gemini-test:streamGenerateContent?alt=sse" {
+		t.Fatalf("native Gemini path/query = %q", gotPath)
+	}
+	if gotKey != "gemini-key" {
+		t.Fatalf("native Gemini key = %q", gotKey)
+	}
+	if !strings.Contains(recorder.Body.String(), "\"finishReason\":\"STOP\"") || result.InputTokens != 3 || result.OutputTokens != 1 {
+		t.Fatalf("native Gemini response/audit = %s %+v", recorder.Body.String(), result)
+	}
+}
+
 func TestForwardUsesDynamicMaxAttemptsPerRequest(t *testing.T) {
 	servers := make([]*httptest.Server, 0, 4)
 	upstreams := make([]*upstream.Upstream, 0, 4)
@@ -617,6 +653,46 @@ func TestForwardModelUnsupportedFailover(t *testing.T) {
 	}
 	if hm.EffectiveState(1) != "CLOSED" {
 		t.Fatal("model capability mismatch must not open A")
+	}
+}
+
+func TestForwardClientErrorsDoNotFailOver(t *testing.T) {
+	for _, status := range []int{http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var backupHits atomic.Int32
+			primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(status)
+				io.WriteString(w, `{"error":{"message":"invalid client request"}}`)
+			}))
+			defer primary.Close()
+			backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				backupHits.Add(1)
+				io.WriteString(w, `{"ok":true}`)
+			}))
+			defer backup.Close()
+
+			upstreams := []*upstream.Upstream{
+				{ID: 1, BaseURL: primary.URL, APIKey: "k", Priority: 1, Weight: 1},
+				{ID: 2, BaseURL: backup.URL, APIKey: "k", Priority: 2, Weight: 1},
+			}
+			hm := health.New(1, time.Hour)
+			fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 2)
+			body := []byte(`{"model":"gpt-5.6"}`)
+			recorder := httptest.NewRecorder()
+			result := fwd.Forward(recorder,
+				httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)), body, 1, "")
+
+			if recorder.Code != status || result.Status != status || result.Outcome != OutcomeClientError {
+				t.Fatalf("status=%d result=%+v", recorder.Code, result)
+			}
+			if backupHits.Load() != 0 {
+				t.Fatalf("client error %d must not reach backup", status)
+			}
+			if hm.EffectiveState(1) != "CLOSED" {
+				t.Fatalf("client error %d must not open primary breaker", status)
+			}
+		})
 	}
 }
 

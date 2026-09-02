@@ -11,6 +11,7 @@ import (
 type RequestAttemptRecord struct {
 	AttemptNo           int
 	Protocol            string // 快照当次协议，供费用比对使用正确的 cached_tokens 口径
+	MappedModel         string
 	UpstreamID          int64
 	Priority            int
 	SelectionReason     string
@@ -72,6 +73,7 @@ type RequestAttemptEntry struct {
 	AttemptNo           int     `json:"attempt_no"`
 	UpstreamID          int64   `json:"upstream_id"`
 	UpstreamName        string  `json:"upstream_name"`
+	MappedModel         string  `json:"mapped_model,omitempty"`
 	Priority            int     `json:"priority"`
 	SelectionReason     string  `json:"selection_reason"`
 	HealthBefore        string  `json:"health_before"`
@@ -200,7 +202,7 @@ func (s *Store) runRequestWriter() {
 }
 
 func (s *Store) writeRequest(record RequestRecord) error {
-	tx, err := s.db.Begin()
+	tx, err := s.beginTx()
 	if err != nil {
 		return err
 	}
@@ -225,15 +227,15 @@ func (s *Store) writeRequest(record RequestRecord) error {
 			request_id,attempt_no,upstream_id,status,outcome,ttft_ms,duration_ms,created_at,completed_at,error_text,
 			priority,selection_reason,health_before,health_after,response_bytes,stream,stream_completed,last_event,
 			input_tokens,output_tokens,cached_tokens,cache_creation_tokens,upstream_request_id,error_kind,error_source,
-			protocol)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			protocol,mapped_model)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			record.RequestID, attempt.AttemptNo, attempt.UpstreamID, attempt.Status, attempt.Outcome,
 			attempt.TTFTMs, attempt.DurationMs, s.timeValue(attempt.CreatedAt),
 			s.timeValue(attempt.CompletedAt), attempt.Error, attempt.Priority, attempt.SelectionReason,
 			attempt.HealthBefore, attempt.HealthAfter, attempt.ResponseBytes, attempt.Stream,
 			attempt.StreamCompleted, attempt.LastEvent, attempt.InputTokens, attempt.OutputTokens,
 			attempt.CachedTokens, attempt.CacheCreationTokens, attempt.UpstreamRequestID, attempt.ErrorKind, attempt.ErrorSource,
-			attempt.Protocol)
+			attempt.Protocol, attempt.MappedModel)
 		if err != nil {
 			return err
 		}

@@ -5,7 +5,10 @@ import (
 	"errors"
 	"math/rand"
 	"sort"
+	"time"
 
+	"github.com/mirainya/muxapi/internal/routing"
+	"github.com/mirainya/muxapi/internal/store"
 	"github.com/mirainya/muxapi/internal/upstream"
 )
 
@@ -25,13 +28,40 @@ type Health interface {
 // Scheduler applies strict priority first, then standard weighted P2C inside
 // the highest available tier.
 type Scheduler struct {
-	list   func(groupID int64) []*upstream.Upstream
-	health Health
+	list    func(groupID int64) []*upstream.Upstream
+	health  Health
+	routing *intelligentRouter
 }
 
 // New 创建调度器；list 在每次选择时读取最新分组成员。
 func New(list func(groupID int64) []*upstream.Upstream, h Health) *Scheduler {
 	return &Scheduler{list: list, health: h}
+}
+
+// SetIntelligentRouting enables the cost/cache-aware selector. The ordinary
+// priority/P2C path remains the fallback whenever pricing or history is not
+// sufficient to make a defensible cost decision.
+func (s *Scheduler) SetIntelligentRouting(st *store.Store, config func() routing.Config) {
+	if st == nil {
+		s.routing = nil
+		return
+	}
+	if config == nil {
+		defaults := routing.DefaultConfig()
+		config = func() routing.Config { return defaults }
+	}
+	s.routing = &intelligentRouter{store: st, config: config}
+}
+
+// PickWithFeatures is the optional forwarder hook for intelligent routing.
+// It deliberately keeps the existing Picker interface unchanged for callers
+// and tests that only need ordinary scheduling.
+func (s *Scheduler) PickWithFeatures(groupID int64, model string, features routing.RequestFeatures, exclude map[int64]bool) (*upstream.Upstream, routing.Decision, error) {
+	if s.routing == nil {
+		candidate, err := s.PickExcluding(groupID, model, exclude)
+		return candidate, routing.Decision{}, err
+	}
+	return s.routing.pick(s, groupID, model, features, exclude)
 }
 
 // Pick 选择一个上游，并在健康管理器中声明并发占用。
@@ -147,4 +177,20 @@ func weightedPick(tier []*upstream.Upstream) *upstream.Upstream {
 		draw -= weight
 	}
 	return tier[0]
+}
+
+// EstimateTTFT returns the P95 TTFT (ms) and sample count for a given upstream
+// and model. Used by the forwarder's adaptive timeout. Returns zero values when
+// intelligent routing is not configured or stats are unavailable.
+func (s *Scheduler) EstimateTTFT(upstreamID int64, model string) (p95Ms float64, samples int64) {
+	if s.routing == nil {
+		return 0, 0
+	}
+	now := time.Now()
+	cfg := s.routing.config()
+	stats, err := s.routing.upstreamStats(upstreamID, model, cfg.Window, now)
+	if err != nil {
+		return 0, 0
+	}
+	return float64(stats.P95TTFTMs), stats.Requests
 }

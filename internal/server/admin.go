@@ -14,27 +14,35 @@ import (
 
 var errBadMonitor = errors.New("monitor requires upstream_id and model")
 
-// registerAdmin 集中注册管理接口，并统一套用管理员鉴权。
+// registerAdmin 集中注册管理接口，并统一套用管理员鉴权 + gzip 压缩。
+// admin 响应体动辄几百 KB(如 /admin/routing/decisions?include_candidates=true
+// 一次返回 ~750KB 裸 JSON)，公网走隧道时传输段是主要延迟；gzip 后能压到 ~1/8。
+// 所有 admin 端点都是非流式 JSON，可以安全 gzip。
 func (s *Server) registerAdmin(mux *http.ServeMux) {
-	mux.HandleFunc("/admin/upstreams", s.auth(s.adminUpstreams))              // GET 全局池 / POST 新增
-	mux.HandleFunc("/admin/upstreams/", s.auth(s.adminUpstreamItem))          // PUT 改 / DELETE 删
-	mux.HandleFunc("/admin/tags", s.auth(s.adminTags))                        // GET 列表 / POST 新增
-	mux.HandleFunc("/admin/tags/", s.auth(s.adminTagItem))                    // PUT 改 / DELETE 删
-	mux.HandleFunc("/admin/monitors", s.auth(s.adminMonitors))                // GET 监控列表 / POST 新增
-	mux.HandleFunc("/admin/monitors/", s.auth(s.adminMonitorItem))            // PUT 改 / DELETE 删 / {id}/probe 立即探测
-	mux.HandleFunc("/admin/groups", s.auth(s.adminGroups))                    // GET 列表 / POST 新增
-	mux.HandleFunc("/admin/groups/", s.auth(s.adminGroupSub))                 // /{id} 改/删 ; /{id}/upstreams 成员 ; /{id}/keys 密钥
-	mux.HandleFunc("/admin/keys/", s.auth(s.adminKeyItem))                    // PUT 启停 / DELETE 删
-	mux.HandleFunc("/admin/logs", s.auth(s.adminLogs))                        // GET 调用日志(游标分页+筛选)
-	mux.HandleFunc("/admin/logs/stats", s.auth(s.adminLogStats))              // GET 当前筛选范围统计
-	mux.HandleFunc("/admin/logs/cache-stats", s.auth(s.adminLogCacheStats))   // GET 按渠道汇总缓存命中率
-	mux.HandleFunc("/admin/logs/options", s.auth(s.adminLogOptions))          // GET 筛选下拉选项(全量去重)
-	mux.HandleFunc("/admin/logs/", s.auth(s.adminLogItem))                    // GET 单条请求完整尝试链
-	mux.HandleFunc("/admin/overview/summary", s.auth(s.adminOverviewSummary)) // GET 今日请求/本周费用汇总
-	mux.HandleFunc("/admin/overview/trends", s.auth(s.adminOverviewTrends))   // GET 总览余额/成功率趋势
-	mux.HandleFunc("/admin/settings", s.auth(s.adminSettings))                // GET/PUT 运行时设置
-	mux.HandleFunc("/admin/backup", s.auth(s.adminBackup))                    // GET 列表 / POST 触发
-	mux.HandleFunc("/admin/backup/", s.auth(s.adminBackup))                   // config / schedule / records/{id}
+	admin := func(h http.HandlerFunc) http.HandlerFunc { return gzipMiddleware(s.auth(h)) }
+	mux.HandleFunc("/admin/upstreams", admin(s.adminUpstreams))                // GET 全局池 / POST 新增
+	mux.HandleFunc("/admin/upstreams/", admin(s.adminUpstreamItem))            // PUT 改 / DELETE 删
+	mux.HandleFunc("/admin/tags", admin(s.adminTags))                          // GET 列表 / POST 新增
+	mux.HandleFunc("/admin/tags/", admin(s.adminTagItem))                      // PUT 改 / DELETE 删
+	mux.HandleFunc("/admin/monitors", admin(s.adminMonitors))                  // GET 监控列表 / POST 新增
+	mux.HandleFunc("/admin/monitors/", admin(s.adminMonitorItem))              // PUT 改 / DELETE 删 / {id}/probe 立即探测
+	mux.HandleFunc("/admin/groups", admin(s.adminGroups))                      // GET 列表 / POST 新增
+	mux.HandleFunc("/admin/groups/", admin(s.adminGroupSub))                   // /{id} 改/删 ; /{id}/upstreams 成员 ; /{id}/keys 密钥
+	mux.HandleFunc("/admin/keys/", admin(s.adminKeyItem))                      // PUT 启停 / DELETE 删
+	mux.HandleFunc("/admin/logs", admin(s.adminLogs))                          // GET 调用日志(游标分页+筛选)
+	mux.HandleFunc("/admin/logs/stats", admin(s.adminLogStats))                // GET 当前筛选范围统计
+	mux.HandleFunc("/admin/logs/cache-stats", admin(s.adminLogCacheStats))     // GET 按渠道汇总缓存命中率
+	mux.HandleFunc("/admin/logs/options", admin(s.adminLogOptions))            // GET 筛选下拉选项(全量去重)
+	mux.HandleFunc("/admin/logs/", admin(s.adminLogItem))                      // GET 单条请求完整尝试链
+	mux.HandleFunc("/admin/routing/decisions", admin(s.adminRouteDecisions))
+	mux.HandleFunc("/admin/routing/decisions/", admin(s.adminRouteDecisionItem))
+	mux.HandleFunc("/admin/overview/summary", admin(s.adminOverviewSummary)) // GET 今日请求/本周费用汇总
+	mux.HandleFunc("/admin/overview/trends", admin(s.adminOverviewTrends))   // GET 总览余额/成功率趋势
+	mux.HandleFunc("/admin/settings", admin(s.adminSettings))                // GET/PUT 运行时设置
+	mux.HandleFunc("/admin/backup", admin(s.adminBackup))                    // GET 列表 / POST 触发
+	mux.HandleFunc("/admin/backup/", admin(s.adminBackup))                   // config / schedule / records/{id}
+	mux.HandleFunc("/admin/model-mappings", admin(s.adminModelMappings))     // GET 列表 / POST 新增
+	mux.HandleFunc("/admin/model-mappings/", admin(s.adminModelMappingItem)) // DELETE 删
 }
 
 // adminLogs 返回调用日志，兼容游标和偏移量分页。
@@ -123,6 +131,59 @@ func (s *Server) adminLogOptions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, opt)
 }
 
+func (s *Server) adminRouteDecisions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	items, err := s.store.ListRouteDecisions(parseRouteDecisionFilter(r.URL.Query()))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"items": items})
+}
+
+func (s *Server) adminRouteDecisionItem(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	value := strings.Trim(strings.TrimPrefix(r.URL.Path, "/admin/routing/decisions/"), "/")
+	id, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || id <= 0 {
+		http.Error(w, "invalid route decision id", http.StatusBadRequest)
+		return
+	}
+	entry, err := s.store.GetRouteDecision(id)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "route decision not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, entry)
+}
+
+func parseRouteDecisionFilter(q url.Values) store.RouteDecisionFilter {
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	before, _ := strconv.ParseInt(q.Get("before"), 10, 64)
+	groupID, _ := strconv.ParseInt(q.Get("group_id"), 10, 64)
+	selected, _ := strconv.ParseInt(q.Get("selected_upstream_id"), 10, 64)
+	filter := store.RouteDecisionFilter{Limit: limit, BeforeID: before, GroupID: groupID,
+		SelectedUpstreamID: selected, Model: q.Get("model"), SessionKey: q.Get("session_key"),
+		PrefixHash: q.Get("prefix_hash"), IncludeCandidates: q.Get("include_candidates") == "true"}
+	if value, _ := strconv.ParseInt(q.Get("since"), 10, 64); value > 0 {
+		filter.Since = time.Unix(value, 0)
+	}
+	if value, _ := strconv.ParseInt(q.Get("until"), 10, 64); value > 0 {
+		filter.Until = time.Unix(value, 0)
+	}
+	return filter
+}
+
 func settingString(v any) string {
 	switch x := v.(type) {
 	case string:
@@ -150,6 +211,13 @@ func stringSettingValue(dbValue, def string) (string, string) {
 
 func intSettingValue(dbValue string, def int) (string, string) {
 	if n, err := strconv.Atoi(dbValue); err == nil && n > 0 {
+		return dbValue, "settings"
+	}
+	return strconv.Itoa(def), "default"
+}
+
+func intSettingValueAllowZero(dbValue string, def int) (string, string) {
+	if n, err := strconv.Atoi(dbValue); err == nil && n >= 0 {
 		return dbValue, "settings"
 	}
 	return strconv.Itoa(def), "default"

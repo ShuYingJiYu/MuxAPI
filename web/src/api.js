@@ -1,5 +1,7 @@
 // 轻量 admin API 封装：所有请求经 vite proxy /admin → 后端 8080。
 // adminToken 存在 localStorage（后端 AdminToken 为空时鉴权跳过，本地调试免填）。
+import { unwrap, normalizeTs, validate, ROUTE_DECISION_ENTRY_FIELDS } from './api.generated.js'
+
 const token = () => localStorage.getItem('muxapi_token') || ''
 const REQUEST_TIMEOUT_MS = 15000
 // 生产库通过 SSH 隧道访问时，管理列表查询可能需要几十秒；页面不应过早中断。
@@ -58,6 +60,12 @@ async function req(method, path, body, timeoutMs = REQUEST_TIMEOUT_MS, externalS
 }
 
 function groupTestRequest(protocol, model) {
+	if (protocol === 'gemini') {
+		return {
+			path: `/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`,
+			body: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }], generationConfig: { maxOutputTokens: 32 } },
+		}
+	}
   if (protocol === 'claude') {
     return { path: '/v1/messages', body: { model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 32, stream: true } }
   }
@@ -68,12 +76,14 @@ function groupTestRequest(protocol, model) {
 }
 
 function groupTestText(protocol, payload) {
+	if (protocol === 'gemini') return (payload?.candidates || []).flatMap(item => item?.content?.parts || []).map(item => item?.text || '').join('')
   if (protocol === 'claude') return payload?.delta?.text || ''
   if (protocol === 'chat') return payload?.choices?.[0]?.delta?.content || ''
   return payload?.type === 'response.output_text.delta' ? (payload.delta || '') : ''
 }
 
 function groupTestBodyText(protocol, payload) {
+	if (protocol === 'gemini') return (payload?.candidates || []).flatMap(item => item?.content?.parts || []).map(item => item?.text || '').join('')
   if (protocol === 'claude') return (payload?.content || []).filter(item => item.type === 'text').map(item => item.text || '').join('')
   if (protocol === 'chat') return payload?.choices?.[0]?.message?.content || ''
   return (payload?.output || []).flatMap(item => item.content || []).filter(item => item.type === 'output_text').map(item => item.text || '').join('')
@@ -171,6 +181,7 @@ export const api = {
   recoverUpstream: id => req('POST', `/upstreams/${id}/recover`),
   recoverUpstreamModel: (id, model) => req('POST', `/upstreams/${id}/models/recover`, { model }),
   refreshUpstreamBilling: id => req('POST', `/upstreams/${id}/billing/refresh`),
+  setUpstreamBillingMultiplier: (id, multiplier) => req('PUT', `/upstreams/${id}/billing/multiplier`, { multiplier }),
   upstreamBillingAudit: (id, window) => req('GET', `/upstreams/${id}/billing/audit?window=${encodeURIComponent(window || '')}`),
   overviewTrends: ({ window = '24h', tag_id = 0 } = {}) => {
     const p = new URLSearchParams({ window, _ts: String(Date.now()) })
@@ -311,6 +322,19 @@ export const api = {
   logDetail: (id, signal, timeoutMs = REQUEST_TIMEOUT_MS) => req('GET', '/logs/' + id, undefined, timeoutMs, signal),
   logOptions: () => req('GET', '/logs/options'),
 
+  // 路由决策
+  routeDecisions: async (params) => {
+    const p = new URLSearchParams()
+    if (params) for (const [k, v] of Object.entries(params)) { if (v != null && v !== '') p.set(k, v) }
+    p.set('include_candidates', 'true')
+    const qs = p.toString()
+    const raw = await req('GET', '/routing/decisions' + (qs ? '?' + qs : ''))
+    const items = unwrap(raw)
+    if (Array.isArray(items)) items.forEach(i => validate('RouteDecisionEntry', i, ROUTE_DECISION_ENTRY_FIELDS))
+    return items
+  },
+  routeDecisionDetail: (id) => req('GET', `/routing/decisions/${id}`),
+
   // 数据备份
   backupConfig: () => req('GET', '/backup/config'),
   saveBackupConfig: cfg => req('PUT', '/backup/config', cfg),
@@ -321,4 +345,9 @@ export const api = {
   listBackups: () => req('GET', '/backup'),
   deleteBackup: id => req('DELETE', '/backup/records/' + id),
   backupDownloadURL: id => req('GET', '/backup/records/' + id + '/download'),
+
+  // 模型映射
+  modelMappings: (upstreamId) => req('GET', '/model-mappings' + (upstreamId ? '?upstream_id=' + upstreamId : '')),
+  createModelMapping: payload => req('POST', '/model-mappings', payload),
+  deleteModelMapping: id => req('DELETE', '/model-mappings/' + id),
 }

@@ -5,36 +5,32 @@ import (
 	"errors"
 
 	"github.com/mirainya/muxapi/internal/upstream"
+	"gorm.io/gorm"
 )
 
 // --- 上游全局池 ---
 
 func (s *Store) ListTags() ([]upstream.Tag, error) {
-	rows, err := s.db.Query(`SELECT id,name,color FROM tags ORDER BY sort_order,id`)
-	if err != nil {
+	var models []TagModel
+	if err := s.gormDB.Order("sort_order, id").Find(&models).Error; err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var tags []upstream.Tag
-	for rows.Next() {
-		var tag upstream.Tag
-		if err := rows.Scan(&tag.ID, &tag.Name, &tag.Color); err != nil {
-			return nil, err
-		}
-		tags = append(tags, tag)
+	tags := make([]upstream.Tag, len(models))
+	for i, m := range models {
+		tags[i] = upstream.Tag{ID: m.ID, Name: m.Name, Color: m.Color}
 	}
-	return tags, rows.Err()
+	return tags, nil
 }
 
 func (s *Store) CreateTag(name, color string) (int64, error) {
 	var id int64
-	err := s.db.QueryRow(`INSERT INTO tags(name,color,sort_order)
+	err := s.queryRow(`INSERT INTO tags(name,color,sort_order)
 		VALUES(?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM tags)) RETURNING id`, name, color).Scan(&id)
 	return id, err
 }
 
 func (s *Store) UpdateTag(id int64, name, color string) error {
-	tx, err := s.db.Begin()
+	tx, err := s.beginTx()
 	if err != nil {
 		return err
 	}
@@ -50,7 +46,7 @@ func (s *Store) UpdateTag(id int64, name, color string) error {
 }
 
 func (s *Store) DeleteTag(id int64) error {
-	tx, err := s.db.Begin()
+	tx, err := s.beginTx()
 	if err != nil {
 		return err
 	}
@@ -75,7 +71,7 @@ func (s *Store) loadUpstreamTags(list []*upstream.Upstream) error {
 		item.TagIDs = []int64{}
 		byID[item.ID] = item
 	}
-	rows, err := s.db.Query(`SELECT ut.upstream_id,t.id,t.name,t.color,ut.is_primary
+	rows, err := s.query(`SELECT ut.upstream_id,t.id,t.name,t.color,ut.is_primary
 		FROM upstream_tags ut JOIN tags t ON t.id=ut.tag_id ORDER BY t.sort_order,t.id`)
 	if err != nil {
 		return err
@@ -100,7 +96,7 @@ func (s *Store) loadUpstreamTags(list []*upstream.Upstream) error {
 	return rows.Err()
 }
 
-func replaceUpstreamTags(tx *txAdapter, upstreamID, primaryTagID int64, tagIDs []int64) error {
+func replaceUpstreamTags(tx *rawTx, upstreamID, primaryTagID int64, tagIDs []int64) error {
 	if _, err := tx.Exec(`DELETE FROM upstream_tags WHERE upstream_id=?`, upstreamID); err != nil {
 		return err
 	}
@@ -129,7 +125,7 @@ func scanUps(rows *sql.Rows) ([]*upstream.Upstream, error) {
 	var list []*upstream.Upstream
 	for rows.Next() {
 		u := &upstream.Upstream{}
-		if err := rows.Scan(&u.ID, &u.Name, &u.Source, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Protocol, &u.BillingType, &u.Enabled, &u.Priority, &u.Weight, &u.ChannelProbe, &u.CreditRatio); err != nil {
+		if err := rows.Scan(&u.ID, &u.Name, &u.Source, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Protocol, &u.BillingType, &u.CacheMode, &u.Enabled, &u.Priority, &u.Weight, &u.ChannelProbe, &u.CreditRatio); err != nil {
 			return nil, err
 		}
 		list = append(list, u)
@@ -140,7 +136,7 @@ func scanUps(rows *sql.Rows) ([]*upstream.Upstream, error) {
 // ListEnabledByGroup 返回某分组下启用的上游，JOIN 中间表填充组内 priority/weight，
 // 按组内优先级升序（调度用）。
 func (s *Store) ListEnabledByGroup(groupID int64) ([]*upstream.Upstream, error) {
-	rows, err := s.db.Query(`SELECT u.id,u.name,u.source,u.base_url,u.api_key,u.proxy,u.protocol,u.billing_type,u.enabled,gu.priority,gu.weight,u.channel_probe,u.credit_ratio
+	rows, err := s.query(`SELECT u.id,u.name,u.source,u.base_url,u.api_key,u.proxy,u.protocol,u.billing_type,u.cache_mode,u.enabled,gu.priority,gu.weight,u.channel_probe,u.credit_ratio
 		FROM upstreams u JOIN group_upstreams gu ON gu.upstream_id=u.id
 		JOIN groups g ON g.id=gu.group_id
 		LEFT JOIN upstream_billing_status bs ON bs.upstream_id=u.id
@@ -156,7 +152,7 @@ func (s *Store) ListEnabledByGroup(groupID int64) ([]*upstream.Upstream, error) 
 
 // List 返回全部上游(含停用)，priority/weight 置 0（全局池无组内语义），供探测与后台管理。
 func (s *Store) List() ([]*upstream.Upstream, error) {
-	rows, err := s.db.Query(`SELECT id,name,source,base_url,api_key,proxy,protocol,billing_type,enabled,0,0,channel_probe,credit_ratio FROM upstreams ORDER BY sort_order, id`)
+	rows, err := s.query(`SELECT id,name,source,base_url,api_key,proxy,protocol,billing_type,cache_mode,enabled,0,0,channel_probe,credit_ratio FROM upstreams ORDER BY sort_order, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -173,8 +169,8 @@ func (s *Store) List() ([]*upstream.Upstream, error) {
 // Get 按 id 取单个上游（含完整 api_key，供连通测试用）。
 func (s *Store) Get(id int64) (*upstream.Upstream, error) {
 	u := &upstream.Upstream{}
-	err := s.db.QueryRow(`SELECT id,name,source,base_url,api_key,proxy,protocol,billing_type,enabled,channel_probe,credit_ratio FROM upstreams WHERE id=?`, id).
-		Scan(&u.ID, &u.Name, &u.Source, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Protocol, &u.BillingType, &u.Enabled, &u.ChannelProbe, &u.CreditRatio)
+	err := s.queryRow(`SELECT id,name,source,base_url,api_key,proxy,protocol,billing_type,cache_mode,enabled,channel_probe,credit_ratio FROM upstreams WHERE id=?`, id).
+		Scan(&u.ID, &u.Name, &u.Source, &u.BaseURL, &u.APIKey, &u.Proxy, &u.Protocol, &u.BillingType, &u.CacheMode, &u.Enabled, &u.ChannelProbe, &u.CreditRatio)
 	if err == nil {
 		err = s.loadUpstreamTags([]*upstream.Upstream{u})
 	}
@@ -187,17 +183,22 @@ func (s *Store) Create(u *upstream.Upstream) error {
 		return errors.New("unsupported billing type")
 	}
 	u.BillingType = billingType
+	cacheMode, ok := upstream.NormalizeCacheMode(u.CacheMode)
+	if !ok {
+		return errors.New("unsupported cache mode")
+	}
+	u.CacheMode = cacheMode
 	if u.CreditRatio <= 0 {
 		u.CreditRatio = 1
 	}
-	tx, err := s.db.Begin()
+	tx, err := s.beginTx()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err := tx.QueryRow(`INSERT INTO upstreams(name,source,base_url,api_key,proxy,protocol,billing_type,enabled,channel_probe,credit_ratio,sort_order)
-		VALUES(?,?,?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM upstreams)) RETURNING id`,
-		u.Name, u.Source, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.BillingType, u.Enabled, u.ChannelProbe, u.CreditRatio).Scan(&u.ID); err != nil {
+	if err := tx.QueryRow(`INSERT INTO upstreams(name,source,base_url,api_key,proxy,protocol,billing_type,cache_mode,enabled,channel_probe,credit_ratio,sort_order)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM upstreams)) RETURNING id`,
+		u.Name, u.Source, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.BillingType, u.CacheMode, u.Enabled, u.ChannelProbe, u.CreditRatio).Scan(&u.ID); err != nil {
 		return err
 	}
 	if u.TagsSet {
@@ -216,17 +217,14 @@ func (s *Store) Create(u *upstream.Upstream) error {
 
 // ReorderUpstreams 按给定 id 顺序写入 sort_order 权重（从 1 起）。
 func (s *Store) ReorderUpstreams(ids []int64) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	for i, id := range ids {
-		if _, err := tx.Exec(`UPDATE upstreams SET sort_order=? WHERE id=?`, i+1, id); err != nil {
-			return err
+	return s.gormDB.Transaction(func(tx *gorm.DB) error {
+		for i, id := range ids {
+			if err := tx.Model(&UpstreamModel{}).Where("id = ?", id).Update("sort_order", i+1).Error; err != nil {
+				return err
+			}
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 
 func (s *Store) Update(u *upstream.Upstream) error {
@@ -235,10 +233,15 @@ func (s *Store) Update(u *upstream.Upstream) error {
 		return errors.New("unsupported billing type")
 	}
 	u.BillingType = billingType
+	cacheMode, ok := upstream.NormalizeCacheMode(u.CacheMode)
+	if !ok {
+		return errors.New("unsupported cache mode")
+	}
+	u.CacheMode = cacheMode
 	if u.CreditRatio <= 0 {
 		u.CreditRatio = 1
 	}
-	tx, err := s.db.Begin()
+	tx, err := s.beginTx()
 	if err != nil {
 		return err
 	}
@@ -249,11 +252,11 @@ func (s *Store) Update(u *upstream.Upstream) error {
 		return err
 	}
 	if u.APIKey == "" { // 留空则不改凭证（对齐后台「留空则不修改」语义）
-		_, err = tx.Exec(`UPDATE upstreams SET name=?,source=?,base_url=?,proxy=?,protocol=?,billing_type=?,enabled=?,channel_probe=?,credit_ratio=? WHERE id=?`,
-			u.Name, u.Source, u.BaseURL, u.Proxy, u.Protocol, u.BillingType, u.Enabled, u.ChannelProbe, u.CreditRatio, u.ID)
+		_, err = tx.Exec(`UPDATE upstreams SET name=?,source=?,base_url=?,proxy=?,protocol=?,billing_type=?,cache_mode=?,enabled=?,channel_probe=?,credit_ratio=? WHERE id=?`,
+			u.Name, u.Source, u.BaseURL, u.Proxy, u.Protocol, u.BillingType, u.CacheMode, u.Enabled, u.ChannelProbe, u.CreditRatio, u.ID)
 	} else {
-		_, err = tx.Exec(`UPDATE upstreams SET name=?,source=?,base_url=?,api_key=?,proxy=?,protocol=?,billing_type=?,enabled=?,channel_probe=?,credit_ratio=? WHERE id=?`,
-			u.Name, u.Source, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.BillingType, u.Enabled, u.ChannelProbe, u.CreditRatio, u.ID)
+		_, err = tx.Exec(`UPDATE upstreams SET name=?,source=?,base_url=?,api_key=?,proxy=?,protocol=?,billing_type=?,cache_mode=?,enabled=?,channel_probe=?,credit_ratio=? WHERE id=?`,
+			u.Name, u.Source, u.BaseURL, u.APIKey, u.Proxy, u.Protocol, u.BillingType, u.CacheMode, u.Enabled, u.ChannelProbe, u.CreditRatio, u.ID)
 	}
 	if err != nil {
 		return err
@@ -288,7 +291,7 @@ func (s *Store) BatchUpdateUpstreams(ids []int64, update UpstreamBatchUpdate) er
 	if len(ids) == 0 || (update.Enabled == nil && update.PrimaryTagID == nil && len(update.AddTagIDs) == 0 && len(update.RemoveTagIDs) == 0) {
 		return errors.New("batch update requires ids and at least one field")
 	}
-	tx, err := s.db.Begin()
+	tx, err := s.beginTx()
 	if err != nil {
 		return err
 	}
@@ -336,25 +339,19 @@ func (s *Store) BatchUpdateUpstreams(ids []int64, update UpstreamBatchUpdate) er
 }
 
 func (s *Store) Delete(id int64) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`DELETE FROM group_upstreams WHERE upstream_id=?`, id); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM monitors WHERE upstream_id=?`, id); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM upstreams WHERE id=?`, id); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return s.gormDB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("upstream_id = ?", id).Delete(&GroupUpstreamModel{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("upstream_id = ?", id).Delete(&MonitorModel{}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&UpstreamModel{}, id).Error
+	})
 }
 
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() { close(s.requestQueue) })
 	<-s.requestDone
-	return s.db.Close()
+	return s.sqlDB.Close()
 }

@@ -9,12 +9,13 @@ import FancySelect from './FancySelect.vue'
 import UpstreamPicker from './UpstreamPicker.vue'
 import Chart from './Chart.vue'
 import ThemePicker from './ThemePicker.vue'
+import RoutingView from './RoutingView.vue'
 import { api } from './api.js'
 import { useLogs } from './composables/useLogs.js'
 import { useMonitorViews } from './composables/useMonitorViews.js'
 
 const route = useRoute()
-const pageNames = new Set(['overview', 'groups', 'upstreams', 'monitors', 'logs', 'settings'])
+const pageNames = new Set(['overview', 'groups', 'upstreams', 'monitors', 'logs', 'routing', 'settings'])
 const page = computed(() => pageNames.has(String(route.name)) ? String(route.name) : 'overview')
 const detailGroup = ref(null)     // 进入分组详情时设置
 
@@ -271,7 +272,7 @@ function activatePage(p) {
     else if (p === 'upstreams') { await loadTags(); await loadGroups(); await loadUpstreams(); startRtPoll(loadUpstreams) }
     else if (p === 'monitors') { await loadTags(); await loadUpstreams(); await loadMonitors(); startMonPoll() }
     else if (p === 'logs') { await loadLogOptions(); await loadLogs(true); startLogPoll() }
-    else if (p === 'settings') { await loadSettings(); await Promise.all([loadBackupConfig(), loadBackupSchedule(), loadBackups()]) }
+    else if (p === 'settings') { await loadSettings(); await Promise.all([loadBackupConfig(), loadBackupSchedule(), loadBackups(), loadUpstreams(), loadMappings()]) }
   }).finally(() => {
     if (epoch === pageLoadEpoch) pageLoading.value = false
   })
@@ -315,6 +316,7 @@ const pages = {
   upstreams: { title: '上游池', desc: '按主标签管理全局渠道，并用普通标签快速筛选' },
   monitors: { title: '监控看板', desc: '按主标签组织模型探测卡片与运行时健康' },
   logs: { title: '请求记录', desc: '每一次转发请求的真实去向：模型 → 选中渠道 → 状态 → 延迟' },
+  routing: { title: '路由决策', desc: '实时查看路由引擎的选路逻辑与候选成本对比' },
   settings: { title: '设置', desc: '运行时配置，保存后即时生效（无需重启）' },
 }
 
@@ -391,6 +393,7 @@ const protocolOptions = [
   { value: 'openai-response', label: 'OpenAI Responses' },
   { value: 'claude', label: 'Anthropic Messages' },
   { value: 'codex', label: 'Codex Responses' },
+  { value: 'gemini', label: 'Google Gemini' },
 ]
 // 厂商预设：选中后自动填 base_url 与协议；custom 表示手动输入。
 const vendorPresets = [
@@ -495,11 +498,19 @@ const protocolLabels = Object.fromEntries(protocolOptions.map(option => [option.
 function protocolLabel(protocol) { return protocolLabels[protocol || 'passthrough'] || protocol }
 const billingTypeOptions = [
   { value: 'none', label: '不采集' },
+  { value: 'auto', label: '自动探测' },
   { value: 'sub2api', label: 'Sub2API' },
   { value: 'newapi', label: 'New API' },
 ]
 const billingTypeLabels = Object.fromEntries(billingTypeOptions.map(option => [option.value, option.label]))
 function billingTypeLabel(value) { return billingTypeLabels[value || 'none'] || value }
+const cacheModeOptions = [
+  { value: 'auto', label: '自动学习' },
+  { value: 'enabled', label: '支持缓存' },
+  { value: 'disabled', label: '不使用缓存' },
+]
+const cacheModeLabels = Object.fromEntries(cacheModeOptions.map(option => [option.value, option.label]))
+function cacheModeLabel(value) { return cacheModeLabels[value || 'auto'] || value }
 function billingAmount(item) {
   const state = item.billing
   if (state?.unlimited) return '无限额度'
@@ -568,6 +579,10 @@ function billingAuditText(item) {
   if (audit.status === 'pending') return '费用比对 · 待采集'
   if (audit.theoretical_cost == null) return `理论 — · 实际 ${billingCost(item, audit.actual_cost)}`
   const prefix = audit.status === 'warning' ? '异常 · ' : ''
+  // catalog_cost_exceeded 是价目轨道告警（本地估算 vs 上游报价），不是计费轨道
+  if (audit.reason === 'catalog_cost_exceeded' && audit.list_cost != null && audit.reported_list_cost != null) {
+    return `${prefix}本地 ${billingCost(item, audit.list_cost)} · 报价 ${billingCost(item, audit.reported_list_cost)}`
+  }
   // 标签跟随实际基准：reported=平台自报原价，local=本地价目表（降级）
   const label = audit.billing_basis === 'local' ? '理论(本地)' : '理论'
   return `${prefix}${label} ${billingCost(item, audit.theoretical_cost)} · 实际 ${billingCost(item, audit.actual_cost)}`
@@ -649,7 +664,7 @@ function billingDetailRows(item) {
   return rows
 }
 function billingMeta(item) {
-  return [billingTypeLabel(item.billing_type), item.billing?.billing_group, billingStatusText(item)].filter(Boolean).join(' · ')
+  return [billingTypeLabel(item.billing_type), cacheModeLabel(item.cache_mode), item.billing?.billing_group, billingStatusText(item)].filter(Boolean).join(' · ')
 }
 function billingTitle(item) {
   return [billingMeta(item), item.billing?.error, item.billing?.refreshed_at ? `更新于 ${sinceText(item.billing.refreshed_at)}` : '尚未采集'].filter(Boolean).join('\n')
@@ -696,7 +711,7 @@ function newUpstream() {
   dlg.type = 'upstream'
   dlg.form = draft?.form
     ? { ...draft.form, tag_ids: [...(draft.form.tag_ids || [])] }
-    : { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', billing_type: 'none', credit_ratio: 1, enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] }
+    : { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', billing_type: 'none', cache_mode: 'auto', credit_ratio: 1, enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] }
 }
 function editUpstream(u) {
   upstreamDraft.value = null
@@ -708,7 +723,7 @@ function editUpstream(u) {
   upstreamImportError.value = false
   upstreamBaseURLDirty.value = true
   dlg.type = 'upstream'
-  dlg.form = { ...u, protocol: u.protocol || 'passthrough', billing_type: u.billing_type || 'none', credit_ratio: u.credit_ratio || 1, api_key: '', primary_tag_id: u.primary_tag_id || 0, tag_ids: [...(u.tag_ids || [])] }
+  dlg.form = { ...u, protocol: u.protocol || 'passthrough', billing_type: u.billing_type || 'none', cache_mode: u.cache_mode || 'auto', credit_ratio: u.credit_ratio || 1, api_key: '', primary_tag_id: u.primary_tag_id || 0, tag_ids: [...(u.tag_ids || [])] }
 }
 function saveUpstream() {
   guardDialogSave(async () => {
@@ -768,6 +783,26 @@ async function refreshUpstreamBilling(item) {
   } finally {
     refreshingBilling.delete(item.id)
   }
+}
+
+// setBillingMultiplierPrompt 手动录入倍率，等价于一次人工探测。
+// 下次 auto-refresh(约10分钟)若从扣费日志取到 group_ratio 会覆盖此值。
+async function setBillingMultiplierPrompt(item) {
+  if (!item.id || item.billing_type === 'none') return
+  const current = Number(item.billing?.effective_multiplier ?? item.billing?.group_multiplier ?? 1)
+  const input = window.prompt(
+    `手动录入「${item.name}」倍率(等同一次探测结果，下次自动刷新可能覆盖):`,
+    String(current)
+  )
+  if (input == null) return
+  const value = Number(String(input).trim())
+  if (!Number.isFinite(value) || value <= 0) {
+    flash('倍率必须是大于 0 的数字', 'error')
+    return
+  }
+  const state = await api.setUpstreamBillingMultiplier(item.id, value)
+  item.billing = state
+  flash(`已录入「${item.name}」倍率 ${value}`)
 }
 
 const upstreamRunFilter = ref('')
@@ -1146,6 +1181,7 @@ const groupTestProtocolOptions = [
   { value: 'responses', label: 'OpenAI Responses' },
   { value: 'chat', label: 'Chat Completions' },
   { value: 'claude', label: 'Anthropic Messages' },
+  { value: 'gemini', label: 'Gemini GenerateContent' },
 ]
 const groupTestModelOptions = computed(() => {
   if (groupTestState.modelsLoading) return [{ value: '', label: '加载模型中…', disabled: true }]
@@ -1309,6 +1345,29 @@ function startBackupPoll() {
   }, 4000)
 }
 function stopBackupPoll() { clearInterval(_backupPollTimer); _backupPollTimer = null }
+
+// 模型映射
+const mappings = ref([])
+const mappingsLoading = ref(false)
+const showNewMapping = ref(false)
+const newMappingForm = reactive({ upstream_id: '', source_model: '', target_model: '' })
+async function loadMappings() {
+  mappingsLoading.value = true
+  try { mappings.value = (await api.modelMappings()) || [] }
+  finally { mappingsLoading.value = false }
+}
+async function saveNewMapping() {
+  if (!newMappingForm.source_model.trim() || !newMappingForm.target_model.trim()) return
+  await api.createModelMapping({
+    upstream_id: Number(newMappingForm.upstream_id) || 0,
+    source_model: newMappingForm.source_model.trim(),
+    target_model: newMappingForm.target_model.trim(),
+    mapping_type: 'static',
+  })
+  showNewMapping.value = false
+  Object.assign(newMappingForm, { upstream_id: '', source_model: '', target_model: '' })
+  await loadMappings()
+}
 
 async function loadBackupConfig() {
   backupConfig.value = (await api.backupConfig()) || { endpoint: '', region: '', bucket: '', access_key_id: '', secret_key: '', prefix: '', force_path_style: false }
@@ -2038,6 +2097,7 @@ function logout() {
         <RouterLink class="subnav-item" :class="{ active: page === 'overview' }" :to="{ name: 'overview' }" aria-label="总览" data-label="总览"><Icon name="bolt" :size="18" /><span>总览</span></RouterLink>
         <RouterLink class="subnav-item" :class="{ active: page === 'monitors' }" :to="{ name: 'monitors' }" aria-label="渠道监控" data-label="渠道监控"><Icon name="heart" :size="18" /><span>渠道监控</span></RouterLink>
         <RouterLink class="subnav-item" :class="{ active: page === 'logs' }" :to="{ name: 'logs' }" aria-label="请求记录" data-label="请求记录"><Icon name="refresh" :size="18" /><span>请求记录</span></RouterLink>
+        <RouterLink class="subnav-item" :class="{ active: page === 'routing' }" :to="{ name: 'routing' }" aria-label="路由" data-label="路由"><Icon name="link" :size="18" /><span>路由</span></RouterLink>
         <RouterLink class="subnav-item" :class="{ active: page === 'groups' }" :to="{ name: 'groups' }" aria-label="分组管理" data-label="分组管理" @click.exact="detailGroup && backToGroups()"><Icon name="cube" :size="18" /><span>分组管理</span></RouterLink>
         <RouterLink class="subnav-item" :class="{ active: page === 'upstreams' }" :to="{ name: 'upstreams' }" aria-label="上游池" data-label="上游池"><Icon name="server" :size="18" /><span>上游池</span></RouterLink>
         <RouterLink class="subnav-item" :class="{ active: page === 'settings' }" :to="{ name: 'settings' }" aria-label="系统设置" data-label="系统设置"><Icon name="cog" :size="18" /><span>系统设置</span></RouterLink>
@@ -2439,7 +2499,7 @@ function logout() {
                       <td class="billing-cell">
                         <span v-if="!u.billing_type || u.billing_type === 'none'" class="tag-empty">未采集</span>
                         <div v-else class="billing-summary" :class="`billing-${billingStatusClass(u)}`" :title="billingTitle(u)">
-                          <div class="billing-values"><strong :class="{ 'billing-debt': Number(u.billing?.remaining) < 0 }">{{ billingAmount(u) }}</strong><span>{{ billingMultiplier(u) }}</span><button class="icon-btn billing-refresh" title="刷新计费数据" :disabled="refreshingBilling.has(u.id)" @click="guard(() => refreshUpstreamBilling(u))"><Icon name="refresh" :size="14" /></button></div>
+                          <div class="billing-values"><strong :class="{ 'billing-debt': Number(u.billing?.remaining) < 0 }">{{ billingAmount(u) }}</strong><span>{{ billingMultiplier(u) }}</span><button class="icon-btn billing-refresh" title="手动录入倍率(作为一次探测结果，下次自动刷新可能覆盖)" @click="guard(() => setBillingMultiplierPrompt(u))"><Icon name="pencil" :size="14" /></button><button class="icon-btn billing-refresh" title="刷新计费数据" :disabled="refreshingBilling.has(u.id)" @click="guard(() => refreshUpstreamBilling(u))"><Icon name="refresh" :size="14" /></button></div>
                           <small><i></i>{{ billingMeta(u) }}</small>
                           <div v-if="u.billing?.audit" class="billing-audit" :class="`billing-audit-${u.billing.audit.status}`">{{ billingAuditText(u) }}</div>
                           <div v-if="billingPricingText(u)" class="billing-pricing">{{ billingPricingText(u) }}</div>
@@ -2699,6 +2759,11 @@ function logout() {
           </div>
         </template>
 
+        <!-- 路由决策 -->
+        <template v-else-if="page === 'routing'">
+          <RoutingView />
+        </template>
+
         <!-- 设置页：页面内配置分类 -->
         <template v-else-if="page === 'settings'">
           <div class="settings-layout">
@@ -2708,12 +2773,14 @@ function logout() {
               <button type="button" class="set-navitem" :class="{ active: settingsSection === 'alert' }" @click="gotoSection('alert')"><Icon name="alert" :size="16" />健康告警</button>
               <button type="button" class="set-navitem" :class="{ active: settingsSection === 'endpoint' }" @click="gotoSection('endpoint')"><Icon name="link" :size="16" />接入地址</button>
               <button type="button" class="set-navitem" :class="{ active: settingsSection === 'backup' }" @click="gotoSection('backup')"><Icon name="refresh" :size="16" />数据备份</button>
+              <button type="button" class="set-navitem" :class="{ active: settingsSection === 'mappings' }" @click="gotoSection('mappings')"><Icon name="link" :size="16" />模型映射</button>
+              <p class="set-navhint">探测间隔 / 路径已下放到各监控项，在「监控看板」逐项配置。</p>
             </aside>
             <div class="settings-body">
               <section id="set-logs" v-show="settingsSection === 'logs'" class="card settings-card">
-                <div class="settings-title"><h3>日志清理</h3><p>按完成时间保留请求记录，过期记录与尝试链自动删除。</p></div>
+                <div class="settings-title"><h3>日志清理</h3><p>按完成时间保留请求记录；设为 0 可永久保留完整路由与计费历史。</p></div>
                 <div class="settings-fields">
-                  <div class="field"><label>保留天数</label><input v-model="logRetention" type="number" min="1" max="365" placeholder="7" /></div>
+                  <div class="field"><label>保留天数（0=永久）</label><input v-model="logRetention" type="number" min="0" max="365" placeholder="0" /></div>
                 </div>
                 <div class="settings-info">
                   <div><span>请求记录</span><b>{{ effectiveLogRetention ? effectiveLogRetention + ' 天' : '—' }}</b><em>{{ sourceText(logRetentionSource) }}</em></div>
@@ -2769,8 +2836,9 @@ function logout() {
                   <div><span>OpenAI</span><code>{{ apiBase }}/v1/chat/completions</code></div>
                   <div><span>Responses</span><code>{{ apiBase }}/v1/responses</code></div>
                   <div><span>Claude</span><code>{{ apiBase }}/v1/messages</code></div>
+                  <div><span>Gemini</span><code>{{ apiBase }}/v1beta/models/&lt;model&gt;:generateContent</code></div>
                 </div>
-                <p class="hint">请求头：<code>Authorization: Bearer &lt;密钥&gt;</code></p>
+                <p class="hint">请求头：<code>Authorization: Bearer &lt;密钥&gt;</code>；Gemini SDK 也可使用 <code>x-goog-api-key</code>。</p>
               </section>
 
               <!-- 数据备份 -->
@@ -2844,6 +2912,41 @@ function logout() {
                 </div>
                 <div v-if="backupRecords.some(r => r.error)" class="backup-errors">
                   <div v-for="r in backupRecords.filter(r => r.error)" :key="r.id+'e'" class="hint backup-error">{{ r.file_name }}：{{ r.error }}</div>
+                </div>
+              </section>
+
+              <!-- 模型映射 -->
+              <section id="set-mappings" v-show="settingsSection === 'mappings'" class="card settings-card">
+                <div class="settings-title"><h3>模型映射</h3><p>管理请求模型名到上游实际模型名的映射规则。自动学习的映射由前缀匹配产生,可手动覆盖或删除。</p></div>
+                <div class="settings-actions" style="margin-bottom:12px">
+                  <button class="btn btn-sm" @click="loadMappings"><Icon name="refresh" :size="14" />刷新</button>
+                  <button class="btn btn-sm" @click="showNewMapping = true"><Icon name="plus" :size="14" />手动添加</button>
+                </div>
+                <div v-if="showNewMapping" class="mapping-form">
+                  <FancySelect v-model="newMappingForm.upstream_id" :options="upstreamSelectOptions" />
+                  <input v-model="newMappingForm.source_model" placeholder="请求模型名" />
+                  <span style="color:var(--g400)">→</span>
+                  <input v-model="newMappingForm.target_model" placeholder="上游实际模型名" />
+                  <button class="btn btn-sm" @click="saveNewMapping">保存</button>
+                  <button class="btn btn-ghost btn-sm" @click="showNewMapping = false">取消</button>
+                </div>
+                <div v-if="!mappings.length && !mappingsLoading" class="hint">暂无模型映射规则</div>
+                <div v-else-if="mappingsLoading" class="hint">加载中…</div>
+                <div v-else class="mapping-table-wrap">
+                  <table class="backup-table">
+                    <thead><tr><th>上游</th><th>请求模型</th><th></th><th>实际模型</th><th>类型</th><th>过期</th><th>操作</th></tr></thead>
+                    <tbody>
+                      <tr v-for="m in mappings" :key="m.id">
+                        <td>{{ upName(m.upstream_id) }}</td>
+                        <td><code>{{ m.source_model }}</code></td>
+                        <td style="color:var(--g400)">→</td>
+                        <td><code>{{ m.target_model }}</code></td>
+                        <td><span class="tag" :class="m.mapping_type === 'auto' ? 'on' : ''">{{ m.mapping_type === 'auto' ? '自动' : '手动' }}</span></td>
+                        <td style="font-size:11px;color:var(--g400)">{{ m.expires_at ? new Date(m.expires_at).toLocaleDateString() : '永久' }}</td>
+                        <td><button class="icon-btn danger" @click="guard(async () => { await api.deleteModelMapping(m.id); await loadMappings() })"><Icon name="trash" :size="16" /></button></td>
+                      </tr>
+                    </tbody>
+                  </table>
                 </div>
               </section>
             </div>
@@ -2937,6 +3040,7 @@ function logout() {
                     <div><b>{{ attempt.upstream_name || ('#' + attempt.upstream_id) }}</b><span>{{ selectionText(attempt.selection_reason) }} · 优先级 {{ attempt.priority || '—' }}</span></div>
                     <span class="log-status" :class="attempt.outcome === 'success' ? 'ok' : attempt.outcome === 'canceled' ? 'muted' : 'fail'">{{ outcomeText(attempt.outcome) }} · {{ statusText(attempt.status) }}</span>
                   </header>
+                  <div v-if="attempt.mapped_model" class="attempt-mapping">模型映射 <code>{{ logDetail.model }} → {{ attempt.mapped_model }}</code></div>
                   <div class="attempt-facts">
                     <span>熔断 {{ attempt.health_before || '—' }} → {{ attempt.health_after || '—' }}</span>
                     <span>TTFT {{ fmtMs(attempt.ttft_ms) }}</span>
@@ -3171,7 +3275,7 @@ function logout() {
             <div class="field"><label>探测间隔(秒)</label><input v-model="dlg.form.interval_sec" type="number" min="0" placeholder="留空/0 用默认 5 分钟" /></div>
             <div class="field"><label>max_tokens</label><input v-model="dlg.form.max_tokens" type="number" min="0" placeholder="留空/0 用默认 1" /></div>
           </div>
-          <div class="field"><label>探测路径</label><input v-model="dlg.form.path" placeholder="留空用默认 /v1/chat/completions，Claude 填 /v1/messages" /></div>
+          <div class="field"><label>探测路径</label><input v-model="dlg.form.path" placeholder="留空用默认 /v1/chat/completions；Gemini 填 /v1beta/models/{model}:generateContent" /></div>
           <div class="field"><label>探测消息</label><input v-model="dlg.form.probe_text" placeholder="留空用默认「hi」" /></div>
           <label class="check"><input type="checkbox" v-model="dlg.form.stream" /> 流式探测（请求体加 stream:true）</label>
           <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>
@@ -3199,7 +3303,7 @@ function logout() {
               <div class="field"><label>探测间隔(秒)</label><input v-model="dlg.form.interval_sec" type="number" min="0" placeholder="留空/0 用默认 5 分钟" /></div>
               <div class="field"><label>max_tokens</label><input v-model="dlg.form.max_tokens" type="number" min="0" placeholder="留空/0 用默认 1" /></div>
             </div>
-            <div class="field"><label>探测路径</label><input v-model="dlg.form.path" placeholder="留空用默认 /v1/chat/completions，Claude 填 /v1/messages" /></div>
+            <div class="field"><label>探测路径</label><input v-model="dlg.form.path" placeholder="留空用默认 /v1/chat/completions；Gemini 填 /v1beta/models/{model}:generateContent" /></div>
             <div class="field"><label>探测消息</label><input v-model="dlg.form.probe_text" placeholder="留空用默认「hi」" /></div>
             <label class="check"><input type="checkbox" v-model="dlg.form.stream" /> 流式探测（请求体加 stream:true）</label>
             <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>

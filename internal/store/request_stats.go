@@ -26,7 +26,7 @@ func (s *Store) LogFilterOptions() (*LogFilterOptions, error) {
 		ErrorKinds: []string{}, Upstreams: []LogUpstreamOption{},
 	}
 	collect := func(q string) ([]string, error) {
-		rows, err := s.db.Query(q)
+		rows, err := s.query(q)
 		if err != nil {
 			return nil, err
 		}
@@ -59,7 +59,7 @@ func (s *Store) LogFilterOptions() (*LogFilterOptions, error) {
 	if opt.ErrorKinds, err = collect(`SELECT DISTINCT error_kind FROM requests WHERE error_kind<>'' ORDER BY error_kind`); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.Query(`SELECT DISTINCT a.upstream_id,COALESCE(u.name,'')
+	rows, err := s.query(`SELECT DISTINCT a.upstream_id,COALESCE(u.name,'')
 		FROM request_attempts a LEFT JOIN upstreams u ON u.id=a.upstream_id
 		WHERE a.upstream_id>0 ORDER BY a.upstream_id`)
 	if err != nil {
@@ -105,9 +105,9 @@ type RequestStats struct {
 
 func (s *Store) RequestStats(filter RequestFilter) (*RequestStats, error) {
 	where, args := s.requestWhere(filter, false)
-	if s.db.postgres {
+	if s.postgres {
 		stats := &RequestStats{}
-		err := s.db.QueryRow(`SELECT COUNT(*),
+		err := s.queryRow(`SELECT COUNT(*),
 			COALESCE(SUM(CASE WHEN r.outcome='success' AND r.attempt_count<=1 THEN 1 ELSE 0 END),0),
 			COALESCE(SUM(CASE WHEN r.outcome='success' AND r.attempt_count>1 THEN 1 ELSE 0 END),0),
 			COALESCE(SUM(CASE WHEN r.outcome NOT IN ('success','partial','canceled','client_error') THEN 1 ELSE 0 END),0),
@@ -142,7 +142,7 @@ func (s *Store) RequestStats(filter RequestFilter) (*RequestStats, error) {
 		stats.CacheRate = tokenCacheRate(stats.CachedTokens, stats.CacheInputTokens)
 		return stats, nil
 	}
-	rows, err := s.db.Query(`SELECT r.outcome,r.attempt_count,r.ttft_ms,r.duration_ms,
+	rows, err := s.query(`SELECT r.outcome,r.attempt_count,r.ttft_ms,r.duration_ms,
 		r.input_tokens,r.output_tokens,r.cached_tokens,r.cache_creation_tokens,COALESCE(u.protocol,'')
 		FROM requests r LEFT JOIN groups g ON g.id=r.group_id
 		LEFT JOIN upstreams u ON u.id=r.final_upstream_id`+where, args...)
@@ -226,7 +226,7 @@ func (s *Store) RequestCacheStats(filter RequestFilter) ([]ChannelCacheStats, er
 		where += " AND a.upstream_id=?"
 		args = append(args, filter.UpstreamID)
 	}
-	rows, err := s.db.Query(`SELECT a.upstream_id,COALESCE(u.name,''),
+	rows, err := s.query(`SELECT a.upstream_id,COALESCE(u.name,''),
 		COALESCE(SUM(CASE WHEN a.input_tokens>0 OR a.cached_tokens>0 OR a.cache_creation_tokens>0 THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN COALESCE(u.protocol,'')='claude'
 			THEN a.input_tokens+a.cached_tokens+a.cache_creation_tokens ELSE a.input_tokens END),0),
@@ -290,7 +290,7 @@ func (s *Store) RecentSamples(limit int) ([]RouteSample, error) {
 	if limit <= 0 {
 		limit = 2000
 	}
-	rows, err := s.db.Query(`SELECT a.upstream_id,r.model,a.outcome,a.ttft_ms FROM
+	rows, err := s.query(`SELECT a.upstream_id,r.model,a.outcome,a.ttft_ms FROM
 		(SELECT id,request_id,upstream_id,outcome,ttft_ms FROM request_attempts
 		 WHERE upstream_id>0 AND outcome IN ('success','failed') ORDER BY id DESC LIMIT ?) a
 		JOIN requests r ON r.request_id=a.request_id ORDER BY a.id ASC`, limit)
@@ -325,13 +325,17 @@ func (s *Store) ListRequests(limit int) ([]*RequestEntry, error) {
 	return page.Entries, nil
 }
 
-// PruneRequests 每轮分批删除超过 keepDays 天的请求，尝试记录由外键级联删除。
+// PruneRequests 每轮分批删除超过 keepDays 天的请求及其尝试记录。
 func (s *Store) PruneRequests(keepDays, batch int) (int64, error) {
 	if keepDays <= 0 || batch <= 0 {
 		return 0, nil
 	}
 	cutoff := s.timeValue(time.Now().Add(-time.Duration(keepDays) * 24 * time.Hour))
-	res, err := s.db.Exec(`DELETE FROM requests WHERE id IN (
+	// 先删关联的 attempts，再删 requests（不依赖外键级联）
+	s.exec(`DELETE FROM request_attempts WHERE request_id IN (
+		SELECT request_id FROM requests WHERE created_at < ? ORDER BY created_at LIMIT ?
+	)`, cutoff, batch)
+	res, err := s.exec(`DELETE FROM requests WHERE id IN (
 		SELECT id FROM requests WHERE created_at < ? ORDER BY created_at LIMIT ?
 	)`, cutoff, batch)
 	if err != nil {

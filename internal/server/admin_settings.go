@@ -28,7 +28,7 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getRuntimeSettings(w http.ResponseWriter) {
-	logRetention, logRetentionSource := intSettingValue(s.store.GetSetting("request_retention_days", ""), 7)
+	logRetention, logRetentionSource := intSettingValueAllowZero(s.store.GetSetting("request_retention_days", ""), 0)
 	alertWebhook, alertWebhookSource := stringSettingValue(s.store.GetSetting("alert_webhook", ""), "")
 	alertDebounce, alertDebounceSource := settingValue(s.store.GetSetting("alert_debounce", ""), "60s")
 	firstResponseTimeout, firstResponseTimeoutSource := intSettingValue(s.store.GetSetting("first_response_timeout_ms", ""), 120000)
@@ -135,8 +135,8 @@ func (s *Server) putRuntimeSettings(w http.ResponseWriter, r *http.Request) {
 
 func validateRuntimeSettings(values map[string]string) error {
 	if value := values["request_retention_days"]; value != "" {
-		if n, err := strconv.Atoi(value); err != nil || n < 1 || n > 365 {
-			return settingsError("请求记录保留天数须为 1~365 的整数")
+		if n, err := strconv.Atoi(value); err != nil || n < 0 || n > 365 {
+			return settingsError("请求记录保留天数须为 0~365 的整数，0 表示永久保留")
 		}
 	}
 	webhook := values["alert_webhook"]

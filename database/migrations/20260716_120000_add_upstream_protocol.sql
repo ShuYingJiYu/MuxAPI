@@ -1,4 +1,4 @@
--- Reason: route requests through CPA protocol translators when client and upstream schemas differ.
+-- Reason: route requests through protocol translators when client and upstream schemas differ.
 -- Scope: additive upstream protocol selector; existing channels remain passthrough.
 
 ALTER TABLE upstreams
