@@ -251,7 +251,11 @@ function startRtPoll(fn) {
 }
 function stopRtPoll() { if (rtTimer) { clearInterval(rtTimer); rtTimer = null } }
 function stopAllPoll() { stopMonPoll(); stopOverviewPoll(); stopRtPoll(); stopLogPoll() }
-onUnmounted(() => { stopAllPoll() })
+onUnmounted(() => {
+  stopAllPoll()
+  abortUpstreamTestRequests?.()
+  abortGroupTestRequests?.()
+})
 
 function activatePage(p) {
   const epoch = ++pageLoadEpoch
@@ -318,9 +322,13 @@ const pages = {
 
 // --- 弹窗状态 ---
 const dlg = reactive({ type: '', form: {} })
+const upstreamDraft = ref(null)
 const dialogSaving = ref(false)
-const upstreamFormTagSearch = ref('')
 const upstreamVendor = ref('')
+const upstreamImportText = ref('')
+const upstreamImportMessage = ref('')
+const upstreamImportError = ref(false)
+const upstreamBaseURLDirty = ref(false)
 const upstreamFormGroupSearch = ref('')
 const upstreamFormGroupChoices = computed(() => {
   const selected = new Set(upstreamFormGroupIDs.value)
@@ -328,7 +336,30 @@ const upstreamFormGroupChoices = computed(() => {
   return groups.value.filter(g => !selected.has(g.id) && (!query || g.name.toLowerCase().includes(query)))
 })
 const tagManagerSearch = ref('')
-function closeDlg() { dlg.type = ''; upstreamFormTagSearch.value = ''; upstreamVendor.value = ''; upstreamFormGroupSearch.value = ''; tagManagerSearch.value = '' }
+function closeDlg({ preserveDraft = false } = {}) {
+  const closingType = dlg.type
+  if (preserveDraft && closingType === 'upstream' && !dlg.form.id) {
+    upstreamDraft.value = {
+      form: { ...dlg.form, tag_ids: [...(dlg.form.tag_ids || [])] },
+      groupIDs: [...upstreamFormGroupIDs.value],
+      vendor: upstreamVendor.value,
+      importText: upstreamImportText.value,
+      importMessage: upstreamImportMessage.value,
+      importError: upstreamImportError.value,
+      baseURLDirty: upstreamBaseURLDirty.value,
+    }
+  } else if (!preserveDraft && closingType === 'upstream') {
+    upstreamDraft.value = null
+  }
+  dlg.type = ''
+  upstreamVendor.value = ''
+  upstreamImportText.value = ''
+  upstreamImportMessage.value = ''
+  upstreamImportError.value = false
+  upstreamBaseURLDirty.value = false
+  upstreamFormGroupSearch.value = ''
+  tagManagerSearch.value = ''
+}
 
 // 表单保存统一显示进行中状态，避免重复点击和无反馈等待。
 async function guardDialogSave(fn) {
@@ -379,8 +410,83 @@ const vendorPresets = [
 function applyVendorPreset(value) {
   const preset = vendorPresets.find(p => p.value === value)
   if (!preset || dlg.form.id) return // 编辑已有上游时不覆盖
-  if (preset.base_url) dlg.form.base_url = preset.base_url
+  // 预设只接管空地址或仍由预设填充的地址，避免覆盖用户已经手动输入的内容。
+  if (preset.base_url && (!String(dlg.form.base_url || '').trim() || !upstreamBaseURLDirty.value)) dlg.form.base_url = preset.base_url
   if (preset.protocol) dlg.form.protocol = preset.protocol
+}
+function markUpstreamBaseURLDirty() { upstreamBaseURLDirty.value = true }
+
+function importedValue(source, keys) {
+  for (const key of keys) {
+    if (source && source[key] != null && String(source[key]).trim() !== '') return String(source[key]).trim()
+  }
+  return ''
+}
+function importedProtocol(value) {
+  const normalized = String(value || '').trim().toLowerCase()
+  return ({
+    'openai-chat': 'openai',
+    'openai_chat': 'openai',
+    chat: 'openai',
+    anthropic: 'claude',
+    claude: 'claude',
+    responses: 'openai-response',
+    'openai-responses': 'openai-response',
+    codex: 'codex',
+    passthrough: 'passthrough',
+    relay: 'passthrough',
+  })[normalized] || (protocolOptions.some(option => option.value === normalized) ? normalized : '')
+}
+function parseUpstreamImport(raw) {
+  const text = String(raw || '').trim()
+  if (!text) throw new Error('请先粘贴上游配置')
+  if (text.startsWith('{') || text.startsWith('[')) {
+    let parsed
+    try { parsed = JSON.parse(text) } catch { throw new Error('JSON 格式无效') }
+    const source = Array.isArray(parsed) ? parsed[0] : parsed
+    if (!source || typeof source !== 'object' || Array.isArray(source)) throw new Error('JSON 需要是上游对象')
+    return source
+  }
+  const lines = text.split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith('#'))
+  const envValues = {}
+  for (const line of lines) {
+    const match = line.match(/^([a-z][a-z0-9_.-]*)\s*=\s*(.*)$/i)
+    if (match) envValues[match[1].toLowerCase()] = match[2].trim().replace(/^['"]|['"]$/g, '')
+  }
+  if (Object.keys(envValues).length) return envValues
+  const parts = lines[0].split(/\s*\|\s*|\t+/).map(value => value.trim()).filter(Boolean)
+  if (parts.length >= 3) return { name: parts[0], base_url: parts[1], api_key: parts.slice(2).join(' | ') }
+  if (parts.length === 2) {
+    return /^https?:\/\//i.test(parts[0])
+      ? { base_url: parts[0], api_key: parts[1] }
+      : { name: parts[0], base_url: parts[1] }
+  }
+  if (/^https?:\/\//i.test(parts[0])) return { base_url: parts[0] }
+  throw new Error('格式无法识别，请使用 名称 | 地址 | API Key')
+}
+function importUpstreamConfig() {
+  upstreamImportError.value = false
+  try {
+    const source = parseUpstreamImport(upstreamImportText.value)
+    const values = {
+      name: importedValue(source, ['name', 'title', 'channel_name']),
+      base_url: importedValue(source, ['base_url', 'baseUrl', 'url', 'endpoint']),
+      api_key: importedValue(source, ['api_key', 'apiKey', 'key', 'token']),
+      proxy: importedValue(source, ['proxy', 'proxy_url', 'proxyUrl']),
+      protocol: importedProtocol(importedValue(source, ['protocol', 'type'])),
+    }
+    const changed = []
+    if (values.name) { dlg.form.name = values.name; changed.push('名称') }
+    if (values.base_url) { dlg.form.base_url = values.base_url; upstreamBaseURLDirty.value = true; changed.push('base_url') }
+    if (values.api_key) { dlg.form.api_key = values.api_key; changed.push('api_key') }
+    if (values.proxy) { dlg.form.proxy = values.proxy; changed.push('代理') }
+    if (values.protocol) { dlg.form.protocol = values.protocol; changed.push('协议') }
+    if (!changed.length) throw new Error('没有找到可导入的名称、地址或密钥字段')
+    upstreamImportMessage.value = `已填充：${changed.join('、')}`
+  } catch (error) {
+    upstreamImportError.value = true
+    upstreamImportMessage.value = error.message || '导入失败'
+  }
 }
 const upstreamFormGroupIDs = ref([])
 function toggleUpstreamFormGroup(id) {
@@ -588,26 +694,34 @@ const upstreamFormSelectedTags = computed(() => {
   const primary = Number(dlg.form.primary_tag_id) || 0
   return tags.value.filter(tag => selected.has(tag.id) && tag.id !== primary)
 })
-const upstreamFormAvailableTags = computed(() => {
-  const selected = new Set(upstreamFormSelectedTags.value.map(tag => tag.id))
+const upstreamFormTagOptions = computed(() => {
   const primary = Number(dlg.form.primary_tag_id) || 0
-  const query = upstreamFormTagSearch.value.trim().toLowerCase()
-  return tags.value.filter(tag => tag.id !== primary && !selected.has(tag.id)
-    && (!query || tag.name.toLowerCase().includes(query)))
+  return tags.value.filter(tag => tag.id !== primary).map(tag => ({ value: tag.id, label: tag.name, color: tag.color }))
 })
 function newUpstream() {
-  upstreamFormTagSearch.value = ''
-  upstreamFormGroupIDs.value = []
+  const draft = upstreamDraft.value
+  upstreamDraft.value = null
+  upstreamFormGroupIDs.value = draft?.groupIDs ? [...draft.groupIDs] : []
   upstreamFormGroupSearch.value = ''
-  upstreamVendor.value = ''
+  upstreamVendor.value = draft?.vendor || ''
+  upstreamImportText.value = draft?.importText || ''
+  upstreamImportMessage.value = draft?.importMessage || ''
+  upstreamImportError.value = draft?.importError || false
+  upstreamBaseURLDirty.value = draft?.baseURLDirty || false
   dlg.type = 'upstream'
-  dlg.form = { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', billing_type: 'none', cache_mode: 'auto', credit_ratio: 1, enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] }
+  dlg.form = draft?.form
+    ? { ...draft.form, tag_ids: [...(draft.form.tag_ids || [])] }
+    : { name: '', base_url: '', api_key: '', proxy: '', protocol: 'passthrough', billing_type: 'none', cache_mode: 'auto', credit_ratio: 1, enabled: true, channel_probe: false, primary_tag_id: 0, tag_ids: [] }
 }
 function editUpstream(u) {
-  upstreamFormTagSearch.value = ''
+  upstreamDraft.value = null
   upstreamFormGroupIDs.value = []
   upstreamFormGroupSearch.value = ''
   upstreamVendor.value = ''
+  upstreamImportText.value = ''
+  upstreamImportMessage.value = ''
+  upstreamImportError.value = false
+  upstreamBaseURLDirty.value = true
   dlg.type = 'upstream'
   dlg.form = { ...u, protocol: u.protocol || 'passthrough', billing_type: u.billing_type || 'none', cache_mode: u.cache_mode || 'auto', credit_ratio: u.credit_ratio || 1, api_key: '', primary_tag_id: u.primary_tag_id || 0, tag_ids: [...(u.tag_ids || [])] }
 }
@@ -793,13 +907,6 @@ function buildPageItems(total, current) {
   items.push({ type: 'page', value: total, key: `page-${total}` })
   return items
 }
-function toggleUpstreamFormTag(id) {
-  const set = new Set(dlg.form.tag_ids || [])
-  if (set.has(id)) set.delete(id)
-  else set.add(id)
-  dlg.form.tag_ids = [...set]
-}
-
 const tagColorChoices = [
   { value: 'gray', label: '灰' }, { value: 'green', label: '绿' },
   { value: 'teal', label: '青绿' }, { value: 'cyan', label: '青' },
@@ -972,35 +1079,68 @@ const testState = reactive({
   modelsLoading: false, models: [], model: '', modelsErr: '',
   running: false, output: '', status: null, // status: {ok,latency_ms,code,error}
 })
+let testAbortController = null
+let testModelsAbortController = null
+function abortUpstreamTestRequests() {
+  testAbortController?.abort()
+  testAbortController = null
+  testModelsAbortController?.abort()
+  testModelsAbortController = null
+}
+function closeTest() {
+  abortUpstreamTestRequests()
+  testState.show = false
+  testState.modelsLoading = false
+  testState.running = false
+}
 // 打开测试弹窗：先拉模型列表供选择
 function testUpstream(u) {
+  abortUpstreamTestRequests()
+  const modelsController = new AbortController()
+  testModelsAbortController = modelsController
   Object.assign(testState, {
     show: true, id: u.id, name: u.name,
     modelsLoading: true, models: [], model: '', modelsErr: '',
     running: false, output: '', status: null,
   })
-  api.testUpstream(u.id)
+  api.testUpstream(u.id, modelsController.signal)
     .then(r => {
+      if (modelsController.signal.aborted || testModelsAbortController !== modelsController) return
       testState.models = r.models || []
       testState.model = testState.models[0] || 'gpt-5.5'
       if (!r.ok && r.error) testState.modelsErr = r.error
     })
-    .catch(e => { testState.modelsErr = String(e.message || e); testState.model = 'gpt-5.5' })
-    .finally(() => { testState.modelsLoading = false })
+    .catch(e => {
+      if (modelsController.signal.aborted || testModelsAbortController !== modelsController) return
+      testState.modelsErr = String(e.message || e); testState.model = 'gpt-5.5'
+    })
+    .finally(() => {
+      if (testModelsAbortController === modelsController) {
+        testModelsAbortController = null
+        testState.modelsLoading = false
+      }
+    })
 }
 // 真实对话测试：流式回显上游回复
 async function runTest() {
   if (!testState.model || testState.running) return
+  testAbortController?.abort()
+  const controller = new AbortController()
+  testAbortController = controller
   testState.running = true; testState.output = ''; testState.status = null
   try {
     await api.testUpstreamStream(testState.id, testState.model, e => {
+      if (controller.signal.aborted || testAbortController !== controller) return
       if (e.type === 'content') testState.output += e.text
       else if (e.type === 'test_complete') testState.status = { ok: true, latency_ms: e.latency_ms }
       else if (e.type === 'error') testState.status = { ok: false, code: e.status, error: e.error, latency_ms: e.latency_ms }
-    })
+    }, controller.signal)
   } catch (e) {
+    if (controller.signal.aborted || testAbortController !== controller) return
     testState.status = { ok: false, error: String(e.message || e) }
   } finally {
+    if (testAbortController !== controller) return
+    testAbortController = null
     testState.running = false
     // 流正常结束但没收到 test_complete：
     //  - 有 content → 视为「部分成功」（连上了且有回复，只是缺收尾事件）
@@ -1023,6 +1163,20 @@ const groupTestState = reactive({
   modelsLoading: false, models: [], model: '', modelsError: '',
   running: false, output: '', error: '', status: 0, requestId: '', result: null,
 })
+let groupTestAbortController = null
+let groupModelsAbortController = null
+function abortGroupTestRequests() {
+  groupTestAbortController?.abort()
+  groupTestAbortController = null
+  groupModelsAbortController?.abort()
+  groupModelsAbortController = null
+}
+function closeGroupTest() {
+  abortGroupTestRequests()
+  groupTestState.show = false
+  groupTestState.modelsLoading = false
+  groupTestState.running = false
+}
 const groupTestProtocolOptions = [
   { value: 'responses', label: 'OpenAI Responses' },
   { value: 'chat', label: 'Chat Completions' },
@@ -1036,36 +1190,51 @@ const groupTestModelOptions = computed(() => {
   return options
 })
 function selectedGroupTestKey() { return keys.value.find(key => key.enabled && key.id === Number(groupTestState.keyId)) }
-async function loadGroupTestModels() {
+async function loadGroupTestModels(controller = new AbortController()) {
   const key = selectedGroupTestKey()
+  groupModelsAbortController?.abort()
+  groupModelsAbortController = controller
   groupTestState.modelsLoading = true
   groupTestState.models = []
   groupTestState.modelsError = ''
   try {
-    groupTestState.models = key ? await api.groupModels(key.key) : []
+    groupTestState.models = key ? await api.groupModels(key.key, controller.signal) : []
+    if (controller.signal.aborted || groupModelsAbortController !== controller) return
     groupTestState.model = groupTestState.models[0] || groupTestState.model || 'gpt-5.5'
   } catch (e) {
+    if (controller.signal.aborted || groupModelsAbortController !== controller) return
     groupTestState.modelsError = String(e.message || e)
     groupTestState.model ||= 'gpt-5.5'
   } finally {
-    groupTestState.modelsLoading = false
+    if (groupModelsAbortController === controller) {
+      groupModelsAbortController = null
+      groupTestState.modelsLoading = false
+    }
   }
 }
 function openGroupTest(key) {
   if (!key?.enabled) return
+  abortGroupTestRequests()
+  const modelsController = new AbortController()
   Object.assign(groupTestState, {
     show: true, groupName: detailGroup.value?.name || '', keyId: key.id, keyName: key.name || key.masked || ('#' + key.id), protocol: 'responses',
     modelsLoading: false, models: [], model: '', modelsError: '',
     running: false, output: '', error: '', status: 0, requestId: '', result: null,
   })
-  loadGroupTestModels()
+  loadGroupTestModels(modelsController)
 }
-async function waitForGroupTestLog(requestId) {
+async function waitForGroupTestLog(requestId, signal) {
   if (!requestId) return null
-  for (let attempt = 0; attempt < 12; attempt++) {
-    const page = await api.logs({ q: requestId, limit: 1 })
-    const entry = (page?.entries || []).find(item => item.request_id === requestId)
-    if (entry) return api.logDetail(entry.id)
+  const deadline = Date.now() + 10000
+  for (let attempt = 0; attempt < 8 && Date.now() < deadline; attempt++) {
+    if (signal?.aborted) return null
+    try {
+      const page = await api.logs({ q: requestId, limit: 1 }, signal, 2000)
+      const entry = (page?.entries || []).find(item => item.request_id === requestId)
+      if (entry) return await api.logDetail(entry.id, signal, 2000)
+    } catch (e) {
+      if (signal?.aborted) return null
+    }
     await new Promise(resolve => setTimeout(resolve, 200))
   }
   return null
@@ -1073,19 +1242,37 @@ async function waitForGroupTestLog(requestId) {
 async function runGroupTest() {
   const key = selectedGroupTestKey()
   if (!key || !groupTestState.model || groupTestState.running) return
+  groupTestAbortController?.abort()
+  const controller = new AbortController()
+  groupTestAbortController = controller
   Object.assign(groupTestState, { running: true, output: '', error: '', status: 0, requestId: '', result: null })
   try {
-    const response = await api.testGroupStream({ key: key.key, protocol: groupTestState.protocol, model: groupTestState.model }, text => { groupTestState.output += text })
+    const response = await api.testGroupStream({ key: key.key, protocol: groupTestState.protocol, model: groupTestState.model }, text => {
+      if (!controller.signal.aborted && groupTestAbortController === controller) groupTestState.output += text
+    }, controller.signal)
+    if (controller.signal.aborted || groupTestAbortController !== controller) return
     groupTestState.status = response.status
     groupTestState.requestId = response.requestId
-    groupTestState.result = await waitForGroupTestLog(response.requestId)
+    groupTestState.running = false
+    const result = await waitForGroupTestLog(response.requestId, controller.signal)
+    if (controller.signal.aborted || groupTestAbortController !== controller) return
+    groupTestState.result = result
   } catch (e) {
+    if (controller.signal.aborted || groupTestAbortController !== controller) return
     groupTestState.error = String(e.message || e)
     groupTestState.status = Number(e.status) || 0
     groupTestState.requestId = e.requestId || ''
-    if (groupTestState.requestId) groupTestState.result = await waitForGroupTestLog(groupTestState.requestId).catch(() => null)
-  } finally {
     groupTestState.running = false
+    if (groupTestState.requestId) {
+      const result = await waitForGroupTestLog(groupTestState.requestId, controller.signal).catch(() => null)
+      if (controller.signal.aborted || groupTestAbortController !== controller) return
+      groupTestState.result = result
+    }
+  } finally {
+    if (groupTestAbortController === controller) {
+      groupTestAbortController = null
+      groupTestState.running = false
+    }
   }
 }
 
@@ -1869,6 +2056,8 @@ function login() {
   activatePage(page.value)
 }
 function logout() {
+  abortUpstreamTestRequests()
+  abortGroupTestRequests()
   api.clearToken()
   loggedIn.value = false
   loginForm.token = ''
@@ -2579,15 +2768,38 @@ function logout() {
         <template v-else-if="page === 'settings'">
           <div class="settings-layout">
             <aside class="settings-nav">
-              <button type="button" class="set-navitem" :class="{ active: settingsSection === 'logs' }" @click="gotoSection('logs')"><Icon name="refresh" :size="16" />日志清理</button>
-              <button type="button" class="set-navitem" :class="{ active: settingsSection === 'route' }" @click="gotoSection('route')"><Icon name="link" :size="16" />渠道路由</button>
-              <button type="button" class="set-navitem" :class="{ active: settingsSection === 'alert' }" @click="gotoSection('alert')"><Icon name="alert" :size="16" />健康告警</button>
-              <button type="button" class="set-navitem" :class="{ active: settingsSection === 'endpoint' }" @click="gotoSection('endpoint')"><Icon name="link" :size="16" />接入地址</button>
-              <button type="button" class="set-navitem" :class="{ active: settingsSection === 'backup' }" @click="gotoSection('backup')"><Icon name="refresh" :size="16" />数据备份</button>
-              <button type="button" class="set-navitem" :class="{ active: settingsSection === 'mappings' }" @click="gotoSection('mappings')"><Icon name="link" :size="16" />模型映射</button>
-              <p class="set-navhint">探测间隔 / 路径已下放到各监控项，在「监控看板」逐项配置。</p>
+              <div class="settings-nav-head">
+                <span class="settings-nav-kicker"><i></i>CONTROL CENTER</span>
+                <strong>设置中心</strong>
+                <small>运行策略与数据工具</small>
+              </div>
+              <nav class="settings-nav-list" aria-label="设置分类">
+                <button type="button" class="set-navitem" :class="{ active: settingsSection === 'logs' }" @click="gotoSection('logs')">
+                  <span class="set-navicon"><Icon name="refresh" :size="16" /></span><span class="set-navcopy"><strong>日志清理</strong><small>记录保存</small></span><Icon class="set-navarrow" name="chevron-right" :size="14" />
+                </button>
+                <button type="button" class="set-navitem" :class="{ active: settingsSection === 'route' }" @click="gotoSection('route')">
+                  <span class="set-navicon"><Icon name="link" :size="16" /></span><span class="set-navcopy"><strong>渠道路由</strong><small>失败切换</small></span><Icon class="set-navarrow" name="chevron-right" :size="14" />
+                </button>
+                <button type="button" class="set-navitem" :class="{ active: settingsSection === 'alert' }" @click="gotoSection('alert')">
+                  <span class="set-navicon"><Icon name="alert" :size="16" /></span><span class="set-navcopy"><strong>健康告警</strong><small>Webhook 通知</small></span><Icon class="set-navarrow" name="chevron-right" :size="14" />
+                </button>
+                <button type="button" class="set-navitem" :class="{ active: settingsSection === 'endpoint' }" @click="gotoSection('endpoint')">
+                  <span class="set-navicon"><Icon name="external-link" :size="16" /></span><span class="set-navcopy"><strong>接入地址</strong><small>客户端入口</small></span><Icon class="set-navarrow" name="chevron-right" :size="14" />
+                </button>
+                <button type="button" class="set-navitem" :class="{ active: settingsSection === 'backup' }" @click="gotoSection('backup')">
+                  <span class="set-navicon"><Icon name="server" :size="16" /></span><span class="set-navcopy"><strong>数据备份</strong><small>S3 / R2 存储</small></span><Icon class="set-navarrow" name="chevron-right" :size="14" />
+                </button>
+                <button type="button" class="set-navitem" :class="{ active: settingsSection === 'mappings' }" @click="gotoSection('mappings')">
+                  <span class="set-navicon"><Icon name="link" :size="16" /></span><span class="set-navcopy"><strong>模型映射</strong><small>名称转换</small></span><Icon class="set-navarrow" name="chevron-right" :size="14" />
+                </button>
+              </nav>
+              <div class="set-navhint"><Icon name="alert" :size="14" /><span>探测间隔与路径已下放到「监控看板」逐项配置。</span></div>
             </aside>
             <div class="settings-body">
+              <header class="settings-body-head">
+                <div><span class="settings-body-kicker">RUNTIME CONFIGURATION</span><h2>运行设置</h2><p>修改后的参数会即时应用到新的请求。</p></div>
+                <span class="settings-live"><i></i>实时生效</span>
+              </header>
               <section id="set-logs" v-show="settingsSection === 'logs'" class="card settings-card">
                 <div class="settings-title"><h3>日志清理</h3><p>按完成时间保留请求记录；设为 0 可永久保留完整路由与计费历史。</p></div>
                 <div class="settings-fields">
@@ -2728,18 +2940,17 @@ function logout() {
 
               <!-- 模型映射 -->
               <section id="set-mappings" v-show="settingsSection === 'mappings'" class="card settings-card">
-                <div class="settings-title"><h3>模型映射</h3><p>管理请求模型名到上游实际模型名的映射规则。自动学习的映射由前缀匹配产生,可手动覆盖或删除。</p></div>
-                <div class="settings-actions" style="margin-bottom:12px">
+                <div class="settings-title"><h3>模型映射</h3><p>管理请求模型名到上游实际模型名的映射规则。自动学习的映射由前缀匹配产生，可手动覆盖或删除。</p></div>
+                <div class="settings-actions mapping-actions">
                   <button class="btn btn-sm" @click="loadMappings"><Icon name="refresh" :size="14" />刷新</button>
                   <button class="btn btn-sm" @click="showNewMapping = true"><Icon name="plus" :size="14" />手动添加</button>
                 </div>
                 <div v-if="showNewMapping" class="mapping-form">
                   <FancySelect v-model="newMappingForm.upstream_id" :options="upstreamSelectOptions" />
                   <input v-model="newMappingForm.source_model" placeholder="请求模型名" />
-                  <span style="color:var(--g400)">→</span>
+                  <span class="mapping-arrow"><Icon name="chevron-right" :size="15" /></span>
                   <input v-model="newMappingForm.target_model" placeholder="上游实际模型名" />
-                  <button class="btn btn-sm" @click="saveNewMapping">保存</button>
-                  <button class="btn btn-ghost btn-sm" @click="showNewMapping = false">取消</button>
+                  <div class="mapping-form-actions"><button class="btn btn-sm" @click="saveNewMapping">保存</button><button class="btn btn-ghost btn-sm" @click="showNewMapping = false">取消</button></div>
                 </div>
                 <div v-if="!mappings.length && !mappingsLoading" class="hint">暂无模型映射规则</div>
                 <div v-else-if="mappingsLoading" class="hint">加载中…</div>
@@ -2750,11 +2961,11 @@ function logout() {
                       <tr v-for="m in mappings" :key="m.id">
                         <td>{{ upName(m.upstream_id) }}</td>
                         <td><code>{{ m.source_model }}</code></td>
-                        <td style="color:var(--g400)">→</td>
+                        <td class="mapping-table-arrow"><Icon name="chevron-right" :size="13" /></td>
                         <td><code>{{ m.target_model }}</code></td>
                         <td><span class="tag" :class="m.mapping_type === 'auto' ? 'on' : ''">{{ m.mapping_type === 'auto' ? '自动' : '手动' }}</span></td>
-                        <td style="font-size:11px;color:var(--g400)">{{ m.expires_at ? new Date(m.expires_at).toLocaleDateString() : '永久' }}</td>
-                        <td><button class="icon-btn danger" @click="guard(async () => { await api.deleteModelMapping(m.id); await loadMappings() })"><Icon name="trash" :size="16" /></button></td>
+                        <td class="mapping-expiry">{{ m.expires_at ? new Date(m.expires_at).toLocaleDateString() : '永久' }}</td>
+                        <td><button class="icon-btn danger" title="删除映射" @click="guard(async () => { await api.deleteModelMapping(m.id); await loadMappings() })"><Icon name="trash" :size="16" /></button></td>
                       </tr>
                     </tbody>
                   </table>
@@ -2893,7 +3104,7 @@ function logout() {
       </div>
     </div>
 
-    <div class="mask" v-if="groupTestState.show" @click.self="groupTestState.show = false">
+    <div class="mask" v-if="groupTestState.show" @click.self="closeGroupTest">
       <div class="dialog group-test-dialog">
         <div class="group-test-heading">
           <h3>测试分组 · {{ groupTestState.groupName }}</h3>
@@ -2924,12 +3135,12 @@ function logout() {
           </div>
           <div v-if="groupTestState.requestId" class="group-test-request-id"><span>请求 ID</span><code>{{ groupTestState.requestId }}</code><button class="icon-btn" title="复制请求 ID" @click="copyText(groupTestState.requestId, 'group-test-request')"><Icon :name="copied === 'group-test-request' ? 'check' : 'copy'" :size="14" /></button></div>
         </section>
-        <div class="dialog-foot"><button class="btn btn-ghost" :disabled="groupTestState.running" @click="groupTestState.show = false">关闭</button></div>
+        <div class="dialog-foot"><button class="btn btn-ghost" @click="closeGroupTest">关闭</button></div>
       </div>
     </div>
 
     <!-- 真实对话测试 -->
-    <div class="mask" v-if="testState.show" @click.self="testState.show = false">
+    <div class="mask" v-if="testState.show" @click.self="closeTest">
       <div class="dialog">
         <h3>测试上游 · {{ testState.name }}</h3>
         <p class="hint test-dialog-hint">发一条真实对话请求，验证能否端到端跑通并查看回复。</p>
@@ -2956,7 +3167,7 @@ function logout() {
         </div>
         <p v-if="testState.status && !testState.status.ok && testState.status.error" class="test-err">{{ testState.status.error }}</p>
 
-        <div class="dialog-foot"><button class="btn btn-ghost" @click="testState.show = false">关闭</button></div>
+        <div class="dialog-foot"><button class="btn btn-ghost" @click="closeTest">关闭</button></div>
       </div>
     </div>
 
@@ -2973,7 +3184,7 @@ function logout() {
     </div>
 
     <!-- 表单弹窗 -->
-    <div class="mask" v-if="dlg.type" @click.self="closeDlg">
+    <div class="mask" v-if="dlg.type" @click.self="closeDlg({ preserveDraft: true })">
       <div class="dialog" :class="[dlg.type === 'tags' ? 'tag-dialog' : (dlg.type === 'upstream' ? 'upstream-dialog' : ''), { 'dialog-saving': dialogSaving }]">
         <template v-if="dlg.type === 'group'">
           <h3>{{ dlg.form.id ? '编辑分组' : '新建分组' }}</h3>
@@ -2992,34 +3203,35 @@ function logout() {
 
         <template v-else-if="dlg.type === 'upstream'">
           <h3>{{ dlg.form.id ? '编辑上游' : '新增上游' }}</h3>
+          <section v-if="!dlg.form.id" class="upstream-quick-import">
+            <div class="upstream-quick-import-head">
+              <div>
+                <strong><Icon name="copy" :size="14" />快捷导入</strong>
+                <small>粘贴 JSON，或使用「名称 | 地址 | API Key」</small>
+              </div>
+              <button class="btn btn-ghost btn-sm" type="button" @click="importUpstreamConfig"><Icon name="check" :size="14" />填充表单</button>
+            </div>
+            <textarea v-model="upstreamImportText" rows="2" placeholder="例如：OpenRouter | https://openrouter.ai/api | sk-or-..." @keydown.ctrl.enter="importUpstreamConfig"></textarea>
+            <p v-if="upstreamImportMessage" class="upstream-import-message" :class="{ error: upstreamImportError }">{{ upstreamImportMessage }}</p>
+          </section>
+          <div v-if="!dlg.form.id" class="field upstream-vendor-field">
+            <label>厂商预设</label>
+            <FancySelect v-model="upstreamVendor" :options="vendorPresets.map(p => ({ value: p.value, label: p.label }))" @change="applyVendorPreset" />
+          </div>
           <div class="upstream-form-grid">
             <div class="field"><label>名称</label><input v-model="dlg.form.name" /></div>
-            <div class="field" v-if="!dlg.form.id"><label>厂商</label><FancySelect v-model="upstreamVendor" :options="vendorPresets.map(p => ({ value: p.value, label: p.label }))" @change="applyVendorPreset" /></div>
+            <div class="field"><label>base_url <small v-if="upstreamBaseURLDirty" class="field-note">已手动填写</small></label><input v-model="dlg.form.base_url" placeholder="https://..." @input="markUpstreamBaseURLDirty" /></div>
+            <div class="field"><label>协议</label><FancySelect v-model="dlg.form.protocol" :options="protocolOptions" /></div>
+            <div class="field"><label>api_key</label><input v-model="dlg.form.api_key" :placeholder="dlg.form.id ? '留空则不修改' : 'sk-...'" /></div>
+            <div class="field"><label>代理</label><input v-model="dlg.form.proxy" placeholder="留空=直连/环境变量；如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></div>
+            <div class="field"><label>计费平台</label><FancySelect v-model="dlg.form.billing_type" :options="billingTypeOptions" /></div>
             <div class="field"><label>主标签</label><FancySelect v-model="dlg.form.primary_tag_id" :options="primaryTagOptions" /></div>
             <div class="field upstream-form-tags">
               <label class="field-label-row"><span>普通标签</span><small>{{ upstreamFormSelectedTags.length }} 个已选</small></label>
-              <div class="tag-picker-panel">
-                <div v-if="upstreamFormSelectedTags.length" class="tag-picker-selected">
-                  <button v-for="tag in upstreamFormSelectedTags" :key="tag.id" type="button" class="manage-tag selected" :class="`tag-${tag.color}`" :title="`移除 ${tag.name}`" @click="toggleUpstreamFormTag(tag.id)">
-                    {{ tag.name }}<Icon name="x" :size="12" />
-                  </button>
-                </div>
-                <div class="tag-picker-search"><Icon name="search" :size="15" /><input v-model="upstreamFormTagSearch" placeholder="搜索普通标签" /></div>
-                <div class="tag-picker-options">
-                  <button v-for="tag in upstreamFormAvailableTags" :key="tag.id" type="button" class="tag-picker-option" @click="toggleUpstreamFormTag(tag.id)">
-                    <span class="tag-color-dot" :class="`tag-${tag.color}`"></span><span>{{ tag.name }}</span><Icon name="plus" :size="14" />
-                  </button>
-                  <span v-if="!tags.length" class="tag-picker-empty">请先在标签管理中创建标签</span>
-                  <span v-else-if="!upstreamFormAvailableTags.length" class="tag-picker-empty">没有可添加的标签</span>
-                </div>
-              </div>
+              <FancySelect v-model="dlg.form.tag_ids" variant="tag" multiple searchable :options="upstreamFormTagOptions" />
             </div>
-            <div class="field"><label>base_url</label><input v-model="dlg.form.base_url" placeholder="https://..." /></div>
-            <div class="field"><label>协议</label><FancySelect v-model="dlg.form.protocol" :options="protocolOptions" /></div>
-            <div class="field"><label>计费平台</label><FancySelect v-model="dlg.form.billing_type" :options="billingTypeOptions" /></div>
             <div class="field"><label>储值倍率</label><input v-model="dlg.form.credit_ratio" type="number" step="any" min="0" placeholder="充1得N积分时填 N；默认 1" /></div>
-            <div class="field"><label>api_key</label><input v-model="dlg.form.api_key" :placeholder="dlg.form.id ? '留空则不修改' : 'sk-...'" /></div>
-            <div class="field" v-if="!dlg.form.id">
+            <div class="field upstream-form-groups" v-if="!dlg.form.id">
               <label class="field-label-row"><span>加入分组</span><small>{{ upstreamFormGroupIDs.length }} 个已选</small></label>
               <div class="tag-picker-panel">
                 <div v-if="upstreamFormGroupIDs.length" class="tag-picker-selected">
@@ -3037,7 +3249,6 @@ function logout() {
                 </div>
               </div>
             </div>
-            <div class="field"><label>代理</label><input v-model="dlg.form.proxy" placeholder="留空=直连/环境变量；如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></div>
           </div>
           <label class="check"><input type="checkbox" v-model="dlg.form.enabled" /> 启用</label>
           <div class="dialog-foot"><button class="btn btn-ghost" :disabled="dialogSaving" @click="closeDlg">取消</button><button class="btn" :disabled="dialogSaving" @click="saveUpstream"><Icon :name="dialogSaving ? 'loader' : 'check'" :class="{ spin: dialogSaving }" :size="16" />{{ dialogSaving ? '保存中…' : '保存' }}</button></div>
