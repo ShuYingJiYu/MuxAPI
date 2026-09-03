@@ -2922,7 +2922,7 @@ function logout() {
                   <div class="field"><label>模型不支持缓存时间</label><input v-model="modelUnsupportedTTL" placeholder="5m" /></div>
                 </div>
                 <div class="settings-info">
-                  <div><span>算法</span><b>标准 P2C</b><em>渠道级</em></div>
+                  <div><span>算法</span><b>{{ intelligentRoutingEnabled ? '智能成本路由' : '标准 P2C' }}</b><em>渠道级</em></div>
                   <div><span>首字节超时</span><b>{{ effectiveFirstResponseTimeoutMs ? Math.round(effectiveFirstResponseTimeoutMs / 1000) + ' 秒' : '—' }}</b><em>{{ sourceText(firstResponseTimeoutSource) }}</em></div>
                   <div><span>故障切换</span><b>最多 {{ effectiveMaxUpstreamAttempts || '—' }} 个上游</b><em>{{ sourceText(maxUpstreamAttemptsSource) }}</em></div>
                   <div><span>熔断策略</span><b>{{ effectiveFailThreshold || '—' }} 次 / {{ effectiveCooldown || '—' }}</b><em>{{ sourceText(failThresholdSource || cooldownSource) }}</em></div>

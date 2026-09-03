@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -274,7 +275,7 @@ func validateRuntimeSettings(values map[string]string) error {
 	intRange := func(key string, min, max int64, message string) error {
 		if value := values[key]; value != "" {
 			n, err := strconv.ParseInt(value, 10, 64)
-			if err != nil || n < min || n > max {
+			if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n < min || n > max {
 				return settingsError(message)
 			}
 		}
