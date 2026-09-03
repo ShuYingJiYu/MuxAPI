@@ -12,6 +12,19 @@ func (s *Store) GetSetting(key, def string) string {
 	return def
 }
 
+// Settings returns one immutable-friendly snapshot of all runtime settings.
+func (s *Store) Settings() (map[string]string, error) {
+	var rows []SettingModel
+	if err := s.gormDB.Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	values := make(map[string]string, len(rows))
+	for _, row := range rows {
+		values[row.Key] = row.Value
+	}
+	return values, nil
+}
+
 func (s *Store) SetSetting(key, value string) error {
 	return s.gormDB.Save(&SettingModel{Key: key, Value: value}).Error
 }

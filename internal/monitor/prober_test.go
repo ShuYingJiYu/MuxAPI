@@ -15,26 +15,23 @@ import (
 )
 
 type breakerCall struct {
-	id    int64
-	model string
-	ok    bool
-	lat   int64
+	id     int64
+	model  string
+	result health.Result
+	lat    int64
 }
 
 type fakeBreaker struct {
-	calls       []breakerCall
-	unsupported []string
-	supported   []string
+	calls     []breakerCall
+	nextToken uint64
 }
 
-func (f *fakeBreaker) ObserveProbe(id int64, model string, ok bool, latencyMs int64) {
-	f.calls = append(f.calls, breakerCall{id: id, model: model, ok: ok, lat: latencyMs})
+func (f *fakeBreaker) BeginProbe(id int64, model string) health.Lease {
+	f.nextToken++
+	return health.Lease{UpstreamID: id, Token: f.nextToken}
 }
-func (f *fakeBreaker) MarkModelUnsupported(id int64, model string) {
-	f.unsupported = append(f.unsupported, model)
-}
-func (f *fakeBreaker) MarkModelSupported(id int64, model string) {
-	f.supported = append(f.supported, model)
+func (f *fakeBreaker) Complete(lease health.Lease, result health.Result, latencyMs int64) {
+	f.calls = append(f.calls, breakerCall{id: lease.UpstreamID, result: result, lat: latencyMs})
 }
 
 func TestBuildProbeBodyChat(t *testing.T) {
@@ -89,39 +86,44 @@ func TestValidProbePayload(t *testing.T) {
 	}
 }
 
-func TestObserveAlwaysUsesChannelBreaker(t *testing.T) {
+func TestProbeReportsChannelBreaker(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	defer server.Close()
+	st, err := store.Open(filepath.Join(t.TempDir(), "probe.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
 	fake := &fakeBreaker{}
-	prober := &Prober{breaker: fake}
-	monitor := &store.Monitor{UpstreamID: 7, Model: "gpt-x", ChannelProbe: false}
-	prober.observe(monitor, false, 0, 0)
-	prober.observe(monitor, true, 429, 50)
-	prober.observe(monitor, true, 200, 40)
-	if len(fake.calls) != 3 {
-		t.Fatalf("expected three breaker calls, got %+v", fake.calls)
+	prober := NewProber(New(st), st, fake, nil, nil)
+	monitor := &store.Monitor{ID: 1, UpstreamID: 7, Model: "gpt-x", BaseURL: server.URL}
+	prober.Probe(context.Background(), monitor)
+	if len(fake.calls) != 1 {
+		t.Fatalf("expected one breaker call, got %+v", fake.calls)
 	}
-	for _, call := range fake.calls {
-		if call.id != 7 || call.model != "gpt-x" {
-			t.Fatalf("unexpected channel call: %+v", call)
-		}
-	}
-	if fake.calls[0].ok || fake.calls[1].ok || !fake.calls[2].ok {
-		t.Fatalf("unexpected outcomes: %+v", fake.calls)
+	if call := fake.calls[0]; call.id != 7 || call.result != health.ResultSuccess {
+		t.Fatalf("unexpected channel call: %+v", call)
 	}
 }
 
 func TestProbeRecoveryNeedsTwoSuccesses(t *testing.T) {
-	mgr := health.New(1, time.Hour)
-	prober := &Prober{breaker: mgr}
-	monitor := &store.Monitor{UpstreamID: 9, Model: "gpt-x"}
-	prober.observe(monitor, false, 0, 0)
+	mgr := health.New(1, 5*time.Millisecond)
+	failed := mgr.BeginProbe(9, "gpt-x")
+	mgr.Complete(failed, health.ResultFailure, 0)
 	if got := mgr.EffectiveState(9); got != "OPEN" {
 		t.Fatalf("expected OPEN, got %s", got)
 	}
-	prober.observe(monitor, true, 200, 30)
+	time.Sleep(10 * time.Millisecond)
+	first := mgr.BeginProbe(9, "gpt-x")
+	mgr.Complete(first, health.ResultSuccess, 30)
 	if got := mgr.EffectiveState(9); got != "HALF_OPEN" {
 		t.Fatalf("first success should enter HALF_OPEN, got %s", got)
 	}
-	prober.observe(monitor, true, 200, 25)
+	second := mgr.BeginProbe(9, "gpt-x")
+	mgr.Complete(second, health.ResultSuccess, 25)
 	if got := mgr.EffectiveState(9); got != "CLOSED" {
 		t.Fatalf("second success should close channel, got %s", got)
 	}
@@ -151,6 +153,24 @@ func TestProbeRejectsIncompleteStream(t *testing.T) {
 	}
 	if got := prober.mgr.Snapshot(1).State; got != "DOWN" {
 		t.Fatalf("monitor should show DOWN, got %s", got)
+	}
+}
+
+func TestCanceledProbeDoesNotChangeChannelHealth(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "probe.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	hm := health.New(1, time.Hour)
+	prober := NewProber(New(st), st, hm, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	prober.Probe(ctx, &store.Monitor{
+		ID: 1, UpstreamID: 7, Model: "gpt", BaseURL: "http://127.0.0.1:1",
+	})
+	if got := hm.EffectiveState(7); got != "CLOSED" {
+		t.Fatalf("canceled probe changed channel health: %s", got)
 	}
 }
 

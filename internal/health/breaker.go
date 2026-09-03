@@ -31,11 +31,13 @@ type breaker struct {
 	state             State
 	fails             int
 	openUntil         time.Time
-	halfOpenInFlight  bool
-	halfOpenClaimAt   time.Time
+	generation        uint64
+	recoveryLease     uint64
+	earlyTrial        bool
 	recoverySuccesses int
 	reopenCount       int
 	lastProbe         time.Time
+	lastSuccess       time.Time
 
 	latencyMs   int64
 	latencyEWMA float64
@@ -53,6 +55,50 @@ type breaker struct {
 type modelKey struct {
 	upstreamID int64
 	model      string
+}
+
+// Result is the breaker-relevant outcome of one leased attempt.
+type Result uint8
+
+const (
+	ResultNeutral Result = iota
+	ResultSuccess
+	ResultFailure
+	ResultModelUnsupported
+)
+
+// Lease identifies one exact channel attempt. The manager validates its token
+// against the internal lease registry before accepting a completion.
+type Lease struct {
+	UpstreamID int64
+	Token      uint64
+}
+
+func (l Lease) Valid() bool { return l.UpstreamID != 0 && l.Token != 0 }
+
+type leaseRecord struct {
+	upstreamID    int64
+	groupID       int64
+	generation    uint64
+	model         string
+	probe         bool
+	authoritative bool
+	recovery      bool
+}
+
+type groupRecovery struct {
+	owner     uint64
+	notBefore time.Time
+}
+
+// RecoveryCandidate contains only in-memory data used to pick a controlled
+// last-route trial when a group has no normally schedulable channel.
+type RecoveryCandidate struct {
+	State       string
+	EarlyTrial  bool
+	ReopenCount int
+	LastSuccess time.Time
+	OpenUntil   time.Time
 }
 
 // TrendPoint is one channel health sample.
@@ -97,6 +143,10 @@ type Manager struct {
 	mu            sync.Mutex
 	breakers      map[int64]*breaker
 	unsupported   map[modelKey]time.Time
+	capLatest     map[modelKey]uint64
+	leases        map[uint64]leaseRecord
+	groupRecovery map[int64]*groupRecovery
+	nextToken     uint64
 	failThreshold int
 	cooldown      time.Duration
 	recoveryGoal  int
@@ -116,6 +166,9 @@ func New(failThreshold int, cooldown time.Duration) *Manager {
 	return &Manager{
 		breakers:      make(map[int64]*breaker),
 		unsupported:   make(map[modelKey]time.Time),
+		capLatest:     make(map[modelKey]uint64),
+		leases:        make(map[uint64]leaseRecord),
+		groupRecovery: make(map[int64]*groupRecovery),
 		failThreshold: failThreshold,
 		cooldown:      cooldown,
 		recoveryGoal:  defaultRecoverySuccessGoal,
@@ -178,12 +231,10 @@ func (m *Manager) canServe(b *breaker) bool {
 		}
 		b.state = HalfOpen
 		b.recoverySuccesses = 0
-		b.halfOpenInFlight = false
+		b.recoveryLease = 0
+		b.earlyTrial = false
 	}
-	if b.state == HalfOpen && b.halfOpenInFlight && now.Sub(b.halfOpenClaimAt) > m.cooldown {
-		b.halfOpenInFlight = false
-	}
-	return b.state != HalfOpen || !b.halfOpenInFlight
+	return b.state != HalfOpen || b.recoveryLease == 0
 }
 
 func (m *Manager) modelUnsupportedLocked(id int64, model string) bool {
@@ -212,36 +263,184 @@ func (m *Manager) IsAvailable(id int64, model string) bool {
 	return m.canServe(m.get(id))
 }
 
-// Claim reserves a request slot. HALF_OPEN permits exactly one concurrent
-// request; CLOSED requests only increment the load counter used by P2C.
-func (m *Manager) Claim(id int64, model string) bool {
+// Claim reserves a business request. Recovery requests are exclusive both for
+// the channel and for the group, while CLOSED channels remain concurrent.
+func (m *Manager) Claim(groupID, id int64, model string) (Lease, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.modelUnsupportedLocked(id, model) {
-		return false
+		return Lease{}, false
 	}
 	b := m.get(id)
 	if !m.canServe(b) {
-		return false
+		return Lease{}, false
 	}
-	if b.state == HalfOpen {
-		b.halfOpenInFlight = true
-		b.halfOpenClaimAt = time.Now()
+	recovery := b.state == HalfOpen
+	if recovery && !m.groupCanRecoverLocked(groupID) {
+		return Lease{}, false
 	}
-	b.inFlight++
-	return true
+	return m.newLeaseLocked(groupID, id, model, false, true, recovery), true
 }
 
-// ReleaseClaim releases the generic load counter and the HALF_OPEN gate.
-func (m *Manager) ReleaseClaim(id int64) {
+// ClaimLastResort permits one early, group-scoped recovery trial after all
+// normal candidates have become unavailable. A failed trial must wait for the
+// regular exponential cooldown before another recovery attempt.
+func (m *Manager) ClaimLastResort(groupID, id int64, model string) (Lease, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.modelUnsupportedLocked(id, model) || !m.groupCanRecoverLocked(groupID) {
+		return Lease{}, false
+	}
+	b := m.get(id)
+	if b.state != Open || !b.earlyTrial || b.recoveryLease != 0 {
+		return Lease{}, false
+	}
+	b.state = HalfOpen
+	b.recoverySuccesses = 0
+	b.earlyTrial = false
+	return m.newLeaseLocked(groupID, id, model, false, true, true), true
+}
+
+// BeginProbe always returns an observation lease so monitoring remains useful.
+// An OPEN channel only grants state-changing recovery ownership after cooldown;
+// other concurrent or early probes may update monitoring data but not state.
+func (m *Manager) BeginProbe(id int64, model string) Lease {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	b := m.get(id)
-	if b.inFlight > 0 {
+	m.canServe(b)
+	authoritative := b.state == Closed
+	recovery := false
+	if b.state == HalfOpen && b.recoveryLease == 0 {
+		authoritative = true
+		recovery = true
+	}
+	return m.newLeaseLocked(0, id, model, true, authoritative, recovery)
+}
+
+func (m *Manager) newLeaseLocked(groupID, id int64, model string, probe, authoritative, recovery bool) Lease {
+	m.nextToken++
+	token := m.nextToken
+	b := m.get(id)
+	m.leases[token] = leaseRecord{
+		upstreamID: id, groupID: groupID, generation: b.generation, model: model,
+		probe: probe, authoritative: authoritative, recovery: recovery,
+	}
+	if !probe {
+		b.inFlight++
+	}
+	if recovery {
+		b.recoveryLease = token
+		if groupID != 0 {
+			g := m.groupRecovery[groupID]
+			if g == nil {
+				g = &groupRecovery{}
+				m.groupRecovery[groupID] = g
+			}
+			g.owner = token
+		}
+	}
+	return Lease{UpstreamID: id, Token: token}
+}
+
+func (m *Manager) groupCanRecoverLocked(groupID int64) bool {
+	if groupID == 0 {
+		return true
+	}
+	g := m.groupRecovery[groupID]
+	return g == nil || (g.owner == 0 && !time.Now().Before(g.notBefore))
+}
+
+// Complete records and releases one lease exactly once. Results from an older
+// breaker generation remain visible in statistics but cannot change state.
+func (m *Manager) Complete(lease Lease, result Result, latencyMs int64) {
+	m.mu.Lock()
+	record, ok := m.leases[lease.Token]
+	if !ok || record.upstreamID != lease.UpstreamID {
+		m.mu.Unlock()
+		return
+	}
+	delete(m.leases, lease.Token)
+	b := m.get(record.upstreamID)
+	if !record.probe && b.inFlight > 0 {
 		b.inFlight--
 	}
-	if b.state == HalfOpen {
-		b.halfOpenInFlight = false
+	if b.recoveryLease == lease.Token {
+		b.recoveryLease = 0
+	}
+	if record.probe {
+		b.lastProbe = time.Now()
+	} else if result == ResultSuccess || result == ResultFailure {
+		b.reqs++
+		if result == ResultFailure {
+			b.failReqs++
+		} else if latencyMs > 0 {
+			b.totLatency += latencyMs
+			b.latSamples++
+		}
+	}
+	if result == ResultSuccess {
+		m.observeSuccessLocked(b, latencyMs)
+	}
+
+	sameGeneration := record.generation == b.generation
+	key := modelKey{record.upstreamID, record.model}
+	if sameGeneration && record.model != "" &&
+		(result == ResultSuccess || result == ResultModelUnsupported) && lease.Token >= m.capLatest[key] {
+		m.capLatest[key] = lease.Token
+		switch result {
+		case ResultSuccess:
+			delete(m.unsupported, key)
+		case ResultModelUnsupported:
+			m.unsupported[key] = time.Now().Add(m.modelTTL)
+		}
+	}
+
+	from, to := b.state, b.state
+	if sameGeneration && record.authoritative {
+		switch result {
+		case ResultSuccess:
+			from, to = m.drive(b, true, 0)
+		case ResultFailure:
+			from, to = m.drive(b, false, 0)
+		}
+	}
+	if record.recovery && record.groupID != 0 {
+		g := m.groupRecovery[record.groupID]
+		if g != nil && g.owner == lease.Token {
+			g.owner = 0
+			switch result {
+			case ResultSuccess:
+				delete(m.groupRecovery, record.groupID)
+			case ResultFailure:
+				g.notBefore = b.openUntil
+			default:
+				if !time.Now().Before(g.notBefore) {
+					delete(m.groupRecovery, record.groupID)
+				}
+			}
+		}
+	}
+	ev, flipped := transitionEvent(record.upstreamID, record.model, from, to, b.fails)
+	m.mu.Unlock()
+	if flipped {
+		m.dispatch(ev)
+	}
+}
+
+// Release abandons an attempt without changing health or capability state.
+func (m *Manager) Release(lease Lease) { m.Complete(lease, ResultNeutral, 0) }
+
+func (m *Manager) observeSuccessLocked(b *breaker, latencyMs int64) {
+	b.lastSuccess = time.Now()
+	if latencyMs <= 0 {
+		return
+	}
+	b.latencyMs = latencyMs
+	if b.latencyEWMA == 0 {
+		b.latencyEWMA = float64(latencyMs)
+	} else {
+		b.latencyEWMA = ewmaAlpha*float64(latencyMs) + (1-ewmaAlpha)*b.latencyEWMA
 	}
 }
 
@@ -258,6 +457,8 @@ func (m *Manager) MarkModelUnsupported(id int64, model string) {
 		return
 	}
 	m.mu.Lock()
+	m.nextToken++
+	m.capLatest[modelKey{id, model}] = m.nextToken
 	m.unsupported[modelKey{id, model}] = time.Now().Add(m.modelTTL)
 	m.mu.Unlock()
 }
@@ -267,6 +468,8 @@ func (m *Manager) MarkModelSupported(id int64, model string) {
 		return
 	}
 	m.mu.Lock()
+	m.nextToken++
+	m.capLatest[modelKey{id, model}] = m.nextToken
 	delete(m.unsupported, modelKey{id, model})
 	m.mu.Unlock()
 }
@@ -274,6 +477,8 @@ func (m *Manager) MarkModelSupported(id int64, model string) {
 func (m *Manager) MarkModelsSupported(id int64, models []string) {
 	m.mu.Lock()
 	for _, model := range models {
+		m.nextToken++
+		m.capLatest[modelKey{id, model}] = m.nextToken
 		delete(m.unsupported, modelKey{id, model})
 	}
 	m.mu.Unlock()
@@ -299,17 +504,16 @@ func (m *Manager) Report(id int64, model string, ok bool, latencyMs int64) {
 	b.reqs++
 	if !ok {
 		b.failReqs++
-	} else if latencyMs > 0 {
-		b.totLatency += latencyMs
-		b.latSamples++
-		b.latencyMs = latencyMs
+	} else {
+		if latencyMs > 0 {
+			b.totLatency += latencyMs
+			b.latSamples++
+		}
+		m.observeSuccessLocked(b, latencyMs)
 	}
-	// A request that was already in flight before another request opened the
-	// circuit is not a controlled recovery trial. Its late success may update
-	// statistics, but must not bypass the configured cool-down.
 	from, to := b.state, b.state
-	if !(ok && b.state == Open) {
-		from, to = m.drive(b, ok, latencyMs)
+	if b.state != Open {
+		from, to = m.drive(b, ok, 0)
 	}
 	ev, flipped := transitionEvent(id, model, from, to, b.fails)
 	m.mu.Unlock()
@@ -318,41 +522,19 @@ func (m *Manager) Report(id int64, model string, ok bool, latencyMs int64) {
 	}
 }
 
-// ReportTimeout immediately opens a channel after a confirmed response stall.
-// A timeout can hold a request slot for minutes, so waiting for the normal
-// failure threshold would allow more requests to select the same channel.
+// ReportTimeout remains for compatibility; a timeout is one ordinary failure.
 func (m *Manager) ReportTimeout(id int64, model string, latencyMs int64) {
-	m.mu.Lock()
-	b := m.get(id)
-	b.reqs++
-	b.failReqs++
-	if b.fails < m.failThreshold-1 {
-		b.fails = m.failThreshold - 1
-	}
-	from, to := m.drive(b, false, latencyMs)
-	ev, flipped := transitionEvent(id, model, from, to, b.fails)
-	m.mu.Unlock()
-	if flipped {
-		m.dispatch(ev)
-	}
+	m.Report(id, model, false, latencyMs)
 }
 
-// ObserveProbe uses the same channel state machine as business traffic but
-// does not affect business request counters. Two successes are required to
-// close an OPEN/HALF_OPEN channel.
+// ObserveProbe is the synchronous compatibility form of BeginProbe+Complete.
 func (m *Manager) ObserveProbe(id int64, model string, ok bool, latencyMs int64) {
-	m.mu.Lock()
-	b := m.get(id)
-	b.lastProbe = time.Now()
-	if ok && model != "" {
-		delete(m.unsupported, modelKey{id, model})
+	lease := m.BeginProbe(id, model)
+	result := ResultFailure
+	if ok {
+		result = ResultSuccess
 	}
-	from, to := m.drive(b, ok, latencyMs)
-	ev, flipped := transitionEvent(id, model, from, to, b.fails)
-	m.mu.Unlock()
-	if flipped {
-		m.dispatch(ev)
-	}
+	m.Complete(lease, result, latencyMs)
 }
 
 // Forget 丢弃某渠道的全部内存状态，供上游被删除时调用。
@@ -360,10 +542,26 @@ func (m *Manager) ObserveProbe(id int64, model string, ok bool, latencyMs int64)
 func (m *Manager) Forget(id int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	for token, record := range m.leases {
+		if record.upstreamID != id {
+			continue
+		}
+		if record.groupID != 0 {
+			if g := m.groupRecovery[record.groupID]; g != nil && g.owner == token {
+				delete(m.groupRecovery, record.groupID)
+			}
+		}
+		delete(m.leases, token)
+	}
 	delete(m.breakers, id)
 	for key := range m.unsupported {
 		if key.upstreamID == id {
 			delete(m.unsupported, key)
+		}
+	}
+	for key := range m.capLatest {
+		if key.upstreamID == id {
+			delete(m.capLatest, key)
 		}
 	}
 }
@@ -374,13 +572,23 @@ func (m *Manager) ResetCircuit(id int64) {
 	m.mu.Lock()
 	b := m.get(id)
 	from := b.state
+	oldRecoveryLease := b.recoveryLease
+	b.generation++
 	b.state = Closed
 	b.fails = 0
 	b.openUntil = time.Time{}
-	b.halfOpenInFlight = false
-	b.halfOpenClaimAt = time.Time{}
+	b.recoveryLease = 0
+	b.earlyTrial = false
 	b.recoverySuccesses = 0
 	b.reopenCount = 0
+	if oldRecoveryLease != 0 {
+		for _, g := range m.groupRecovery {
+			if g.owner == oldRecoveryLease {
+				g.owner = 0
+				g.notBefore = time.Time{}
+			}
+		}
+	}
 	ev, flipped := transitionEvent(id, "", from, Closed, 0)
 	m.mu.Unlock()
 	if flipped {
@@ -393,28 +601,20 @@ func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) (from, to State) {
 	from = b.state
 	if ok {
 		b.fails = 0
-		if latencyMs > 0 {
-			b.latencyMs = latencyMs
-			if b.latencyEWMA == 0 {
-				b.latencyEWMA = float64(latencyMs)
-			} else {
-				b.latencyEWMA = ewmaAlpha*float64(latencyMs) + (1-ewmaAlpha)*b.latencyEWMA
-			}
-		}
 		switch b.state {
 		case Closed:
 			b.recoverySuccesses = 0
 		case Open:
 			b.state = HalfOpen
 			b.recoverySuccesses = 1
-			b.halfOpenInFlight = false
 		case HalfOpen:
 			b.recoverySuccesses++
-			b.halfOpenInFlight = false
 			if b.recoverySuccesses >= m.recoveryGoal {
 				b.state = Closed
 				b.recoverySuccesses = 0
 				b.reopenCount = 0
+				b.openUntil = time.Time{}
+				b.earlyTrial = false
 			}
 		}
 		return from, b.state
@@ -422,13 +622,22 @@ func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) (from, to State) {
 
 	b.fails++
 	b.recoverySuccesses = 0
-	if b.state == HalfOpen || b.state == Open || b.fails >= m.failThreshold {
-		b.state = Open
-		b.halfOpenInFlight = false
-		b.reopenCount++
-		b.openUntil = time.Now().Add(m.backoff(b.reopenCount))
+	switch {
+	case b.state == HalfOpen:
+		m.openLocked(b, false)
+	case b.state == Closed && b.fails >= m.failThreshold:
+		m.openLocked(b, true)
 	}
 	return from, b.state
+}
+
+func (m *Manager) openLocked(b *breaker, allowEarlyTrial bool) {
+	b.state = Open
+	b.generation++
+	b.recoveryLease = 0
+	b.earlyTrial = allowEarlyTrial
+	b.reopenCount++
+	b.openUntil = time.Now().Add(m.backoff(b.reopenCount))
 }
 
 // backoff 对反复熔断使用指数冷却，最长为五分钟或基础冷却时间。
@@ -558,6 +767,17 @@ func (m *Manager) EffectiveState(id int64) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.get(id).state.String()
+}
+
+// RecoveryInfo returns a side-effect-free snapshot used for last-route choice.
+func (m *Manager) RecoveryInfo(id int64) RecoveryCandidate {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b := m.get(id)
+	return RecoveryCandidate{
+		State: b.state.String(), EarlyTrial: b.earlyTrial && b.recoveryLease == 0,
+		ReopenCount: b.reopenCount, LastSuccess: b.lastSuccess, OpenUntil: b.openUntil,
+	}
 }
 
 // Sample 将累计请求计数转换成一个趋势采样点，并限制内存窗口长度。

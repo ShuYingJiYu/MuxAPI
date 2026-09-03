@@ -29,14 +29,20 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getRuntimeSettings(w http.ResponseWriter) {
-	logRetention, logRetentionSource := intSettingValueAllowZero(s.store.GetSetting("request_retention_days", ""), 0)
-	alertWebhook, alertWebhookSource := stringSettingValue(s.store.GetSetting("alert_webhook", ""), "")
-	alertDebounce, alertDebounceSource := settingValue(s.store.GetSetting("alert_debounce", ""), "60s")
-	firstResponseTimeout, firstResponseTimeoutSource := intSettingValue(s.store.GetSetting("first_response_timeout_ms", ""), 120000)
-	failThreshold, failThresholdSource := intSettingValue(s.store.GetSetting("fail_threshold", ""), defaultFailThreshold)
-	cooldown, cooldownSource := settingValue(s.store.GetSetting("cooldown", ""), defaultCooldown)
-	maxAttempts, maxAttemptsSource := intSettingValue(s.store.GetSetting("max_upstream_attempts", ""), defaultMaxAttempts)
-	maxBodyBytes, maxBodySource := intSettingValue(s.store.GetSetting("max_body_bytes", ""), defaultMaxBodyBytes)
+	settings, err := s.store.Settings()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	value := func(key string) string { return settings[key] }
+	logRetention, logRetentionSource := intSettingValueAllowZero(value("request_retention_days"), 0)
+	alertWebhook, alertWebhookSource := stringSettingValue(value("alert_webhook"), "")
+	alertDebounce, alertDebounceSource := settingValue(value("alert_debounce"), "60s")
+	firstResponseTimeout, firstResponseTimeoutSource := intSettingValue(value("first_response_timeout_ms"), 120000)
+	failThreshold, failThresholdSource := intSettingValue(value("fail_threshold"), defaultFailThreshold)
+	cooldown, cooldownSource := settingValue(value("cooldown"), defaultCooldown)
+	maxAttempts, maxAttemptsSource := intSettingValue(value("max_upstream_attempts"), defaultMaxAttempts)
+	maxBodyBytes, maxBodySource := intSettingValue(value("max_body_bytes"), defaultMaxBodyBytes)
 	defaults := map[string]string{
 		"adaptive_timeout_enabled": "true", "adaptive_timeout_floor_ms": "10000",
 		"adaptive_timeout_multiplier": "2", "adaptive_timeout_min_samples": "5",
@@ -52,14 +58,14 @@ func (s *Server) getRuntimeSettings(w http.ResponseWriter) {
 	}
 
 	out := map[string]string{
-		"log_retention":                       s.store.GetSetting("request_retention_days", ""),
-		"alert_webhook":                       s.store.GetSetting("alert_webhook", ""),
-		"alert_debounce":                      s.store.GetSetting("alert_debounce", ""),
-		"first_response_timeout_ms":           s.store.GetSetting("first_response_timeout_ms", ""),
-		"fail_threshold":                      s.store.GetSetting("fail_threshold", ""),
-		"cooldown":                            s.store.GetSetting("cooldown", ""),
-		"max_upstream_attempts":               s.store.GetSetting("max_upstream_attempts", ""),
-		"max_body_bytes":                      s.store.GetSetting("max_body_bytes", ""),
+		"log_retention":                       value("request_retention_days"),
+		"alert_webhook":                       value("alert_webhook"),
+		"alert_debounce":                      value("alert_debounce"),
+		"first_response_timeout_ms":           value("first_response_timeout_ms"),
+		"fail_threshold":                      value("fail_threshold"),
+		"cooldown":                            value("cooldown"),
+		"max_upstream_attempts":               value("max_upstream_attempts"),
+		"max_body_bytes":                      value("max_body_bytes"),
 		"effective_log_retention":             logRetention,
 		"effective_alert_webhook":             alertWebhook,
 		"effective_alert_debounce":            alertDebounce,
@@ -78,12 +84,12 @@ func (s *Server) getRuntimeSettings(w http.ResponseWriter) {
 		"max_body_bytes_source":               maxBodySource,
 	}
 	for key, def := range defaults {
-		value := s.store.GetSetting(key, "")
-		out[key] = value
+		setting := value(key)
+		out[key] = setting
 		out["effective_"+key] = def
 		out[key+"_source"] = "default"
-		if value != "" {
-			out["effective_"+key] = value
+		if setting != "" {
+			out["effective_"+key] = setting
 			out[key+"_source"] = "settings"
 		}
 	}
@@ -211,7 +217,32 @@ func (s *Server) putRuntimeSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := validateRuntimeSettings(values); err != nil {
+	for _, key := range []string{"adaptive_timeout_enabled", "intelligent_routing_enabled", "routing_allow_unknown_price"} {
+		if !provided[key] {
+			continue
+		}
+		enabled, err := strconv.ParseBool(strings.TrimSpace(values[key]))
+		if err != nil {
+			http.Error(w, "开关设置须为 true 或 false", http.StatusBadRequest)
+			return
+		}
+		values[key] = strconv.FormatBool(enabled)
+	}
+	current, err := s.store.Settings()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	combined := make(map[string]string, len(current)+len(values))
+	for key, value := range current {
+		combined[key] = value
+	}
+	for key, value := range values {
+		if provided[key] {
+			combined[key] = value
+		}
+	}
+	if err := validateRuntimeSettings(combined); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -331,6 +362,26 @@ func validateRuntimeSettings(values map[string]string) error {
 		if err != nil {
 			return err
 		}
+	}
+	integer := func(key string, def int) int {
+		value, err := strconv.Atoi(values[key])
+		if err != nil {
+			return def
+		}
+		return value
+	}
+	duration := func(key string, def time.Duration) time.Duration {
+		value, err := time.ParseDuration(values[key])
+		if err != nil {
+			return def
+		}
+		return value
+	}
+	if integer("adaptive_timeout_floor_ms", 10000) > integer("first_response_timeout_ms", 120000) {
+		return settingsError("自适应超时下限不能超过首响应超时")
+	}
+	if duration("breaker_max_cooldown", 5*time.Minute) < duration("cooldown", 30*time.Second) {
+		return settingsError("最大熔断冷却不能小于基础冷却时间")
 	}
 	return nil
 }

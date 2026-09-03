@@ -262,6 +262,33 @@ func TestRuntimeRoutingSettings(t *testing.T) {
 	}
 }
 
+func TestRuntimeSettingsNormalizeBooleansAndValidateRelations(t *testing.T) {
+	ts, st, tok := newAdminTestServer(t)
+	url := ts.URL + "/admin/settings"
+
+	put := adminReq(t, http.MethodPut, url, tok, `{"adaptive_timeout_enabled":"TRUE"}`)
+	put.Body.Close()
+	if put.StatusCode != http.StatusNoContent {
+		t.Fatalf("boolean update returned %d", put.StatusCode)
+	}
+	if got := st.GetSetting("adaptive_timeout_enabled", ""); got != "true" {
+		t.Fatalf("boolean was not normalized: %q", got)
+	}
+
+	for name, body := range map[string]string{
+		"adaptive floor":   `{"first_response_timeout_ms":"10000","adaptive_timeout_floor_ms":"11000"}`,
+		"breaker cooldown": `{"cooldown":"10m","breaker_max_cooldown":"5m"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := adminReq(t, http.MethodPut, url, tok, body)
+			response.Body.Close()
+			if response.StatusCode != http.StatusBadRequest {
+				t.Fatalf("invalid related settings returned %d", response.StatusCode)
+			}
+		})
+	}
+}
+
 // L13 回归：布尔启停 PUT 收到空/畸形 body 必须 400，绝不静默写 enabled=false。
 func TestKeyEnabledRejectsMalformedBody(t *testing.T) {
 	ts, st, tok := newAdminTestServer(t)

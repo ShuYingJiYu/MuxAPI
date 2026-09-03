@@ -24,18 +24,20 @@ func TestChannelFailuresAccumulateAcrossModels(t *testing.T) {
 	}
 }
 
-func TestTimeoutOpensChannelImmediately(t *testing.T) {
+func TestTimeoutUsesConfiguredFailureThreshold(t *testing.T) {
 	m := New(3, time.Hour)
 	m.ReportTimeout(1, "gpt-5.6", 120000)
-	if m.IsAvailable(1, "gpt-5.6") {
-		t.Fatal("a response timeout must immediately remove the channel from scheduling")
+	if !m.IsAvailable(1, "gpt-5.6") {
+		t.Fatal("one timeout must remain below the configured threshold")
 	}
-	if got := m.EffectiveState(1); got != "OPEN" {
-		t.Fatalf("expected OPEN after one timeout, got %s", got)
+	m.ReportTimeout(1, "gpt-5.6", 120000)
+	m.ReportTimeout(1, "gpt-5.6", 120000)
+	if m.IsAvailable(1, "gpt-5.6") {
+		t.Fatal("three consecutive timeouts must open the channel")
 	}
 	snapshot := m.Snapshot(1)
-	if snapshot.Reqs != 1 || snapshot.FailReqs != 1 {
-		t.Fatalf("timeout should count as one failed request: %+v", snapshot)
+	if snapshot.Reqs != 3 || snapshot.FailReqs != 3 {
+		t.Fatalf("timeouts should count as ordinary failed requests: %+v", snapshot)
 	}
 }
 
@@ -69,8 +71,9 @@ func TestClosedSuccessResetsConsecutiveFailures(t *testing.T) {
 }
 
 func TestRecoveryRequiresTwoSuccesses(t *testing.T) {
-	m := New(1, time.Hour)
+	m := New(1, 5*time.Millisecond)
 	m.Report(1, "gpt", false, 0)
+	time.Sleep(10 * time.Millisecond)
 	m.ObserveProbe(1, "gpt", true, 50)
 	if got := m.EffectiveState(1); got != "HALF_OPEN" {
 		t.Fatalf("first recovery success should enter HALF_OPEN, got %s", got)
@@ -96,6 +99,7 @@ func TestLateInFlightSuccessDoesNotBypassOpenCooldown(t *testing.T) {
 func TestRecoveryFailureReopens(t *testing.T) {
 	m := New(1, 10*time.Millisecond)
 	m.Report(1, "gpt", false, 0)
+	time.Sleep(15 * time.Millisecond)
 	m.ObserveProbe(1, "gpt", true, 50)
 	m.ObserveProbe(1, "gpt", false, 0)
 	if got := m.EffectiveState(1); got != "OPEN" {
@@ -133,17 +137,19 @@ func TestHalfOpenAllowsOneClaim(t *testing.T) {
 	if !m.IsAvailable(1, "gpt") {
 		t.Fatal("cooldown expiry should expose one HALF_OPEN slot")
 	}
-	if !m.Claim(1, "gpt") {
+	first, ok := m.Claim(1, 1, "gpt")
+	if !ok {
 		t.Fatal("first HALF_OPEN claim should pass")
 	}
-	if m.Claim(1, "gpt") {
+	if _, ok := m.Claim(1, 1, "gpt"); ok {
 		t.Fatal("second concurrent HALF_OPEN claim should be blocked")
 	}
-	m.ReleaseClaim(1)
-	if !m.Claim(1, "gpt") {
+	m.Release(first)
+	second, ok := m.Claim(1, 1, "gpt")
+	if !ok {
 		t.Fatal("released HALF_OPEN slot should be reusable")
 	}
-	m.ReleaseClaim(1)
+	m.Release(second)
 }
 
 func TestHalfOpenConcurrentBurst(t *testing.T) {
@@ -151,13 +157,18 @@ func TestHalfOpenConcurrentBurst(t *testing.T) {
 	m.Report(1, "gpt", false, 0)
 	time.Sleep(10 * time.Millisecond)
 	var accepted int32
+	var acceptedLease Lease
+	var leaseMu sync.Mutex
 	var wg sync.WaitGroup
 	for i := 0; i < 16; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if m.Claim(1, "gpt") {
+			if lease, ok := m.Claim(1, 1, "gpt"); ok {
 				atomic.AddInt32(&accepted, 1)
+				leaseMu.Lock()
+				acceptedLease = lease
+				leaseMu.Unlock()
 			}
 		}()
 	}
@@ -165,7 +176,7 @@ func TestHalfOpenConcurrentBurst(t *testing.T) {
 	if accepted != 1 {
 		t.Fatalf("expected one HALF_OPEN claim, got %d", accepted)
 	}
-	m.ReleaseClaim(1)
+	m.Release(acceptedLease)
 }
 
 func TestModelUnsupportedDoesNotAffectChannel(t *testing.T) {
@@ -201,15 +212,17 @@ func TestModelUnsupportedExpires(t *testing.T) {
 
 func TestInFlightAccounting(t *testing.T) {
 	m := New(3, time.Hour)
-	if !m.Claim(1, "gpt") || !m.Claim(1, "gpt") {
+	first, ok1 := m.Claim(1, 1, "gpt")
+	second, ok2 := m.Claim(1, 1, "gpt")
+	if !ok1 || !ok2 {
 		t.Fatal("closed channel claims should pass")
 	}
 	if got := m.InFlight(1); got != 2 {
 		t.Fatalf("expected in-flight=2, got %d", got)
 	}
-	m.ReleaseClaim(1)
-	m.ReleaseClaim(1)
-	m.ReleaseClaim(1)
+	m.Release(first)
+	m.Release(first)
+	m.Release(second)
 	if got := m.InFlight(1); got != 0 {
 		t.Fatalf("release must be idempotent at zero, got %d", got)
 	}
@@ -265,5 +278,89 @@ func TestSampleTrend(t *testing.T) {
 	snapshot := m.Snapshot(1)
 	if len(snapshot.Trend) != 1 || snapshot.Trend[0].Status != statDown {
 		t.Fatalf("unexpected trend: %+v", snapshot.Trend)
+	}
+}
+
+func TestLeaseCompletionIsIdempotent(t *testing.T) {
+	m := New(3, time.Hour)
+	first, ok := m.Claim(1, 1, "gpt")
+	if !ok {
+		t.Fatal("first claim failed")
+	}
+	second, ok := m.Claim(1, 1, "gpt")
+	if !ok {
+		t.Fatal("second claim failed")
+	}
+	m.Release(first)
+	m.Release(first)
+	if got := m.InFlight(1); got != 1 {
+		t.Fatalf("duplicate completion released another request: in-flight=%d", got)
+	}
+	m.Release(second)
+}
+
+func TestOldGenerationResultsCannotChangeCircuit(t *testing.T) {
+	t.Run("late success cannot recover", func(t *testing.T) {
+		m := New(1, time.Hour)
+		failed, _ := m.Claim(1, 1, "gpt")
+		lateSuccess, _ := m.Claim(1, 1, "gpt")
+		m.Complete(failed, ResultFailure, 0)
+		m.Complete(lateSuccess, ResultSuccess, 20)
+		if got := m.EffectiveState(1); got != "OPEN" {
+			t.Fatalf("late success changed a newer generation: %s", got)
+		}
+	})
+
+	t.Run("late failure cannot reopen reset circuit", func(t *testing.T) {
+		m := New(1, time.Hour)
+		lateFailure, _ := m.Claim(1, 1, "gpt")
+		m.ResetCircuit(1)
+		m.Complete(lateFailure, ResultFailure, 0)
+		if got := m.EffectiveState(1); got != "CLOSED" {
+			t.Fatalf("late failure changed a newer generation: %s", got)
+		}
+	})
+}
+
+func TestRecoveryLeaseExcludesProbeAndGroupPeers(t *testing.T) {
+	m := New(1, 5*time.Millisecond)
+	m.Report(1, "gpt", false, 0)
+	m.Report(2, "gpt", false, 0)
+	time.Sleep(10 * time.Millisecond)
+
+	first, ok := m.Claim(7, 1, "gpt")
+	if !ok {
+		t.Fatal("first group recovery claim failed")
+	}
+	if _, ok := m.Claim(7, 2, "gpt"); ok {
+		t.Fatal("same group must not recover two channels concurrently")
+	}
+	if _, ok := m.Claim(8, 1, "gpt"); ok {
+		t.Fatal("same channel must not recover concurrently across groups")
+	}
+	probe := m.BeginProbe(1, "gpt")
+	m.Complete(probe, ResultSuccess, 10)
+	if got := m.EffectiveState(1); got != "HALF_OPEN" {
+		t.Fatalf("concurrent probe changed business-owned recovery: %s", got)
+	}
+	m.Complete(first, ResultFailure, 0)
+}
+
+func TestLateCapabilityResultCannotOverrideNewerResult(t *testing.T) {
+	m := New(3, time.Hour)
+	old := m.BeginProbe(1, "gpt")
+	newer := m.BeginProbe(1, "gpt")
+	m.Complete(newer, ResultModelUnsupported, 0)
+	m.Complete(old, ResultSuccess, 10)
+	if !m.IsModelUnsupported(1, "gpt") {
+		t.Fatal("late success cleared a newer unsupported result")
+	}
+
+	old = m.BeginProbe(2, "gpt")
+	newer = m.BeginProbe(2, "gpt")
+	m.Complete(newer, ResultSuccess, 10)
+	m.Complete(old, ResultModelUnsupported, 0)
+	if m.IsModelUnsupported(2, "gpt") {
+		t.Fatal("late unsupported result replaced a newer success")
 	}
 }
