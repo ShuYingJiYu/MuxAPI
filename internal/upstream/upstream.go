@@ -148,27 +148,24 @@ func FailIsUpstreamLevel(code int) bool {
 // IsModelUnsupported identifies deterministic model/channel mismatches. They
 // exclude only this model for a short TTL and never affect channel health.
 func IsModelUnsupported(code int, model, body string) bool {
-	if model == "" {
+	if model == "" || (code != http.StatusBadRequest && code != http.StatusNotFound) {
 		return false
 	}
-	if code != http.StatusBadRequest && code != http.StatusNotFound && code != http.StatusServiceUnavailable {
+	var payload map[string]any
+	if json.Unmarshal([]byte(body), &payload) != nil {
 		return false
 	}
-	lower := strings.ToLower(body)
-	for _, marker := range []string{
-		"model_not_found",
-		"model not found",
-		"model does not exist",
-		"unknown model",
-		"unsupported model",
-		"no available channel",
-		"模型不存在",
-		"不支持该模型",
-		"不支持模型",
-	} {
-		if strings.Contains(lower, marker) {
+	return hasModelNotFoundCode(payload)
+}
+
+func hasModelNotFoundCode(payload map[string]any) bool {
+	for _, key := range []string{"code", "type"} {
+		if value, ok := payload[key].(string); ok && strings.EqualFold(strings.TrimSpace(value), "model_not_found") {
 			return true
 		}
+	}
+	if nested, ok := payload["error"].(map[string]any); ok {
+		return hasModelNotFoundCode(nested)
 	}
 	return false
 }

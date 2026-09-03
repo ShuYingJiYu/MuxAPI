@@ -14,9 +14,11 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
+	healthpkg "github.com/mirainya/muxapi/internal/health"
 	"github.com/mirainya/muxapi/internal/routing"
 	"github.com/mirainya/muxapi/internal/translate"
 	"github.com/mirainya/muxapi/internal/upstream"
@@ -27,28 +29,19 @@ const defaultFirstResponseTimeout = 120 * time.Second
 
 // Health 汇总转发层需要的熔断反馈、并发占用和模型能力接口。
 type Health interface {
-	Report(id int64, model string, ok bool, latencyMs int64)
-	ReleaseClaim(id int64)
-	MarkModelUnsupported(id int64, model string)
-	MarkModelSupported(id int64, model string)
-}
-
-// timeoutHealth lets the breaker distinguish a confirmed stalled response
-// from ordinary transient upstream failures.
-type timeoutHealth interface {
-	ReportTimeout(id int64, model string, latencyMs int64)
+	Complete(lease healthpkg.Lease, result healthpkg.Result, latencyMs int64)
 }
 
 // Picker 从指定分组选择一个未尝试且可用的上游。
 type Picker interface {
-	PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, error)
+	PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, healthpkg.Lease, error)
 }
 
 // FeaturePicker is an optional extension implemented by the intelligent
 // scheduler. Keeping it separate from Picker preserves compatibility with
 // embedders and tests that provide a minimal picker.
 type FeaturePicker interface {
-	PickWithFeatures(groupID int64, model string, features routing.RequestFeatures, exclude map[int64]bool) (*upstream.Upstream, routing.Decision, error)
+	PickWithFeatures(groupID int64, model string, features routing.RequestFeatures, exclude map[int64]bool) (*upstream.Upstream, healthpkg.Lease, routing.Decision, error)
 }
 
 // ModelMapper resolves model names per-upstream and records outcomes for
@@ -64,6 +57,23 @@ type TTFTEstimator interface {
 	EstimateTTFT(upstreamID int64, model string) (p95Ms float64, samples int64)
 }
 
+// AdaptiveTimeoutPolicy controls how historical TTFT is converted into a
+// per-request first-response deadline. The configured first-response timeout
+// remains the hard ceiling.
+type AdaptiveTimeoutPolicy struct {
+	Enabled    bool
+	Floor      time.Duration
+	Multiplier float64
+	MinSamples int64
+	TokenStep  int64
+	TokenBonus time.Duration
+}
+
+func DefaultAdaptiveTimeoutPolicy() AdaptiveTimeoutPolicy {
+	return AdaptiveTimeoutPolicy{Enabled: true, Floor: 10 * time.Second, Multiplier: 2,
+		MinSamples: 5, TokenStep: 50_000, TokenBonus: 5 * time.Second}
+}
+
 // Forwarder 协调一次客户端请求的选路、重试、协议转换和响应审计。
 type Forwarder struct {
 	picker               Picker
@@ -71,6 +81,8 @@ type Forwarder struct {
 	modelAliases         map[string]string
 	modelMapper          ModelMapper
 	ttftEstimator        TTFTEstimator
+	adaptivePolicy       func() AdaptiveTimeoutPolicy
+	streamIdleTimeout    func() time.Duration
 	maxAttempts          int
 	maxAttemptsProvider  func() int
 	firstResponseTimeout func() time.Duration
@@ -108,6 +120,14 @@ func (f *Forwarder) SetTTFTEstimator(estimator TTFTEstimator) {
 	f.ttftEstimator = estimator
 }
 
+func (f *Forwarder) SetAdaptiveTimeoutPolicyProvider(provider func() AdaptiveTimeoutPolicy) {
+	f.adaptivePolicy = provider
+}
+
+func (f *Forwarder) SetStreamIdleTimeoutProvider(provider func() time.Duration) {
+	f.streamIdleTimeout = provider
+}
+
 // SetMaxAttemptsProvider supplies the current per-request upstream attempt limit.
 // The provider is evaluated once when a request starts, so a settings change
 // cannot alter the retry budget halfway through an in-flight request.
@@ -141,18 +161,35 @@ func (f *Forwarder) firstByteTimeout() time.Duration {
 // historical P95 TTFT and the request's input token count. Falls back to
 // the global firstByteTimeout when no estimator is configured or data is cold.
 func (f *Forwarder) adaptiveTimeout(upstreamID int64, model string, inputTokens int64) time.Duration {
-	if f.ttftEstimator == nil {
+	policy := DefaultAdaptiveTimeoutPolicy()
+	if f.adaptivePolicy != nil {
+		policy = f.adaptivePolicy()
+	}
+	if !policy.Enabled || f.ttftEstimator == nil {
 		return f.firstByteTimeout()
 	}
 	p95, samples := f.ttftEstimator.EstimateTTFT(upstreamID, model)
 	return ComputeAdaptiveTimeout(AdaptiveTimeoutParams{
-		P95Ms:       p95,
-		Samples:     samples,
-		InputTokens: inputTokens,
-		Multiplier:  2.0,
-		Floor:       10 * time.Second,
-		Ceiling:     f.firstByteTimeout(),
+		P95Ms:                p95,
+		Samples:              samples,
+		InputTokens:          inputTokens,
+		Multiplier:           policy.Multiplier,
+		Floor:                policy.Floor,
+		Ceiling:              f.firstByteTimeout(),
+		MinSamples:           policy.MinSamples,
+		TokenStep:            policy.TokenStep,
+		TokenBonus:           policy.TokenBonus,
+		TokenBonusConfigured: true,
 	})
+}
+
+func (f *Forwarder) streamIdleDeadline() time.Duration {
+	if f.streamIdleTimeout != nil {
+		if value := f.streamIdleTimeout(); value > 0 {
+			return value
+		}
+	}
+	return 5 * time.Minute
 }
 
 // StatusClientClosedRequest 用于审计客户端提前断开；Go 标准库没有该常量。
@@ -324,22 +361,31 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 	for upstreamAttempts := 0; upstreamAttempts < maxAttempts; {
 		// tried 同时防止重复选择；本地协议不兼容不消耗实际网络尝试次数。
 		var candidate *upstream.Upstream
+		var lease healthpkg.Lease
 		var decision routing.Decision
 		var err error
 		if picker, ok := f.picker.(FeaturePicker); ok {
-			candidate, decision, err = picker.PickWithFeatures(groupID, model, features, tried)
+			candidate, lease, decision, err = picker.PickWithFeatures(groupID, model, features, tried)
 			if err == nil && routeDecision == nil && decision.SelectedID != 0 {
 				copyDecision := decision
 				routeDecision = &copyDecision
 			}
 		} else {
-			candidate, err = f.picker.PickExcluding(groupID, model, tried)
+			candidate, lease, err = f.picker.PickExcluding(groupID, model, tried)
 		}
 		if err != nil {
 			break
 		}
 		tried[candidate.ID] = true
-		release := func() { f.health.ReleaseClaim(candidate.ID) }
+		completed := false
+		complete := func(result healthpkg.Result, latencyMs int64) {
+			if completed {
+				return
+			}
+			completed = true
+			f.health.Complete(lease, result, latencyMs)
+		}
+		release := func() { complete(healthpkg.ResultNeutral, 0) }
 		attemptStarted := time.Now()
 		attemptNo := len(attempts) + 1
 		selectionReason := "initial"
@@ -407,16 +453,15 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		upstreamAttempts++
 		req, err := candidate.BuildRequest(r.Method, targetPath, bytes.NewReader(exchange.UpstreamRequest), r.Header)
 		if err != nil {
-			f.health.Report(candidate.ID, model, false, 0)
-			release()
+			complete(healthpkg.ResultFailure, 0)
 			attempts = append(attempts, attemptCtx.finish(f.health, 0, OutcomeFailed, relayResult{}, "request_build", "gateway", err.Error()))
 			lastErr = err
 			continue
 		}
 		translate.ConfigureRequestHeaders(req.Header, targetFormat, exchange.Translated())
 
-		// 计时器覆盖建立连接到响应正文结束；收到任意上游字节会重置，
-		// 因此正常持续输出的流不会被限制，卡住的流会及时释放渠道占用。
+		// 首个有效输出使用绝对超时；之后仅正文活动刷新流空闲超时。
+		// SSE 心跳和空事件不能无限延长首个有效输出等待。
 		ctx, cancel := context.WithCancelCause(r.Context())
 		watchdog := newResponseWatchdog(f.adaptiveTimeout(candidate.ID, model, features.InputTokens), cancel)
 		req = req.WithContext(ctx)
@@ -427,8 +472,8 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			watchdog.stop()
 			cause := context.Cause(ctx)
 			cancel(nil)
-			release()
 			if r.Context().Err() != nil {
+				release()
 				finished := attemptCtx.finish(f.health, StatusClientClosedRequest, OutcomeCanceled, relayResult{}, "client_canceled", "client", r.Context().Err().Error())
 				attempts = append(attempts, finished)
 				return withRouting(resultFromAttempt(finished, attempts))
@@ -437,23 +482,23 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			if errors.Is(cause, errFirstResponseTimeout) {
 				errorKind = "first_response_timeout"
 			}
-			f.reportFailure(candidate.ID, model, 0, cause)
+			complete(healthpkg.ResultFailure, 0)
 			attempts = append(attempts, attemptCtx.finish(f.health, 0, OutcomeFailed, relayResult{}, errorKind, "upstream", err.Error()))
 			lastErr = err
 			continue
 		}
-		resp.Body = watchdogReadCloser{ReadCloser: resp.Body, touch: watchdog.touch}
+		markOutput := func() { watchdog.markOutput(f.streamIdleDeadline()) }
 
 		// 400/404/503 需要先读取正文，以区分"不支持模型"和普通客户端/上游错误。
 		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusServiceUnavailable {
-			payload, readErr := readLimitedBody(resp.Body, 2<<20)
+			payload, readErr := readLimitedBody(resp.Body, 2<<20, markOutput)
 			watchdog.stop()
 			cause := context.Cause(ctx)
 			cancel(nil)
 			resp.Body.Close()
 			if readErr != nil {
-				release()
 				if r.Context().Err() != nil {
+					release()
 					finished := attemptCtx.finish(f.health, StatusClientClosedRequest, OutcomeCanceled, relayResult{}, "client_canceled", "client", r.Context().Err().Error())
 					attempts = append(attempts, finished)
 					return withRouting(resultFromAttempt(finished, attempts))
@@ -462,18 +507,17 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 				if errors.Is(cause, errFirstResponseTimeout) {
 					errorKind = "first_response_timeout"
 				}
-				f.reportFailure(candidate.ID, model, 0, cause)
+				complete(healthpkg.ResultFailure, 0)
 				attempts = append(attempts, attemptCtx.finish(f.health, 0, OutcomeFailed, relayResult{}, errorKind, "upstream", readErr.Error()))
 				lastErr = readErr
 				continue
 			}
 			responseMeta := relayResult{ttftMs: time.Since(start).Milliseconds(), upstreamRequestID: upstreamRequestID(resp.Header)}
 			if upstream.IsModelUnsupported(resp.StatusCode, model, string(payload)) {
-				f.health.MarkModelUnsupported(candidate.ID, model)
 				if f.modelMapper != nil {
 					f.modelMapper.RecordFailure(candidate.ID, model)
 				}
-				release()
+				complete(healthpkg.ResultModelUnsupported, responseMeta.ttftMs)
 				attempts = append(attempts, attemptCtx.finish(f.health, resp.StatusCode, OutcomeUnsupported,
 					responseMeta, "model_unsupported", "upstream", string(payload)))
 				continue
@@ -482,8 +526,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			// 503 that is NOT model-unsupported should fall through to normal
 			// failure handling (breaker + failover), not be treated as client error.
 			if resp.StatusCode == http.StatusServiceUnavailable {
-				release()
-				f.reportFailure(candidate.ID, model, responseMeta.ttftMs, nil)
+				complete(healthpkg.ResultFailure, responseMeta.ttftMs)
 				attempts = append(attempts, attemptCtx.finish(f.health, resp.StatusCode, OutcomeFailed,
 					responseMeta, "upstream_error", "upstream", string(payload)))
 				lastErr = errors.New(string(payload))
@@ -515,14 +558,12 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 
 		// 认证、限流及 5xx 属于渠道失败：记录熔断反馈后尝试下一个上游。
 		if upstream.IsFailureStatus(resp.StatusCode) {
-			payload, _ := readLimitedBody(resp.Body, 64<<10)
+			payload, _ := readLimitedBody(resp.Body, 64<<10, markOutput)
 			watchdog.stop()
-			cause := context.Cause(ctx)
 			resp.Body.Close()
 			cancel(nil)
 			latency := time.Since(start).Milliseconds()
-			f.reportFailure(candidate.ID, model, latency, cause)
-			release()
+			complete(healthpkg.ResultFailure, latency)
 			responseMeta := relayResult{ttftMs: latency, upstreamRequestID: upstreamRequestID(resp.Header)}
 			attempts = append(attempts, attemptCtx.finish(f.health, resp.StatusCode, OutcomeFailed,
 				responseMeta, "upstream_http", "upstream", string(payload)))
@@ -531,14 +572,14 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		}
 
 		// relayResult.committed 表示响应是否已写出；只有未写出时才能安全换源。
-		result := relayTranslatedResponse(r.Context(), w, resp, start, nil, exchange)
+		result := relayTranslatedResponse(r.Context(), w, resp, start, markOutput, exchange)
 		watchdog.stop()
 		cause := context.Cause(ctx)
 		cancel(nil)
-		release()
 
 		if result.err != nil {
 			if result.source == relayDownstream || r.Context().Err() != nil {
+				release()
 				errText := result.err.Error()
 				errorKind := "downstream_write"
 				if r.Context().Err() != nil {
@@ -550,7 +591,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 				attempts = append(attempts, finished)
 				return withRouting(resultFromAttempt(finished, attempts))
 			}
-			f.reportFailure(candidate.ID, model, result.ttftMs, cause)
+			complete(healthpkg.ResultFailure, result.ttftMs)
 			outcome := OutcomeFailed
 			status := 0
 			if result.committed {
@@ -573,14 +614,15 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		// 注意：仅「缺少终止事件」不算失败，部分上游合法地不发终止标记。
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			if result.streamErrored {
-				f.health.Report(candidate.ID, model, false, result.ttftMs)
+				complete(healthpkg.ResultFailure, result.ttftMs)
 			} else {
-				f.health.MarkModelSupported(candidate.ID, model)
 				if f.modelMapper != nil {
 					f.modelMapper.RecordSuccess(candidate.ID, model)
 				}
-				f.health.Report(candidate.ID, model, true, result.ttftMs)
+				complete(healthpkg.ResultSuccess, result.ttftMs)
 			}
+		} else {
+			release()
 		}
 		outcome := OutcomeSuccess
 		if result.streamErrored {
@@ -639,20 +681,12 @@ func hashUpstreamKey(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (f *Forwarder) reportFailure(id int64, model string, latencyMs int64, cause error) {
-	if errors.Is(cause, errFirstResponseTimeout) {
-		if reporter, ok := f.health.(timeoutHealth); ok {
-			reporter.ReportTimeout(id, model, latencyMs)
-			return
-		}
-	}
-	f.health.Report(id, model, false, latencyMs)
-}
-
 func relayErrorKind(err error, cause error) string {
 	switch {
 	case errors.Is(cause, errFirstResponseTimeout):
 		return "first_response_timeout"
+	case errors.Is(cause, errStreamIdleTimeout):
+		return "stream_idle_timeout"
 	case errors.Is(err, errEmptyResponse):
 		return "empty_response"
 	case errors.Is(err, errErrorPayload):
@@ -682,30 +716,38 @@ func clipUTF8(value string, maxBytes int) string {
 	return value[:cut]
 }
 
-func readLimitedBody(reader io.Reader, limit int64) ([]byte, error) {
-	return io.ReadAll(io.LimitReader(reader, limit))
+func readLimitedBody(reader io.Reader, limit int64, onOutput func()) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(activityReader{Reader: reader, onOutput: onOutput}, limit))
 }
 
 var errEmptyResponse = errors.New("upstream returned an empty response")
 var errErrorPayload = errors.New("upstream returned an error payload with a successful status")
 var errFirstResponseTimeout = errors.New("upstream first response timeout")
+var errStreamIdleTimeout = errors.New("upstream stream idle timeout")
 
-// responseWatchdog cancels an upstream attempt when no response bytes arrive
-// within the configured interval. It is reset by every successful body read,
-// so a healthy long-running stream remains allowed to continue.
+// responseWatchdog applies an absolute deadline until the first meaningful
+// output, then an idle deadline refreshed by later output.
 type responseWatchdog struct {
 	timeout  time.Duration
 	cancel   context.CancelCauseFunc
 	activity chan struct{}
+	policy   chan watchdogReset
 	done     chan struct{}
 	stopped  chan struct{}
 	once     sync.Once
+	output   atomic.Bool
+}
+
+type watchdogReset struct {
+	timeout time.Duration
+	cause   error
 }
 
 func newResponseWatchdog(timeout time.Duration, cancel context.CancelCauseFunc) *responseWatchdog {
 	w := &responseWatchdog{
 		timeout: timeout, cancel: cancel,
-		activity: make(chan struct{}, 1), done: make(chan struct{}), stopped: make(chan struct{}),
+		activity: make(chan struct{}, 1), policy: make(chan watchdogReset, 1),
+		done: make(chan struct{}), stopped: make(chan struct{}),
 	}
 	go w.run()
 	return w
@@ -713,6 +755,7 @@ func newResponseWatchdog(timeout time.Duration, cancel context.CancelCauseFunc) 
 
 func (w *responseWatchdog) run() {
 	timer := time.NewTimer(w.timeout)
+	cause := error(errFirstResponseTimeout)
 	defer func() {
 		if !timer.Stop() {
 			select {
@@ -725,7 +768,7 @@ func (w *responseWatchdog) run() {
 	for {
 		select {
 		case <-timer.C:
-			w.cancel(errFirstResponseTimeout)
+			w.cancel(cause)
 			return
 		case <-w.activity:
 			if !timer.Stop() {
@@ -734,6 +777,16 @@ func (w *responseWatchdog) run() {
 				default:
 				}
 			}
+			timer.Reset(w.timeout)
+		case reset := <-w.policy:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			w.timeout = reset.timeout
+			cause = reset.cause
 			timer.Reset(w.timeout)
 		case <-w.done:
 			return
@@ -748,21 +801,38 @@ func (w *responseWatchdog) touch() {
 	}
 }
 
+func (w *responseWatchdog) markOutput(idleTimeout time.Duration) {
+	if w.output.CompareAndSwap(false, true) {
+		w.setPolicy(idleTimeout, errStreamIdleTimeout)
+		return
+	}
+	w.touch()
+}
+
+func (w *responseWatchdog) setPolicy(timeout time.Duration, cause error) {
+	if timeout <= 0 || cause == nil {
+		return
+	}
+	select {
+	case w.policy <- watchdogReset{timeout: timeout, cause: cause}:
+	case <-w.stopped:
+	}
+}
+
 func (w *responseWatchdog) stop() {
 	w.once.Do(func() { close(w.done) })
 	<-w.stopped
 }
 
-// watchdogReadCloser reports body activity without changing the body API.
-type watchdogReadCloser struct {
-	io.ReadCloser
-	touch func()
+type activityReader struct {
+	io.Reader
+	onOutput func()
 }
 
-func (r watchdogReadCloser) Read(p []byte) (int, error) {
-	n, err := r.ReadCloser.Read(p)
-	if n > 0 && r.touch != nil {
-		r.touch()
+func (r activityReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if n > 0 && r.onOutput != nil {
+		r.onOutput()
 	}
 	return n, err
 }
@@ -789,13 +859,13 @@ type relayResult struct {
 	upstreamRequestID string
 }
 
-func relayResponse(w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func()) relayResult {
-	return relayTranslatedResponse(context.Background(), w, resp, start, onFirstByte, nil)
+func relayResponse(w http.ResponseWriter, resp *http.Response, start time.Time, onOutput func()) relayResult {
+	return relayTranslatedResponse(context.Background(), w, resp, start, onOutput, nil)
 }
 
 // relayTranslatedResponse 按"上游是否流式"和"客户端是否要求流式"选择转发方式。
 // auditReadCloser 在同一次读取中旁路提取完成事件、Token 用量和请求 ID。
-func relayTranslatedResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func(), exchange *translate.Exchange) relayResult {
+func relayTranslatedResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, start time.Time, onOutput func(), exchange *translate.Exchange) relayResult {
 	contentType := resp.Header.Get("Content-Type")
 	stream := strings.HasPrefix(contentType, "text/event-stream")
 	audited := newAuditReadCloser(resp.Body, stream)
@@ -804,16 +874,16 @@ func relayTranslatedResponse(ctx context.Context, w http.ResponseWriter, resp *h
 	var result relayResult
 	if stream && exchange != nil && exchange.Translated() {
 		if exchange.Stream {
-			result = relayTranslatedSSE(ctx, w, resp, start, onFirstByte, exchange)
+			result = relayTranslatedSSE(ctx, w, resp, start, onOutput, exchange)
 		} else {
-			result = relayTranslatedSSEToBody(ctx, w, resp, start, onFirstByte, exchange)
+			result = relayTranslatedSSEToBody(ctx, w, resp, start, onOutput, exchange)
 		}
 	} else if stream {
-		result = relaySSE(w, resp, start, onFirstByte)
+		result = relaySSE(w, resp, start, onOutput)
 	} else if exchange != nil && exchange.Translated() {
-		result = relayTranslatedBody(ctx, w, resp, start, onFirstByte, exchange)
+		result = relayTranslatedBody(ctx, w, resp, start, onOutput, exchange)
 	} else {
-		result = relayBody(w, resp, start, onFirstByte)
+		result = relayBody(w, resp, start, onOutput)
 	}
 	audited.audit.finish()
 	result.stream = stream
@@ -826,7 +896,7 @@ func relayTranslatedResponse(ctx context.Context, w http.ResponseWriter, resp *h
 }
 
 // relayTranslatedSSE 逐行翻译 SSE；翻译器可能将一个上游事件展开为多个客户端事件。
-func relayTranslatedSSE(ctx context.Context, w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func(), exchange *translate.Exchange) relayResult {
+func relayTranslatedSSE(ctx context.Context, w http.ResponseWriter, resp *http.Response, start time.Time, onOutput func(), exchange *translate.Exchange) relayResult {
 	flusher, canFlush := w.(http.Flusher)
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 52_428_800)
@@ -844,12 +914,12 @@ func relayTranslatedSSE(ctx context.Context, w http.ResponseWriter, resp *http.R
 			if len(chunk) == 0 {
 				continue
 			}
+			if onOutput != nil {
+				onOutput()
+			}
 			// 首个有效翻译结果才提交响应；此前的读取或翻译错误仍可换源。
 			if !committed {
 				ttft = time.Since(start).Milliseconds()
-				if onFirstByte != nil {
-					onFirstByte()
-				}
 				copyTranslatedResponseHeaders(w.Header(), resp.Header, true)
 				w.WriteHeader(resp.StatusCode)
 				committed = true
@@ -874,7 +944,7 @@ func relayTranslatedSSE(ctx context.Context, w http.ResponseWriter, resp *http.R
 }
 
 // relayTranslatedSSEToBody 汇集流式上游的终态，再向非流式客户端输出单个 JSON。
-func relayTranslatedSSEToBody(ctx context.Context, w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func(), exchange *translate.Exchange) relayResult {
+func relayTranslatedSSEToBody(ctx context.Context, w http.ResponseWriter, resp *http.Response, start time.Time, onOutput func(), exchange *translate.Exchange) relayResult {
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 52_428_800)
 	ttft := int64(0)
@@ -888,16 +958,16 @@ func relayTranslatedSSEToBody(ctx context.Context, w http.ResponseWriter, resp *
 		if len(line) == 0 || !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
+		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if !json.Valid(payload) || !meaningfulSSEPayload(payload) {
+			continue
+		}
+		if onOutput != nil {
+			onOutput()
+		}
 		if firstLine {
 			firstLine = false
 			ttft = time.Since(start).Milliseconds()
-			if onFirstByte != nil {
-				onFirstByte()
-			}
-		}
-		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
-		if bytes.Equal(payload, []byte("[DONE]")) || !json.Valid(payload) {
-			continue
 		}
 		terminalPayload = append(terminalPayload[:0], payload...)
 	}
@@ -934,7 +1004,7 @@ func relayTranslatedSSEToBody(ctx context.Context, w http.ResponseWriter, resp *
 }
 
 // relayTranslatedBody 必须先读完整正文再转换，因此转换成功前不会提交响应。
-func relayTranslatedBody(ctx context.Context, w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func(), exchange *translate.Exchange) relayResult {
+func relayTranslatedBody(ctx context.Context, w http.ResponseWriter, resp *http.Response, start time.Time, onOutput func(), exchange *translate.Exchange) relayResult {
 	buffer := make([]byte, 32*1024)
 	var body bytes.Buffer
 	ttft := int64(0)
@@ -942,12 +1012,12 @@ func relayTranslatedBody(ctx context.Context, w http.ResponseWriter, resp *http.
 	for {
 		n, readErr := resp.Body.Read(buffer)
 		if n > 0 {
+			if onOutput != nil {
+				onOutput()
+			}
 			if firstByte {
 				firstByte = false
 				ttft = time.Since(start).Milliseconds()
-				if onFirstByte != nil {
-					onFirstByte()
-				}
 			}
 			body.Write(buffer[:n])
 		}
@@ -998,31 +1068,54 @@ func copyTranslatedResponseHeaders(dst, src http.Header, stream bool) {
 }
 
 // relaySSE 透明转发 SSE，并在每次写入后立即刷新可用的 Flusher。
-func relaySSE(w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func()) relayResult {
+func relaySSE(w http.ResponseWriter, resp *http.Response, start time.Time, onOutput func()) relayResult {
 	flusher, canFlush := w.(http.Flusher)
 	buffer := make([]byte, 32*1024)
 	committed := false
 	ttft := int64(0)
 	bytesSent := int64(0)
+	var pending bytes.Buffer
+	detector := sseOutputDetector{}
 
 	for {
 		n, readErr := resp.Body.Read(buffer)
 		if n > 0 {
+			meaningful := detector.observe(buffer[:n])
 			if !committed {
-				ttft = time.Since(start).Milliseconds()
-				if onFirstByte != nil {
-					onFirstByte()
+				pending.Write(buffer[:n])
+				if !meaningful {
+					if pending.Len() > 64<<10 && len(detector.line) == 0 {
+						pending.Reset()
+					}
+					if readErr == nil {
+						continue
+					}
+				} else {
+					if onOutput != nil {
+						onOutput()
+					}
+					ttft = time.Since(start).Milliseconds()
+					copyResponseHeaders(w.Header(), resp.Header)
+					w.WriteHeader(resp.StatusCode)
+					committed = true
+					written, err := w.Write(pending.Bytes())
+					bytesSent += int64(written)
+					pending.Reset()
+					if err != nil {
+						return relayResult{err: err, source: relayDownstream, ttftMs: ttft, committed: true, bytesSent: bytesSent}
+					}
 				}
-				copyResponseHeaders(w.Header(), resp.Header)
-				w.WriteHeader(resp.StatusCode)
-				committed = true
+			} else {
+				if meaningful && onOutput != nil {
+					onOutput()
+				}
+				written, err := w.Write(buffer[:n])
+				bytesSent += int64(written)
+				if err != nil {
+					return relayResult{err: err, source: relayDownstream, ttftMs: ttft, committed: true, bytesSent: bytesSent}
+				}
 			}
-			written, err := w.Write(buffer[:n])
-			bytesSent += int64(written)
-			if err != nil {
-				return relayResult{err: err, source: relayDownstream, ttftMs: ttft, committed: true, bytesSent: bytesSent}
-			}
-			if canFlush {
+			if committed && canFlush {
 				flusher.Flush()
 			}
 		}
@@ -1039,9 +1132,59 @@ func relaySSE(w http.ResponseWriter, resp *http.Response, start time.Time, onFir
 	}
 }
 
+type sseOutputDetector struct {
+	line []byte
+}
+
+func (d *sseOutputDetector) observe(chunk []byte) bool {
+	meaningful := false
+	for _, value := range chunk {
+		if value != '\n' {
+			d.line = append(d.line, value)
+			continue
+		}
+		line := bytes.TrimSpace(d.line)
+		d.line = d.line[:0]
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if meaningfulSSEPayload(payload) {
+			meaningful = true
+		}
+	}
+	return meaningful
+}
+
+func meaningfulSSEPayload(payload []byte) bool {
+	payload = bytes.TrimSpace(payload)
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		return false
+	}
+	if !json.Valid(payload) {
+		return true
+	}
+	var value any
+	if json.Unmarshal(payload, &value) != nil {
+		return true
+	}
+	switch typed := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(typed) != ""
+	case map[string]any:
+		return len(typed) > 0
+	case []any:
+		return len(typed) > 0
+	default:
+		return true
+	}
+}
+
 // relayBody 先暂存最多 64 KiB，用于识别"HTTP 2xx 包含错误 JSON"的异常上游。
 // 超过检查窗口后立即提交并继续流式复制，避免大响应全部驻留内存。
-func relayBody(w http.ResponseWriter, resp *http.Response, start time.Time, onFirstByte func()) relayResult {
+func relayBody(w http.ResponseWriter, resp *http.Response, start time.Time, onOutput func()) relayResult {
 	const inspectLimit = 64 << 10
 	buffer := make([]byte, 32*1024)
 	ttft := int64(0)
@@ -1051,12 +1194,12 @@ func relayBody(w http.ResponseWriter, resp *http.Response, start time.Time, onFi
 	for pending.Len() <= inspectLimit {
 		n, readErr := resp.Body.Read(buffer)
 		if n > 0 {
+			if onOutput != nil {
+				onOutput()
+			}
 			if !firstByteSeen {
 				firstByteSeen = true
 				ttft = time.Since(start).Milliseconds()
-				if onFirstByte != nil {
-					onFirstByte()
-				}
 			}
 			pending.Write(buffer[:n])
 		}
@@ -1096,6 +1239,9 @@ func relayBody(w http.ResponseWriter, resp *http.Response, start time.Time, onFi
 	for {
 		n, readErr := resp.Body.Read(buffer)
 		if n > 0 {
+			if onOutput != nil {
+				onOutput()
+			}
 			written, err := w.Write(buffer[:n])
 			bytesSent += int64(written)
 			if err != nil {

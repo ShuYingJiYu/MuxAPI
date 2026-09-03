@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -448,17 +449,16 @@ type countingHealth struct {
 	up      *upstream.Upstream
 }
 
-func (c *countingHealth) Report(id int64, model string, ok bool, latencyMs int64) {
-	atomic.AddInt32(&c.reports, 1)
-}
-func (c *countingHealth) ReleaseClaim(id int64)                       {}
-func (c *countingHealth) MarkModelUnsupported(id int64, model string) {}
-func (c *countingHealth) MarkModelSupported(id int64, model string)   {}
-func (c *countingHealth) PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, error) {
-	if exclude[c.up.ID] {
-		return nil, io.EOF // 没有更多可用上游
+func (c *countingHealth) Complete(_ health.Lease, result health.Result, _ int64) {
+	if result != health.ResultNeutral {
+		atomic.AddInt32(&c.reports, 1)
 	}
-	return c.up, nil
+}
+func (c *countingHealth) PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, health.Lease, error) {
+	if exclude[c.up.ID] {
+		return nil, health.Lease{}, io.EOF // 没有更多可用上游
+	}
+	return c.up, health.Lease{UpstreamID: c.up.ID, Token: 1}, nil
 }
 
 // H2 回归：客户端中途断连(ctx canceled)时，转发层不得 Report 失败——
@@ -728,7 +728,7 @@ func (w *failingWriter) Flush() {}
 func TestDownstreamWriteFailureDoesNotReportChannelFailure(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		io.WriteString(w, "data: {}\ndata: [DONE]\n")
+		io.WriteString(w, "data: {\"chunk\":1}\ndata: [DONE]\n")
 	}))
 	defer server.Close()
 	counting := &countingHealth{up: &upstream.Upstream{ID: 1, BaseURL: server.URL, APIKey: "k", Priority: 1}}
@@ -768,6 +768,83 @@ func TestFirstByteTimeoutFailsOver(t *testing.T) {
 	}
 }
 
+func TestSSEHeartbeatsDoNotExtendFirstResponseDeadline(t *testing.T) {
+	stalled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				io.WriteString(w, ": keep-alive\n\ndata:\n\n")
+				flusher.Flush()
+			}
+		}
+	}))
+	defer stalled.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"text\":\"backup\"}\n\n")
+	}))
+	defer backup.Close()
+
+	upstreams := []*upstream.Upstream{
+		{ID: 1, BaseURL: stalled.URL, APIKey: "k", Priority: 1, Weight: 1},
+		{ID: 2, BaseURL: backup.URL, APIKey: "k", Priority: 2, Weight: 1},
+	}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 2)
+	fwd.SetFirstResponseTimeout(func() time.Duration { return 30 * time.Millisecond })
+	body := []byte(`{"model":"gpt","stream":true}`)
+	recorder := httptest.NewRecorder()
+	started := time.Now()
+	result := fwd.Forward(recorder, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)), body, 1, "")
+
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("heartbeats extended first response deadline: %v", elapsed)
+	}
+	if result.Outcome != OutcomeSuccess || result.FinalUpstreamID != 2 || !strings.Contains(recorder.Body.String(), "backup") {
+		t.Fatalf("heartbeat-only stream should fail over: result=%+v body=%s", result, recorder.Body.String())
+	}
+}
+
+func TestSSEOutputRefreshesIdleDeadline(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		for i := 0; i < 4; i++ {
+			io.WriteString(w, fmt.Sprintf("data: {\"chunk\":%d}\n\n", i))
+			flusher.Flush()
+			time.Sleep(15 * time.Millisecond)
+		}
+	}))
+	defer server.Close()
+	hm := health.New(3, time.Hour)
+	upstreams := []*upstream.Upstream{{ID: 1, BaseURL: server.URL, APIKey: "k", Priority: 1, Weight: 1}}
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 1)
+	fwd.SetFirstResponseTimeout(func() time.Duration { return 25 * time.Millisecond })
+	fwd.SetStreamIdleTimeoutProvider(func() time.Duration { return 25 * time.Millisecond })
+	body := []byte(`{"model":"gpt","stream":true}`)
+	result := fwd.Forward(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)), body, 1, "")
+	if result.Outcome != OutcomeSuccess {
+		t.Fatalf("active stream should remain alive: %+v", result)
+	}
+}
+
+func TestSSEOutputDetectorIgnoresEmptyEvents(t *testing.T) {
+	detector := sseOutputDetector{}
+	if detector.observe([]byte(": ping\n\ndata:\n\ndata: {}\n\ndata: []\n\n")) {
+		t.Fatal("comments and empty data events must not count as output")
+	}
+	if !detector.observe([]byte("data: {\"type\":\"message_start\"}\n\n")) {
+		t.Fatal("non-empty data event should count as output")
+	}
+}
+
 func TestResponseWatchdogReleasesStalledStreamAfterFirstByte(t *testing.T) {
 	stalled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -783,6 +860,7 @@ func TestResponseWatchdogReleasesStalledStreamAfterFirstByte(t *testing.T) {
 	hm := health.New(3, time.Hour)
 	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 1)
 	fwd.SetFirstResponseTimeout(func() time.Duration { return 20 * time.Millisecond })
+	fwd.SetStreamIdleTimeoutProvider(func() time.Duration { return 20 * time.Millisecond })
 	body := []byte(`{"model":"gpt","stream":true}`)
 	recorder := httptest.NewRecorder()
 	started := time.Now()
@@ -790,11 +868,11 @@ func TestResponseWatchdogReleasesStalledStreamAfterFirstByte(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("stalled stream was not cancelled promptly: %v", elapsed)
 	}
-	if result.Outcome != OutcomePartial || result.ErrorKind != "first_response_timeout" {
+	if result.Outcome != OutcomePartial || result.ErrorKind != "stream_idle_timeout" {
 		t.Fatalf("result = %+v, want a timed-out partial stream", result)
 	}
-	if hm.EffectiveState(1) != "OPEN" {
-		t.Fatalf("stalled upstream should be opened by the breaker, state=%s", hm.EffectiveState(1))
+	if hm.EffectiveState(1) != "CLOSED" {
+		t.Fatalf("one stalled stream must remain below threshold, state=%s", hm.EffectiveState(1))
 	}
 }
 
@@ -1102,7 +1180,7 @@ func TestForwardStrictPriorityFailoverAndAutomaticFailback(t *testing.T) {
 		{ID: 1, Name: "primary", BaseURL: primary.URL, APIKey: "k", Protocol: "passthrough", Priority: 1, Weight: 1},
 		{ID: 2, Name: "backup", BaseURL: backup.URL, APIKey: "k", Protocol: "passthrough", Priority: 2, Weight: 1},
 	}
-	hm := health.New(1, time.Hour)
+	hm := health.New(1, 5*time.Millisecond)
 	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 2)
 	body := []byte(`{"model":"gpt-test","stream":false}`)
 	forwardOnce := func() (Result, string) {
@@ -1130,6 +1208,7 @@ func TestForwardStrictPriorityFailoverAndAutomaticFailback(t *testing.T) {
 	}
 
 	primaryFails.Store(false)
+	time.Sleep(10 * time.Millisecond)
 	hm.ObserveProbe(1, "gpt-test", true, 20)
 	hm.ObserveProbe(1, "gpt-test", true, 18)
 	third, thirdBody := forwardOnce()
@@ -1197,18 +1276,13 @@ type recordingHealth struct {
 	inner *health.Manager
 }
 
-func (r *recordingHealth) Report(id int64, model string, ok bool, latencyMs int64) {
-	r.mu.Lock()
-	r.oks = append(r.oks, ok)
-	r.mu.Unlock()
-	r.inner.Report(id, model, ok, latencyMs)
-}
-func (r *recordingHealth) ReleaseClaim(id int64) { r.inner.ReleaseClaim(id) }
-func (r *recordingHealth) MarkModelUnsupported(id int64, model string) {
-	r.inner.MarkModelUnsupported(id, model)
-}
-func (r *recordingHealth) MarkModelSupported(id int64, model string) {
-	r.inner.MarkModelSupported(id, model)
+func (r *recordingHealth) Complete(lease health.Lease, result health.Result, latencyMs int64) {
+	if result == health.ResultSuccess || result == health.ResultFailure {
+		r.mu.Lock()
+		r.oks = append(r.oks, result == health.ResultSuccess)
+		r.mu.Unlock()
+	}
+	r.inner.Complete(lease, result, latencyMs)
 }
 func (r *recordingHealth) EffectiveState(id int64) string { return r.inner.EffectiveState(id) }
 func (r *recordingHealth) reported() []bool {

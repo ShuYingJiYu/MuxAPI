@@ -63,6 +63,15 @@ func TestComputeAdaptiveTimeout(t *testing.T) {
 			// 5000*2=10s + 50000/50000*5s = 10s + 5s = 15s
 			want: 15 * time.Second,
 		},
+		{
+			name: "explicit zero token bonus disables context extension",
+			params: AdaptiveTimeoutParams{
+				P95Ms: 5000, Samples: 10, InputTokens: 50000,
+				Floor: 10 * time.Second, Ceiling: 120 * time.Second,
+				TokenBonusConfigured: true,
+			},
+			want: 10 * time.Second,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

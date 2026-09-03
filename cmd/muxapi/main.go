@@ -55,20 +55,30 @@ func main() {
 		"max_upstream_attempts": strconv.Itoa(initialMaxAttempts),
 		"max_body_bytes":        strconv.FormatInt(cfg.MaxBody, 10),
 	}
+	storedSettings, err := st.Settings()
+	if err != nil {
+		slog.Error("load runtime settings failed", "err", err)
+		return
+	}
 	if !cfg.ReadOnly {
+		missing := make(map[string]string)
 		for key, value := range runtimeDefaults {
-			if st.GetSetting(key, "") != "" {
-				continue
-			}
-			if err := st.SetSetting(key, value); err != nil {
-				slog.Error("seed runtime setting failed", "key", key, "err", err)
-				return
+			if storedSettings[key] == "" {
+				missing[key] = value
 			}
 		}
+		if err := st.SetSettings(missing); err != nil {
+			slog.Error("seed runtime settings failed", "err", err)
+			return
+		}
+		for key, value := range missing {
+			storedSettings[key] = value
+		}
 	}
+	runtimeSettings := newRuntimeSettingSnapshot(st, storedSettings)
 	settingDuration := func(key string, def time.Duration) func() time.Duration {
 		return func() time.Duration {
-			if d, err := time.ParseDuration(st.GetSetting(key, "")); err == nil && d > 0 {
+			if d, err := time.ParseDuration(runtimeSettings.Get(key)); err == nil && d > 0 {
 				return d
 			}
 			return def
@@ -76,7 +86,7 @@ func main() {
 	}
 	settingString := func(key, def string) func() string {
 		return func() string {
-			if v := st.GetSetting(key, ""); v != "" {
+			if v := runtimeSettings.Get(key); v != "" {
 				return v
 			}
 			return def
@@ -84,7 +94,7 @@ func main() {
 	}
 	settingInt := func(key string, def int) func() int {
 		return func() int {
-			if n, err := strconv.Atoi(st.GetSetting(key, "")); err == nil && n > 0 {
+			if n, err := strconv.Atoi(runtimeSettings.Get(key)); err == nil && n > 0 {
 				return n
 			}
 			return def
@@ -92,8 +102,32 @@ func main() {
 	}
 	settingInt64 := func(key string, def int64) func() int64 {
 		return func() int64 {
-			if n, err := strconv.ParseInt(st.GetSetting(key, ""), 10, 64); err == nil && n > 0 {
+			if n, err := strconv.ParseInt(runtimeSettings.Get(key), 10, 64); err == nil && n > 0 {
 				return n
+			}
+			return def
+		}
+	}
+	settingIntAllowZero := func(key string, def int) func() int {
+		return func() int {
+			if n, err := strconv.Atoi(runtimeSettings.Get(key)); err == nil && n >= 0 {
+				return n
+			}
+			return def
+		}
+	}
+	settingFloat := func(key string, def float64) func() float64 {
+		return func() float64 {
+			if n, err := strconv.ParseFloat(runtimeSettings.Get(key), 64); err == nil && n >= 0 {
+				return n
+			}
+			return def
+		}
+	}
+	settingBool := func(key string, def bool) func() bool {
+		return func() bool {
+			if enabled, err := strconv.ParseBool(runtimeSettings.Get(key)); err == nil {
+				return enabled
 			}
 			return def
 		}
@@ -113,6 +147,10 @@ func main() {
 	failThreshold := settingInt("fail_threshold", cfg.FailThreshold)
 	cooldown := settingDuration("cooldown", cfg.Cooldown)
 	hm := health.New(failThreshold(), cooldown())
+	breakerRecoverySuccesses := settingInt("breaker_recovery_successes", 2)
+	breakerMaxCooldown := settingDuration("breaker_max_cooldown", 5*time.Minute)
+	modelUnsupportedTTL := settingDuration("model_unsupported_ttl", 5*time.Minute)
+	hm.SetAdvancedPolicy(breakerRecoverySuccesses(), breakerMaxCooldown(), modelUnsupportedTTL())
 	// 重启恢复：用最近的转发样本重建选路用的渠道延迟 EWMA，不重建熔断状态
 	if samples, err := st.RecentSamples(2000); err != nil {
 		slog.Warn("seed route stats from logs failed", "err", err)
@@ -128,9 +166,20 @@ func main() {
 	// Cost/cache-aware selection is enabled globally. It falls back to the
 	// existing health/P2C scheduler when pricing is incomplete or cold.
 	routeConfig := func() routing.Config {
-		return routing.DefaultConfig()
+		return routing.Config{
+			Window:            settingDuration("routing_window", 15*time.Minute)(),
+			CostTieTolerance:  settingFloat("routing_cost_tie_tolerance", 0.01)(),
+			LatencyWeight:     settingFloat("routing_latency_weight", 0.25)(),
+			ReliabilityWeight: settingFloat("routing_reliability_weight", 0.15)(),
+			MinSamples:        int64(settingIntAllowZero("routing_min_samples", 20)()),
+			MaxTTFTMs:         settingFloat("routing_max_ttft_ms", 0)(),
+			MaxDurationMs:     settingFloat("routing_max_duration_ms", 0)(),
+			AllowUnknownPrice: settingBool("routing_allow_unknown_price", false)(),
+			ExplorationRate:   settingFloat("routing_exploration_rate", 0.02)(),
+		}
 	}
 	sched.SetIntelligentRouting(st, routeConfig)
+	sched.SetIntelligentRoutingEnabled(settingBool("intelligent_routing_enabled", true))
 	maxUpstreamAttempts := settingInt("max_upstream_attempts", initialMaxAttempts)
 	var maxAttemptsValue atomic.Int64
 	maxAttemptsValue.Store(int64(maxUpstreamAttempts()))
@@ -142,7 +191,7 @@ func main() {
 		slog.Info("model aliases loaded", "count", len(aliases))
 	}
 	mon := monitor.New(st)
-	// 首个响应或流中连续无数据达到阈值时取消上游；每收到字节都会重置计时器。
+	// 首字节和流中空闲使用不同的超时策略，避免把 TTFT 分位数误用于长流。
 	firstResponseTimeoutMs := settingInt("first_response_timeout_ms", 120000)
 	fwd.SetFirstResponseTimeout(func() time.Duration {
 		return time.Duration(firstResponseTimeoutMs()) * time.Millisecond
@@ -153,6 +202,19 @@ func main() {
 	fwd.SetModelMapper(modelMapper)
 	// Adaptive first-byte timeout: use per-upstream P95 TTFT from routing stats.
 	fwd.SetTTFTEstimator(sched)
+	fwd.SetAdaptiveTimeoutPolicyProvider(func() forward.AdaptiveTimeoutPolicy {
+		return forward.AdaptiveTimeoutPolicy{
+			Enabled:    settingBool("adaptive_timeout_enabled", true)(),
+			Floor:      time.Duration(settingInt("adaptive_timeout_floor_ms", 10000)()) * time.Millisecond,
+			Multiplier: settingFloat("adaptive_timeout_multiplier", 2)(),
+			MinSamples: int64(settingInt("adaptive_timeout_min_samples", 5)()),
+			TokenStep:  int64(settingInt("adaptive_timeout_token_step", 50000)()),
+			TokenBonus: time.Duration(settingIntAllowZero("adaptive_timeout_token_bonus_ms", 5000)()) * time.Millisecond,
+		}
+	})
+	fwd.SetStreamIdleTimeoutProvider(func() time.Duration {
+		return time.Duration(settingInt("stream_idle_timeout_ms", 300000)()) * time.Millisecond
+	})
 
 	// 健康事件主动告警：熔断翻转时推送 Webhook（URL 空则关闭）。
 	// id→name 解析用现成 List()，解析不到回退 id 字符串。
@@ -184,7 +246,12 @@ func main() {
 	srv.SetVersion(Version)
 	srv.SetMaxBodyProvider(maxBodyValue.Load)
 	srv.SetSettingsChanged(func() {
+		if err := runtimeSettings.Reload(); err != nil {
+			slog.Error("refresh runtime settings failed", "err", err)
+			return
+		}
 		hm.SetFailurePolicy(failThreshold(), cooldown())
+		hm.SetAdvancedPolicy(breakerRecoverySuccesses(), breakerMaxCooldown(), modelUnsupportedTTL())
 		maxAttemptsValue.Store(int64(maxUpstreamAttempts()))
 		maxBodyValue.Store(maxBodyBytes())
 	})
@@ -225,7 +292,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runLogJanitor(ctx, st, requestRetentionDays)
+			runLogJanitor(ctx, st, requestRetentionDays, settingIntAllowZero("probe_retention_hours", 0), settingIntAllowZero("billing_snapshot_retention_days", 0))
 		}()
 	} else {
 		slog.Info("read-only mode enabled: background writers disabled")
@@ -260,11 +327,10 @@ func main() {
 // runLogJanitor 定时执行可选的数据清理：启动先执行一次，之后每 10 分钟一轮。
 // keepDays() 每轮读取最新保留天数；每批最多 5000 个请求，避免长事务影响业务查询。
 // 默认不删除探测结果、请求记录或计费快照；正数保留策略仍可由运维显式启用。
-func runLogJanitor(ctx context.Context, st *store.Store, keepDays func() int) {
+func runLogJanitor(ctx context.Context, st *store.Store, keepDays, probeKeepHours, billingKeepDays func() int) {
 	const (
-		probeKeepHours = 0
-		requestBatch   = 5000
-		maxBatches     = 10
+		requestBatch = 5000
+		maxBatches   = 10
 	)
 	prune := func() {
 		days := keepDays()
@@ -283,21 +349,19 @@ func runLogJanitor(ctx context.Context, st *store.Store, keepDays func() int) {
 				}
 			}
 		}
-		if deleted, err := st.PruneProbes(probeKeepHours); err != nil {
+		probeHours := probeKeepHours()
+		if deleted, err := st.PruneProbes(probeHours); err != nil {
 			slog.Error("probe janitor prune failed", "err", err)
 		} else if deleted > 0 {
-			slog.Info("probe janitor pruned", "deleted", deleted, "keepHours", probeKeepHours)
+			slog.Info("probe janitor pruned", "deleted", deleted, "keepHours", probeHours)
 		}
 		// 计费快照同样默认永久保留；仅显式正数策略才清理。
-		billingKeepDays := 0
-		if value, err := strconv.Atoi(st.GetSetting("billing_snapshot_retention_days", "0")); err == nil {
-			billingKeepDays = value
-		}
-		if deleted, err := st.PruneBillingSnapshots(billingKeepDays); err != nil {
+		billingDays := billingKeepDays()
+		if deleted, err := st.PruneBillingSnapshots(billingDays); err != nil {
 			slog.Error("billing snapshot janitor prune failed", "err", err)
 		} else if deleted > 0 {
 			slog.Info("billing snapshot janitor pruned", "deleted", deleted,
-				"keepDays", store.BillingSnapshotKeepDays)
+				"keepDays", billingDays)
 		}
 	}
 	prune() // 启动即清一次，立刻收敛历史堆积

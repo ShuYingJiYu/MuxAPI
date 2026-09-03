@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mirainya/muxapi/internal/health"
 	"github.com/mirainya/muxapi/internal/store"
 	"github.com/mirainya/muxapi/internal/translate"
 	"github.com/mirainya/muxapi/internal/upstream"
@@ -19,13 +20,8 @@ import (
 // breakerReporter 探测结果喂给熔断器的最小接口（由 health.Manager 实现）。
 // 定义在 monitor 侧避免 import 环：health 不依赖 monitor，反向注入即可。
 type breakerReporter interface {
-	ObserveProbe(id int64, model string, ok bool, latencyMs int64)
-}
-
-// capabilityReporter 将明确的模型支持结果写入短期能力缓存。
-type capabilityReporter interface {
-	MarkModelUnsupported(id int64, model string)
-	MarkModelSupported(id int64, model string)
+	BeginProbe(id int64, model string) health.Lease
+	Complete(lease health.Lease, result health.Result, latencyMs int64)
 }
 
 // Prober 监控探测器：按各监控项自带的渠道+模型+探测参数发最小请求。
@@ -195,6 +191,17 @@ func buildProbeBody(m *store.Monitor) []byte {
 
 // Probe 探测单个监控项一次：双写看板统计与路由熔断器。
 func (p *Prober) Probe(ctx context.Context, m *store.Monitor) {
+	var lease health.Lease
+	if p.breaker != nil {
+		lease = p.breaker.BeginProbe(m.UpstreamID, m.Model)
+	}
+	complete := func(result health.Result, latencyMs int64) {
+		if p.breaker != nil && lease.Valid() {
+			p.breaker.Complete(lease, result, latencyMs)
+			lease = health.Lease{}
+		}
+	}
+	defer complete(health.ResultNeutral, 0)
 	path := m.Path
 	if strings.TrimSpace(path) == "" {
 		path = p.path()
@@ -203,7 +210,7 @@ func (p *Prober) Probe(ctx context.Context, m *store.Monitor) {
 		strings.TrimSuffix(m.BaseURL, "/")+path, strings.NewReader(string(buildProbeBody(m))))
 	if err != nil {
 		p.mgr.Record(m.ID, statDown, 0)
-		p.observe(m, false, 0, 0)
+		complete(health.ResultFailure, 0)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -219,62 +226,48 @@ func (p *Prober) Probe(ctx context.Context, m *store.Monitor) {
 	resp, err := client.Do(req)
 	ttft := time.Since(start).Milliseconds()
 	if err != nil { // 网络错误：看板记故障 + 熔断器记模型级失败
+		if ctx.Err() != nil {
+			complete(health.ResultNeutral, 0)
+			return
+		}
 		p.mgr.Record(m.ID, statDown, 0)
-		p.observe(m, false, 0, 0)
+		complete(health.ResultFailure, 0)
 		return
 	}
 	defer resp.Body.Close()
 	payload, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if readErr != nil {
+		if ctx.Err() != nil {
+			complete(health.ResultNeutral, 0)
+			return
+		}
 		p.mgr.Record(m.ID, statDown, 0)
-		p.observe(m, false, 0, 0)
+		complete(health.ResultFailure, 0)
 		return
 	}
 	if upstream.IsModelUnsupported(resp.StatusCode, m.Model, string(payload)) {
 		p.mgr.Record(m.ID, statDown, ttft)
-		if reporter, ok := p.breaker.(capabilityReporter); ok {
-			reporter.MarkModelUnsupported(m.UpstreamID, m.Model)
-		}
+		complete(health.ResultModelUnsupported, ttft)
 		return
 	}
 	if upstream.IsFailureStatus(resp.StatusCode) {
 		p.mgr.Record(m.ID, classify(resp.StatusCode), ttft)
-		p.observe(m, true, resp.StatusCode, ttft)
+		complete(health.ResultFailure, ttft)
 		return
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		if validProbePayload(resp.Header.Get("Content-Type"), payload, m.Stream) {
 			p.mgr.Record(m.ID, statOK, ttft)
-			if reporter, ok := p.breaker.(capabilityReporter); ok {
-				reporter.MarkModelSupported(m.UpstreamID, m.Model)
-			}
-			p.observe(m, true, resp.StatusCode, ttft)
+			complete(health.ResultSuccess, ttft)
 			return
 		}
 		p.mgr.Record(m.ID, statDown, ttft)
-		p.observe(m, false, 0, 0)
+		complete(health.ResultFailure, ttft)
 		return
 	}
 	// Other 4xx responses are request/configuration errors. They remain visible
 	// on the monitor but do not poison channel health.
 	p.mgr.Record(m.ID, classify(resp.StatusCode), ttft)
-}
-
-// observe sends only channel-level failures/successes to the breaker.
-func (p *Prober) observe(m *store.Monitor, hasResp bool, code int, lat int64) {
-	if p.breaker == nil {
-		return
-	}
-	if !hasResp {
-		p.breaker.ObserveProbe(m.UpstreamID, m.Model, false, 0)
-		return
-	}
-	switch {
-	case code >= 200 && code < 300:
-		p.breaker.ObserveProbe(m.UpstreamID, m.Model, true, lat)
-	case upstream.IsFailureStatus(code):
-		p.breaker.ObserveProbe(m.UpstreamID, m.Model, false, lat)
-	}
 }
 
 func validProbePayload(contentType string, payload []byte, stream bool) bool {

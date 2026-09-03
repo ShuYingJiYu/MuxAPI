@@ -20,20 +20,20 @@ var errBadMonitor = errors.New("monitor requires upstream_id and model")
 // 所有 admin 端点都是非流式 JSON，可以安全 gzip。
 func (s *Server) registerAdmin(mux *http.ServeMux) {
 	admin := func(h http.HandlerFunc) http.HandlerFunc { return gzipMiddleware(s.auth(h)) }
-	mux.HandleFunc("/admin/upstreams", admin(s.adminUpstreams))                // GET 全局池 / POST 新增
-	mux.HandleFunc("/admin/upstreams/", admin(s.adminUpstreamItem))            // PUT 改 / DELETE 删
-	mux.HandleFunc("/admin/tags", admin(s.adminTags))                          // GET 列表 / POST 新增
-	mux.HandleFunc("/admin/tags/", admin(s.adminTagItem))                      // PUT 改 / DELETE 删
-	mux.HandleFunc("/admin/monitors", admin(s.adminMonitors))                  // GET 监控列表 / POST 新增
-	mux.HandleFunc("/admin/monitors/", admin(s.adminMonitorItem))              // PUT 改 / DELETE 删 / {id}/probe 立即探测
-	mux.HandleFunc("/admin/groups", admin(s.adminGroups))                      // GET 列表 / POST 新增
-	mux.HandleFunc("/admin/groups/", admin(s.adminGroupSub))                   // /{id} 改/删 ; /{id}/upstreams 成员 ; /{id}/keys 密钥
-	mux.HandleFunc("/admin/keys/", admin(s.adminKeyItem))                      // PUT 启停 / DELETE 删
-	mux.HandleFunc("/admin/logs", admin(s.adminLogs))                          // GET 调用日志(游标分页+筛选)
-	mux.HandleFunc("/admin/logs/stats", admin(s.adminLogStats))                // GET 当前筛选范围统计
-	mux.HandleFunc("/admin/logs/cache-stats", admin(s.adminLogCacheStats))     // GET 按渠道汇总缓存命中率
-	mux.HandleFunc("/admin/logs/options", admin(s.adminLogOptions))            // GET 筛选下拉选项(全量去重)
-	mux.HandleFunc("/admin/logs/", admin(s.adminLogItem))                      // GET 单条请求完整尝试链
+	mux.HandleFunc("/admin/upstreams", admin(s.adminUpstreams))            // GET 全局池 / POST 新增
+	mux.HandleFunc("/admin/upstreams/", admin(s.adminUpstreamItem))        // PUT 改 / DELETE 删
+	mux.HandleFunc("/admin/tags", admin(s.adminTags))                      // GET 列表 / POST 新增
+	mux.HandleFunc("/admin/tags/", admin(s.adminTagItem))                  // PUT 改 / DELETE 删
+	mux.HandleFunc("/admin/monitors", admin(s.adminMonitors))              // GET 监控列表 / POST 新增
+	mux.HandleFunc("/admin/monitors/", admin(s.adminMonitorItem))          // PUT 改 / DELETE 删 / {id}/probe 立即探测
+	mux.HandleFunc("/admin/groups", admin(s.adminGroups))                  // GET 列表 / POST 新增
+	mux.HandleFunc("/admin/groups/", admin(s.adminGroupSub))               // /{id} 改/删 ; /{id}/upstreams 成员 ; /{id}/keys 密钥
+	mux.HandleFunc("/admin/keys/", admin(s.adminKeyItem))                  // PUT 启停 / DELETE 删
+	mux.HandleFunc("/admin/logs", admin(s.adminLogs))                      // GET 调用日志(游标分页+筛选)
+	mux.HandleFunc("/admin/logs/stats", admin(s.adminLogStats))            // GET 当前筛选范围统计
+	mux.HandleFunc("/admin/logs/cache-stats", admin(s.adminLogCacheStats)) // GET 按渠道汇总缓存命中率
+	mux.HandleFunc("/admin/logs/options", admin(s.adminLogOptions))        // GET 筛选下拉选项(全量去重)
+	mux.HandleFunc("/admin/logs/", admin(s.adminLogItem))                  // GET 单条请求完整尝试链
 	mux.HandleFunc("/admin/routing/decisions", admin(s.adminRouteDecisions))
 	mux.HandleFunc("/admin/routing/decisions/", admin(s.adminRouteDecisionItem))
 	mux.HandleFunc("/admin/overview/summary", admin(s.adminOverviewSummary)) // GET 今日请求/本周费用汇总
@@ -189,7 +189,9 @@ func settingString(v any) string {
 	case string:
 		return x
 	case float64:
-		return strconv.FormatInt(int64(x), 10)
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	case bool:
+		return strconv.FormatBool(x)
 	default:
 		return ""
 	}

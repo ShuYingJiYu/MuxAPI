@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mirainya/muxapi/internal/health"
 	"github.com/mirainya/muxapi/internal/routing"
 	"github.com/mirainya/muxapi/internal/store"
 	"github.com/mirainya/muxapi/internal/upstream"
@@ -75,10 +76,10 @@ type inflationCacheEntry struct {
 	value   float64
 }
 
-func (r *intelligentRouter) pick(s *Scheduler, groupID int64, model string, features routing.RequestFeatures, exclude map[int64]bool) (*upstream.Upstream, routing.Decision, error) {
+func (r *intelligentRouter) pick(s *Scheduler, groupID int64, model string, features routing.RequestFeatures, exclude map[int64]bool) (*upstream.Upstream, health.Lease, routing.Decision, error) {
 	all := s.list(groupID)
 	if len(all) == 0 {
-		return nil, routing.Decision{}, ErrNoUpstream
+		return nil, health.Lease{}, routing.Decision{}, ErrNoUpstream
 	}
 	blocked := make(map[int64]bool, len(exclude))
 	for id, value := range exclude {
@@ -98,6 +99,7 @@ func (r *intelligentRouter) pick(s *Scheduler, groupID int64, model string, feat
 			Features: features, Forecast: r.forecast(all, model, features, cfg, now),
 			Candidates: candidates, Config: cfg, Now: now,
 		})
+		blockHardLimitRejections(blocked, decision.Evaluations, cfg)
 		if err != nil {
 			break
 		}
@@ -105,8 +107,8 @@ func (r *intelligentRouter) pick(s *Scheduler, groupID int64, model string, feat
 			if candidate.ID != decision.SelectedID || blocked[candidate.ID] {
 				continue
 			}
-			if s.health.Claim(candidate.ID, model) {
-				return candidate, decision, nil
+			if lease, ok := s.health.Claim(groupID, candidate.ID, model); ok {
+				return candidate, lease, decision, nil
 			}
 			blocked[candidate.ID] = true
 			break
@@ -114,15 +116,30 @@ func (r *intelligentRouter) pick(s *Scheduler, groupID int64, model string, feat
 	}
 	// Unknown price, a cold catalog, or a claim race must never make the
 	// gateway unavailable. Preserve the original scheduler behavior.
-	candidate, err := s.PickExcluding(groupID, model, blocked)
+	candidate, lease, err := s.PickExcluding(groupID, model, blocked)
 	if candidate == nil || err != nil {
-		return candidate, routing.Decision{}, err
+		return candidate, lease, routing.Decision{}, err
 	}
-	return candidate, routing.Decision{
+	return candidate, lease, routing.Decision{
 		SelectedID: candidate.ID, SelectedName: candidate.Name,
 		Reason:   "fallback: cost data incomplete; standard health/P2C scheduler",
 		Forecast: routing.TrafficForecast{Window: cfg.Window},
 	}, nil
+}
+
+func blockHardLimitRejections(blocked map[int64]bool, evaluations []routing.CandidateEvaluation, cfg routing.Config) {
+	for _, evaluation := range evaluations {
+		if evaluation.Samples <= 0 {
+			continue
+		}
+		if cfg.MaxTTFTMs > 0 && evaluation.P95TTFTMs > cfg.MaxTTFTMs {
+			blocked[evaluation.CandidateID] = true
+			continue
+		}
+		if cfg.MaxDurationMs > 0 && evaluation.P95DurationMs > cfg.MaxDurationMs {
+			blocked[evaluation.CandidateID] = true
+		}
+	}
 }
 
 func (r *intelligentRouter) candidates(s *Scheduler, all []*upstream.Upstream, model string, features routing.RequestFeatures, blocked map[int64]bool, now time.Time, cfg routing.Config) []routing.Candidate {

@@ -1319,6 +1319,28 @@ const failThresholdSource = ref('')
 const cooldownSource = ref('')
 const maxUpstreamAttemptsSource = ref('')
 const maxBodyBytesSource = ref('')
+const adaptiveTimeoutEnabled = ref(true)
+const adaptiveTimeoutFloorSec = ref('10')
+const adaptiveTimeoutMultiplier = ref('2')
+const adaptiveTimeoutMinSamples = ref('5')
+const adaptiveTimeoutTokenStep = ref('50000')
+const adaptiveTimeoutTokenBonusSec = ref('5')
+const streamIdleTimeoutSec = ref('300')
+const intelligentRoutingEnabled = ref(true)
+const routingWindow = ref('15m')
+const routingCostTieTolerance = ref('0.01')
+const routingLatencyWeight = ref('0.25')
+const routingReliabilityWeight = ref('0.15')
+const routingMinSamples = ref('20')
+const routingMaxTTFTMs = ref('0')
+const routingMaxDurationMs = ref('0')
+const routingAllowUnknownPrice = ref(false)
+const routingExplorationRate = ref('0.02')
+const breakerRecoverySuccesses = ref('2')
+const breakerMaxCooldown = ref('5m')
+const modelUnsupportedTTL = ref('5m')
+const billingSnapshotRetentionDays = ref('0')
+const probeRetentionHours = ref('0')
 const apiBase = location.origin    // 当前访问地址，用于展示客户端接入端点
 const settingsSaved = ref(false)
 const settingsSection = ref('logs')  // 设置页左锚点：logs | alert | endpoint | backup
@@ -1446,6 +1468,7 @@ function copyText(t, id) {
 }
 async function loadSettings() {
   const s = await api.getSettings()
+  const value = key => s[key] || s[`effective_${key}`] || ''
   effectiveLogRetention.value = s.effective_log_retention || ''
   effectiveAlertWebhook.value = s.effective_alert_webhook || ''
   effectiveAlertDebounce.value = s.effective_alert_debounce || ''
@@ -1471,6 +1494,28 @@ async function loadSettings() {
   cooldownSource.value = s.cooldown_source || ''
   maxUpstreamAttemptsSource.value = s.max_upstream_attempts_source || ''
   maxBodyBytesSource.value = s.max_body_bytes_source || ''
+  adaptiveTimeoutEnabled.value = value('adaptive_timeout_enabled') === 'true'
+  adaptiveTimeoutFloorSec.value = String(Number(value('adaptive_timeout_floor_ms')) / 1000)
+  adaptiveTimeoutMultiplier.value = value('adaptive_timeout_multiplier')
+  adaptiveTimeoutMinSamples.value = value('adaptive_timeout_min_samples')
+  adaptiveTimeoutTokenStep.value = value('adaptive_timeout_token_step')
+  adaptiveTimeoutTokenBonusSec.value = String(Number(value('adaptive_timeout_token_bonus_ms')) / 1000)
+  streamIdleTimeoutSec.value = String(Number(value('stream_idle_timeout_ms')) / 1000)
+  intelligentRoutingEnabled.value = value('intelligent_routing_enabled') === 'true'
+  routingWindow.value = value('routing_window')
+  routingCostTieTolerance.value = value('routing_cost_tie_tolerance')
+  routingLatencyWeight.value = value('routing_latency_weight')
+  routingReliabilityWeight.value = value('routing_reliability_weight')
+  routingMinSamples.value = value('routing_min_samples')
+  routingMaxTTFTMs.value = value('routing_max_ttft_ms')
+  routingMaxDurationMs.value = value('routing_max_duration_ms')
+  routingAllowUnknownPrice.value = value('routing_allow_unknown_price') === 'true'
+  routingExplorationRate.value = value('routing_exploration_rate')
+  breakerRecoverySuccesses.value = value('breaker_recovery_successes')
+  breakerMaxCooldown.value = value('breaker_max_cooldown')
+  modelUnsupportedTTL.value = value('model_unsupported_ttl')
+  billingSnapshotRetentionDays.value = value('billing_snapshot_retention_days')
+  probeRetentionHours.value = value('probe_retention_hours')
 }
 const sourceText = s => s === 'settings' ? '数据库设置' : '默认值'
 // 设置页左锚点点击：滚动到对应 section 并高亮
@@ -1488,6 +1533,28 @@ function saveSettings() {
       cooldown: cooldown.value,
       max_upstream_attempts: String(maxUpstreamAttempts.value),
       max_body_bytes: String(Math.round((Number(maxBodyMB.value) || 32) * 1048576)),
+      adaptive_timeout_enabled: adaptiveTimeoutEnabled.value,
+      adaptive_timeout_floor_ms: String(Number(adaptiveTimeoutFloorSec.value) * 1000),
+      adaptive_timeout_multiplier: String(adaptiveTimeoutMultiplier.value),
+      adaptive_timeout_min_samples: String(adaptiveTimeoutMinSamples.value),
+      adaptive_timeout_token_step: String(adaptiveTimeoutTokenStep.value),
+      adaptive_timeout_token_bonus_ms: String(Number(adaptiveTimeoutTokenBonusSec.value) * 1000),
+      stream_idle_timeout_ms: String(Number(streamIdleTimeoutSec.value) * 1000),
+      intelligent_routing_enabled: intelligentRoutingEnabled.value,
+      routing_window: routingWindow.value,
+      routing_cost_tie_tolerance: String(routingCostTieTolerance.value),
+      routing_latency_weight: String(routingLatencyWeight.value),
+      routing_reliability_weight: String(routingReliabilityWeight.value),
+      routing_min_samples: String(routingMinSamples.value),
+      routing_max_ttft_ms: String(routingMaxTTFTMs.value),
+      routing_max_duration_ms: String(routingMaxDurationMs.value),
+      routing_allow_unknown_price: routingAllowUnknownPrice.value,
+      routing_exploration_rate: String(routingExplorationRate.value),
+      breaker_recovery_successes: String(breakerRecoverySuccesses.value),
+      breaker_max_cooldown: breakerMaxCooldown.value,
+      model_unsupported_ttl: modelUnsupportedTTL.value,
+      billing_snapshot_retention_days: String(billingSnapshotRetentionDays.value),
+      probe_retention_hours: String(probeRetentionHours.value),
     })
     await loadSettings()
     settingsSaved.value = true
@@ -2804,6 +2871,8 @@ function logout() {
                 <div class="settings-title"><h3>日志清理</h3><p>按完成时间保留请求记录；设为 0 可永久保留完整路由与计费历史。</p></div>
                 <div class="settings-fields">
                   <div class="field"><label>保留天数（0=永久）</label><input v-model="logRetention" type="number" min="0" max="365" placeholder="0" /></div>
+                  <div class="field"><label>探测记录保留小时（0=永久）</label><input v-model="probeRetentionHours" type="number" min="0" max="87600" /></div>
+                  <div class="field"><label>计费快照保留天数（0=永久）</label><input v-model="billingSnapshotRetentionDays" type="number" min="0" max="3650" /></div>
                 </div>
                 <div class="settings-info">
                   <div><span>请求记录</span><b>{{ effectiveLogRetention ? effectiveLogRetention + ' 天' : '—' }}</b><em>{{ sourceText(logRetentionSource) }}</em></div>
@@ -2815,22 +2884,51 @@ function logout() {
               </section>
 
               <section id="set-route" v-show="settingsSection === 'route'" class="card settings-card">
-                <div class="settings-title"><h3>渠道路由</h3><p>首字节前允许故障切换，流开始后保持透明传输。</p></div>
+                <div class="settings-title"><h3>渠道路由</h3><p>首字节前允许故障切换，流开始后使用独立的空闲超时。</p></div>
                 <div class="settings-fields">
                   <div class="field"><label>首字节超时（秒）</label><input v-model="firstResponseTimeoutSec" type="number" min="1" max="600" placeholder="120" /></div>
+                  <div class="field"><label>流空闲超时（秒）</label><input v-model="streamIdleTimeoutSec" type="number" min="1" max="3600" /></div>
                   <div class="field"><label>最大上游尝试数</label><input v-model="maxUpstreamAttempts" type="number" min="1" max="100" placeholder="6" /></div>
                   <div class="field"><label>熔断失败阈值</label><input v-model="failThreshold" type="number" min="1" max="100" placeholder="3" /></div>
                   <div class="field"><label>熔断冷却时间</label><input v-model="cooldown" placeholder="30s / 5m" /></div>
                   <div class="field"><label>请求体上限（MB）</label><input v-model="maxBodyMB" type="number" min="1" max="256" placeholder="32" /></div>
                 </div>
+                <h4>自适应首字节超时</h4>
+                <label class="check"><input type="checkbox" v-model="adaptiveTimeoutEnabled" /> 根据渠道历史 P95 TTFT 动态缩短首字节等待</label>
+                <div class="settings-fields">
+                  <div class="field"><label>超时下限（秒）</label><input v-model="adaptiveTimeoutFloorSec" type="number" min="1" max="600" step="0.1" /></div>
+                  <div class="field"><label>P95 倍数</label><input v-model="adaptiveTimeoutMultiplier" type="number" min="0.1" max="10" step="0.1" /></div>
+                  <div class="field"><label>最少样本数</label><input v-model="adaptiveTimeoutMinSamples" type="number" min="1" max="10000" /></div>
+                  <div class="field"><label>长上下文步长（token）</label><input v-model="adaptiveTimeoutTokenStep" type="number" min="1" max="10000000" /></div>
+                  <div class="field"><label>每步增加（秒）</label><input v-model="adaptiveTimeoutTokenBonusSec" type="number" min="0" max="600" step="0.1" /></div>
+                </div>
+                <h4>智能路由</h4>
+                <label class="check"><input type="checkbox" v-model="intelligentRoutingEnabled" /> 启用成本、延迟和可靠性联合选路</label>
+                <label class="check"><input type="checkbox" v-model="routingAllowUnknownPrice" /> 允许价格未知的渠道参与智能路由</label>
+                <div class="settings-fields">
+                  <div class="field"><label>统计窗口</label><input v-model="routingWindow" placeholder="15m" /></div>
+                  <div class="field"><label>成本接近阈值（0~1）</label><input v-model="routingCostTieTolerance" type="number" min="0" max="1" step="0.01" /></div>
+                  <div class="field"><label>延迟权重</label><input v-model="routingLatencyWeight" type="number" min="0" max="10" step="0.05" /></div>
+                  <div class="field"><label>可靠性权重</label><input v-model="routingReliabilityWeight" type="number" min="0" max="10" step="0.05" /></div>
+                  <div class="field"><label>最少样本数（0=不限）</label><input v-model="routingMinSamples" type="number" min="0" max="1000000" /></div>
+                  <div class="field"><label>TTFT 硬上限 ms（0=不限）</label><input v-model="routingMaxTTFTMs" type="number" min="0" max="3600000" /></div>
+                  <div class="field"><label>总耗时硬上限 ms（0=不限）</label><input v-model="routingMaxDurationMs" type="number" min="0" max="86400000" /></div>
+                  <div class="field"><label>探索率（0~1）</label><input v-model="routingExplorationRate" type="number" min="0" max="1" step="0.01" /></div>
+                </div>
+                <h4>熔断恢复</h4>
+                <div class="settings-fields">
+                  <div class="field"><label>恢复所需连续成功</label><input v-model="breakerRecoverySuccesses" type="number" min="1" max="100" /></div>
+                  <div class="field"><label>最大冷却时间</label><input v-model="breakerMaxCooldown" placeholder="5m" /></div>
+                  <div class="field"><label>模型不支持缓存时间</label><input v-model="modelUnsupportedTTL" placeholder="5m" /></div>
+                </div>
                 <div class="settings-info">
-                  <div><span>算法</span><b>标准 P2C</b><em>渠道级</em></div>
+                  <div><span>算法</span><b>{{ intelligentRoutingEnabled ? '智能成本路由' : '标准 P2C' }}</b><em>渠道级</em></div>
                   <div><span>首字节超时</span><b>{{ effectiveFirstResponseTimeoutMs ? Math.round(effectiveFirstResponseTimeoutMs / 1000) + ' 秒' : '—' }}</b><em>{{ sourceText(firstResponseTimeoutSource) }}</em></div>
                   <div><span>故障切换</span><b>最多 {{ effectiveMaxUpstreamAttempts || '—' }} 个上游</b><em>{{ sourceText(maxUpstreamAttemptsSource) }}</em></div>
                   <div><span>熔断策略</span><b>{{ effectiveFailThreshold || '—' }} 次 / {{ effectiveCooldown || '—' }}</b><em>{{ sourceText(failThresholdSource || cooldownSource) }}</em></div>
                   <div><span>请求体上限</span><b>{{ effectiveMaxBodyBytes ? Math.round(effectiveMaxBodyBytes / 1048576) + ' MB' : '—' }}</b><em>{{ sourceText(maxBodyBytesSource) }}</em></div>
                 </div>
-                <p class="hint">收到任何响应字节前可切换渠道；开始传输后不再解析或强制等待结束事件。</p>
+                <p class="hint">首字节超时发生在尚可安全换源的阶段；流开始后只检测连续无数据，不复用 TTFT 超时，也不会再切换渠道。</p>
                 <div class="settings-actions">
                   <span class="save-status" :class="{ show: settingsSaved }">已保存 ✓</span>
                   <button class="btn" @click="saveSettings"><Icon name="check" :size="16" />保存</button>

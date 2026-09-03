@@ -42,6 +42,7 @@ func TestAlertOnlyOnFlip(t *testing.T) {
 	// 第三次失败 → Closed→Open，发「熔断」
 	m.Report(id, "", false, 0)
 	// 首次探测成功只进入 HalfOpen；第二次成功才恢复并发告警。
+	time.Sleep(40 * time.Millisecond)
 	m.ObserveProbe(id, "gpt", true, 50)
 	m.ObserveProbe(id, "gpt", true, 45)
 

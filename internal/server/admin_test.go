@@ -219,7 +219,14 @@ func TestRuntimeRoutingSettings(t *testing.T) {
 		"fail_threshold":"4",
 		"cooldown":"2m",
 		"max_upstream_attempts":"8",
-		"max_body_bytes":"67108864"
+		"max_body_bytes":"67108864",
+		"adaptive_timeout_enabled":false,
+		"adaptive_timeout_multiplier":2.5,
+		"stream_idle_timeout_ms":"240000",
+		"intelligent_routing_enabled":true,
+		"routing_latency_weight":0.4,
+		"breaker_recovery_successes":"3",
+		"probe_retention_hours":"168"
 	}`)
 	put.Body.Close()
 	if put.StatusCode != http.StatusNoContent {
@@ -228,6 +235,10 @@ func TestRuntimeRoutingSettings(t *testing.T) {
 	for key, want := range map[string]string{
 		"fail_threshold": "4", "cooldown": "2m",
 		"max_upstream_attempts": "8", "max_body_bytes": "67108864",
+		"adaptive_timeout_enabled": "false", "adaptive_timeout_multiplier": "2.5",
+		"stream_idle_timeout_ms": "240000", "intelligent_routing_enabled": "true",
+		"routing_latency_weight": "0.4", "breaker_recovery_successes": "3",
+		"probe_retention_hours": "168",
 	} {
 		if got := st.GetSetting(key, ""); got != want {
 			t.Fatalf("setting %s = %q, want %q", key, got, want)
@@ -248,6 +259,33 @@ func TestRuntimeRoutingSettings(t *testing.T) {
 	bad.Body.Close()
 	if bad.StatusCode != http.StatusBadRequest {
 		t.Fatalf("invalid max attempts returned %d", bad.StatusCode)
+	}
+}
+
+func TestRuntimeSettingsNormalizeBooleansAndValidateRelations(t *testing.T) {
+	ts, st, tok := newAdminTestServer(t)
+	url := ts.URL + "/admin/settings"
+
+	put := adminReq(t, http.MethodPut, url, tok, `{"adaptive_timeout_enabled":"TRUE"}`)
+	put.Body.Close()
+	if put.StatusCode != http.StatusNoContent {
+		t.Fatalf("boolean update returned %d", put.StatusCode)
+	}
+	if got := st.GetSetting("adaptive_timeout_enabled", ""); got != "true" {
+		t.Fatalf("boolean was not normalized: %q", got)
+	}
+
+	for name, body := range map[string]string{
+		"adaptive floor":   `{"first_response_timeout_ms":"10000","adaptive_timeout_floor_ms":"11000"}`,
+		"breaker cooldown": `{"cooldown":"10m","breaker_max_cooldown":"5m"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := adminReq(t, http.MethodPut, url, tok, body)
+			response.Body.Close()
+			if response.StatusCode != http.StatusBadRequest {
+				t.Fatalf("invalid related settings returned %d", response.StatusCode)
+			}
+		})
 	}
 }
 

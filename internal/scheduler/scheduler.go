@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/mirainya/muxapi/internal/health"
 	"github.com/mirainya/muxapi/internal/routing"
 	"github.com/mirainya/muxapi/internal/store"
 	"github.com/mirainya/muxapi/internal/upstream"
@@ -20,7 +21,9 @@ var ErrNoUpstream = errors.New("no healthy upstream available")
 // channel.
 type Health interface {
 	IsAvailable(id int64, model string) bool
-	Claim(id int64, model string) bool
+	Claim(groupID, id int64, model string) (health.Lease, bool)
+	ClaimLastResort(groupID, id int64, model string) (health.Lease, bool)
+	RecoveryInfo(id int64) health.RecoveryCandidate
 	LatencyEWMA(id int64) int64
 	InFlight(id int64) int64
 }
@@ -28,9 +31,15 @@ type Health interface {
 // Scheduler applies strict priority first, then standard weighted P2C inside
 // the highest available tier.
 type Scheduler struct {
-	list    func(groupID int64) []*upstream.Upstream
-	health  Health
-	routing *intelligentRouter
+	list           func(groupID int64) []*upstream.Upstream
+	health         Health
+	routing        *intelligentRouter
+	routingEnabled func() bool
+}
+
+// SetIntelligentRoutingEnabled controls the intelligent selector at runtime.
+func (s *Scheduler) SetIntelligentRoutingEnabled(enabled func() bool) {
+	s.routingEnabled = enabled
 }
 
 // New 创建调度器；list 在每次选择时读取最新分组成员。
@@ -56,21 +65,21 @@ func (s *Scheduler) SetIntelligentRouting(st *store.Store, config func() routing
 // PickWithFeatures is the optional forwarder hook for intelligent routing.
 // It deliberately keeps the existing Picker interface unchanged for callers
 // and tests that only need ordinary scheduling.
-func (s *Scheduler) PickWithFeatures(groupID int64, model string, features routing.RequestFeatures, exclude map[int64]bool) (*upstream.Upstream, routing.Decision, error) {
-	if s.routing == nil {
-		candidate, err := s.PickExcluding(groupID, model, exclude)
-		return candidate, routing.Decision{}, err
+func (s *Scheduler) PickWithFeatures(groupID int64, model string, features routing.RequestFeatures, exclude map[int64]bool) (*upstream.Upstream, health.Lease, routing.Decision, error) {
+	if s.routing == nil || (s.routingEnabled != nil && !s.routingEnabled()) {
+		candidate, lease, err := s.PickExcluding(groupID, model, exclude)
+		return candidate, lease, routing.Decision{}, err
 	}
 	return s.routing.pick(s, groupID, model, features, exclude)
 }
 
 // Pick 选择一个上游，并在健康管理器中声明并发占用。
-func (s *Scheduler) Pick(groupID int64, model string) (*upstream.Upstream, error) {
+func (s *Scheduler) Pick(groupID int64, model string) (*upstream.Upstream, health.Lease, error) {
 	return s.PickExcluding(groupID, model, nil)
 }
 
 // PickExcluding 排除已尝试渠道，供转发层故障切换时重复调用。
-func (s *Scheduler) PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, error) {
+func (s *Scheduler) PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, health.Lease, error) {
 	blocked := make(map[int64]bool, len(exclude))
 	for id, value := range exclude {
 		blocked[id] = value
@@ -81,13 +90,13 @@ func (s *Scheduler) PickExcluding(groupID int64, model string, exclude map[int64
 	for {
 		var healthy []*upstream.Upstream
 		for _, candidate := range all {
-			if blocked[candidate.ID] || !s.health.IsAvailable(candidate.ID, model) {
+			if candidate == nil || blocked[candidate.ID] || !s.health.IsAvailable(candidate.ID, model) {
 				continue
 			}
 			healthy = append(healthy, candidate)
 		}
 		if len(healthy) == 0 {
-			return nil, ErrNoUpstream
+			return s.pickLastResort(groupID, model, all, blocked)
 		}
 
 		topPriority := healthy[0].Priority
@@ -105,11 +114,47 @@ func (s *Scheduler) PickExcluding(groupID int64, model string, exclude map[int64
 
 		// IsAvailable 与 Claim 分离，声明失败时重新选择可处理并发半开竞争。
 		chosen := s.pickP2C(tier)
-		if s.health.Claim(chosen.ID, model) {
-			return chosen, nil
+		if lease, ok := s.health.Claim(groupID, chosen.ID, model); ok {
+			return chosen, lease, nil
 		}
 		blocked[chosen.ID] = true
 	}
+}
+
+func (s *Scheduler) pickLastResort(groupID int64, model string, all []*upstream.Upstream, blocked map[int64]bool) (*upstream.Upstream, health.Lease, error) {
+	type recoverable struct {
+		upstream *upstream.Upstream
+		info     health.RecoveryCandidate
+	}
+	options := make([]recoverable, 0, len(all))
+	for _, candidate := range all {
+		if candidate == nil || blocked[candidate.ID] {
+			continue
+		}
+		info := s.health.RecoveryInfo(candidate.ID)
+		if info.State == health.Open.String() && info.EarlyTrial {
+			options = append(options, recoverable{upstream: candidate, info: info})
+		}
+	}
+	sort.SliceStable(options, func(i, j int) bool {
+		a, b := options[i], options[j]
+		if a.info.ReopenCount != b.info.ReopenCount {
+			return a.info.ReopenCount < b.info.ReopenCount
+		}
+		if !a.info.LastSuccess.Equal(b.info.LastSuccess) {
+			return a.info.LastSuccess.After(b.info.LastSuccess)
+		}
+		if a.upstream.Priority != b.upstream.Priority {
+			return a.upstream.Priority < b.upstream.Priority
+		}
+		return a.upstream.ID < b.upstream.ID
+	})
+	for _, option := range options {
+		if lease, ok := s.health.ClaimLastResort(groupID, option.upstream.ID, model); ok {
+			return option.upstream, lease, nil
+		}
+	}
+	return nil, health.Lease{}, ErrNoUpstream
 }
 
 // pickP2C performs two independent weighted draws. Drawing the same upstream
