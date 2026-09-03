@@ -686,7 +686,7 @@ func hashUpstreamKey(value string) string {
 }
 
 func (f *Forwarder) reportFailure(id int64, model string, latencyMs int64, cause error) {
-	if errors.Is(cause, errFirstResponseTimeout) {
+	if errors.Is(cause, errFirstResponseTimeout) || errors.Is(cause, errStreamIdleTimeout) {
 		if reporter, ok := f.health.(timeoutHealth); ok {
 			reporter.ReportTimeout(id, model, latencyMs)
 			return
