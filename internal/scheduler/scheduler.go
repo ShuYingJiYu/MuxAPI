@@ -28,9 +28,15 @@ type Health interface {
 // Scheduler applies strict priority first, then standard weighted P2C inside
 // the highest available tier.
 type Scheduler struct {
-	list    func(groupID int64) []*upstream.Upstream
-	health  Health
-	routing *intelligentRouter
+	list           func(groupID int64) []*upstream.Upstream
+	health         Health
+	routing        *intelligentRouter
+	routingEnabled func() bool
+}
+
+// SetIntelligentRoutingEnabled controls the intelligent selector at runtime.
+func (s *Scheduler) SetIntelligentRoutingEnabled(enabled func() bool) {
+	s.routingEnabled = enabled
 }
 
 // New 创建调度器；list 在每次选择时读取最新分组成员。
@@ -57,7 +63,7 @@ func (s *Scheduler) SetIntelligentRouting(st *store.Store, config func() routing
 // It deliberately keeps the existing Picker interface unchanged for callers
 // and tests that only need ordinary scheduling.
 func (s *Scheduler) PickWithFeatures(groupID int64, model string, features routing.RequestFeatures, exclude map[int64]bool) (*upstream.Upstream, routing.Decision, error) {
-	if s.routing == nil {
+	if s.routing == nil || (s.routingEnabled != nil && !s.routingEnabled()) {
 		candidate, err := s.PickExcluding(groupID, model, exclude)
 		return candidate, routing.Decision{}, err
 	}

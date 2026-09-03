@@ -71,6 +71,9 @@ func TestIsModelUnsupported(t *testing.T) {
 	if IsModelUnsupported(http.StatusBadRequest, "gpt-5.6", `{"error":"invalid temperature"}`) {
 		t.Fatal("ordinary request validation errors must not change model capability")
 	}
+	if IsModelUnsupported(http.StatusServiceUnavailable, "gpt-5.6", `{"code":"model_not_found","message":"No available channel for model gpt-5.6 under group"}`) {
+		t.Fatal("temporary 503 channel exhaustion must not create a model capability exclusion")
+	}
 	if IsModelUnsupported(http.StatusNotFound, "", `{"error":"not found"}`) {
 		t.Fatal("missing model must not create a capability exclusion")
 	}

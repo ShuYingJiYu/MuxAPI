@@ -783,6 +783,7 @@ func TestResponseWatchdogReleasesStalledStreamAfterFirstByte(t *testing.T) {
 	hm := health.New(3, time.Hour)
 	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 1)
 	fwd.SetFirstResponseTimeout(func() time.Duration { return 20 * time.Millisecond })
+	fwd.SetStreamIdleTimeoutProvider(func() time.Duration { return 20 * time.Millisecond })
 	body := []byte(`{"model":"gpt","stream":true}`)
 	recorder := httptest.NewRecorder()
 	started := time.Now()
@@ -790,7 +791,7 @@ func TestResponseWatchdogReleasesStalledStreamAfterFirstByte(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("stalled stream was not cancelled promptly: %v", elapsed)
 	}
-	if result.Outcome != OutcomePartial || result.ErrorKind != "first_response_timeout" {
+	if result.Outcome != OutcomePartial || result.ErrorKind != "stream_idle_timeout" {
 		t.Fatalf("result = %+v, want a timed-out partial stream", result)
 	}
 	if hm.EffectiveState(1) != "OPEN" {

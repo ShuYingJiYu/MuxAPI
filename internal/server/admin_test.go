@@ -219,7 +219,14 @@ func TestRuntimeRoutingSettings(t *testing.T) {
 		"fail_threshold":"4",
 		"cooldown":"2m",
 		"max_upstream_attempts":"8",
-		"max_body_bytes":"67108864"
+		"max_body_bytes":"67108864",
+		"adaptive_timeout_enabled":false,
+		"adaptive_timeout_multiplier":2.5,
+		"stream_idle_timeout_ms":"240000",
+		"intelligent_routing_enabled":true,
+		"routing_latency_weight":0.4,
+		"breaker_recovery_successes":"3",
+		"probe_retention_hours":"168"
 	}`)
 	put.Body.Close()
 	if put.StatusCode != http.StatusNoContent {
@@ -228,6 +235,10 @@ func TestRuntimeRoutingSettings(t *testing.T) {
 	for key, want := range map[string]string{
 		"fail_threshold": "4", "cooldown": "2m",
 		"max_upstream_attempts": "8", "max_body_bytes": "67108864",
+		"adaptive_timeout_enabled": "false", "adaptive_timeout_multiplier": "2.5",
+		"stream_idle_timeout_ms": "240000", "intelligent_routing_enabled": "true",
+		"routing_latency_weight": "0.4", "breaker_recovery_successes": "3",
+		"probe_retention_hours": "168",
 	} {
 		if got := st.GetSetting(key, ""); got != want {
 			t.Fatalf("setting %s = %q, want %q", key, got, want)

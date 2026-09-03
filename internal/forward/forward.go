@@ -64,6 +64,23 @@ type TTFTEstimator interface {
 	EstimateTTFT(upstreamID int64, model string) (p95Ms float64, samples int64)
 }
 
+// AdaptiveTimeoutPolicy controls how historical TTFT is converted into a
+// per-request first-response deadline. The configured first-response timeout
+// remains the hard ceiling.
+type AdaptiveTimeoutPolicy struct {
+	Enabled    bool
+	Floor      time.Duration
+	Multiplier float64
+	MinSamples int64
+	TokenStep  int64
+	TokenBonus time.Duration
+}
+
+func DefaultAdaptiveTimeoutPolicy() AdaptiveTimeoutPolicy {
+	return AdaptiveTimeoutPolicy{Enabled: true, Floor: 10 * time.Second, Multiplier: 2,
+		MinSamples: 5, TokenStep: 50_000, TokenBonus: 5 * time.Second}
+}
+
 // Forwarder 协调一次客户端请求的选路、重试、协议转换和响应审计。
 type Forwarder struct {
 	picker               Picker
@@ -71,6 +88,8 @@ type Forwarder struct {
 	modelAliases         map[string]string
 	modelMapper          ModelMapper
 	ttftEstimator        TTFTEstimator
+	adaptivePolicy       func() AdaptiveTimeoutPolicy
+	streamIdleTimeout    func() time.Duration
 	maxAttempts          int
 	maxAttemptsProvider  func() int
 	firstResponseTimeout func() time.Duration
@@ -108,6 +127,14 @@ func (f *Forwarder) SetTTFTEstimator(estimator TTFTEstimator) {
 	f.ttftEstimator = estimator
 }
 
+func (f *Forwarder) SetAdaptiveTimeoutPolicyProvider(provider func() AdaptiveTimeoutPolicy) {
+	f.adaptivePolicy = provider
+}
+
+func (f *Forwarder) SetStreamIdleTimeoutProvider(provider func() time.Duration) {
+	f.streamIdleTimeout = provider
+}
+
 // SetMaxAttemptsProvider supplies the current per-request upstream attempt limit.
 // The provider is evaluated once when a request starts, so a settings change
 // cannot alter the retry budget halfway through an in-flight request.
@@ -141,18 +168,35 @@ func (f *Forwarder) firstByteTimeout() time.Duration {
 // historical P95 TTFT and the request's input token count. Falls back to
 // the global firstByteTimeout when no estimator is configured or data is cold.
 func (f *Forwarder) adaptiveTimeout(upstreamID int64, model string, inputTokens int64) time.Duration {
-	if f.ttftEstimator == nil {
+	policy := DefaultAdaptiveTimeoutPolicy()
+	if f.adaptivePolicy != nil {
+		policy = f.adaptivePolicy()
+	}
+	if !policy.Enabled || f.ttftEstimator == nil {
 		return f.firstByteTimeout()
 	}
 	p95, samples := f.ttftEstimator.EstimateTTFT(upstreamID, model)
 	return ComputeAdaptiveTimeout(AdaptiveTimeoutParams{
-		P95Ms:       p95,
-		Samples:     samples,
-		InputTokens: inputTokens,
-		Multiplier:  2.0,
-		Floor:       10 * time.Second,
-		Ceiling:     f.firstByteTimeout(),
+		P95Ms:                p95,
+		Samples:              samples,
+		InputTokens:          inputTokens,
+		Multiplier:           policy.Multiplier,
+		Floor:                policy.Floor,
+		Ceiling:              f.firstByteTimeout(),
+		MinSamples:           policy.MinSamples,
+		TokenStep:            policy.TokenStep,
+		TokenBonus:           policy.TokenBonus,
+		TokenBonusConfigured: true,
 	})
+}
+
+func (f *Forwarder) streamIdleDeadline() time.Duration {
+	if f.streamIdleTimeout != nil {
+		if value := f.streamIdleTimeout(); value > 0 {
+			return value
+		}
+	}
+	return 5 * time.Minute
 }
 
 // StatusClientClosedRequest 用于审计客户端提前断开；Go 标准库没有该常量。
@@ -531,7 +575,9 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		}
 
 		// relayResult.committed 表示响应是否已写出；只有未写出时才能安全换源。
-		result := relayTranslatedResponse(r.Context(), w, resp, start, nil, exchange)
+		result := relayTranslatedResponse(r.Context(), w, resp, start, func() {
+			watchdog.setPolicy(f.streamIdleDeadline(), errStreamIdleTimeout)
+		}, exchange)
 		watchdog.stop()
 		cause := context.Cause(ctx)
 		cancel(nil)
@@ -653,6 +699,8 @@ func relayErrorKind(err error, cause error) string {
 	switch {
 	case errors.Is(cause, errFirstResponseTimeout):
 		return "first_response_timeout"
+	case errors.Is(cause, errStreamIdleTimeout):
+		return "stream_idle_timeout"
 	case errors.Is(err, errEmptyResponse):
 		return "empty_response"
 	case errors.Is(err, errErrorPayload):
@@ -689,6 +737,7 @@ func readLimitedBody(reader io.Reader, limit int64) ([]byte, error) {
 var errEmptyResponse = errors.New("upstream returned an empty response")
 var errErrorPayload = errors.New("upstream returned an error payload with a successful status")
 var errFirstResponseTimeout = errors.New("upstream first response timeout")
+var errStreamIdleTimeout = errors.New("upstream stream idle timeout")
 
 // responseWatchdog cancels an upstream attempt when no response bytes arrive
 // within the configured interval. It is reset by every successful body read,
@@ -697,15 +746,22 @@ type responseWatchdog struct {
 	timeout  time.Duration
 	cancel   context.CancelCauseFunc
 	activity chan struct{}
+	policy   chan watchdogReset
 	done     chan struct{}
 	stopped  chan struct{}
 	once     sync.Once
 }
 
+type watchdogReset struct {
+	timeout time.Duration
+	cause   error
+}
+
 func newResponseWatchdog(timeout time.Duration, cancel context.CancelCauseFunc) *responseWatchdog {
 	w := &responseWatchdog{
 		timeout: timeout, cancel: cancel,
-		activity: make(chan struct{}, 1), done: make(chan struct{}), stopped: make(chan struct{}),
+		activity: make(chan struct{}, 1), policy: make(chan watchdogReset, 1),
+		done: make(chan struct{}), stopped: make(chan struct{}),
 	}
 	go w.run()
 	return w
@@ -713,6 +769,7 @@ func newResponseWatchdog(timeout time.Duration, cancel context.CancelCauseFunc) 
 
 func (w *responseWatchdog) run() {
 	timer := time.NewTimer(w.timeout)
+	cause := error(errFirstResponseTimeout)
 	defer func() {
 		if !timer.Stop() {
 			select {
@@ -725,7 +782,7 @@ func (w *responseWatchdog) run() {
 	for {
 		select {
 		case <-timer.C:
-			w.cancel(errFirstResponseTimeout)
+			w.cancel(cause)
 			return
 		case <-w.activity:
 			if !timer.Stop() {
@@ -734,6 +791,16 @@ func (w *responseWatchdog) run() {
 				default:
 				}
 			}
+			timer.Reset(w.timeout)
+		case reset := <-w.policy:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			w.timeout = reset.timeout
+			cause = reset.cause
 			timer.Reset(w.timeout)
 		case <-w.done:
 			return
@@ -745,6 +812,16 @@ func (w *responseWatchdog) touch() {
 	select {
 	case w.activity <- struct{}{}:
 	default:
+	}
+}
+
+func (w *responseWatchdog) setPolicy(timeout time.Duration, cause error) {
+	if timeout <= 0 || cause == nil {
+		return
+	}
+	select {
+	case w.policy <- watchdogReset{timeout: timeout, cause: cause}:
+	case <-w.stopped:
 	}
 }
 

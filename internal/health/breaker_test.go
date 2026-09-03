@@ -81,6 +81,18 @@ func TestRecoveryRequiresTwoSuccesses(t *testing.T) {
 	}
 }
 
+func TestLateInFlightSuccessDoesNotBypassOpenCooldown(t *testing.T) {
+	m := New(1, time.Hour)
+	m.Report(1, "failed", false, 0)
+	m.Report(1, "already-running", true, 40)
+	if got := m.EffectiveState(1); got != "OPEN" {
+		t.Fatalf("late in-flight success bypassed cooldown: state=%s", got)
+	}
+	if m.IsAvailable(1, "next") {
+		t.Fatal("channel must remain unavailable until controlled recovery")
+	}
+}
+
 func TestRecoveryFailureReopens(t *testing.T) {
 	m := New(1, 10*time.Millisecond)
 	m.Report(1, "gpt", false, 0)

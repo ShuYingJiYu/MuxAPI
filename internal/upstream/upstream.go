@@ -155,13 +155,17 @@ func IsModelUnsupported(code int, model, body string) bool {
 		return false
 	}
 	lower := strings.ToLower(body)
+	// Some relays return code=model_not_found together with HTTP 503 when all
+	// channels are temporarily unavailable. Treat that combination as transient.
+	if code == http.StatusServiceUnavailable && strings.Contains(lower, "no available channel") {
+		return false
+	}
 	for _, marker := range []string{
 		"model_not_found",
 		"model not found",
 		"model does not exist",
 		"unknown model",
 		"unsupported model",
-		"no available channel",
 		"模型不存在",
 		"不支持该模型",
 		"不支持模型",
@@ -169,6 +173,12 @@ func IsModelUnsupported(code int, model, body string) bool {
 		if strings.Contains(lower, marker) {
 			return true
 		}
+	}
+	// A 503 "no available channel" usually describes temporary downstream
+	// capacity/health, not a durable model capability. Caching it as unsupported
+	// removes a viable failover candidate for five minutes.
+	if code != http.StatusServiceUnavailable && strings.Contains(lower, "no available channel") {
+		return true
 	}
 	return false
 }

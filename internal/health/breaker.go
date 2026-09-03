@@ -71,8 +71,9 @@ const (
 	trendCap     = 60
 	ewmaAlpha    = 0.3
 
-	modelUnsupportedTTL = 5 * time.Minute
-	recoverySuccessGoal = 2
+	defaultModelUnsupportedTTL = 5 * time.Minute
+	defaultRecoverySuccessGoal = 2
+	defaultMaxCooldown         = 5 * time.Minute
 )
 
 // AlertEvent reports a channel breaker transition. Model is the request model
@@ -98,6 +99,9 @@ type Manager struct {
 	unsupported   map[modelKey]time.Time
 	failThreshold int
 	cooldown      time.Duration
+	recoveryGoal  int
+	maxCooldown   time.Duration
+	modelTTL      time.Duration
 	alerter       Alerter
 }
 
@@ -114,7 +118,27 @@ func New(failThreshold int, cooldown time.Duration) *Manager {
 		unsupported:   make(map[modelKey]time.Time),
 		failThreshold: failThreshold,
 		cooldown:      cooldown,
+		recoveryGoal:  defaultRecoverySuccessGoal,
+		maxCooldown:   defaultMaxCooldown,
+		modelTTL:      defaultModelUnsupportedTTL,
 	}
+}
+
+// SetAdvancedPolicy updates recovery and capability-cache behavior without a
+// restart. Invalid values fall back to conservative defaults.
+func (m *Manager) SetAdvancedPolicy(recoveryGoal int, maxCooldown, modelTTL time.Duration) {
+	if recoveryGoal < 1 {
+		recoveryGoal = defaultRecoverySuccessGoal
+	}
+	if maxCooldown <= 0 {
+		maxCooldown = defaultMaxCooldown
+	}
+	if modelTTL <= 0 {
+		modelTTL = defaultModelUnsupportedTTL
+	}
+	m.mu.Lock()
+	m.recoveryGoal, m.maxCooldown, m.modelTTL = recoveryGoal, maxCooldown, modelTTL
+	m.mu.Unlock()
 }
 
 // SetAlerter 设置状态翻转通知器。
@@ -234,7 +258,7 @@ func (m *Manager) MarkModelUnsupported(id int64, model string) {
 		return
 	}
 	m.mu.Lock()
-	m.unsupported[modelKey{id, model}] = time.Now().Add(modelUnsupportedTTL)
+	m.unsupported[modelKey{id, model}] = time.Now().Add(m.modelTTL)
 	m.mu.Unlock()
 }
 
@@ -280,7 +304,13 @@ func (m *Manager) Report(id int64, model string, ok bool, latencyMs int64) {
 		b.latSamples++
 		b.latencyMs = latencyMs
 	}
-	from, to := m.drive(b, ok, latencyMs)
+	// A request that was already in flight before another request opened the
+	// circuit is not a controlled recovery trial. Its late success may update
+	// statistics, but must not bypass the configured cool-down.
+	from, to := b.state, b.state
+	if !(ok && b.state == Open) {
+		from, to = m.drive(b, ok, latencyMs)
+	}
 	ev, flipped := transitionEvent(id, model, from, to, b.fails)
 	m.mu.Unlock()
 	if flipped {
@@ -381,7 +411,7 @@ func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) (from, to State) {
 		case HalfOpen:
 			b.recoverySuccesses++
 			b.halfOpenInFlight = false
-			if b.recoverySuccesses >= recoverySuccessGoal {
+			if b.recoverySuccesses >= m.recoveryGoal {
 				b.state = Closed
 				b.recoverySuccesses = 0
 				b.reopenCount = 0
@@ -411,7 +441,7 @@ func (m *Manager) backoff(reopenCount int) time.Duration {
 		shift = 6
 	}
 	d := m.cooldown * time.Duration(1<<shift)
-	capDuration := 5 * time.Minute
+	capDuration := m.maxCooldown
 	if m.cooldown > capDuration {
 		capDuration = m.cooldown
 	}
