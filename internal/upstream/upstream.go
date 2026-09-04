@@ -214,7 +214,11 @@ func (u *Upstream) BuildRequest(method, path string, body io.Reader, clientHeade
 	// 覆盖凭证为上游自己的 key（客户端那个是 sub2api 发的，上游不认）
 	req.Header.Set("Authorization", "Bearer "+u.APIKey)
 	req.Header.Set("x-api-key", u.APIKey)
-	req.Header.Set("x-goog-api-key", u.APIKey)
+	// Gemini endpoints use x-goog-api-key; sending it to a Claude/New API
+	// endpoint can make the relay misclassify /v1/models as a Gemini request.
+	if strings.EqualFold(strings.TrimSpace(u.Protocol), "gemini") {
+		req.Header.Set("x-goog-api-key", u.APIKey)
+	}
 	return req, nil
 }
 
@@ -261,7 +265,12 @@ func (u *Upstream) FetchModels(ctx context.Context, timeout time.Duration) ([]st
 			Name string `json:"name"`
 		} `json:"models"`
 	}
-	json.Unmarshal(body, &parsed)
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, resp.StatusCode, err
+	}
+	if IsErrorPayload(body) {
+		return nil, resp.StatusCode, &HTTPError{Status: resp.StatusCode, Body: strings.TrimSpace(string(body))}
+	}
 	models := make([]string, 0, len(parsed.Data))
 	for _, m := range parsed.Data {
 		if m.ID != "" {

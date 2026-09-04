@@ -11,6 +11,7 @@ RUN npm run build
 # Go 版本必须 >= go.mod 的 1.26.3。同步上游后必须 grep go.mod 核对本行。
 FROM golang:1.26.3-alpine AS build
 ARG VERSION=dev
+ENV GOPROXY=https://goproxy.cn,direct
 WORKDIR /src
 COPY go.mod go.sum ./
 # go.mod 有本地 replace 指向 ./third_party/cliproxyapi(库内 vendor 子树,非 submodule),

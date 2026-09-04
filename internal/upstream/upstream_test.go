@@ -1,9 +1,12 @@
 package upstream
 
 import (
+	"context"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBuildRequestLetsTransportManageCompression(t *testing.T) {
@@ -21,6 +24,32 @@ func TestBuildRequestLetsTransportManageCompression(t *testing.T) {
 	}
 	if got := req.Header.Get("User-Agent"); got != "Codex Desktop" {
 		t.Fatalf("ordinary client headers must remain forwarded: %q", got)
+	}
+	if got := req.Header.Get("x-goog-api-key"); got != "" {
+		t.Fatalf("Claude/OpenAI upstream must not receive Gemini header: %q", got)
+	}
+
+	gemini := &Upstream{BaseURL: "https://example.com", APIKey: "gemini-key", Protocol: "gemini"}
+	geminiReq, err := gemini.BuildRequest(http.MethodGet, "/v1beta/models", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := geminiReq.Header.Get("x-goog-api-key"); got != "gemini-key" {
+		t.Fatalf("Gemini upstream must receive x-goog-api-key: %q", got)
+	}
+}
+
+func TestFetchModelsRejectsSuccessfulErrorEnvelope(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"error":{"message":"The model '' does not exist","code":"model_not_found"}}`))
+	}))
+	defer server.Close()
+
+	u := &Upstream{BaseURL: server.URL, APIKey: "key", Protocol: "claude"}
+	models, status, err := u.FetchModels(context.Background(), time.Second)
+	if err == nil || status != http.StatusOK || models != nil {
+		t.Fatalf("successful error envelope must fail discovery: models=%v status=%d err=%v", models, status, err)
 	}
 }
 
