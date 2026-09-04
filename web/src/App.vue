@@ -3239,7 +3239,7 @@ function logout() {
 
     <!-- 真实对话测试 -->
     <div class="mask" v-if="testState.show" @click.self="closeTest">
-      <div class="dialog">
+      <div class="dialog test-dialog">
         <h3>测试上游 · {{ testState.name }}</h3>
         <p class="hint test-dialog-hint">发一条真实对话请求，验证能否端到端跑通并查看回复。</p>
 
@@ -3251,17 +3251,19 @@ function logout() {
         </div>
         <p v-if="testState.modelsErr" class="test-err test-model-error">列模型失败：{{ testState.modelsErr }}（仍可手动测试默认模型）</p>
 
-        <div v-if="testState.running || testState.output || testState.status" class="test-output">
-          <span v-if="testState.output">{{ testState.output }}</span>
-          <span v-if="testState.running" class="cursor">▋</span>
-          <span v-else-if="!testState.output && testState.status?.ok" class="hint">（上游无文本输出，但连接成功）</span>
-        </div>
+        <div v-if="testState.running || testState.output || testState.status" class="test-result">
+          <div v-if="testState.running || testState.output || (testState.status?.ok && !testState.output)" class="test-output">
+            <span v-if="testState.output">{{ testState.output }}</span>
+            <span v-if="testState.running" class="cursor">▋</span>
+            <span v-else-if="!testState.output && testState.status?.ok" class="hint">（上游无文本输出，但连接成功）</span>
+          </div>
 
-        <div v-if="testState.status" class="test-status" :class="testState.status.ok ? 'ok' : 'fail'">
-          <Icon :name="testState.status.ok ? 'check' : 'x'" :size="16" />
-          <span>{{ testState.status.ok ? '测试通过' : '测试失败' }}</span>
-          <small v-if="testState.status.latency_ms != null">{{ testState.status.latency_ms }}ms</small>
-          <small v-if="testState.status.code">HTTP {{ testState.status.code }}</small>
+          <div v-if="testState.status" class="test-status" :class="testState.status.ok ? 'ok' : 'fail'">
+            <Icon :name="testState.status.ok ? 'check' : 'x'" :size="16" />
+            <span>{{ testState.status.ok ? '测试通过' : '测试失败' }}</span>
+            <small v-if="testState.status.latency_ms != null">{{ testState.status.latency_ms }}ms</small>
+            <small v-if="testState.status.code">HTTP {{ testState.status.code }}</small>
+          </div>
         </div>
         <p v-if="testState.status && !testState.status.ok && testState.status.error" class="test-err">{{ testState.status.error }}</p>
 

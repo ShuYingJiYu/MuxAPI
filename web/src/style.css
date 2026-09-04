@@ -1033,9 +1033,20 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .test-err { font-size: 12px; color: var(--state-danger); background: var(--state-danger-soft); border-radius: 8px; padding: 8px 10px; word-break: break-all; margin: 4px 0 0; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; max-height: 220px; overflow-y: auto; }
 .chip { font-size: 12px; padding: 4px 10px; border-radius: 999px; background: var(--g100); color: var(--g700); white-space: nowrap; }
-.test-row { display: flex; gap: 8px; margin-bottom: 10px; }
+.test-dialog { width: min(500px, 100%); }
+.test-dialog > h3 { margin-bottom: 15px; padding-bottom: 15px; font-size: 17px; }
+.dialog .test-dialog-hint { margin: 0 0 15px; padding: 0; border: 0; border-radius: 0; background: transparent; color: var(--g500); font-size: 12px; }
+.test-row { display: grid; grid-template-columns: minmax(0, 1fr) 122px; align-items: stretch; gap: 10px; margin-bottom: 0; }
+.test-row .fancy-select { min-width: 0; }
+.test-row .fancy-select-btn, .test-row > .btn { height: 42px; }
+.test-row > .btn { justify-content: center; padding: 0 15px; white-space: nowrap; }
 .select { flex: 1; padding: 9px 11px; border: 1px solid var(--g200); border-radius: 10px; font-size: 14px; background: var(--surface-raised); color: var(--g700); }
-.test-output { font-size: 13px; line-height: 1.6; background: var(--g100); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; max-height: 180px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }
+.test-result { margin-top: 14px; overflow: hidden; border: 1px solid var(--line); border-radius: var(--r-control); background: var(--surface-muted); }
+.test-output { max-height: 180px; overflow-y: auto; margin: 0; padding: 12px 14px; background: transparent; color: var(--g800); font-size: 13px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+.test-result .test-output .hint { margin: 0; padding: 0; border: 0; background: transparent; }
+.test-result .test-status { margin: 0; padding: 10px 14px; border-top: 1px solid var(--line); border-radius: 0; }
+.test-dialog > .test-err { margin-top: 10px; }
+.test-dialog > .dialog-foot { margin-top: 18px; padding-top: 14px; }
 .group-test-dialog { width: min(680px, 94vw); max-height: min(820px, 92vh); overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--g300) transparent; }
 .group-test-dialog::-webkit-scrollbar { width: 6px; }
 .group-test-dialog::-webkit-scrollbar-thumb { border-radius: 6px; background: var(--g300); }
@@ -1065,6 +1076,8 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
   .dialog-foot { gap: 8px; }
   .dialog-foot .btn { min-width: 0; flex: 1; }
   .field-row { gap: 9px; }
+  .test-row { grid-template-columns: 1fr; }
+  .test-row > .btn { width: 100%; }
 }
 .group-test-metrics { display: grid; grid-template-columns: 1.5fr 1fr 1fr; }
 .group-test-metrics > div { min-width: 0; padding: 10px 12px; border-right: 1px solid var(--g200); }
