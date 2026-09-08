@@ -46,11 +46,41 @@ type CostEstimate struct {
 	Warnings           []string      `json:"warnings,omitempty"`
 }
 
+// EstimateActualCost prices observed usage with the same token semantics used
+// by billing reconciliation. Claude reports uncached input separately, while
+// OpenAI-shaped protocols include cached tokens in their input total.
+func EstimateActualCost(price Pricing, protocol string, inputTokens, outputTokens,
+	cachedTokens, cacheCreationTokens int64) (float64, bool) {
+	if inputTokens < 0 || outputTokens < 0 || cachedTokens < 0 || cacheCreationTokens < 0 {
+		return 0, false
+	}
+	if inputTokens == 0 && outputTokens == 0 && cachedTokens == 0 && cacheCreationTokens == 0 {
+		return 0, false
+	}
+	price = price.Normalized()
+	if NormalizeProtocol(protocol) != "claude" {
+		inputTokens -= cachedTokens
+		if inputTokens < 0 {
+			return 0, false
+		}
+	}
+	if (inputTokens > 0 && !price.InputKnown) || (outputTokens > 0 && !price.OutputKnown) ||
+		(cachedTokens > 0 && !price.CacheReadKnown) ||
+		(cacheCreationTokens > 0 && !price.CacheWriteKnown) {
+		return 0, false
+	}
+	cost := float64(inputTokens)*price.InputPerToken +
+		float64(outputTokens)*price.OutputPerToken +
+		float64(cachedTokens)*price.CacheReadPerToken +
+		float64(cacheCreationTokens)*price.CacheWritePerToken
+	return cost * price.Multiplier, true
+}
+
 // EstimateWindowCost computes both strategies for the expected request
 // window. The cache strategy assumes a cache write replaces ordinary input
 // billing for the reusable prefix unless the profile explicitly says
-// otherwise. A cache miss creates a new entry, so observed hit rate directly
-// controls expected write/read counts after each TTL lifetime.
+// otherwise. Cache reads and writes are independent: rolling conversations may
+// report both cached and cache_creation tokens in one request.
 func EstimateWindowCost(features RequestFeatures, forecast TrafficForecast, pricing Pricing, cache CacheProfile, now time.Time, defaultWindow time.Duration) CostEstimate {
 	features = features.Normalize()
 	forecast = forecast.normalized(features, defaultWindow)
@@ -196,17 +226,29 @@ func EstimateWindowCost(features RequestFeatures, forecast TrafficForecast, pric
 	result.ExpectedHits = hits
 	result.ExpectedMisses = misses
 	result.ExpectedCreates = misses
+	writeTokens := misses * cachedPrefix
+	if cache.CacheWriteObserved {
+		observedCreates := n * cache.CreateRate
+		if observedCreates > result.ExpectedCreates {
+			result.ExpectedCreates = observedCreates
+		}
+		observedWriteTokens := n * cache.CreateTokensPerRequest
+		if observedWriteTokens > writeTokens {
+			writeTokens = observedWriteTokens
+			result.Warnings = append(result.Warnings, "cache writes overlap hits; using observed rolling write-token rate")
+		}
+	}
 	result.CacheLifetimes = lifetimes
 
 	result.CacheReadCost = hits * cachedPrefix * pricing.CacheReadPerToken * multiplier
-	result.CacheWriteCost = misses * cachedPrefix * pricing.CacheWritePerToken * multiplier
+	result.CacheWriteCost = writeTokens * pricing.CacheWritePerToken * multiplier
 	// suffix + uncached portion of prefix always pay full input price
 	result.CacheInputCost = n * (suffix + uncachedPrefix) * input * multiplier
 	if cache.CacheReadIncludesInput {
 		result.CacheReadCost += hits * cachedPrefix * input * multiplier
 	}
 	if cache.CacheWriteIncludesInput {
-		result.CacheWriteCost += misses * cachedPrefix * input * multiplier
+		result.CacheWriteCost += writeTokens * input * multiplier
 	}
 	result.CacheTotal = result.CacheInputCost + result.CacheReadCost + result.CacheWriteCost + result.OutputCost
 	result.SelectedTotal = result.NoCacheTotal
@@ -303,6 +345,16 @@ func breakEvenRequests(features RequestFeatures, forecast TrafficForecast, prici
 	}
 	// Expected subsequent request cost at the observed hit rate.
 	steady := h*hit + (1-h)*miss
+	if cache.CacheWriteObserved {
+		observedWriteTokens := cache.CreateTokensPerRequest
+		modeledWriteTokens := (1 - h) * cachedPrefix
+		if observedWriteTokens > modeledWriteTokens {
+			steady += (observedWriteTokens - modeledWriteTokens) * pricing.CacheWritePerToken * multiplier
+			if cache.CacheWriteIncludesInput {
+				steady += (observedWriteTokens - modeledWriteTokens) * pricing.InputPerToken * multiplier
+			}
+		}
+	}
 	denominator := noCache - steady
 	if denominator <= 0 {
 		return -1

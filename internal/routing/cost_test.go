@@ -19,6 +19,35 @@ func TestEstimateWindowCostNoCache(t *testing.T) {
 	}
 }
 
+func TestEstimateActualCostUsesProtocolTokenSemantics(t *testing.T) {
+	price := Pricing{
+		InputPerToken: 1, OutputPerToken: 2, CacheReadPerToken: 0.1, CacheWritePerToken: 1.25,
+		InputKnown: true, OutputKnown: true, CacheReadKnown: true, CacheWriteKnown: true,
+		Multiplier: 0.5,
+	}
+	claude, ok := EstimateActualCost(price, "claude", 100, 10, 80, 20)
+	if !ok {
+		t.Fatal("Claude usage should be priceable")
+	}
+	closeTo(t, claude, (100+20+8+25)*0.5)
+
+	openAI, ok := EstimateActualCost(price, "openai", 100, 10, 80, 20)
+	if !ok {
+		t.Fatal("OpenAI usage should be priceable")
+	}
+	closeTo(t, openAI, (20+20+8+25)*0.5)
+}
+
+func TestEstimateActualCostRejectsIncompleteUsageOrPricing(t *testing.T) {
+	price := Pricing{InputKnown: true, OutputKnown: true, Multiplier: 1}
+	if _, ok := EstimateActualCost(price, "claude", 0, 0, 0, 0); ok {
+		t.Fatal("empty usage must not be reported as an authoritative zero cost")
+	}
+	if _, ok := EstimateActualCost(price, "claude", 1, 0, 2, 0); ok {
+		t.Fatal("cached usage without a known cache-read price must be incomplete")
+	}
+}
+
 func TestEstimateWindowCostCacheWinsAtVolume(t *testing.T) {
 	features := RequestFeatures{InputTokens: 1_000, ReusableInputTokens: 800, EstimatedOutputTokens: 100}
 	price := Pricing{
@@ -42,6 +71,24 @@ func TestEstimateWindowCostCacheWinsAtVolume(t *testing.T) {
 	closeTo(t, cost.Savings, 0.00628)
 	if cost.BreakEvenRequests <= 1 || cost.BreakEvenRequests >= 2 {
 		t.Fatalf("break-even = %v, want between 1 and 2", cost.BreakEvenRequests)
+	}
+}
+
+func TestEstimateWindowCostAccountsForWritesThatOverlapHits(t *testing.T) {
+	features := RequestFeatures{InputTokens: 2_000, ReusableInputTokens: 1_000}
+	price := Pricing{
+		InputPerToken: 1e-6, OutputPerToken: 0, CacheWritePerToken: 2e-6, CacheReadPerToken: 0.1e-6,
+		InputKnown: true, OutputKnown: true, CacheWriteKnown: true, CacheReadKnown: true,
+	}
+	cost := EstimateWindowCost(features, TrafficForecast{Requests: 10, Window: 15 * time.Minute}, price,
+		CacheProfile{Supported: true, TTL: time.Hour, HitRate: 0.9, HitRateSource: HitRateObserved,
+			CacheWriteObserved: true, CreateRate: 0.5, CreateTokensPerRequest: 300}, time.Time{}, 15*time.Minute)
+	if cost.ExpectedCreates < 5 {
+		t.Fatalf("observed writes should not be hidden by hit rate: %+v", cost)
+	}
+	closeTo(t, cost.CacheWriteCost, 10*300*2e-6)
+	if len(cost.Warnings) == 0 {
+		t.Fatal("overlapping write behavior should be visible in the audit warning")
 	}
 }
 
