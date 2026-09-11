@@ -535,11 +535,16 @@ func (s *Store) GetPrefixCacheStats(apiKeyHash string, upstreamID int64, model, 
 		// Fallback: if no exact prefix_hash match, aggregate by session_key from
 		// routing_observations. This handles multi-turn sessions where the prefix
 		// hash changes every turn but the session (and its cache behavior) is stable.
-		stats, fallbackErr := s.getSessionCacheStats(apiKeyHash, upstreamID, model, prefixHash, protocol, window, now)
+		//
+		// When the fallback also fails, surface the fallback's error (which may
+		// carry a real DB failure) rather than the primary ErrNoRows that
+		// triggered the fallback. Return the outer initialised stats value so
+		// the caller sees consistent field content on the error path.
+		fallbackStats, fallbackErr := s.getSessionCacheStats(apiKeyHash, upstreamID, model, prefixHash, protocol, window, now)
 		if fallbackErr != nil {
-			return stats, err
+			return stats, fallbackErr
 		}
-		return stats, nil
+		return fallbackStats, nil
 	}
 	stats.HitRate = routingRatio(stats.HitCount, stats.HitCount+stats.MissCount)
 	stats.Valid = stats.ExpiresAt > now.Unix()
@@ -563,6 +568,11 @@ func (s *Store) GetPrefixCacheStats(apiKeyHash string, upstreamID int64, model, 
 func (s *Store) getSessionCacheStats(apiKeyHash string, upstreamID int64, model, sessionKey, protocol string, window time.Duration, now time.Time) (PrefixCacheStats, error) {
 	stats := PrefixCacheStats{APIKeyHash: apiKeyHash, UpstreamID: upstreamID, Model: model, PrefixHash: sessionKey, SessionKey: sessionKey}
 	from := now.Add(-window)
+	// Both the in-window query and the lifetime fallback below MUST apply the
+	// same success=TRUE filter, otherwise a single failed retry inside the
+	// window suppresses the widen path and yields divergent verdicts for the
+	// same underlying history depending purely on where the failure lands
+	// relative to the window boundary.
 	err := s.queryRow(`SELECT
 		COUNT(*),
 		COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END),0),
@@ -574,6 +584,7 @@ func (s *Store) getSessionCacheStats(apiKeyHash string, upstreamID int64, model,
 		COALESCE(MIN(`+s.unixExpr("observed_at")+`),0)
 		FROM routing_observations
 		WHERE api_key_hash=? AND upstream_id=? AND model=? AND session_key=?
+		AND success=TRUE
 		AND observed_at>=? AND observed_at<?`,
 		apiKeyHash, upstreamID, model, sessionKey,
 		s.timeValue(from), s.timeValue(now)).Scan(
