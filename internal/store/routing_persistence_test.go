@@ -120,14 +120,14 @@ func TestRoutingObservationStatsAndCacheIsolation(t *testing.T) {
 	if stats.P95TTFTMs != 200 || stats.P95DurationMs != 2000 {
 		t.Fatalf("unexpected percentiles: %+v", stats)
 	}
-	cache, err := st.GetPrefixCacheStats("key-a", 7, "m", "p", 15*time.Minute, now)
+	cache, err := st.GetPrefixCacheStats("key-a", 7, "m", "p", "claude", 15*time.Minute, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cache.HitCount != 1 || cache.MissCount != 1 || cache.CreateCount != 1 || cache.HitRate != 0.5 || !cache.Valid {
 		t.Fatalf("unexpected key-a cache stats: %+v", cache)
 	}
-	if _, err := st.GetPrefixCacheStats("key-b", 7, "m", "p", 15*time.Minute, now); err != nil {
+	if _, err := st.GetPrefixCacheStats("key-b", 7, "m", "p", "claude", 15*time.Minute, now); err != nil {
 		// key-b has its own entry; reading it must not return key-a's cache.
 		t.Fatal(err)
 	}
@@ -158,11 +158,40 @@ func TestSessionCacheStatsExposeRollingWrites(t *testing.T) {
 	if err := st.SaveRoutingObservations(observations); err != nil {
 		t.Fatal(err)
 	}
-	stats, err := st.GetPrefixCacheStats("key-a", 7, "m", "session-a", 15*time.Minute, now)
+	stats, err := st.GetPrefixCacheStats("key-a", 7, "m", "session-a", "claude", 15*time.Minute, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stats.WindowCreateCount != 2 || stats.WindowCreateTokens != 1500 || stats.HitCount != 1 || stats.MissCount != 1 {
 		t.Fatalf("rolling session cache writes were not aggregated: %+v", stats)
+	}
+}
+
+// AssumedCacheTTL must mirror routing.selectAdaptiveTTL exactly, otherwise the
+// store fallback would stamp an ExpiresAt derived from a wrong TTL and the
+// state machine would flip CacheHot → CacheExpired prematurely.
+func TestAssumedCacheTTL(t *testing.T) {
+	now := int64(1_700_000_000)
+	// Gemini always → 1h.
+	for _, p := range []string{"gemini", "google", "generativelanguage", "generatecontent"} {
+		if got := AssumedCacheTTL(p, 1, 1, now-60, now); got != time.Hour {
+			t.Fatalf("%s → %v want 1h", p, got)
+		}
+	}
+	// Long session + rebuilds → 1h.
+	if got := AssumedCacheTTL("claude", 20, 3, now-15*60, now); got != time.Hour {
+		t.Fatalf("long/rebuilds → %v want 1h", got)
+	}
+	// Sparse conversation + any rebuild → 1h.
+	if got := AssumedCacheTTL("claude", 2, 1, now-10*60, now); got != time.Hour {
+		t.Fatalf("sparse → %v want 1h", got)
+	}
+	// Short session, few rebuilds → 5min.
+	if got := AssumedCacheTTL("claude", 3, 1, now-3*60, now); got != 5*time.Minute {
+		t.Fatalf("short → %v want 5min", got)
+	}
+	// No observations → 5min default.
+	if got := AssumedCacheTTL("claude", 0, 0, 0, now); got != 5*time.Minute {
+		t.Fatalf("empty → %v want 5min", got)
 	}
 }
