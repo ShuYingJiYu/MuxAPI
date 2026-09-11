@@ -35,6 +35,7 @@ type RouteDecisionModel struct {
 	ActualOutputTokens        *int64     `gorm:"column:actual_output_tokens;type:integer"`
 	ActualCachedTokens        *int64     `gorm:"column:actual_cached_tokens;type:integer"`
 	ActualCacheCreationTokens *int64     `gorm:"column:actual_cache_creation_tokens;type:integer"`
+	ActualUpstreamID          int64      `gorm:"column:actual_upstream_id;type:integer;not null;default:0"`
 	ActualOutcome             string     `gorm:"column:actual_outcome;type:text;not null;default:''"`
 	CreatedAt                 time.Time  `gorm:"column:created_at;not null;index:idx_route_decisions_created"`
 	CompletedAt               *time.Time `gorm:"column:completed_at"`
