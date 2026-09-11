@@ -247,15 +247,45 @@ func usageFromValue(value any) tokenUsage {
 	return out
 }
 
-// parseUsageObject 将 OpenAI 与 Claude 的字段名归一为统一计数。
+// parseUsageObject 将 OpenAI / Anthropic / Gemini 的 usage 归一为统一计数。
+//
+// 语义 (Anthropic 约定):
+//   input          = uncached prompt tokens (排他,不含 cached / cacheCreation)
+//   cached         = cache_read tokens (命中缓存部分)
+//   cacheCreation  = cache_write tokens (首次写入部分)
+//   output         = completion / response tokens
+//
+// 协议差异:
+//   Anthropic:  usage.input_tokens 本身就是 uncached; cache_read_input_tokens /
+//               cache_creation_input_tokens 独立字段。
+//   OpenAI:     usage.prompt_tokens 是 INCLUSIVE 的 —— 已经包含 cached。
+//               cached 出现在 usage.cached_tokens 或 prompt_tokens_details.cached_tokens。
+//   Gemini:     usage.promptTokenCount 是 INCLUSIVE 的 —— 已经包含 cachedContentTokenCount。
+//
+// 因此对 OpenAI/Gemini 需要在这里减去 cached,让存入 routing_observations 的
+// input 列在所有协议下保持"uncached"这个不变量。下游 SQL (CacheCoverageRatio,
+// TokenInflationFactor) 依赖这个不变量;不做归一它们会双数 cached。
 func parseUsageObject(usage map[string]any) tokenUsage {
-	input := maxInt64(maxInt64(number(usage["input_tokens"]), number(usage["prompt_tokens"])), number(usage["promptTokenCount"]))
+	inputAnthropic := number(usage["input_tokens"])
+	inputInclusive := maxInt64(number(usage["prompt_tokens"]), number(usage["promptTokenCount"]))
 	output := maxInt64(maxInt64(maxInt64(number(usage["output_tokens"]), number(usage["completion_tokens"])), number(usage["candidatesTokenCount"])), number(usage["thoughtsTokenCount"]))
 	cached := maxInt64(maxInt64(number(usage["cached_tokens"]), number(usage["cache_read_input_tokens"])), number(usage["cachedContentTokenCount"]))
 	cacheCreation := maxInt64(number(usage["cache_creation_tokens"]), number(usage["cache_creation_input_tokens"]))
 	for _, key := range []string{"input_tokens_details", "prompt_tokens_details"} {
 		if details, ok := usage[key].(map[string]any); ok {
 			cached = maxInt64(cached, number(details["cached_tokens"]))
+		}
+	}
+	// Anthropic 已经是排他语义,直接采用其 input_tokens。
+	// OpenAI/Gemini 的 inputInclusive 减 cached 得到与 Anthropic 一致的排他值。
+	input := inputAnthropic
+	if inputInclusive > input {
+		normalized := inputInclusive - cached
+		if normalized < 0 {
+			normalized = 0
+		}
+		if normalized > input {
+			input = normalized
 		}
 	}
 	return tokenUsage{input: input, output: output, cached: cached, cacheCreation: cacheCreation}
