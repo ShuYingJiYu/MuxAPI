@@ -235,7 +235,7 @@ func (r *intelligentRouter) cache(item *upstream.Upstream, model string, feature
 		prefixHash = features.SessionID
 	}
 
-	stats, err := r.prefixStats(keyHash, item.ID, model, prefixHash, window, now)
+	stats, err := r.prefixStats(keyHash, item.ID, model, prefixHash, item.Protocol, window, now)
 	observed := err == nil
 	cacheObserved := observed && (stats.HitCount > 0 || stats.CreateCount > 0)
 	supported := cacheMode == upstream.CacheEnabled || cacheMode == upstream.CacheAuto || cacheObserved
@@ -391,7 +391,7 @@ func (r *intelligentRouter) upstreamStats(id int64, model string, window time.Du
 	return value, err
 }
 
-func (r *intelligentRouter) prefixStats(apiKeyHash string, upstreamID int64, model, prefixHash string, window time.Duration, now time.Time) (store.PrefixCacheStats, error) {
+func (r *intelligentRouter) prefixStats(apiKeyHash string, upstreamID int64, model, prefixHash, protocol string, window time.Duration, now time.Time) (store.PrefixCacheStats, error) {
 	key := prefixCacheKey{apiKeyHash: apiKeyHash, upstreamID: upstreamID, model: model, prefixHash: prefixHash, window: window}
 	r.mu.Lock()
 	if entry, ok := r.prefix[key]; ok && now.Before(entry.expires) {
@@ -399,7 +399,7 @@ func (r *intelligentRouter) prefixStats(apiKeyHash string, upstreamID int64, mod
 		return entry.value, entry.err
 	}
 	r.mu.Unlock()
-	value, err := r.store.GetPrefixCacheStats(apiKeyHash, upstreamID, model, prefixHash, window, now)
+	value, err := r.store.GetPrefixCacheStats(apiKeyHash, upstreamID, model, prefixHash, protocol, window, now)
 	r.mu.Lock()
 	if r.prefix == nil {
 		r.prefix = make(map[prefixCacheKey]prefixCacheEntry)
