@@ -60,11 +60,18 @@ func (s *Server) persistRoutingAudit(requestID string, started time.Time, groupI
 		} else {
 			_ = id
 			actualCost := actualRouteCost(result.Attempts)
+			// ActualUpstreamID may differ from SelectedUpstreamID when the
+			// initial pick failed and a failover attempt succeeded. Persist
+			// it so downstream analysis can distinguish 'was picked' from
+			// 'actually served the successful attempt' — otherwise a JOIN by
+			// selected_upstream_id misattributes failover requests to the
+			// upstream that failed.
 			complete := store.RouteDecisionOutcome{
 				ActualCost:        actualCost,
 				ActualInputTokens: optionalInt64Ptr(result.InputTokens), ActualOutputTokens: optionalInt64Ptr(result.OutputTokens),
 				ActualCachedTokens: optionalInt64Ptr(result.CachedTokens), ActualCacheCreationTokens: optionalInt64Ptr(result.CacheCreationTokens),
-				Outcome: result.Outcome, CompletedAt: time.Now(),
+				ActualUpstreamID: result.FinalUpstreamID,
+				Outcome:          result.Outcome, CompletedAt: time.Now(),
 			}
 			if err := s.store.CompleteRouteDecision(requestID, complete); err != nil {
 				slog.Warn("complete route decision failed", "request_id", requestID, "err", err)
