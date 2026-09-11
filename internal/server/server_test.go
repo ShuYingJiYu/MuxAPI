@@ -85,6 +85,13 @@ func TestEndToEndForward(t *testing.T) {
 	if requests[0].Outcome != forward.OutcomeSuccess || requests[0].AttemptCount != 2 || len(requests[0].Attempts) != 2 {
 		t.Fatalf("请求应为换源后成功且包含两次尝试，实际 %+v", requests[0])
 	}
+	passive := srv.passive.Snapshot()
+	if passive.Requests != 1 || passive.Attempts != 2 || passive.Retried != 1 {
+		t.Fatalf("被动观测应按 1 个客户端请求、2 次上游尝试和 1 次换源计数，实际 %+v", passive)
+	}
+	if passive.Outcomes[forward.OutcomeSuccess] != 1 || passive.Outcomes[forward.OutcomeFailed] != 0 {
+		t.Fatalf("被动请求 outcome 不应把失败尝试当成客户端失败，实际 %+v", passive.Outcomes)
+	}
 	groups, err := st.ListGroups()
 	if err != nil || len(groups) != 1 || groups[0].RecentTotal != 1 || groups[0].SuccessRate != 100 {
 		t.Fatalf("分组统计应按客户端请求计为 1 次且成功率 100%%，实际 %+v，错误 %v", groups, err)

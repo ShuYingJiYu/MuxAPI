@@ -273,6 +273,7 @@ func main() {
 		slog.Error("invalid MUXAPI_TRUSTED_PROXIES", "err", err)
 		return
 	}
+	srv.SetMetricsToken(cfg.MetricsToken)
 	srv.SetVersion(Version)
 	updateSvc := update.New(Version, update.HealthURL(cfg.Addr))
 	srv.SetUpdateService(updateSvc)
@@ -299,6 +300,27 @@ func main() {
 	// 后台 goroutine 用 WaitGroup 跟踪：Shutdown 后等它们退出再 st.Close()，
 	// 消除退出期探测/清理仍在写库而 DB 已关的竞态。
 	var wg sync.WaitGroup
+	var metricsSrv *http.Server
+	if cfg.MetricsAddr != "" && cfg.MetricsAddr != cfg.Addr {
+		metricsSrv = &http.Server{
+			Addr:              cfg.MetricsAddr,
+			Handler:           srv.MetricsHandler(),
+			ReadHeaderTimeout: 15 * time.Second,
+			MaxHeaderBytes:    1 << 20,
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Error("metrics server exited", "err", err)
+				stop()
+			}
+		}()
+		slog.Info("muxapi metrics starting", "addr", cfg.MetricsAddr)
+	} else if cfg.MetricsAddr == cfg.Addr && cfg.MetricsAddr != "" {
+		slog.Error("metrics address must differ from business address", "addr", cfg.MetricsAddr)
+		stop()
+	}
 	if !cfg.ReadOnly {
 		// 监控、计费、备份和清理任务都会写库；只读调试模式全部停用。
 		wg.Add(1)
@@ -353,6 +375,11 @@ func main() {
 	defer cancel()
 	if err := httpSrv.Shutdown(shutCtx); err != nil {
 		slog.Error("shutdown failed", "err", err)
+	}
+	if metricsSrv != nil {
+		if err := metricsSrv.Shutdown(shutCtx); err != nil {
+			slog.Error("metrics shutdown failed", "err", err)
+		}
 	}
 	wg.Wait() // 等后台 goroutine 退出，再让 defer st.Close() 安全关库
 }
