@@ -284,6 +284,15 @@ export const api = {
   deleteMonitor: id => req('DELETE', '/monitors/' + id),
   reorderMonitors: ids => req('POST', '/monitors/reorder', { ids }), // 持久化拖拽顺序
   probeMonitor: id => req('POST', `/monitors/${id}/probe`), // 立即探测一次，返回最新快照
+  // 真实流量观测：进程启动以来的累计快照，不会触发上游请求。
+  passive: () => req('GET', `/passive?_ts=${Date.now()}`),
+  // 持久化真实流量窗口；查询可能涉及远程审计库，使用重查询超时。
+  passiveHistory: (window = '24h') => req(
+    'GET',
+    `/passive/history?window=${encodeURIComponent(window)}&_ts=${Date.now()}`,
+    undefined,
+    HEAVY_REQUEST_TIMEOUT_MS,
+  ),
   // 运行时设置
   getSettings: () => req('GET', '/settings'),
   saveSettings: s => req('PUT', '/settings', s),

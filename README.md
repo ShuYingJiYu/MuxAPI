@@ -28,6 +28,7 @@ MuxAPI 针对这三点设计：严格优先级、主动探测发现故障与恢�
 - **模型清单汇总**：`/v1/models` 实时汇总分组内各上游模型并集，带缓存
 - **接入密钥**：客户端用接入密钥访问，按密钥路由到对应分组的上游池
 - **监控看板**：按上游主标签分区展示「渠道 + 模型」卡片，保留成功率、延迟与 24h 趋势；异常模型优先显示
+- **被动流量观测**：从真实请求记录请求/上游尝试、切换、失败分类、延迟与审计丢弃，不发送额外探测请求；与主动探测口径分开
 - **Webhook 告警**：熔断状态翻转时推送 Webhook，带去抖防刷屏
 - **请求审计**：记录完整渠道尝试链、TTFT、总耗时、Token、流量、SSE 完成事件、上游 Request ID 与结构化错误来源，默认永久保留
 - **路由审计**：保存候选渠道的价格、缓存命中/创建预测、盈亏平衡请求数、延迟/可靠性和最终选择理由；缓存统计按 API key、上游、模型和前缀隔离
@@ -64,7 +65,7 @@ MuxAPI 针对这三点设计：严格优先级、主动探测发现故障与恢�
 | 调度层 Scheduler | 按分组选上游：成本/缓存预测 → 健康与可靠性修正 → 冷启动时优先级 + P2C |
 | 健康层 Health | 渠道级熔断器 + 模型能力缓存 + Webhook 告警 |
 | 转发层 Forward | 按候选渠道翻译请求与响应、首事件前换源、渠道尝试链 |
-| 监控层 Monitor | 唯一主动探测源：双写看板统计与路由熔断器 |
+| 监控层 Monitor | 主动探测看板与真实流量被动观测分开；主动探测双写看板统计与路由熔断器，被动观测只读请求结果 |
 
 **回切原理**：每个请求都重新筛选健康上游并取最高优先级层。高优先级上游一旦被健康层探测判定恢复，下个请求立即重新被选中——failback 自然发生，无需额外逻辑。
 
@@ -125,7 +126,9 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o muxapi-linux-amd64 ./cmd/muxap
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `MUXAPI_ADDR` | `:8080` | 监听地址 |
+| `MUXAPI_ADDR` | `:8080` | 业务 API、后台和 `/healthz` 监听地址 |
+| `MUXAPI_METRICS_ADDR` | `:9090` | 独立 Prometheus 监听地址；设为空禁用。不会注册到业务 `:8080` |
+| `MUXAPI_METRICS_TOKEN` | （空） | 可选的 metrics Bearer/x-api-key；仅在 metrics 端口需要额外鉴权时设置 |
 | `MUXAPI_DATABASE_URL` | （必填） | PostgreSQL 连接串，建议连接本机加密隧道或私网地址 |
 | `MUXAPI_TOKEN` | （空） | 管理后台鉴权 token，**留空则后台无鉴权，切勿对外暴露** |
 | `MUXAPI_FAIL_THRESHOLD` | `3` | 连续失败多少次熔断 |
@@ -155,8 +158,11 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o muxapi-linux-amd64 ./cmd/muxap
 | `GET /v1beta/models` | Gemini 模型清单 |
 | `GET /v1/models` | 汇总分组内各上游模型清单（OpenAI 兼容） |
 | `GET /healthz` | 健康检查 |
+| `GET :9090/metrics` | 真实请求的低基数 Prometheus 指标（独立 metrics listener，默认端口见配置） |
 | `GET /admin/logs` | 请求记录偏移量/游标分页与筛选 |
 | `GET /admin/logs/stats` | 当前筛选范围的成功率、延迟与 Token 统计 |
+| `GET /admin/passive` | 进程启动以来的实时流量累计观测（重启后归零） |
+| `GET /admin/passive/history?window=24h` | 数据库请求审计窗口与 upstream/model 尝试统计；不触发主动探测 |
 | `GET /admin/logs/options` | 请求记录筛选项 |
 | `GET /admin/logs/{id}` | 单次请求及完整渠道尝试链 |
 | `GET /admin/routing/decisions` | 路由决定、候选成本和缓存预测审计 |

@@ -213,6 +213,11 @@ const (
 // AttemptResult 记录一次上游尝试，完整请求可能包含多次尝试。
 type AttemptResult struct {
 	AttemptNo int
+	// NetworkAttempt is true only after the translated request has been built
+	// and the forwarder is about to contact the upstream. Gateway-local
+	// candidate failures (for example unsupported protocol or request build
+	// errors) remain in the audit chain but are not upstream attempts.
+	NetworkAttempt bool
 	// Protocol 快照本次尝试实际使用的渠道协议。费用比对靠它决定 cached_tokens
 	// 的口径，事后现查会用改动后的协议解释历史用量。
 	Protocol            string
@@ -268,6 +273,7 @@ type Result struct {
 
 type attemptContext struct {
 	number          int
+	networkAttempt  bool
 	protocol        string
 	mappedModel     string
 	upstreamID      int64
@@ -293,7 +299,7 @@ func healthState(h Health, id int64) string {
 func (a attemptContext) finish(h Health, status int, outcome string, relay relayResult, errorKind, errorSource, errText string) AttemptResult {
 	completed := time.Now()
 	return AttemptResult{
-		AttemptNo: a.number, Protocol: a.protocol, MappedModel: a.mappedModel,
+		AttemptNo: a.number, NetworkAttempt: a.networkAttempt, Protocol: a.protocol, MappedModel: a.mappedModel,
 		UpstreamID: a.upstreamID, Priority: a.priority,
 		SelectionReason: a.selectionReason, HealthBefore: a.healthBefore, HealthAfter: healthState(h, a.upstreamID),
 		Status: status, Outcome: outcome, TTFTMs: relay.ttftMs, DurationMs: completed.Sub(a.started).Milliseconds(),
@@ -305,6 +311,20 @@ func (a attemptContext) finish(h Health, status int, outcome string, relay relay
 		CreatedAt: a.started, CompletedAt: completed, Error: clipErr(errText),
 		UpstreamKeyHash: a.keyHash, RouteDecision: a.routeDecision,
 	}
+}
+
+// ReachedUpstream reports whether an attempt represents an actual upstream
+// exchange. The explicit marker is authoritative for new results; the
+// fallback keeps passive accounting compatible with older/synthetic results
+// that predate the marker and only contain audit outcome fields.
+func (a AttemptResult) ReachedUpstream() bool {
+	if a.NetworkAttempt {
+		return true
+	}
+	if a.ErrorSource == "gateway" {
+		return false
+	}
+	return a.ErrorSource == "upstream" || a.Status != 0 || a.UpstreamRequestID != "" || a.ResponseBytes > 0 || a.TTFTMs > 0
 }
 
 func resultFromAttempt(attempt AttemptResult, attempts []AttemptResult) Result {
@@ -476,6 +496,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		req = req.WithContext(ctx)
 		client := &http.Client{Timeout: 0, Transport: candidate.NewTransport()}
 		start := time.Now()
+		attemptCtx.networkAttempt = true
 		resp, err := client.Do(req)
 		if err != nil {
 			watchdog.stop()
