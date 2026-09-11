@@ -201,7 +201,7 @@ func Choose(request Request) (Decision, error) {
 		return a.CandidateID < b.CandidateID
 	})
 	winnerIndex := shortlist[0]
-	if explored, ok := chooseExploration(request, cfg, eligible, winnerIndex, now); ok {
+	if explored, ok := chooseExploration(request, cfg, decision.Evaluations, eligible, winnerIndex, now); ok {
 		winnerIndex = explored
 		decision.Exploration = true
 	}
@@ -250,7 +250,7 @@ func Choose(request Request) (Decision, error) {
 // still sending a small, bounded sample to less-observed eligible channels.
 // Only explores candidates within CostTieTolerance of the runner-up to avoid
 // wasting money on channels that are obviously more expensive.
-func chooseExploration(request Request, cfg Config, eligible []int, winner int, now time.Time) (int, bool) {
+func chooseExploration(request Request, cfg Config, evaluations []CandidateEvaluation, eligible []int, winner int, now time.Time) (int, bool) {
 	if request.Now.IsZero() || cfg.ExplorationRate <= 0 || len(eligible) < 2 {
 		return 0, false
 	}
@@ -260,26 +260,46 @@ func chooseExploration(request Request, cfg Config, eligible []int, winner int, 
 	}
 	bucket := now.UnixNano() / bucketWindow.Nanoseconds()
 	hash := sha256.Sum256([]byte(request.Features.CacheKey + "\x00" + request.Features.Model + "\x00" + fmt.Sprint(bucket)))
-	threshold := uint64(cfg.ExplorationRate * float64(^uint64(0)))
+	// Rate >= 1 must always fire. float64 rounds ^uint64(0) up to 2^64, and
+	// the back-cast to uint64 is implementation-defined (on x86 it lands on
+	// 2^63), silently degrading rate=1.0 to ~50% fire rate.
+	var threshold uint64
+	if cfg.ExplorationRate >= 1 {
+		threshold = ^uint64(0)
+	} else {
+		threshold = uint64(cfg.ExplorationRate * float64(^uint64(0)))
+	}
 	if binary.BigEndian.Uint64(hash[:8]) > threshold {
 		return 0, false
 	}
-	// Only explore among candidates that are at most 2x the winner's cost.
-	// Expensive fallback channels are not worth exploring.
-	winnerCost := request.Candidates[winner].Price.Multiplier
-	if winnerCost <= 0 {
-		winnerCost = 1
+	// Only explore among candidates that are at most 2x the winner's forecast
+	// cost. The evaluation's EffectiveCost is the real per-decision price
+	// (SelectedTotal, possibly divided by success rate); Price.Multiplier is
+	// only a billing scalar and is typically ~1 across all channels, so it
+	// filters nothing in practice.
+	winnerCost := evaluations[winner].EffectiveCost
+	if math.IsNaN(winnerCost) || math.IsInf(winnerCost, 0) || winnerCost < 0 {
+		winnerCost = 0
 	}
+	// When winnerCost == 0 (e.g. the forecast reports zero requests or zero
+	// tokens), the 2x ceiling collapses to 0 and would filter every candidate.
+	// Fall back to a permissive ceiling in that case so exploration can still
+	// probe cold candidates during early warm-up.
 	costCeiling := winnerCost * 2
+	unbounded := winnerCost == 0
 	best := -1
 	for _, index := range eligible {
 		if index == winner {
 			continue
 		}
-		candidate := request.Candidates[index]
-		if candidate.Price.Multiplier > costCeiling {
+		cost := evaluations[index].EffectiveCost
+		if math.IsNaN(cost) || math.IsInf(cost, 0) || cost < 0 {
 			continue
 		}
+		if !unbounded && cost > costCeiling {
+			continue
+		}
+		candidate := request.Candidates[index]
 		if best < 0 || candidate.Performance.Samples < request.Candidates[best].Performance.Samples ||
 			(candidate.Performance.Samples == request.Candidates[best].Performance.Samples && candidate.ID < request.Candidates[best].ID) {
 			best = index

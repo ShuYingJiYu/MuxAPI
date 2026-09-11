@@ -35,6 +35,35 @@ func TestUsageAuditParsesAnthropicCacheTokens(t *testing.T) {
 	}
 }
 
+// OpenAI's prompt_tokens is inclusive of cached_tokens; Anthropic's input_tokens
+// is exclusive. Downstream SQL (CacheCoverageRatio, TokenInflationFactor)
+// assumes a single convention, so we normalize at parse time to Anthropic's
+// "uncached input" semantics.
+func TestUsageAuditNormalizesOpenAIPromptTokensToUncached(t *testing.T) {
+	// prompt_tokens=1000 includes cached=200 → uncached=800.
+	usage := usageFromJSON([]byte(`{"usage":{"prompt_tokens":1000,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":200}}}`))
+	if usage.input != 800 || usage.cached != 200 || usage.output != 50 {
+		t.Fatalf("openai normalization failed: %+v", usage)
+	}
+}
+
+// Gemini's promptTokenCount is inclusive of cachedContentTokenCount.
+func TestUsageAuditNormalizesGeminiPromptTokensToUncached(t *testing.T) {
+	usage := usageFromJSON([]byte(`{"usageMetadata":{"promptTokenCount":500,"candidatesTokenCount":40,"cachedContentTokenCount":150}}`))
+	if usage.input != 350 || usage.cached != 150 || usage.output != 40 {
+		t.Fatalf("gemini normalization failed: %+v", usage)
+	}
+}
+
+// Guard: if cached > prompt_tokens (garbage upstream), clamp to zero
+// instead of going negative.
+func TestUsageAuditClampsNegativeUncached(t *testing.T) {
+	usage := usageFromJSON([]byte(`{"usage":{"prompt_tokens":10,"cached_tokens":50}}`))
+	if usage.input != 0 || usage.cached != 50 {
+		t.Fatalf("negative uncached must clamp to zero: %+v", usage)
+	}
+}
+
 func TestContentBlockStopIsNotWholeStreamCompletion(t *testing.T) {
 	audit := &responseAudit{stream: true}
 	audit.feed([]byte("event: content_block_stop\ndata: {\"type\":\"content_block_stop\"}\n\n"))
@@ -58,7 +87,9 @@ func TestRelayResponseCapturesUsageBytesAndRequestID(t *testing.T) {
 	if result.err != nil || result.bytesSent != int64(len(body)) {
 		t.Fatalf("relay result mismatch: %+v", result)
 	}
-	if result.usage.input != 9 || result.usage.output != 4 || result.usage.cached != 2 {
+	// input is normalized to Anthropic-style "uncached" semantics: OpenAI
+	// prompt_tokens (9) is inclusive of cached (2), so uncached = 9 - 2 = 7.
+	if result.usage.input != 7 || result.usage.output != 4 || result.usage.cached != 2 {
 		t.Fatalf("usage mismatch: %+v", result.usage)
 	}
 	if result.upstreamRequestID != "upstream-123" {

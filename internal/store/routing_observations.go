@@ -481,11 +481,40 @@ func (s *Store) GetUpstreamRoutingStats(upstreamID int64, model string, window t
 	return stats, nil
 }
 
+// AssumedCacheTTL picks the TTL to attribute to the most recent cache create
+// when we only know aggregate observations for a session (no explicit ExpiresAt
+// row). It mirrors the routing.selectAdaptiveTTL policy so the two encodings of
+// the same rule stay in sync: Gemini → 1h; long session with rebuilds → 1h;
+// sparse conversation with any rebuild → 1h; otherwise 5min default.
+//
+// Kept here (rather than importing routing) to avoid a store → routing cycle;
+// see the routing.selectAdaptiveTTL doc-comment for the source of truth.
+func AssumedCacheTTL(protocol string, observations, createCount int64, firstSeenAt, now int64) time.Duration {
+	const defaultTTL = 5 * time.Minute
+	const extendedTTL = time.Hour
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "gemini", "google", "generativelanguage", "generatecontent":
+		return extendedTTL
+	}
+	if firstSeenAt <= 0 || observations <= 0 {
+		return defaultTTL
+	}
+	sessionDuration := time.Duration(now-firstSeenAt) * time.Second
+	if sessionDuration > 10*time.Minute && createCount >= 2 {
+		return extendedTTL
+	}
+	avgInterval := sessionDuration / time.Duration(observations)
+	if avgInterval > 4*time.Minute && createCount >= 1 {
+		return extendedTTL
+	}
+	return defaultTTL
+}
+
 // GetPrefixCacheStats reads the cache state isolated by upstream credential,
 // upstream, model, and prefix. Lifetime counters are returned alongside a
 // recent-window hit rate; zero/unknown expiry is treated conservatively as
 // not currently valid.
-func (s *Store) GetPrefixCacheStats(apiKeyHash string, upstreamID int64, model, prefixHash string, window time.Duration, now time.Time) (PrefixCacheStats, error) {
+func (s *Store) GetPrefixCacheStats(apiKeyHash string, upstreamID int64, model, prefixHash, protocol string, window time.Duration, now time.Time) (PrefixCacheStats, error) {
 	if window <= 0 {
 		window = DefaultRoutingStatsWindow
 	}
@@ -506,11 +535,16 @@ func (s *Store) GetPrefixCacheStats(apiKeyHash string, upstreamID int64, model, 
 		// Fallback: if no exact prefix_hash match, aggregate by session_key from
 		// routing_observations. This handles multi-turn sessions where the prefix
 		// hash changes every turn but the session (and its cache behavior) is stable.
-		stats, fallbackErr := s.getSessionCacheStats(apiKeyHash, upstreamID, model, prefixHash, window, now)
+		//
+		// When the fallback also fails, surface the fallback's error (which may
+		// carry a real DB failure) rather than the primary ErrNoRows that
+		// triggered the fallback. Return the outer initialised stats value so
+		// the caller sees consistent field content on the error path.
+		fallbackStats, fallbackErr := s.getSessionCacheStats(apiKeyHash, upstreamID, model, prefixHash, protocol, window, now)
 		if fallbackErr != nil {
-			return stats, err
+			return stats, fallbackErr
 		}
-		return stats, nil
+		return fallbackStats, nil
 	}
 	stats.HitRate = routingRatio(stats.HitCount, stats.HitCount+stats.MissCount)
 	stats.Valid = stats.ExpiresAt > now.Unix()
@@ -531,9 +565,14 @@ func (s *Store) GetPrefixCacheStats(apiKeyHash string, upstreamID int64, model, 
 // getSessionCacheStats aggregates cache observations by session_key when the
 // exact prefix_hash doesn't exist in the summary table. This is the common case
 // for multi-turn conversations where each request has a slightly different prefix.
-func (s *Store) getSessionCacheStats(apiKeyHash string, upstreamID int64, model, sessionKey string, window time.Duration, now time.Time) (PrefixCacheStats, error) {
+func (s *Store) getSessionCacheStats(apiKeyHash string, upstreamID int64, model, sessionKey, protocol string, window time.Duration, now time.Time) (PrefixCacheStats, error) {
 	stats := PrefixCacheStats{APIKeyHash: apiKeyHash, UpstreamID: upstreamID, Model: model, PrefixHash: sessionKey, SessionKey: sessionKey}
 	from := now.Add(-window)
+	// Both the in-window query and the lifetime fallback below MUST apply the
+	// same success=TRUE filter, otherwise a single failed retry inside the
+	// window suppresses the widen path and yields divergent verdicts for the
+	// same underlying history depending purely on where the failure lands
+	// relative to the window boundary.
 	err := s.queryRow(`SELECT
 		COUNT(*),
 		COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END),0),
@@ -545,6 +584,7 @@ func (s *Store) getSessionCacheStats(apiKeyHash string, upstreamID int64, model,
 		COALESCE(MIN(`+s.unixExpr("observed_at")+`),0)
 		FROM routing_observations
 		WHERE api_key_hash=? AND upstream_id=? AND model=? AND session_key=?
+		AND success=TRUE
 		AND observed_at>=? AND observed_at<?`,
 		apiKeyHash, upstreamID, model, sessionKey,
 		s.timeValue(from), s.timeValue(now)).Scan(
@@ -592,14 +632,11 @@ func (s *Store) getSessionCacheStats(apiKeyHash string, upstreamID int64, model,
 		if stats.LastCreatedAt > latestCache {
 			latestCache = stats.LastCreatedAt
 		}
-		// Use adaptive TTL for ExpiresAt: if the session has been running
-		// long enough and cache was rebuilt multiple times, assume 1h TTL
-		// was used for the latest creation (see selectCacheTTL in scheduler).
-		assumedTTL := 5 * time.Minute
-		sessionDuration := now.Unix() - stats.FirstSeenAt
-		if sessionDuration > int64((10*time.Minute)/time.Second) && stats.CreateCount >= 2 {
-			assumedTTL = time.Hour
-		}
+		// Use the same adaptive-TTL policy as routing.selectAdaptiveTTL so a
+		// Gemini session or a sparse conversation with any rebuild is treated
+		// as 1h, not 5min. The old 5-min-default flipped CacheHot → CacheExpired
+		// up to 55 minutes early, killing the guaranteed initial hit credit.
+		assumedTTL := AssumedCacheTTL(protocol, stats.Observations, stats.CreateCount, stats.FirstSeenAt, now.Unix())
 		stats.ExpiresAt = latestCache + int64(assumedTTL/time.Second)
 		stats.Valid = stats.ExpiresAt > now.Unix()
 	}
