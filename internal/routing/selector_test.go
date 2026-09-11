@@ -2,6 +2,7 @@ package routing
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -146,5 +147,62 @@ func TestChooseExploresLeastObservedEligibleCandidate(t *testing.T) {
 	}
 	if decision.SelectedID != cold.ID || !decision.Exploration {
 		t.Fatalf("expected exploration sample of cold candidate: %+v", decision)
+	}
+}
+
+// Exploration must NOT pick a candidate whose forecast cost is materially
+// higher than the winner's. Previously the ceiling compared Price.Multiplier
+// (typically ~1 everywhere), so a 100x-more-expensive fallback slipped through.
+func TestChooseExplorationRejectsExpensiveCandidates(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	// Both eligible under identical multipliers, but "expensive" is 100x pricier
+	// per token; a real forecast must reject it as an exploration target.
+	cheap := healthyCandidate(1, "cheap", 0, basePrice(1e-7))
+	cheap.Performance = Performance{Samples: 100, SuccessRate: 1}
+	expensive := healthyCandidate(2, "expensive", 10, basePrice(1e-5))
+	expensive.Performance = Performance{Samples: 0}
+	cfg := DefaultConfig()
+	cfg.ExplorationRate = 1
+	// Give the request non-zero tokens so EffectiveCost > 0 and the ceiling
+	// is enforced. Otherwise every candidate has cost=0 and the safety
+	// fallback for winnerCost==0 kicks in.
+	decision, err := Choose(Request{
+		Features: RequestFeatures{
+			Model: "gpt-5", CacheKey: "session-expensive",
+			InputTokens: 10_000, EstimatedOutputTokens: 100,
+		},
+		Candidates: []Candidate{cheap, expensive}, Config: cfg, Now: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.SelectedID == expensive.ID {
+		t.Fatalf("100x-more-expensive candidate must not be explored: %+v", decision)
+	}
+}
+
+// Rate=1.0 must always fire — regression for the float64→uint64 rounding bug
+// that silently degraded rate=1.0 to ~50% fire rate.
+func TestChooseExplorationRateOneAlwaysFires(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	cold := healthyCandidate(2, "cold", 10, basePrice(1e-7))
+	cold.Performance.Samples = 0
+	warm := healthyCandidate(1, "warm", 0, basePrice(1e-7))
+	warm.Performance = Performance{Samples: 100, SuccessRate: 1}
+	cfg := DefaultConfig()
+	cfg.ExplorationRate = 1
+	// Try 20 distinct cache_keys — ALL should explore at rate=1.0 regardless
+	// of how the hash lands.
+	for i := 0; i < 20; i++ {
+		decision, err := Choose(Request{
+			Features:   RequestFeatures{Model: "gpt-5", CacheKey: fmt.Sprintf("s-%d", i)},
+			Candidates: []Candidate{warm, cold}, Config: cfg, Now: now,
+		})
+		if err != nil {
+			t.Fatalf("iter %d: %v", i, err)
+		}
+		if !decision.Exploration {
+			t.Fatalf("iter %d: exploration must fire at rate=1.0, got winner=%s", i, decision.SelectedName)
+		}
 	}
 }
