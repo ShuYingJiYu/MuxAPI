@@ -53,6 +53,47 @@ func TestFetchModelsRejectsSuccessfulErrorEnvelope(t *testing.T) {
 	}
 }
 
+func TestFetchModelsAcceptsCommonEnvelopeShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want []string
+	}{
+		{name: "items", body: `{"items":[{"id":"gpt-5.6"}]}`, want: []string{"gpt-5.6"}},
+		{name: "string models", body: `{"models":["models/gpt-5.6"]}`, want: []string{"gpt-5.6"}},
+		{name: "bare array", body: `[{"name":"models/claude-sonnet"}]`, want: []string{"claude-sonnet"}},
+		{name: "nested results", body: `{"data":{"results":[{"id":"gpt-5.5"}]}}`, want: []string{"gpt-5.5"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			u := &Upstream{BaseURL: server.URL, APIKey: "key", Protocol: "claude"}
+			models, status, err := u.FetchModels(context.Background(), time.Second)
+			if err != nil || status != http.StatusOK || len(models) != 1 || models[0] != tc.want[0] {
+				t.Fatalf("models=%v status=%d err=%v", models, status, err)
+			}
+		})
+	}
+}
+
+func TestFetchModelsRejectsSuccessfulEmptyEnvelope(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"data":[]}`))
+	}))
+	defer server.Close()
+
+	u := &Upstream{BaseURL: server.URL, APIKey: "key", Protocol: "claude"}
+	models, status, err := u.FetchModels(context.Background(), time.Second)
+	if err == nil || status != http.StatusOK || models != nil {
+		t.Fatalf("empty successful envelope must fail discovery: models=%v status=%d err=%v", models, status, err)
+	}
+}
+
 func TestIsFailureStatus(t *testing.T) {
 	// 应触发故障切换/熔断的状态码
 	fail := []int{

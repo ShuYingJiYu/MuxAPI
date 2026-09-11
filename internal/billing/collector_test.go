@@ -267,3 +267,68 @@ func TestFetchNewAPIPartialWithoutLogs(t *testing.T) {
 		t.Fatalf("partial New API data should retain balance: %+v", result)
 	}
 }
+
+func TestFetchNewAPIFallsBackToCurrentUserGroupWithoutLogs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/usage/token/":
+			w.Write([]byte(`{"data":{"object":"token_usage","total_used":100,"unlimited_quota":true}}`))
+		case "/api/status":
+			w.Write([]byte(`{"data":{"quota_per_unit":500000}}`))
+		case "/api/log/token":
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+		case "/api/user/self":
+			w.Write([]byte(`{"success":true,"data":{"group":"kiro-high"}}`))
+		case "/api/user/groups":
+			w.Write([]byte(`{"success":true,"data":{"kiro-high":{"ratio":"0.125"}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	result, err := Fetch(context.Background(), &upstream.Upstream{
+		BaseURL: server.URL, APIKey: "sk-test", BillingType: upstream.BillingNewAPI,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BillingGroup != "kiro-high" {
+		t.Fatalf("expected current user group fallback, got %+v", result)
+	}
+	if result.EffectiveMultiplier == nil || *result.EffectiveMultiplier != 0.125 {
+		t.Fatalf("expected numeric-string public multiplier, got %v", result.EffectiveMultiplier)
+	}
+	if result.Warning == "" {
+		t.Fatal("log rate-limit should remain visible as a partial warning")
+	}
+}
+
+func TestFetchNewAPIUsesUsageGroupWhenLogsAreUnavailable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/usage/token/":
+			w.Write([]byte(`{"data":{"object":"token_usage","group":"kiro-high","total_used":100,"unlimited_quota":true}}`))
+		case "/api/status":
+			w.Write([]byte(`{"data":{"quota_per_unit":500000}}`))
+		case "/api/log/token":
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+		case "/api/user/groups":
+			w.Write([]byte(`{"success":true,"data":{"kiro-high":{"ratio":"0.125"}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	result, err := Fetch(context.Background(), &upstream.Upstream{
+		BaseURL: server.URL, APIKey: "sk-test", BillingType: upstream.BillingNewAPI,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BillingGroup != "kiro-high" || result.EffectiveMultiplier == nil ||
+		*result.EffectiveMultiplier != 0.125 {
+		t.Fatalf("expected usage group and current multiplier, got %+v", result)
+	}
+}

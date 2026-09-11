@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -166,6 +167,8 @@ func fetchSub2API(ctx context.Context, item *upstream.Upstream) (Result, error) 
 type newAPIUsageResponse struct {
 	Data struct {
 		Object         string  `json:"object"`
+		Group          string  `json:"group"`
+		UserGroup      string  `json:"user_group"`
 		TotalUsed      float64 `json:"total_used"`
 		TotalAvailable float64 `json:"total_available"`
 		UnlimitedQuota bool    `json:"unlimited_quota"`
@@ -199,15 +202,63 @@ type newAPIGroupResponse struct {
 	} `json:"data"`
 }
 
+// newAPIUserResponse 是 OneAPI/New API 的当前用户信息。分组日志可能因
+// 限流、保留期或权限暂时不可用，但 self 接口仍能提供当前分组名称。
+type newAPIUserResponse struct {
+	Data struct {
+		Group string `json:"group"`
+		User  struct {
+			Group string `json:"group"`
+		} `json:"user"`
+	} `json:"data"`
+}
+
 func decodeNewAPILogBilling(raw json.RawMessage, target *newAPILogBilling) bool {
 	if len(raw) == 0 {
 		return false
 	}
-	if json.Unmarshal(raw, target) == nil {
-		return true
-	}
 	var encoded string
-	return json.Unmarshal(raw, &encoded) == nil && json.Unmarshal([]byte(encoded), target) == nil
+	if json.Unmarshal(raw, &encoded) == nil {
+		raw = json.RawMessage(encoded)
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return false
+	}
+	target.GroupRatio = jsonFloat(fields["group_ratio"])
+	target.UserGroupRatio = jsonFloat(fields["user_group_ratio"])
+	return target.GroupRatio != nil || target.UserGroupRatio != nil
+}
+
+func jsonFloat(raw json.RawMessage) *float64 {
+	if len(raw) == 0 {
+		return nil
+	}
+	var value float64
+	if json.Unmarshal(raw, &value) == nil && math.IsNaN(value) == false && math.IsInf(value, 0) == false {
+		return &value
+	}
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		return nil
+	}
+	value, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+		return nil
+	}
+	return &value
+}
+
+func fetchNewAPIUserGroup(ctx context.Context, item *upstream.Upstream) (string, error) {
+	var profile newAPIUserResponse
+	if err := getJSON(ctx, item, "/api/user/self", &profile); err != nil {
+		return "", err
+	}
+	group := strings.TrimSpace(profile.Data.Group)
+	if group == "" {
+		group = strings.TrimSpace(profile.Data.User.Group)
+	}
+	return group, nil
 }
 
 func fetchNewAPI(ctx context.Context, item *upstream.Upstream) (Result, error) {
@@ -233,11 +284,18 @@ func fetchNewAPI(ctx context.Context, item *upstream.Upstream) (Result, error) {
 	}
 	actual := usage.Data.TotalUsed / status.Data.QuotaPerUnit
 	result.ReportedActualCost = &actual
+	// Some New API forks include the token's selected group in the usage
+	// response. It is available with the relay key even when token logs are
+	// rate-limited, so prefer it as the first fallback for group detection.
+	result.BillingGroup = strings.TrimSpace(usage.Data.Group)
+	if result.BillingGroup == "" {
+		result.BillingGroup = strings.TrimSpace(usage.Data.UserGroup)
+	}
 
 	var logs newAPILogResponse
-	if err := getJSON(ctx, item, "/api/log/token", &logs); err != nil {
-		result.Warning = err.Error()
-		return result, nil
+	logErr := getJSON(ctx, item, "/api/log/token", &logs)
+	if logErr != nil {
+		result.Warning = logErr.Error()
 	}
 	// 分组名取最新一条日志（错误日志也带 group，且反映当前分组归属）；
 	// user_group_ratio 是**个人议价倍率**(>=0 时才是真实扣费)，取最新扣费日志里的。
@@ -253,7 +311,7 @@ func fetchNewAPI(ctx context.Context, item *upstream.Upstream) (Result, error) {
 			result.BillingGroup = group
 		}
 		var detail newAPILogBilling
-		if !decodeNewAPILogBilling(entry.Other, &detail) || detail.GroupRatio == nil {
+		if !decodeNewAPILogBilling(entry.Other, &detail) || (detail.GroupRatio == nil && detail.UserGroupRatio == nil) {
 			continue
 		}
 		// 分组变更后，旧分组的扣费不能套到当前分组上。
@@ -267,7 +325,19 @@ func fetchNewAPI(ctx context.Context, item *upstream.Upstream) (Result, error) {
 		break
 	}
 	if result.BillingGroup == "" {
-		result.Warning = "New API has no recent token log for billing group detection"
+		// 日志接口不可用或尚无消费记录时，当前用户资料仍能给出分组。
+		// 这允许继续读取当前公示倍率，同时保留日志不可用的 partial 状态。
+		group, err := fetchNewAPIUserGroup(ctx, item)
+		if err == nil && group != "" {
+			result.BillingGroup = group
+		} else if result.Warning == "" {
+			result.Warning = "New API has no recent token log for billing group detection"
+		}
+	}
+	if result.BillingGroup == "" {
+		if result.Warning == "" {
+			result.Warning = "New API billing group is unavailable"
+		}
 		return result, nil
 	}
 
@@ -279,10 +349,9 @@ func fetchNewAPI(ctx context.Context, item *upstream.Upstream) (Result, error) {
 		return result, nil
 	}
 	if group, ok := groups.Data[result.BillingGroup]; ok {
-		var ratio float64
-		if json.Unmarshal(group.Ratio, &ratio) == nil {
-			result.GroupMultiplier = &ratio
-			result.EffectiveMultiplier = &ratio
+		if ratio := jsonFloat(group.Ratio); ratio != nil && *ratio > 0 {
+			result.GroupMultiplier = ratio
+			result.EffectiveMultiplier = ratio
 		}
 	}
 	// 有个人议价则覆盖 effective，group 仍是公示价(供审计对比)
