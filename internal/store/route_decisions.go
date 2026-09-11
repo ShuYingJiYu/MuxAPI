@@ -77,8 +77,12 @@ type RouteDecisionOutcome struct {
 	ActualOutputTokens        *int64
 	ActualCachedTokens        *int64
 	ActualCacheCreationTokens *int64
-	Outcome                   string
-	CompletedAt               time.Time
+	// ActualUpstreamID is the upstream whose usage is being recorded. It may
+	// differ from RouteDecisionRecord.SelectedUpstreamID when the initial pick
+	// failed and a failover attempt succeeded. Zero means unknown / unchanged.
+	ActualUpstreamID int64
+	Outcome          string
+	CompletedAt      time.Time
 }
 
 type RouteDecisionEntry struct {
@@ -285,13 +289,19 @@ func (s *Store) CompleteRouteDecision(requestID string, outcome RouteDecisionOut
 	if outcome.CompletedAt.IsZero() {
 		outcome.CompletedAt = time.Now()
 	}
+	var actualUpstream *int64
+	if outcome.ActualUpstreamID > 0 {
+		actualUpstream = &outcome.ActualUpstreamID
+	}
 	result, err := s.exec(`UPDATE route_decisions SET
 		actual_cost=COALESCE(?,actual_cost),actual_input_tokens=COALESCE(?,actual_input_tokens),
 		actual_output_tokens=COALESCE(?,actual_output_tokens),actual_cached_tokens=COALESCE(?,actual_cached_tokens),
 		actual_cache_creation_tokens=COALESCE(?,actual_cache_creation_tokens),
+		actual_upstream_id=COALESCE(?,actual_upstream_id),
 		actual_outcome=CASE WHEN ?='' THEN actual_outcome ELSE ? END,completed_at=?
 		WHERE request_id=?`, outcome.ActualCost, outcome.ActualInputTokens, outcome.ActualOutputTokens,
-		outcome.ActualCachedTokens, outcome.ActualCacheCreationTokens, outcome.Outcome, outcome.Outcome,
+		outcome.ActualCachedTokens, outcome.ActualCacheCreationTokens, actualUpstream,
+		outcome.Outcome, outcome.Outcome,
 		s.timeValue(outcome.CompletedAt), requestID)
 	if err != nil {
 		return err
