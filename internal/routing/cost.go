@@ -58,12 +58,20 @@ func EstimateWindowCost(features RequestFeatures, forecast TrafficForecast, pric
 
 	// InputInflation corrects for upstreams that inject additional tokens
 	// (system prompts, tool definitions) not visible to the router at decision
-	// time. The inflated InputTokens produces a realistic suffix size.
+	// time. These injected tokens are stable across requests in a session, so on
+	// cache-supporting upstreams they participate in the cache lifecycle just
+	// like the client-supplied prefix — they are billed as cache_read on hits
+	// and cache_creation on misses, not at the full input rate.
+	originalInputTokens := features.InputTokens
 	if cache.InputInflation > 1 {
 		inflated := int64(float64(features.InputTokens) * cache.InputInflation)
 		if inflated > features.InputTokens {
 			features.InputTokens = inflated
 		}
+	}
+	inflationTokens := float64(features.InputTokens - originalInputTokens)
+	if inflationTokens < 0 {
+		inflationTokens = 0
 	}
 
 	prefix := float64(features.ReusableInputTokens)
@@ -79,9 +87,13 @@ func EstimateWindowCost(features RequestFeatures, forecast TrafficForecast, pric
 	if coverage <= 0 || coverage > 1 || math.IsNaN(coverage) || math.IsInf(coverage, 0) {
 		coverage = 1
 	}
-	cachedPrefix := prefix * coverage
-	uncachedPrefix := prefix - cachedPrefix
-	suffix := float64(features.InputTokens) - prefix
+	// cacheable tokens = reusable prefix + upstream-injected inflation. Both are
+	// stable across the session and share the provider cache lifecycle.
+	cacheable := prefix + inflationTokens
+	cachedPortion := cacheable * coverage
+	uncachedPortion := cacheable - cachedPortion
+	// true suffix = the newly appended user turn, never cacheable.
+	suffix := float64(originalInputTokens) - prefix
 	if suffix < 0 {
 		suffix = 0
 	}
@@ -198,15 +210,17 @@ func EstimateWindowCost(features RequestFeatures, forecast TrafficForecast, pric
 	result.ExpectedCreates = misses
 	result.CacheLifetimes = lifetimes
 
-	result.CacheReadCost = hits * cachedPrefix * pricing.CacheReadPerToken * multiplier
-	result.CacheWriteCost = misses * cachedPrefix * pricing.CacheWritePerToken * multiplier
-	// suffix + uncached portion of prefix always pay full input price
-	result.CacheInputCost = n * (suffix + uncachedPrefix) * input * multiplier
+	result.CacheReadCost = hits * cachedPortion * pricing.CacheReadPerToken * multiplier
+	result.CacheWriteCost = misses * cachedPortion * pricing.CacheWritePerToken * multiplier
+	// true suffix (new user turn) + uncached portion of prefix+inflation always
+	// pay full input price. Inflation tokens ONLY appear at full input price via
+	// the uncached share of coverage; the cached share flows through read/write.
+	result.CacheInputCost = n * (suffix + uncachedPortion) * input * multiplier
 	if cache.CacheReadIncludesInput {
-		result.CacheReadCost += hits * cachedPrefix * input * multiplier
+		result.CacheReadCost += hits * cachedPortion * input * multiplier
 	}
 	if cache.CacheWriteIncludesInput {
-		result.CacheWriteCost += misses * cachedPrefix * input * multiplier
+		result.CacheWriteCost += misses * cachedPortion * input * multiplier
 	}
 	result.CacheTotal = result.CacheInputCost + result.CacheReadCost + result.CacheWriteCost + result.OutputCost
 	result.SelectedTotal = result.NoCacheTotal
@@ -263,11 +277,16 @@ func cacheLifetimes(cache CacheProfile, window time.Duration, requests float64, 
 // supplied prices, or the equation is not defined.
 func breakEvenRequests(features RequestFeatures, forecast TrafficForecast, pricing Pricing, cache CacheProfile, multiplier float64) float64 {
 	features = features.Normalize()
+	originalInputTokens := features.InputTokens
 	if cache.InputInflation > 1 {
 		inflated := int64(float64(features.InputTokens) * cache.InputInflation)
 		if inflated > features.InputTokens {
 			features.InputTokens = inflated
 		}
+	}
+	inflationTokens := float64(features.InputTokens - originalInputTokens)
+	if inflationTokens < 0 {
+		inflationTokens = 0
 	}
 	prefix := float64(features.ReusableInputTokens)
 	if !cache.Supported || prefix == 0 || (cache.MinTokens > 0 && int64(prefix) < cache.MinTokens) {
@@ -277,11 +296,12 @@ func breakEvenRequests(features RequestFeatures, forecast TrafficForecast, prici
 	if coverage <= 0 || coverage > 1 || math.IsNaN(coverage) || math.IsInf(coverage, 0) {
 		coverage = 1
 	}
-	cachedPrefix := prefix * coverage
-	uncachedPrefix := prefix - cachedPrefix
+	cacheable := prefix + inflationTokens
+	cachedPortion := cacheable * coverage
+	uncachedPortion := cacheable - cachedPortion
 	input := pricing.InputPerToken * multiplier
 	out := forecast.OutputTokensPerReq * pricing.OutputPerToken * multiplier
-	suffix := float64(features.InputTokens) - prefix
+	suffix := float64(originalInputTokens) - prefix
 	if suffix < 0 {
 		suffix = 0
 	}
@@ -293,13 +313,13 @@ func breakEvenRequests(features RequestFeatures, forecast TrafficForecast, prici
 	if h < 0 || h > 1 || math.IsNaN(h) || math.IsInf(h, 0) {
 		h = 0
 	}
-	miss := (suffix+uncachedPrefix)*input + cachedPrefix*pricing.CacheWritePerToken*multiplier + out
-	hit := (suffix+uncachedPrefix)*input + cachedPrefix*pricing.CacheReadPerToken*multiplier + out
+	miss := (suffix+uncachedPortion)*input + cachedPortion*pricing.CacheWritePerToken*multiplier + out
+	hit := (suffix+uncachedPortion)*input + cachedPortion*pricing.CacheReadPerToken*multiplier + out
 	if cache.CacheWriteIncludesInput {
-		miss += cachedPrefix * input
+		miss += cachedPortion * input
 	}
 	if cache.CacheReadIncludesInput {
-		hit += cachedPrefix * input
+		hit += cachedPortion * input
 	}
 	// Expected subsequent request cost at the observed hit rate.
 	steady := h*hit + (1-h)*miss
