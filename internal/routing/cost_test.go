@@ -19,23 +19,27 @@ func TestEstimateWindowCostNoCache(t *testing.T) {
 	}
 }
 
-func TestEstimateActualCostUsesProtocolTokenSemantics(t *testing.T) {
+// After the parseUsageObject normalization, callers pass Anthropic-semantic
+// (uncached-only) input tokens regardless of the origin protocol. This test
+// pins that contract: given the same normalized inputs, the price is
+// protocol-independent.
+func TestEstimateActualCostProtocolIndependent(t *testing.T) {
 	price := Pricing{
 		InputPerToken: 1, OutputPerToken: 2, CacheReadPerToken: 0.1, CacheWritePerToken: 1.25,
 		InputKnown: true, OutputKnown: true, CacheReadKnown: true, CacheWriteKnown: true,
 		Multiplier: 0.5,
 	}
-	claude, ok := EstimateActualCost(price, "claude", 100, 10, 80, 20)
-	if !ok {
-		t.Fatal("Claude usage should be priceable")
-	}
-	closeTo(t, claude, (100+20+8+25)*0.5)
+	// input=uncached=100, cached=80, creation=20, output=10.
+	// cost = (100 + 20 + 0.1*80 + 1.25*20) * 0.5 = (100+20+8+25) * 0.5 = 76.5.
+	want := (100.0 + 20 + 8 + 25) * 0.5
 
-	openAI, ok := EstimateActualCost(price, "openai", 100, 10, 80, 20)
-	if !ok {
-		t.Fatal("OpenAI usage should be priceable")
+	for _, protocol := range []string{"claude", "openai", "gemini", "responses", ""} {
+		got, ok := EstimateActualCost(price, protocol, 100, 10, 80, 20)
+		if !ok {
+			t.Fatalf("%s usage should be priceable", protocol)
+		}
+		closeTo(t, got, want)
 	}
-	closeTo(t, openAI, (20+20+8+25)*0.5)
 }
 
 func TestEstimateActualCostRejectsIncompleteUsageOrPricing(t *testing.T) {

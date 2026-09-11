@@ -46,11 +46,16 @@ type CostEstimate struct {
 	Warnings           []string      `json:"warnings,omitempty"`
 }
 
-// EstimateActualCost prices observed usage with the same token semantics used
-// by billing reconciliation. Claude reports uncached input separately, while
-// OpenAI-shaped protocols include cached tokens in their input total.
+// EstimateActualCost prices observed usage. inputTokens is assumed to be the
+// uncached prompt total under Anthropic semantics — audit.parseUsageObject
+// normalizes OpenAI/Gemini prompt_tokens (which are inclusive of cached) at
+// ingest time, so callers should pass the stored routing_observations.input
+// value directly. The protocol argument is accepted for backward compatibility
+// and future protocol-specific pricing quirks but no longer used for token
+// arithmetic.
 func EstimateActualCost(price Pricing, protocol string, inputTokens, outputTokens,
 	cachedTokens, cacheCreationTokens int64) (float64, bool) {
+	_ = protocol
 	if inputTokens < 0 || outputTokens < 0 || cachedTokens < 0 || cacheCreationTokens < 0 {
 		return 0, false
 	}
@@ -58,12 +63,6 @@ func EstimateActualCost(price Pricing, protocol string, inputTokens, outputToken
 		return 0, false
 	}
 	price = price.Normalized()
-	if NormalizeProtocol(protocol) != "claude" {
-		inputTokens -= cachedTokens
-		if inputTokens < 0 {
-			return 0, false
-		}
-	}
 	if (inputTokens > 0 && !price.InputKnown) || (outputTokens > 0 && !price.OutputKnown) ||
 		(cachedTokens > 0 && !price.CacheReadKnown) ||
 		(cacheCreationTokens > 0 && !price.CacheWriteKnown) {
