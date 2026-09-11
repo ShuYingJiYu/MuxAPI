@@ -4,6 +4,7 @@ package upstream
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -257,32 +258,71 @@ func (u *Upstream) FetchModels(ctx context.Context, timeout time.Duration) ([]st
 	if resp.StatusCode >= 400 {
 		return nil, resp.StatusCode, &HTTPError{Status: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
-	var parsed struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-		Models []struct {
-			Name string `json:"name"`
-		} `json:"models"`
-	}
+	var parsed any
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return nil, resp.StatusCode, err
 	}
 	if IsErrorPayload(body) {
 		return nil, resp.StatusCode, &HTTPError{Status: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
-	models := make([]string, 0, len(parsed.Data))
-	for _, m := range parsed.Data {
-		if m.ID != "" {
-			models = append(models, m.ID)
-		}
-	}
-	for _, m := range parsed.Models {
-		if id := strings.TrimPrefix(strings.TrimSpace(m.Name), "models/"); id != "" {
-			models = append(models, id)
-		}
+	models := modelIDs(parsed)
+	if len(models) == 0 {
+		return nil, resp.StatusCode, fmt.Errorf("upstream returned no models from %s", modelsPath)
 	}
 	return models, resp.StatusCode, nil
+}
+
+// modelIDs accepts the response shapes used by OpenAI-compatible, Claude
+// relays and Gemini-compatible gateways: {data: [...]}, {models: [...]},
+// {items: [...]}, nested envelopes, and a bare array. A successful HTTP
+// response with no recognizable model entry is handled by FetchModels as an
+// error instead of being presented as a healthy empty list.
+func modelIDs(value any) []string {
+	seen := make(map[string]struct{})
+	var ids []string
+	var visit func(any)
+	visit = func(current any) {
+		switch item := current.(type) {
+		case string:
+			id := strings.TrimPrefix(strings.TrimSpace(item), "models/")
+			if id != "" {
+				if _, ok := seen[id]; !ok {
+					seen[id] = struct{}{}
+					ids = append(ids, id)
+				}
+			}
+		case []any:
+			for _, entry := range item {
+				visit(entry)
+			}
+		case map[string]any:
+			if id := modelID(item); id != "" {
+				if _, ok := seen[id]; !ok {
+					seen[id] = struct{}{}
+					ids = append(ids, id)
+				}
+			}
+			for _, key := range []string{"data", "models", "items", "results"} {
+				if nested, ok := item[key]; ok {
+					visit(nested)
+				}
+			}
+		}
+	}
+	visit(value)
+	return ids
+}
+
+func modelID(value map[string]any) string {
+	for _, key := range []string{"id", "name"} {
+		if raw, ok := value[key].(string); ok {
+			id := strings.TrimPrefix(strings.TrimSpace(raw), "models/")
+			if id != "" {
+				return id
+			}
+		}
+	}
+	return ""
 }
 
 // HTTPError 上游返回非 2xx 时携带状态码与响应体片段。

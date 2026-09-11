@@ -83,6 +83,25 @@ func TestBillingStatusAndSnapshots(t *testing.T) {
 		t.Fatalf("unexpected billing state: %+v", got)
 	}
 
+	// A partial provider response may omit the group while still carrying a
+	// balance. It must not erase the last known group used by routing/UI.
+	if err := st.SaveBillingSuccess(BillingStatus{
+		UpstreamID: u.ID, Currency: "USD", Remaining: billingFloat(24.5),
+		ObservedAt: 1_700_000_050, RefreshedAt: 1_700_000_051, Status: "partial",
+		Error: "token log rate limited",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	partial, err := st.GetBillingStatus(u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if partial.BillingGroup != "pro" || partial.GroupMultiplier == nil ||
+		*partial.GroupMultiplier != 0.155 || partial.EffectiveMultiplier == nil ||
+		*partial.EffectiveMultiplier != 0.155 {
+		t.Fatalf("partial refresh must preserve known billing fields: %+v", partial)
+	}
+
 	if err := st.SaveBillingFailure(u.ID, "timeout", 1_700_000_100); err != nil {
 		t.Fatal(err)
 	}
@@ -91,13 +110,13 @@ func TestBillingStatusAndSnapshots(t *testing.T) {
 		t.Fatal(err)
 	}
 	if failed.Status != "error" || failed.Error != "timeout" || failed.Remaining == nil ||
-		*failed.Remaining != 24.93 || failed.LastSuccessAt != state.RefreshedAt {
+		*failed.Remaining != 24.5 || failed.LastSuccessAt != partial.RefreshedAt {
 		t.Fatalf("failure should preserve the last successful values: %+v", failed)
 	}
 
 	snapshots, err := st.ListBillingSnapshots(u.ID, 10)
-	if err != nil || len(snapshots) != 1 || snapshots[0].ReportedActualCost == nil ||
-		*snapshots[0].ReportedActualCost != 15.03 {
+	if err != nil || len(snapshots) != 2 || snapshots[1].ReportedActualCost == nil ||
+		*snapshots[1].ReportedActualCost != 15.03 {
 		t.Fatalf("unexpected billing snapshots: %+v, err=%v", snapshots, err)
 	}
 	statuses, err := st.ListBillingStatuses()

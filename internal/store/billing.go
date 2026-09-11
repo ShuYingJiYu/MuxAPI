@@ -124,7 +124,7 @@ func (s *Store) SaveBillingSuccess(state BillingStatus) error {
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(upstream_id) DO UPDATE SET
 		currency=excluded.currency,remaining=excluded.remaining,unlimited=excluded.unlimited,
-		billing_group=COALESCE(excluded.billing_group,upstream_billing_status.billing_group),
+		billing_group=CASE WHEN excluded.billing_group <> '' THEN excluded.billing_group ELSE upstream_billing_status.billing_group END,
 		group_multiplier=COALESCE(excluded.group_multiplier,upstream_billing_status.group_multiplier),
 		effective_multiplier=COALESCE(excluded.effective_multiplier,upstream_billing_status.effective_multiplier),
 		reported_list_cost=excluded.reported_list_cost,
