@@ -23,6 +23,7 @@ import (
 	"github.com/mirainya/muxapi/internal/forward"
 	"github.com/mirainya/muxapi/internal/health"
 	"github.com/mirainya/muxapi/internal/monitor"
+	"github.com/mirainya/muxapi/internal/observability"
 	"github.com/mirainya/muxapi/internal/store"
 	"github.com/mirainya/muxapi/internal/translate"
 	"github.com/mirainya/muxapi/internal/upstream"
@@ -45,6 +46,8 @@ type Server struct {
 	health          *health.Manager
 	mon             *monitor.Manager
 	monProber       *monitor.Prober
+	passive         *observability.Passive
+	metricsToken    string
 	billingMgr      *billing.Manager
 	backupSvc       *backup.Service
 	version         string
@@ -78,6 +81,12 @@ func (s *Server) SetMaxBodyProvider(provider func() int64) { s.maxBodyProvider =
 // SetReadOnly disables mutating API calls for local inspection of a remote database.
 func (s *Server) SetReadOnly(readOnly bool) { s.readOnly = readOnly }
 
+// SetMetricsToken protects the dedicated metrics listener when it is exposed
+// beyond a strictly internal network. An empty token keeps the listener
+// scrape-friendly; the listener itself is never registered on the business
+// HTTP handler.
+func (s *Server) SetMetricsToken(token string) { s.metricsToken = token }
+
 // SetSettingsChanged registers the runtime policy refresh hook used after the
 // admin settings endpoint persists a new breaker policy.
 func (s *Server) SetSettingsChanged(handler func()) { s.settingsChanged = handler }
@@ -85,7 +94,10 @@ func (s *Server) SetSettingsChanged(handler func()) { s.settingsChanged = handle
 // New 创建 HTTP 服务；maxBody 控制客户端请求正文上限。
 func New(fwd *forward.Forwarder, adminToken string, st *store.Store, hm *health.Manager, mon *monitor.Manager, mp *monitor.Prober, maxBody int64) *Server {
 	srv := &Server{fwd: fwd, adminToken: adminToken, store: st, health: hm, mon: mon, monProber: mp, maxBody: maxBody,
-		modelCache: make(map[int64]modelCacheEntry), modelFlight: make(map[int64]*modelFetch)}
+		passive: observability.New(), modelCache: make(map[int64]modelCacheEntry), modelFlight: make(map[int64]*modelFetch)}
+	if st != nil {
+		srv.passive.SetAuditDropsProvider(st.RequestDrops)
+	}
 	// Restore persisted model lists so model mapping works immediately after restart.
 	if st != nil {
 		if cached, err := st.LoadAllUpstreamModels(); err == nil {
@@ -120,6 +132,15 @@ func (s *Server) Handler() http.Handler {
 	if sub, err := fs.Sub(muxweb.Dist, "dist"); err == nil {
 		mux.Handle("/", spaFileServer(sub))
 	}
+	return mux
+}
+
+// MetricsHandler is intentionally separate from Handler: production ingress
+// and the LoadBalancer expose only the business listener on :8080. The caller
+// should bind this handler to the internal metrics address.
+func (s *Server) MetricsHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", s.metricsAuth(s.passive.ServeHTTP))
 	return mux
 }
 
@@ -184,9 +205,17 @@ func isSPAHistoryRoute(name string) bool {
 // 用常量时间比较防 token 计时侧信道；长度不等时 ConstantTimeCompare 返回 0，
 // 故两路候选(Authorization / x-api-key)分别比较再 OR。
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
+	return s.authToken(s.adminToken, next)
+}
+
+func (s *Server) metricsAuth(next http.HandlerFunc) http.Handler {
+	return s.authToken(s.metricsToken, next)
+}
+
+func (s *Server) authToken(token string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.adminToken != "" {
-			want := []byte(s.adminToken)
+		if token != "" {
+			want := []byte(token)
 			bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 			okBearer := subtle.ConstantTimeCompare([]byte(bearer), want) == 1
 			okKey := subtle.ConstantTimeCompare([]byte(r.Header.Get("x-api-key")), want) == 1
@@ -267,6 +296,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	started := time.Now()
+	s.passive.Begin()
 	requestID := uuid.NewString()
 	w.Header().Set("X-Request-ID", requestID)
 	endpoint := r.URL.Path
@@ -315,6 +345,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 // recordRequest 将转发结果转换为异步持久化的请求与尝试记录。
 func (s *Server) recordRequest(requestID string, started time.Time, groupID int64, keyName, model, endpoint, clientIP, userAgent string, stream bool, requestBytes int64, result forward.Result) {
 	completed := time.Now()
+	s.passive.Finish(result, completed.Sub(started).Milliseconds())
 	attempts := make([]store.RequestAttemptRecord, len(result.Attempts))
 	for i, attempt := range result.Attempts {
 		attempts[i] = store.RequestAttemptRecord{

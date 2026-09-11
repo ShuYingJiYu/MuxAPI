@@ -34,6 +34,8 @@ func loadDotEnv(path string) {
 // Config 全局配置，从环境变量加载（可选 .env 文件提供默认值）
 type Config struct {
 	Addr          string        // 监听地址
+	MetricsAddr   string        // Prometheus 监听地址；disabled 或空值禁用
+	MetricsToken  string        // 可选的独立 metrics token（内网 listener 通常留空）
 	DatabaseURL   string        // PostgreSQL 连接串
 	AdminToken    string        // 接入层鉴权 token（sub2api upstream key）
 	ReadOnly      bool          // 只读调试模式：不迁移、不写库、不启动后台写任务
@@ -46,9 +48,20 @@ type Config struct {
 
 // Load 返回带默认值的启动配置；同名系统环境变量优先于 .env。
 func Load() *Config {
+	// Keep the historical .env precedence for all variables. Metrics is the
+	// one optional listener where an explicitly empty process environment value
+	// is useful, so remember that intent before dotenv loading can fill it.
+	metricsValue, metricsWasSet := os.LookupEnv("MUXAPI_METRICS_ADDR")
+	metricsExplicitEmpty := metricsWasSet && metricsValue == ""
 	loadDotEnv(".env")
+	metricsAddr := env("MUXAPI_METRICS_ADDR", "127.0.0.1:9090")
+	if metricsExplicitEmpty {
+		metricsAddr = ""
+	}
 	return &Config{
 		Addr:          env("MUXAPI_ADDR", ":8080"),
+		MetricsAddr:   metricsAddr,
+		MetricsToken:  env("MUXAPI_METRICS_TOKEN", ""),
 		DatabaseURL:   env("MUXAPI_DATABASE_URL", ""),
 		AdminToken:    env("MUXAPI_TOKEN", ""),
 		ReadOnly:      envBool("MUXAPI_READ_ONLY", false),

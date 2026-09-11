@@ -26,6 +26,18 @@ const members = ref([])           // 当前详情分组的成员
 const keys = ref([])              // 当前详情分组的密钥
 const monitors = ref([])          // 监控项（含探测快照）
 const tags = ref([])              // 上游管理标签
+// 被动观测是进程级累计快照，与主动 monitor.snapshot 保持完全独立。
+const passiveSnapshot = ref(null)
+const passiveLoading = ref(false)
+const passiveUnsupported = ref(false)
+const passiveError = ref('')
+let passiveLoadEpoch = 0
+// 持久化窗口观测单独维护状态；旧服务端缺少该接口时不影响进程累计卡片。
+const passiveHistory = ref(null)
+const passiveHistoryLoading = ref(false)
+const passiveHistoryUnsupported = ref(false)
+const passiveHistoryError = ref('')
+let passiveHistoryEpoch = 0
 const err = ref('')
 const errStatus = ref(0)
 const errorInfo = computed(() => {
@@ -68,6 +80,137 @@ async function loadUpstreams() { upstreams.value = (await api.upstreams()) || []
 async function loadOverviewUpstreams() { upstreams.value = (await api.overviewUpstreams()) || [] }
 async function loadMonitors() { monitors.value = (await api.monitors()) || [] }
 async function loadTags() { tags.value = (await api.tags()) || [] }
+
+// 读取进程级真实流量观测；404 代表旧服务端，降级为主动监控页面而不打断整页加载。
+async function loadPassive() {
+  const epoch = ++passiveLoadEpoch
+  passiveLoading.value = true
+  passiveError.value = ''
+  passiveUnsupported.value = false
+  try {
+    const data = await api.passive()
+    if (epoch !== passiveLoadEpoch) return
+    passiveSnapshot.value = data || null
+    passiveUnsupported.value = false
+  } catch (e) {
+    if (epoch !== passiveLoadEpoch) return
+    if (e.status === 404) {
+      passiveUnsupported.value = true
+      passiveSnapshot.value = null
+    } else {
+      passiveError.value = String(e.message || e)
+    }
+  } finally {
+    if (epoch === passiveLoadEpoch) passiveLoading.value = false
+  }
+}
+
+// 读取已落库的真实流量窗口；这是审计查询，不会触发探测或改变主动监控状态。
+async function loadPassiveHistory() {
+  const epoch = ++passiveHistoryEpoch
+  passiveHistoryLoading.value = true
+  passiveHistoryError.value = ''
+  passiveHistoryUnsupported.value = false
+  try {
+    const data = await api.passiveHistory('24h')
+    if (epoch !== passiveHistoryEpoch) return
+    passiveHistory.value = data || null
+    passiveHistoryUnsupported.value = false
+  } catch (e) {
+    if (epoch !== passiveHistoryEpoch) return
+    if (e.status === 404) {
+      passiveHistoryUnsupported.value = true
+      passiveHistory.value = null
+    } else {
+      passiveHistoryError.value = String(e.message || e)
+    }
+  } finally {
+    if (epoch === passiveHistoryEpoch) passiveHistoryLoading.value = false
+  }
+}
+
+const passiveView = computed(() => {
+  const raw = passiveSnapshot.value
+  if (!raw) return null
+  const outcomes = raw.outcomes || {}
+  const count = key => Number(outcomes[key]) || 0
+  const requests = Number(raw.requests) || 0
+  const durationCount = Number(raw.duration_count) || 0
+  const ttftCount = Number(raw.ttft_count) || 0
+  const failures = [
+    { key: 'failed', label: '上游失败', value: count('failed'), tone: 'danger' },
+    { key: 'partial', label: '流中断', value: count('partial'), tone: 'danger' },
+    { key: 'unavailable', label: '无可用渠道', value: count('unavailable'), tone: 'warn' },
+    { key: 'unsupported', label: '模型不支持', value: count('unsupported'), tone: 'muted' },
+    { key: 'canceled', label: '客户端取消', value: count('canceled'), tone: 'muted' },
+    { key: 'client_error', label: '请求错误', value: count('client_error'), tone: 'muted' },
+    { key: 'unknown', label: '其他结果', value: count('unknown'), tone: 'muted' },
+  ]
+  return {
+    requests,
+    attempts: Number(raw.attempts) || 0,
+    retried: Number(raw.retried) || 0,
+    inFlight: Number(raw.in_flight) || 0,
+    successRate: requests ? count('success') / requests : 0,
+    failures,
+    avgDuration: durationCount > 0 ? Math.round((Number(raw.duration_sum_ms) || 0) / durationCount) : 0,
+    avgTTFT: ttftCount > 0 ? Math.round((Number(raw.ttft_sum_ms) || 0) / ttftCount) : 0,
+    auditDrops: Number(raw.audit_drops) || 0,
+  }
+})
+
+function passiveHistoryWindowText(seconds) {
+  const value = Number(seconds)
+  if (!(value > 0)) return '最近 24 小时'
+  if (value >= 23 * 3600 && value < 25 * 3600) return '最近 24 小时'
+  if (value >= 24 * 3600) return `最近 ${Math.max(1, Math.round(value / (24 * 3600)))} 天`
+  if (value >= 3600) return `最近 ${Math.max(1, Math.round(value / 3600))} 小时`
+  return `最近 ${Math.max(1, Math.round(value / 60))} 分钟`
+}
+
+const passiveHistoryView = computed(() => {
+  const raw = passiveHistory.value
+  if (!raw) return null
+  const stats = raw.requests || {}
+  const requests = Number(stats.total) || 0
+  const channels = (Array.isArray(raw.channels) ? raw.channels : []).map(item => {
+    const attempts = Number(item.attempts) || 0
+    const successes = Number(item.successes) || 0
+    const failures = Number(item.failures) || 0
+    const neutral = Number(item.neutral) || 0
+    const eligible = successes + failures
+    const successRate = Number(item.success_rate)
+    const rate = Number.isFinite(successRate) ? successRate : 0
+    const state = eligible <= 0 ? 'nodata' : rate >= .95 ? 'closed' : rate >= .8 ? 'half' : 'open'
+    return {
+      ...item,
+      attempts,
+      successes,
+      failures,
+      neutral,
+      eligible,
+      state,
+      rate,
+      avgTTFT: Number(item.avg_ttft_ms) || 0,
+      avgDuration: Number(item.avg_duration_ms) || 0,
+    }
+  })
+  return {
+    windowLabel: passiveHistoryWindowText(raw.window_seconds),
+    since: Number(raw.since) || 0,
+    requests,
+    // 新接口提供明确的被动 SLI 分母；旧响应回退到日志统计口径。
+    requestEligible: Number.isFinite(Number(raw.request_health?.eligible))
+      ? Number(raw.request_health.eligible)
+      : requests,
+    successRate: Number.isFinite(Number(raw.request_health?.success_rate))
+      ? Number(raw.request_health.success_rate)
+      : (requests > 0 ? Number(stats.success_rate) || 0 : 0),
+    p95TTFT: Number(stats.p95_ttft_ms) || 0,
+    p95Duration: Number(stats.p95_duration_ms) || 0,
+    channels: channels.slice(0, 8),
+  }
+})
 
 async function loadOverviewTrends() {
   const epoch = ++overviewTrendEpoch
@@ -234,13 +377,23 @@ onMounted(() => {
   if (loggedIn.value) activatePage(page.value)
 })
 
-// 看板自动刷新：探测间隔 5min，这里每 60s 拉一次快照即可，离开即停
+// 看板自动刷新：主动快照/进程累计每 60s；持久化窗口是重查询，降低到 5min。
 let monTimer = null
+let passiveHistoryTimer = null
 function startMonPoll() {
   stopMonPoll()
-  monTimer = setInterval(() => { loadMonitors().catch(() => {}) }, 60000)
+  monTimer = setInterval(() => {
+    loadMonitors().catch(() => {})
+    if (!passiveUnsupported.value) loadPassive().catch(() => {})
+  }, 60000)
+  passiveHistoryTimer = setInterval(() => {
+    if (!passiveHistoryUnsupported.value && !passiveHistoryLoading.value) loadPassiveHistory().catch(() => {})
+  }, 300000)
 }
-function stopMonPoll() { if (monTimer) { clearInterval(monTimer); monTimer = null } }
+function stopMonPoll() {
+  if (monTimer) { clearInterval(monTimer); monTimer = null }
+  if (passiveHistoryTimer) { clearInterval(passiveHistoryTimer); passiveHistoryTimer = null }
+}
 let overviewTimer = null
 function startOverviewPoll() {
   stopOverviewPoll()
@@ -255,7 +408,11 @@ function startRtPoll(fn) {
   rtTimer = setInterval(() => { fn().catch(() => {}) }, 8000)
 }
 function stopRtPoll() { if (rtTimer) { clearInterval(rtTimer); rtTimer = null } }
-function stopAllPoll() { stopMonPoll(); stopOverviewPoll(); stopRtPoll(); stopLogPoll() }
+function stopAllPoll() {
+  stopMonPoll(); stopOverviewPoll(); stopRtPoll(); stopLogPoll()
+  passiveLoadEpoch++
+  passiveHistoryEpoch++
+}
 onUnmounted(() => {
   stopAllPoll()
   abortUpstreamTestRequests?.()
@@ -275,7 +432,12 @@ function activatePage(p) {
     if (p === 'overview') { await loadOverview(); startOverviewPoll() }
     else if (p === 'groups') { await loadGroups(); startRtPoll(loadGroups) }
     else if (p === 'upstreams') { await loadTags(); await loadGroups(); await loadUpstreams(); startRtPoll(loadUpstreams) }
-    else if (p === 'monitors') { await loadTags(); await loadUpstreams(); await loadMonitors(); startMonPoll() }
+    else if (p === 'monitors') {
+      await loadTags(); await loadUpstreams(); await loadMonitors()
+      void loadPassive()
+      void loadPassiveHistory()
+      startMonPoll()
+    }
     else if (p === 'logs') { await loadLogOptions(); await loadLogs(true); startLogPoll() }
     else if (p === 'settings') { await loadSettings(); await Promise.all([loadBackupConfig(), loadBackupSchedule(), loadBackups(), loadUpstreams(), loadMappings()]) }
   }).finally(() => {
@@ -2134,6 +2296,8 @@ function logout() {
   loggedIn.value = false
   loginForm.token = ''
   groups.value = []; upstreams.value = []; members.value = []; keys.value = []; monitors.value = []; tags.value = []
+  passiveSnapshot.value = null; passiveUnsupported.value = false; passiveError.value = ''; passiveLoading.value = false
+  passiveHistory.value = null; passiveHistoryUnsupported.value = false; passiveHistoryError.value = ''; passiveHistoryLoading.value = false
   stopBackupPoll()
   stopAllPoll()
   pageLoading.value = false
@@ -2653,6 +2817,113 @@ function logout() {
               <button class="icon-btn availability-add" title="新增监控" @click="newMonitor"><Icon name="plus" :size="17" /></button>
             </div>
           </section>
+
+          <!-- 真实流量被动观测：与上方主动探测看板保持独立口径。 -->
+          <section class="passive-observation" aria-labelledby="passive-observation-title">
+            <div class="passive-observation-head">
+              <div class="passive-observation-heading">
+                <span class="passive-observation-mark"><Icon name="server" :size="18" /></span>
+                <div>
+                  <h2 id="passive-observation-title">真实流量观测</h2>
+                  <p>进程累计 · 仅观察真实请求，不发送额外探测请求</p>
+                </div>
+              </div>
+              <div class="passive-observation-actions">
+                <span v-if="passiveLoading" class="passive-observation-updating">更新中…</span>
+                <button class="icon-btn" title="刷新真实流量观测" :disabled="passiveLoading" @click="loadPassive"><Icon :name="passiveLoading ? 'loader' : 'refresh'" :class="{ spin: passiveLoading }" :size="16" /></button>
+              </div>
+            </div>
+
+            <div v-if="passiveUnsupported" class="passive-observation-empty">
+              当前服务端未提供被动观测接口；主动探测看板仍可正常使用。
+            </div>
+            <div v-else-if="!passiveView && passiveLoading" class="passive-observation-empty">正在读取进程累计观测…</div>
+            <div v-else-if="!passiveView && passiveError" class="passive-observation-empty passive-observation-error">{{ passiveError }}</div>
+            <template v-else-if="passiveView">
+              <div class="passive-observation-primary">
+                <div><span>请求</span><b>{{ fmtNum(passiveView.requests) }}</b></div>
+                <div><span>上游尝试</span><b>{{ fmtNum(passiveView.attempts) }}</b></div>
+                <div><span>发生重试</span><b>{{ fmtNum(passiveView.retried) }}</b></div>
+                <div><span>当前进行中</span><b>{{ fmtNum(passiveView.inFlight) }}</b></div>
+                <div><span>成功率</span><b :class="{ warn: passiveView.requests > 0 && passiveView.successRate < .95 }">{{ passiveView.requests ? (passiveView.successRate * 100).toFixed(1) + '%' : '—' }}</b></div>
+              </div>
+
+              <div class="passive-observation-details">
+                <section class="passive-observation-block">
+                  <h3>请求结果分类</h3>
+                  <div class="passive-outcome-grid">
+                    <div v-for="item in passiveView.failures" :key="item.key" :class="`tone-${item.tone}`">
+                      <span>{{ item.label }}</span><b>{{ fmtNum(item.value) }}</b>
+                    </div>
+                  </div>
+                </section>
+                <section class="passive-observation-block">
+                  <h3>平均延迟</h3>
+                  <div class="passive-latency-grid">
+                    <div><span>完整请求</span><b>{{ fmtMs(passiveView.avgDuration) }}</b></div>
+                    <div><span>首字节 / Token</span><b>{{ fmtMs(passiveView.avgTTFT) }}</b></div>
+                  </div>
+                </section>
+              </div>
+              <div class="passive-observation-foot">
+                <span v-if="passiveError" class="passive-observation-error">最近一次读取失败：{{ passiveError }}</span>
+                <span v-else>进程重启后重新累计</span>
+                <span v-if="passiveView.auditDrops" class="passive-observation-drops">审计丢弃 {{ fmtNum(passiveView.auditDrops) }}</span>
+              </div>
+            </template>
+            <div v-else class="passive-observation-empty">暂无进程累计观测。</div>
+          </section>
+
+          <!-- 已落库的真实流量窗口：独立于进程累计和主动探测口径。 -->
+          <section class="passive-history" aria-labelledby="passive-history-title">
+            <div class="passive-history-head">
+              <div class="passive-history-heading">
+                <span class="passive-history-mark"><Icon name="server" :size="17" /></span>
+                <div>
+                  <h2 id="passive-history-title">持久化真实流量</h2>
+                  <p>{{ passiveHistoryView?.windowLabel || '最近 24 小时' }} · 已落库请求，不发送额外探测</p>
+                </div>
+              </div>
+              <div class="passive-history-actions">
+                <span v-if="passiveHistoryLoading" class="passive-history-updating">更新中…</span>
+                <button class="icon-btn" title="刷新持久化窗口" :disabled="passiveHistoryLoading" @click="loadPassiveHistory"><Icon :name="passiveHistoryLoading ? 'loader' : 'refresh'" :class="{ spin: passiveHistoryLoading }" :size="15" /></button>
+              </div>
+            </div>
+
+            <div v-if="passiveHistoryUnsupported" class="passive-history-empty">
+              当前服务端未提供持久化窗口接口；进程累计观测和主动探测看板仍可正常使用。
+            </div>
+            <div v-else-if="!passiveHistoryView && passiveHistoryLoading" class="passive-history-empty">正在读取已落库窗口…</div>
+            <div v-else-if="!passiveHistoryView && passiveHistoryError" class="passive-history-empty passive-history-error">{{ passiveHistoryError }}</div>
+            <template v-else-if="passiveHistoryView">
+              <div class="passive-history-summary">
+                <div><span>请求</span><b>{{ fmtNum(passiveHistoryView.requests) }}</b></div>
+                <div><span>成功率</span><b :class="{ warn: passiveHistoryView.requestEligible > 0 && passiveHistoryView.successRate < .95 }">{{ passiveHistoryView.requestEligible ? (passiveHistoryView.successRate * 100).toFixed(1) + '%' : 'NODATA' }}</b></div>
+                <div><span>P95 TTFT</span><b>{{ fmtMs(passiveHistoryView.p95TTFT) }}</b></div>
+                <div><span>P95 总耗时</span><b>{{ fmtMs(passiveHistoryView.p95Duration) }}</b></div>
+              </div>
+
+              <div v-if="!passiveHistoryView.channels.length" class="passive-history-nodata">NODATA · {{ passiveHistoryView.requests ? '当前窗口没有可按渠道归档的上游尝试' : '窗口内暂无已落库数据' }}</div>
+              <div v-else class="passive-history-table-wrap">
+                <table class="passive-history-table">
+                  <thead><tr><th>渠道 / 模型</th><th>尝试</th><th>成功率</th><th>失败 / 中性</th><th>平均耗时 / TTFT</th></tr></thead>
+                  <tbody>
+                    <tr v-for="channel in passiveHistoryView.channels" :key="`${channel.upstream_id}-${channel.model}`">
+                      <td><b class="passive-history-channel" :title="channel.upstream_name || ('#' + channel.upstream_id)">{{ channel.upstream_name || ('#' + channel.upstream_id) }}</b><span class="passive-history-model" :title="channel.model || '未知模型'">{{ channel.model || '未知模型' }}</span></td>
+                      <td class="passive-history-number">{{ fmtNum(channel.attempts) }}</td>
+                      <td><span class="state-badge" :class="channel.state">{{ channel.eligible ? (channel.rate * 100).toFixed(1) + '%' : 'NODATA' }}</span></td>
+                      <td class="passive-history-number">{{ fmtNum(channel.failures) }}<span class="passive-history-neutral"> / {{ fmtNum(channel.neutral) }}</span></td>
+                      <td class="passive-history-latency"><span>{{ fmtMs(channel.avgDuration) }}</span><span>{{ fmtMs(channel.avgTTFT) }}</span></td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div class="passive-history-foot"><span>显示尝试量最高的前 {{ passiveHistoryView.channels.length }} 个渠道 / 模型组合</span><span v-if="passiveHistoryView.since">窗口起点 {{ sinceText(passiveHistoryView.since) }}</span></div>
+              </div>
+              <div v-if="passiveHistoryError" class="passive-history-stale">最近一次读取失败，当前显示上一次成功结果：{{ passiveHistoryError }}</div>
+            </template>
+            <div v-else class="passive-history-empty">暂无已落库窗口数据。</div>
+          </section>
+
           <div class="monitor-toolbar">
             <div class="search-box monitor-search"><Icon class="ic" name="search" :size="16" /><input v-model="monitorSearch" class="search-input" placeholder="搜索渠道、模型或标签" /></div>
             <FancySelect v-model="monitorTagFilter" :options="monitorTagOptions" />

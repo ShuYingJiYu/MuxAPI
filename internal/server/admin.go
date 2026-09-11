@@ -26,6 +26,8 @@ func (s *Server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/tags/", admin(s.adminTagItem))                  // PUT 改 / DELETE 删
 	mux.HandleFunc("/admin/monitors", admin(s.adminMonitors))              // GET 监控列表 / POST 新增
 	mux.HandleFunc("/admin/monitors/", admin(s.adminMonitorItem))          // PUT 改 / DELETE 删 / {id}/probe 立即探测
+	mux.HandleFunc("/admin/passive", admin(s.adminPassive))                // GET process-local real-traffic observations
+	mux.HandleFunc("/admin/passive/history", admin(s.adminPassiveHistory)) // GET durable traffic window
 	mux.HandleFunc("/admin/groups", admin(s.adminGroups))                  // GET 列表 / POST 新增
 	mux.HandleFunc("/admin/groups/", admin(s.adminGroupSub))               // /{id} 改/删 ; /{id}/upstreams 成员 ; /{id}/keys 密钥
 	mux.HandleFunc("/admin/keys/", admin(s.adminKeyItem))                  // PUT 启停 / DELETE 删
@@ -43,6 +45,46 @@ func (s *Server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/backup/", admin(s.adminBackup))                   // config / schedule / records/{id}
 	mux.HandleFunc("/admin/model-mappings", admin(s.adminModelMappings))     // GET 列表 / POST 新增
 	mux.HandleFunc("/admin/model-mappings/", admin(s.adminModelMappingItem)) // DELETE 删
+}
+
+// adminPassive returns process-local observations of real client traffic.
+// Historical windows remain the responsibility of the request audit APIs;
+// this endpoint is deliberately cheap and does not query the database.
+func (s *Server) adminPassive(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, s.passive.Snapshot())
+}
+
+func (s *Server) adminPassiveHistory(w http.ResponseWriter, r *http.Request) {
+	duration, err := parsePassiveWindow(r.URL.Query().Get("window"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	stats, err := s.store.PassiveStats(time.Now().Add(-duration))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, stats)
+}
+
+func parsePassiveWindow(value string) (time.Duration, error) {
+	if strings.TrimSpace(value) == "" {
+		return 24 * time.Hour, nil
+	}
+	value = strings.TrimSpace(strings.ToLower(value))
+	if strings.HasSuffix(value, "d") {
+		days, err := strconv.ParseFloat(strings.TrimSuffix(value, "d"), 64)
+		if err == nil && days > 0 && days <= 30 {
+			return time.Duration(days * 24 * float64(time.Hour)), nil
+		}
+		return 0, errors.New("window must be a positive duration no longer than 30d")
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration <= 0 || duration > 30*24*time.Hour {
+		return 0, errors.New("window must be a positive duration no longer than 30d")
+	}
+	return duration, nil
 }
 
 // adminLogs 返回调用日志，兼容游标和偏移量分页。
