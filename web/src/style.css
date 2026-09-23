@@ -589,7 +589,7 @@ th { padding: 13px 16px; text-align: left; font-size: 12px; font-weight: 650; co
 td { padding: 13px 16px; border-bottom: 1px solid var(--g100); color: var(--g700); }
 tr:last-child td { border-bottom: none; }
 tbody tr { transition: all .18s; }
-tbody tr:nth-child(even) td { background: rgba(250,247,243,.58); }
+tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--surface-muted) 52%, var(--surface)); }
 tbody tr:hover td { background: var(--p50); }
 .cell-name { font-weight: 700; color: var(--g900); }
 .cell-url { color: var(--g500); font-size: 13px; }
