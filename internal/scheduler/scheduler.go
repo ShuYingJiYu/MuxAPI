@@ -132,7 +132,7 @@ func (s *Scheduler) pickLastResort(groupID int64, model string, all []*upstream.
 			continue
 		}
 		info := s.health.RecoveryInfo(candidate.ID)
-		if info.State == health.Open.String() && info.EarlyTrial {
+		if info.State == health.Open.String() {
 			options = append(options, recoverable{upstream: candidate, info: info})
 		}
 	}

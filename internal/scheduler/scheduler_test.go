@@ -186,6 +186,36 @@ func TestAllOpen(t *testing.T) {
 	}
 }
 
+func TestAllOpenKeepsTryingAfterEarlyTrialsAreConsumed(t *testing.T) {
+	upstreams := []*upstream.Upstream{
+		{ID: 1, Priority: 1, Weight: 1},
+		{ID: 2, Priority: 1, Weight: 1},
+	}
+	hm := health.New(1, 5*time.Millisecond)
+	scheduler := New(func(int64) []*upstream.Upstream { return upstreams }, hm)
+	for _, id := range []int64{1, 2} {
+		hm.Report(id, "gpt", false, 0)
+	}
+
+	// Consume the one immediate trial on each channel. After their cooldowns,
+	// both channels remain OPEN with earlyTrial=false, but a real request must
+	// still be allowed to test one of them instead of being rejected outright.
+	for i := 0; i < 2; i++ {
+		chosen, lease, err := scheduler.Pick(1, "gpt")
+		if err != nil || chosen == nil {
+			t.Fatalf("trial %d should select an OPEN channel: chosen=%v err=%v", i+1, chosen, err)
+		}
+		hm.Complete(lease, health.ResultFailure, 0)
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	chosen, lease, err := scheduler.Pick(1, "gpt")
+	if err != nil || chosen == nil || !lease.Valid() {
+		t.Fatalf("all-open request should keep trying a channel, chosen=%v err=%v", chosen, err)
+	}
+	hm.Release(lease)
+}
+
 func TestLastRouteTrialUsesMostRecentlySuccessfulChannel(t *testing.T) {
 	upstreams := []*upstream.Upstream{
 		{ID: 1, Priority: 1, Weight: 1},

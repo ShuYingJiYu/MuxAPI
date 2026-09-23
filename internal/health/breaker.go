@@ -417,9 +417,12 @@ func (m *Manager) Claim(groupID, id int64, model string) (Lease, bool) {
 	return lease, true
 }
 
-// ClaimLastResort permits one early, group-scoped recovery trial after all
-// normal candidates have become unavailable. A failed trial must wait for the
-// regular exponential cooldown before another recovery attempt.
+// ClaimLastResort permits one group-scoped recovery trial after all normal
+// candidates have become unavailable. This deliberately includes OPEN
+// channels whose early trial was already consumed: when every channel is
+// OPEN, a real request is still useful evidence that one may have recovered.
+// A failed trial must wait for the regular exponential cooldown before another
+// recovery attempt.
 func (m *Manager) ClaimLastResort(groupID, id int64, model string) (Lease, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -427,7 +430,7 @@ func (m *Manager) ClaimLastResort(groupID, id int64, model string) (Lease, bool)
 		return Lease{}, false
 	}
 	b := m.get(id)
-	if b.state != Open || !b.earlyTrial || b.recoveryLease != 0 {
+	if b.state != Open || b.recoveryLease != 0 {
 		return Lease{}, false
 	}
 	b.state = HalfOpen
