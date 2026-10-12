@@ -146,9 +146,16 @@ func FailIsUpstreamLevel(code int) bool {
 }
 
 // IsModelUnsupported identifies deterministic model/channel mismatches. They
-// exclude only this model for a short TTL and never affect channel health.
+// exclude only this model and never affect channel health.
+//
+// New API / One API report a group that has no route for one model as HTTP 503
+// with a structured model_not_found code ("No available channel for model …").
+// That is a capability of this credential, not an outage of the whole upstream:
+// treating it as a channel failure opens the breaker and takes every other
+// model on that upstream offline. Bare 503s (no accounts, billing down, gateway
+// errors) stay channel failures.
 func IsModelUnsupported(code int, model, body string) bool {
-	if model == "" || (code != http.StatusBadRequest && code != http.StatusNotFound) {
+	if model == "" || (code != http.StatusBadRequest && code != http.StatusNotFound && code != http.StatusServiceUnavailable) {
 		return false
 	}
 	var payload map[string]any

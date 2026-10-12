@@ -683,6 +683,66 @@ func TestForwardModelUnsupportedFailover(t *testing.T) {
 	}
 }
 
+func TestForwardServiceUnavailableModelNotFoundDoesNotOpenBreaker(t *testing.T) {
+	var missingHits, backupHits int32
+	missing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&missingHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		io.WriteString(w, `{"error":{"code":"model_not_found","message":"No available channel for model claude-fable-5 under group awsq-sushua"}}`)
+	}))
+	defer missing.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&backupHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	defer backup.Close()
+
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	upstreams := []*upstream.Upstream{
+		{Name: "group-without-model", BaseURL: missing.URL, APIKey: "k", Enabled: true},
+		{Name: "backup", BaseURL: backup.URL, APIKey: "k", Enabled: true},
+	}
+	for _, item := range upstreams {
+		if err := st.Create(item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	upstreams[0].Priority, upstreams[0].Weight = 1, 1
+	upstreams[1].Priority, upstreams[1].Weight = 2, 1
+	hm := health.New(1, time.Hour)
+	if err := hm.SetModelExclusionStore(st); err != nil {
+		t.Fatal(err)
+	}
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return upstreams }, hm), hm, 3)
+	body := []byte(`{"model":"claude-fable-5"}`)
+	recorder := httptest.NewRecorder()
+	fwd.Forward(recorder, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)), body, 1, "")
+
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"ok":true`) {
+		t.Fatalf("expected failover success, status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if missingHits != 1 || backupHits != 1 {
+		t.Fatalf("expected one attempt per upstream, missing=%d backup=%d", missingHits, backupHits)
+	}
+	if !hm.IsModelUnsupported(upstreams[0].ID, "claude-fable-5") {
+		t.Fatal("503 model_not_found should exclude only that model")
+	}
+	if hm.EffectiveState(upstreams[0].ID) != "CLOSED" {
+		t.Fatal("503 model_not_found must not open the channel breaker")
+	}
+	other := httptest.NewRecorder()
+	fwd.Forward(other, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{"model":"claude-sonnet"}`))), []byte(`{"model":"claude-sonnet"}`), 1, "")
+	if other.Code != http.StatusOK || missingHits != 2 {
+		t.Fatalf("other models on the same upstream should still be admitted, status=%d missing=%d", other.Code, missingHits)
+	}
+}
+
 func TestForwardClientErrorsDoNotFailOver(t *testing.T) {
 	for _, status := range []int{http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity} {
 		t.Run(http.StatusText(status), func(t *testing.T) {

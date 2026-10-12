@@ -103,8 +103,14 @@ func TestIsModelUnsupported(t *testing.T) {
 	if IsModelUnsupported(http.StatusBadRequest, "gpt-5.6", `{"error":"invalid temperature"}`) {
 		t.Fatal("ordinary request validation errors must not change model capability")
 	}
-	if IsModelUnsupported(http.StatusServiceUnavailable, "gpt-5.6", `{"code":"model_not_found","message":"No available channel for model gpt-5.6 under group"}`) {
-		t.Fatal("503 must always remain a temporary channel failure")
+	if !IsModelUnsupported(http.StatusServiceUnavailable, "gpt-5.6", `{"error":{"code":"model_not_found","message":"No available channel for model gpt-5.6 under group"}}`) {
+		t.Fatal("503 with a structured model_not_found must exclude only that model")
+	}
+	if IsModelUnsupported(http.StatusServiceUnavailable, "gpt-5.6", `{"error":{"message":"No available accounts"}}`) {
+		t.Fatal("503 without model_not_found must remain a temporary channel failure")
+	}
+	if IsModelUnsupported(http.StatusBadGateway, "gpt-5.6", `{"code":"model_not_found"}`) {
+		t.Fatal("model_not_found on a non-capability status must not exclude the model")
 	}
 	if IsModelUnsupported(http.StatusNotFound, "", `{"error":"not found"}`) {
 		t.Fatal("missing model must not create a capability exclusion")
