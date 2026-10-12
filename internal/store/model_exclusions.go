@@ -28,7 +28,9 @@ func (s *Store) upsertModelExclusion(exclusion health.ModelExclusion, increment 
 	}
 	var count any = max(1, exclusion.FailureCount)
 	if increment {
-		count = gorm.Expr("failure_count + 1")
+		// pg18 resolves a bare failure_count to both the inserted row and the
+		// conflicting row, so the target table must be spelled out.
+		count = gorm.Expr("upstream_model_exclusions.failure_count + 1")
 	}
 	return s.gormDB.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "upstream_id"}, {Name: "model"}},
