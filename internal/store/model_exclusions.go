@@ -27,7 +27,7 @@ func (s *Store) UpsertModelExclusion(exclusion health.ModelExclusion) error {
 		Columns: []clause.Column{{Name: "upstream_id"}, {Name: "model"}},
 		DoUpdates: clause.Assignments(map[string]any{
 			"excluded_until": exclusion.ExcludedUntil,
-			"failure_count":  gorm.Expr("failure_count + 1"),
+			"failure_count":  gorm.Expr("upstream_model_exclusions.failure_count + 1"),
 			"last_status":    exclusion.LastStatus,
 			"last_reason":    exclusion.LastReason,
 			"last_failed_at": exclusion.LastFailedAt,

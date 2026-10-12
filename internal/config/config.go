@@ -24,7 +24,7 @@ func loadDotEnv(path string) {
 		}
 		if k, v, ok := strings.Cut(line, "="); ok {
 			k = strings.TrimSpace(k)
-			if os.Getenv(k) == "" {
+			if _, exists := os.LookupEnv(k); !exists {
 				os.Setenv(k, strings.Trim(strings.TrimSpace(v), `"'`))
 			}
 		}
@@ -109,6 +109,13 @@ func envBool(k string, def bool) bool {
 
 func envDur(k string, def time.Duration) time.Duration {
 	if v, err := time.ParseDuration(os.Getenv(k)); err == nil {
+		return v
+	}
+	return def
+}
+
+func envAllowEmpty(k, def string) string {
+	if v, ok := os.LookupEnv(k); ok {
 		return v
 	}
 	return def
