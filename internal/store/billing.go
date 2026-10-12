@@ -103,6 +103,11 @@ func billingTimestamp(value int64, fallback time.Time) time.Time {
 }
 
 // SaveBillingSuccess atomically replaces the latest state and appends a history snapshot.
+// A successful collection is authoritative: an empty billing group or a missing
+// multiplier replaces the previous value. Keeping the old value made a provider
+// change invisible until the operator switched the billing platform, which
+// deletes the row, and switched it back so the next refresh inserted a fresh one.
+// SaveBillingFailure still preserves the last successful counters.
 func (s *Store) SaveBillingSuccess(state BillingStatus) error {
 	now := time.Now()
 	observed := billingTimestamp(state.ObservedAt, now)
@@ -124,9 +129,9 @@ func (s *Store) SaveBillingSuccess(state BillingStatus) error {
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(upstream_id) DO UPDATE SET
 		currency=excluded.currency,remaining=excluded.remaining,unlimited=excluded.unlimited,
-		billing_group=COALESCE(excluded.billing_group,upstream_billing_status.billing_group),
-		group_multiplier=COALESCE(excluded.group_multiplier,upstream_billing_status.group_multiplier),
-		effective_multiplier=COALESCE(excluded.effective_multiplier,upstream_billing_status.effective_multiplier),
+		billing_group=excluded.billing_group,
+		group_multiplier=excluded.group_multiplier,
+		effective_multiplier=excluded.effective_multiplier,
 		reported_list_cost=excluded.reported_list_cost,
 		reported_actual_cost=excluded.reported_actual_cost,status=excluded.status,error_text=excluded.error_text,
 		observed_at=excluded.observed_at,last_success_at=excluded.last_success_at,refreshed_at=excluded.refreshed_at`,

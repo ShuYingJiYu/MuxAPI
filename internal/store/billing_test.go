@@ -83,6 +83,24 @@ func TestBillingStatusAndSnapshots(t *testing.T) {
 		t.Fatalf("unexpected billing state: %+v", got)
 	}
 
+	cleared := BillingStatus{
+		UpstreamID: u.ID, Currency: "USD", Remaining: billingFloat(20),
+		ReportedActualCost: billingFloat(16), ObservedAt: 1_700_000_050,
+		RefreshedAt: 1_700_000_051, Status: "partial",
+		Error: "New API has no recent token log for billing group detection",
+	}
+	if err := st.SaveBillingSuccess(cleared); err != nil {
+		t.Fatal(err)
+	}
+	replaced, err := st.GetBillingStatus(u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replaced.BillingGroup != "" || replaced.GroupMultiplier != nil || replaced.EffectiveMultiplier != nil ||
+		replaced.Remaining == nil || *replaced.Remaining != 20 || replaced.Status != "partial" {
+		t.Fatalf("successful refresh should replace stale billing identity: %+v", replaced)
+	}
+
 	if err := st.SaveBillingFailure(u.ID, "timeout", 1_700_000_100); err != nil {
 		t.Fatal(err)
 	}
@@ -91,13 +109,13 @@ func TestBillingStatusAndSnapshots(t *testing.T) {
 		t.Fatal(err)
 	}
 	if failed.Status != "error" || failed.Error != "timeout" || failed.Remaining == nil ||
-		*failed.Remaining != 24.93 || failed.LastSuccessAt != state.RefreshedAt {
+		*failed.Remaining != 20 || failed.LastSuccessAt != cleared.RefreshedAt {
 		t.Fatalf("failure should preserve the last successful values: %+v", failed)
 	}
 
 	snapshots, err := st.ListBillingSnapshots(u.ID, 10)
-	if err != nil || len(snapshots) != 1 || snapshots[0].ReportedActualCost == nil ||
-		*snapshots[0].ReportedActualCost != 15.03 {
+	if err != nil || len(snapshots) != 2 || snapshots[0].ReportedActualCost == nil ||
+		*snapshots[0].ReportedActualCost != 16 || snapshots[1].BillingGroup != "pro" {
 		t.Fatalf("unexpected billing snapshots: %+v, err=%v", snapshots, err)
 	}
 	statuses, err := st.ListBillingStatuses()
