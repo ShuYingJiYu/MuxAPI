@@ -103,6 +103,11 @@ func billingTimestamp(value int64, fallback time.Time) time.Time {
 }
 
 // SaveBillingSuccess atomically replaces the latest state and appends a history snapshot.
+// A successful collection is authoritative: an empty billing group or a missing
+// multiplier replaces the previous value. Keeping the old value made a provider
+// change invisible until the operator switched the billing platform, which
+// deletes the row, and switched it back so the next refresh inserted a fresh one.
+// SaveBillingFailure still preserves the last successful counters.
 func (s *Store) SaveBillingSuccess(state BillingStatus) error {
 	now := time.Now()
 	observed := billingTimestamp(state.ObservedAt, now)
