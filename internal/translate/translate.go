@@ -13,6 +13,7 @@ import (
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/translator/muxbuiltin"
+	"github.com/tidwall/sjson"
 )
 
 // Format is a request/response schema understood by the CPA translator.
@@ -412,6 +413,9 @@ func NewExchange(source, target Format, model string, stream bool, original []by
 	exchange.UpstreamStream = stream || (exchange.Translated() && (target == Claude || target == Codex))
 	if !exchange.Translated() {
 		exchange.UpstreamRequest = append([]byte(nil), original...)
+		// 同协议透传原样转发客户端正文。静态/自动映射改的是目标模型名，
+		// 不写回 model 字段的话，上游收到的仍是客户端原名。
+		exchange.UpstreamRequest = rewriteBodyModel(exchange.UpstreamRequest, model)
 		sanitizeDeferredTools(exchange)
 		return exchange, nil
 	}
@@ -576,6 +580,35 @@ func normalizeResponsesInput(source Format, original []byte) []byte {
 		return original
 	}
 	return rewritten
+}
+
+// rewriteBodyModel replaces a JSON body's model field when the resolved
+// upstream name differs. Gemini native requests carry the model in the URL,
+// so a body without the field is left unchanged.
+func rewriteBodyModel(body []byte, model string) []byte {
+	model = strings.TrimSpace(model)
+	if model == "" || !json.Valid(body) {
+		return body
+	}
+	current := strings.TrimSpace(bodyModel(body))
+	if current == "" || current == model {
+		return body
+	}
+	rewritten, err := sjson.SetBytes(body, "model", model)
+	if err != nil {
+		return body
+	}
+	return rewritten
+}
+
+func bodyModel(body []byte) string {
+	var payload struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return ""
+	}
+	return payload.Model
 }
 
 // Translated 判断本次交换是否需要跨协议转换。
