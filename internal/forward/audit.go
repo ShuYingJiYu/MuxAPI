@@ -47,6 +47,8 @@ type responseAudit struct {
 	usage           tokenUsage
 	lastEvent       string
 	streamCompleted bool
+	// streamTerminated 只由整个流的终止事件设置；Gemini 的单个候选完成仍可带后续用量。
+	streamTerminated bool
 	// streamErrored 表示上游在 2xx 流里投递过明确的错误事件。
 	streamErrored bool
 }
@@ -66,12 +68,19 @@ func newAuditReadCloser(body io.ReadCloser, stream bool, protocol ...string) *au
 }
 
 func (r *auditReadCloser) Read(p []byte) (int, error) {
+	if r.audit.streamTerminated {
+		return 0, io.EOF
+	}
 	n, err := r.ReadCloser.Read(p)
 	if n > 0 {
 		r.audit.feed(p[:n])
 	}
 	if err == io.EOF {
 		r.audit.finish()
+	}
+	// 完整终止事件之后不再等待 TCP 关闭。写入错误仍由转发层单独处理。
+	if r.audit.streamTerminated {
+		err = io.EOF
 	}
 	return n, err
 }
@@ -160,6 +169,7 @@ func (a *responseAudit) consumeSSEBlock(block []byte) {
 	if data == "[DONE]" {
 		a.lastEvent = "[DONE]"
 		a.streamCompleted = true
+		a.streamTerminated = true
 		return
 	}
 	var payload map[string]any
@@ -174,6 +184,12 @@ func (a *responseAudit) consumeSSEBlock(block []byte) {
 		if isStreamErrorEvent(typ) {
 			a.streamErrored = true
 		}
+		if isCompletionEvent(typ) || isStreamErrorEvent(typ) {
+			a.streamTerminated = true
+		}
+	}
+	if isCompletionEvent(eventName) || isStreamErrorEvent(eventName) {
+		a.streamTerminated = true
 	}
 	if geminiResponseComplete(payload) {
 		a.lastEvent = "generateContent.completed"

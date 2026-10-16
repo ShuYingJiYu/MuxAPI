@@ -27,8 +27,14 @@ func TestHealthURLUsesLoopbackForWildcardBind(t *testing.T) {
 }
 
 func TestCatalogSelectsCurrentPlatformAndMarksNewer(t *testing.T) {
-	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
-		t.Skip("fixture uses the Linux amd64 release asset")
+	packageSuffix := "-" + runtime.GOOS + "-" + runtime.GOARCH
+	switch runtime.GOOS {
+	case "linux":
+		packageSuffix += ".tar.gz"
+	case "windows":
+		packageSuffix += ".zip"
+	default:
+		t.Skip("release packages are only available for Linux and Windows")
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/releases" {
@@ -36,8 +42,8 @@ func TestCatalogSelectsCurrentPlatformAndMarksNewer(t *testing.T) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode([]map[string]any{
-			{"tag_name": "v1.2.0", "name": "MuxAPI v1.2.0", "html_url": "https://github.com/mirainya/MuxAPI/releases/tag/v1.2.0", "published_at": time.Now().UTC(), "assets": []map[string]any{{"name": "muxapi-v1.2.0-linux-amd64.tar.gz", "browser_download_url": "https://example.invalid/pkg", "size": 10}}},
-			{"tag_name": "v1.1.0", "name": "MuxAPI v1.1.0", "html_url": "https://github.com/mirainya/MuxAPI/releases/tag/v1.1.0", "published_at": time.Now().Add(-time.Hour).UTC(), "assets": []map[string]any{{"name": "muxapi-v1.1.0-linux-amd64.tar.gz", "browser_download_url": "https://example.invalid/pkg", "size": 10}}},
+			{"tag_name": "v1.2.0", "name": "MuxAPI v1.2.0", "html_url": "https://github.com/mirainya/MuxAPI/releases/tag/v1.2.0", "published_at": time.Now().UTC(), "assets": []map[string]any{{"name": "muxapi-v1.2.0" + packageSuffix, "browser_download_url": "https://example.invalid/pkg", "size": 10}}},
+			{"tag_name": "v1.1.0", "name": "MuxAPI v1.1.0", "html_url": "https://github.com/mirainya/MuxAPI/releases/tag/v1.1.0", "published_at": time.Now().Add(-time.Hour).UTC(), "assets": []map[string]any{{"name": "muxapi-v1.1.0" + packageSuffix, "browser_download_url": "https://example.invalid/pkg", "size": 10}}},
 		})
 	}))
 	defer server.Close()
@@ -51,7 +57,7 @@ func TestCatalogSelectsCurrentPlatformAndMarksNewer(t *testing.T) {
 	if catalog.Latest != "v1.2.0" || len(catalog.Releases) != 2 {
 		t.Fatalf("unexpected catalog: %+v", catalog)
 	}
-	if !catalog.Releases[0].Newer || catalog.Releases[1].Current {
+	if !catalog.Releases[0].Newer || catalog.Releases[0].Current || !catalog.Releases[1].Current || catalog.Releases[1].Newer {
 		t.Fatalf("unexpected release flags: %+v", catalog.Releases)
 	}
 }

@@ -23,6 +23,70 @@ import (
 	"github.com/mirainya/muxapi/internal/upstream"
 )
 
+type cancelAfterEventWriter struct {
+	*httptest.ResponseRecorder
+	cancel context.CancelFunc
+	event  string
+}
+
+func (w *cancelAfterEventWriter) Flush() {
+	w.ResponseRecorder.Flush()
+	if strings.Contains(w.Body.String(), w.event) {
+		w.cancel()
+	}
+}
+
+func TestForwardStreamCompletionBeforeClientDisconnect(t *testing.T) {
+	for _, protocol := range []string{"codex", "claude", "openai"} {
+		for _, completed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/completed=%v", protocol, completed), func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				payload := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"
+				event := "response.output_text.delta"
+				if completed {
+					payload = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[]}}\n\ndata: [DONE]\n\n"
+					event = "response.completed"
+				}
+				if protocol == "claude" {
+					payload = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n"
+					if completed {
+						payload += "data: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+					}
+				}
+				if protocol == "openai" {
+					payload = "data: {\"id\":\"chat_1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n"
+					if completed {
+						payload += "data: {\"id\":\"chat_1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+					}
+				}
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, payload)
+					w.(http.Flusher).Flush()
+					<-r.Context().Done()
+				}))
+				defer srv.Close()
+				ups := []*upstream.Upstream{{ID: 1, BaseURL: srv.URL, APIKey: "k", Protocol: protocol, Priority: 1, Weight: 1}}
+				hm := health.New(3, time.Hour)
+				fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 1)
+				body := []byte(`{"model":"m","input":"hello","stream":true}`)
+				req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body)).WithContext(ctx)
+				req.Header.Set("X-Codex-Turn-Metadata", `{"turn_id":"turn_1"}`)
+				writer := &cancelAfterEventWriter{ResponseRecorder: httptest.NewRecorder(), cancel: cancel, event: event}
+				result := fwd.Forward(writer, req, body, 1, "")
+				want := OutcomeCanceled
+				if completed {
+					want = OutcomeSuccess
+				}
+				if result.Outcome != want {
+					t.Fatalf("outcome=%s want=%s, result=%+v", result.Outcome, want, result)
+				}
+			})
+		}
+	}
+}
+
 func TestForwardAuditsCompressedCodexSSE(t *testing.T) {
 	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Accept-Encoding"); got != "gzip" {

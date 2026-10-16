@@ -918,8 +918,11 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_RestoresAdditiona
 		if got := tc.got.Get(tc.path + ".type").String(); got != "custom_tool_call" {
 			t.Fatalf("%s type = %q, want custom_tool_call", tc.label, got)
 		}
-		if got := tc.got.Get(tc.path + ".name").String(); got != "terminal__exec" {
-			t.Fatalf("%s name = %q, want terminal__exec", tc.label, got)
+		if got := tc.got.Get(tc.path + ".name").String(); got != "exec" {
+			t.Fatalf("%s name = %q, want exec", tc.label, got)
+		}
+		if got := tc.got.Get(tc.path + ".namespace").String(); got != "terminal" {
+			t.Fatalf("%s namespace = %q, want terminal", tc.label, got)
 		}
 	}
 	if got := inputDone.Get("input").String(); got != "pwd" {
@@ -952,8 +955,11 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_Restores
 	if got := data.Get("output.0.type").String(); got != "custom_tool_call" {
 		t.Fatalf("output type = %q, want custom_tool_call; response=%s", got, resp)
 	}
-	if got := data.Get("output.0.name").String(); got != "terminal__exec" {
-		t.Fatalf("output name = %q, want terminal__exec; response=%s", got, resp)
+	if got := data.Get("output.0.name").String(); got != "exec" {
+		t.Fatalf("output name = %q, want exec; response=%s", got, resp)
+	}
+	if got := data.Get("output.0.namespace").String(); got != "terminal" {
+		t.Fatalf("output namespace = %q, want terminal; response=%s", got, resp)
 	}
 	if got := data.Get("output.0.input").String(); got != "pwd" {
 		t.Fatalf("output input = %q, want pwd; response=%s", got, resp)

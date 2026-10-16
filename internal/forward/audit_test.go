@@ -1,6 +1,7 @@
 package forward
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +9,52 @@ import (
 	"testing"
 	"time"
 )
+
+type canceledStreamReader struct{}
+
+func (canceledStreamReader) Read([]byte) (int, error) { return 0, context.Canceled }
+
+func TestRelayTerminatesAtFinalEvent(t *testing.T) {
+	for _, tc := range []struct {
+		name, event                   string
+		completed, errored, readError bool
+	}{
+		{"responses", "data: {\"type\":\"response.completed\"}\n\n", true, false, false},
+		{"claude", "data: {\"type\":\"message_stop\"}\n\n", true, false, false},
+		{"done", "data: {\"choices\":[]}\n\ndata: [DONE]\n\n", true, false, false},
+		{"failed", "data: {\"type\":\"response.failed\"}\n\ndata: [DONE]\n\n", true, true, false},
+		{"partial_block", "data: {\"type\":\"content_block_stop\"}\n\n", false, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := io.MultiReader(strings.NewReader(tc.event), canceledStreamReader{})
+			resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(body)}
+			result := relayResponse(httptest.NewRecorder(), resp, time.Now(), nil)
+			if (result.err != nil) != tc.readError || result.streamCompleted != tc.completed || result.streamErrored != tc.errored {
+				t.Fatalf("unexpected final stream state: %+v", result)
+			}
+		})
+	}
+}
+
+func TestRelayCompletionDoesNotHideDownstreamWriteError(t *testing.T) {
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\"}\n\n"))}
+	result := relayResponse(&failingWriter{header: http.Header{}}, resp, time.Now(), nil)
+	if result.err == nil || result.source != relayDownstream {
+		t.Fatalf("write failure was hidden: %+v", result)
+	}
+}
+
+func TestRelayGeminiCompletionKeepsTrailingUsage(t *testing.T) {
+	body := io.MultiReader(
+		strings.NewReader("data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n"),
+		strings.NewReader("data: {\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":4}}\n\n"),
+	)
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(body)}
+	result := relayResponse(httptest.NewRecorder(), resp, time.Now(), nil, "gemini")
+	if result.err != nil || result.usage.input != 20 || result.usage.output != 4 {
+		t.Fatalf("trailing usage was lost: %+v", result)
+	}
+}
 
 func TestResponseAuditParsesSplitResponsesEvent(t *testing.T) {
 	audit := &responseAudit{stream: true}

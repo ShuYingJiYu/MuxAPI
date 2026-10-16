@@ -348,6 +348,144 @@ func TestExchangeRestoresAdditionalToolNamespaceForCodex(t *testing.T) {
 	}
 }
 
+func TestExchangeNamespacedToolRoundTrip(t *testing.T) {
+	for _, target := range []Format{Claude, OpenAI} {
+		for _, kind := range []string{"custom", "function"} {
+			t.Run(string(target)+"/"+kind, func(t *testing.T) {
+				callType := "function_call"
+				if kind == "custom" {
+					callType = "custom_tool_call"
+				}
+				body := []byte(`{"model":"m","stream":true,"tools":[{"type":"namespace","name":"functions","tools":[{"type":"` + kind + `","name":"exec","parameters":{"type":"object","properties":{}}}]}],"input":[{"type":"` + callType + `","call_id":"call_old","name":"exec","namespace":"functions","arguments":"{}","input":"pwd"},{"type":"` + callType + `_output","call_id":"call_old","output":"ok"}]}`)
+				exchange, err := NewExchange(Codex, target, "m", true, body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(string(exchange.UpstreamRequest), `"name":"functions__exec"`) {
+					t.Fatalf("missing qualified tool definition: %s", exchange.UpstreamRequest)
+				}
+				var request struct {
+					Messages []struct {
+						Content   json.RawMessage `json:"content"`
+						ToolCalls []struct {
+							Function struct {
+								Name string `json:"name"`
+							} `json:"function"`
+						} `json:"tool_calls"`
+					} `json:"messages"`
+				}
+				if err := json.Unmarshal(exchange.UpstreamRequest, &request); err != nil {
+					t.Fatal(err)
+				}
+				replayed := false
+				for _, message := range request.Messages {
+					for _, call := range message.ToolCalls {
+						if call.Function.Name == "functions__exec" {
+							replayed = true
+						}
+					}
+					if strings.Contains(string(message.Content), `"name":"functions__exec"`) {
+						replayed = true
+					}
+				}
+				if !replayed {
+					t.Errorf("history lost tool namespace: %s", exchange.UpstreamRequest)
+				}
+
+				lines := []string{
+					`data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":2}}}`,
+					`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_exec","name":"functions__exec","input":{}}}`,
+					`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"input\":\"pwd\"}"}}`,
+					`data: {"type":"content_block_stop","index":0}`,
+					`data: {"type":"message_stop"}`,
+				}
+				if target == OpenAI {
+					lines = []string{
+						`data: {"id":"chat_1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_exec","type":"function","function":{"name":"functions__exec","arguments":"{\"input\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}]}`,
+						`data: [DONE]`,
+					}
+				}
+				itemCount := 0
+				for _, line := range lines {
+					chunks, err := exchange.TranslateStream(context.Background(), []byte(line))
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, chunk := range chunks {
+						for _, eventLine := range strings.Split(string(chunk), "\n") {
+							if !strings.HasPrefix(eventLine, "data:") {
+								continue
+							}
+							var event struct {
+								Item     json.RawMessage `json:"item"`
+								Response struct {
+									Output []json.RawMessage `json:"output"`
+								} `json:"response"`
+							}
+							if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(eventLine, "data:"))), &event); err != nil {
+								t.Fatal(err)
+							}
+							items := event.Response.Output
+							if len(event.Item) > 0 {
+								items = append(items, event.Item)
+							}
+							for _, raw := range items {
+								var item struct{ Type, Name, Namespace, Input string }
+								if err := json.Unmarshal(raw, &item); err != nil {
+									t.Fatal(err)
+								}
+								if item.Type != "custom_tool_call" && item.Type != "function_call" {
+									continue
+								}
+								itemCount++
+								if item.Name != "exec" || item.Namespace != "functions" {
+									t.Errorf("tool identity changed: %s", raw)
+								}
+							}
+						}
+					}
+				}
+				if itemCount != 3 {
+					t.Fatalf("got %d tool items, want added, done and completed", itemCount)
+				}
+			})
+		}
+	}
+}
+
+func TestExchangeNamespacedCustomToolNonStream(t *testing.T) {
+	for _, target := range []Format{Claude, OpenAI} {
+		t.Run(string(target), func(t *testing.T) {
+			body := []byte(`{"model":"m","stream":false,"input":[{"type":"additional_tools","tools":[{"type":"namespace","name":"functions","tools":[{"type":"custom","name":"exec"}]}]},{"role":"user","content":"run pwd"}]}`)
+			exchange, err := NewExchange(Codex, target, "m", false, body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			upstreamBody := []byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_exec\",\"name\":\"functions__exec\",\"input\":{}}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"input\\\":\\\"pwd\\\"}\"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"message_stop\"}\n\n")
+			if target == OpenAI {
+				upstreamBody = []byte(`{"id":"chat_1","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"call_exec","type":"function","function":{"name":"functions__exec","arguments":"{\"input\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}]}`)
+			}
+			response, err := exchange.TranslateNonStream(context.Background(), upstreamBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var parsed struct {
+				Output []struct{ Type, Name, Namespace, Input string }
+			}
+			if err := json.Unmarshal(response, &parsed); err != nil {
+				t.Fatal(err)
+			}
+			if len(parsed.Output) != 1 {
+				t.Fatalf("expected one tool call: %s", response)
+			}
+			item := parsed.Output[0]
+			if item.Type != "custom_tool_call" || item.Name != "exec" || item.Namespace != "functions" || item.Input != "pwd" {
+				t.Fatalf("tool identity or input changed: %s", response)
+			}
+		})
+	}
+}
+
 func TestNewExchangeRejectsMissingPair(t *testing.T) {
 	_, err := NewExchange(Claude, OpenAIResponses, "model", false, []byte(`{"model":"model","messages":[]}`))
 	if !errors.Is(err, ErrUnsupported) {

@@ -326,7 +326,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			if isCustom {
 				item = []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"custom_tool_call","status":"in_progress","input":"","call_id":"","name":""}}`)
 				item, _ = sjson.SetBytes(item, "item.id", fmt.Sprintf("ctc_%s", st.CurrentFCID))
-				item, _ = sjson.SetBytes(item, "item.name", name)
+				item = applyResponsesFunctionCallNamespaceFields(item, pickRequestJSON(originalRequestRawJSON, requestRawJSON), name, "item")
 			} else {
 				item = []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"in_progress","arguments":"","call_id":"","name":""}}`)
 				item, _ = sjson.SetBytes(item, "item.id", fmt.Sprintf("fc_%s", st.CurrentFCID))
@@ -473,7 +473,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				itemDone, _ = sjson.SetBytes(itemDone, "item.id", fmt.Sprintf("ctc_%s", st.CurrentFCID))
 				itemDone, _ = sjson.SetBytes(itemDone, "item.input", input)
 				itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", st.CurrentFCID)
-				itemDone, _ = sjson.SetBytes(itemDone, "item.name", st.FuncNames[idx])
+				itemDone = applyResponsesFunctionCallNamespaceFields(itemDone, pickRequestJSON(originalRequestRawJSON, requestRawJSON), st.FuncNames[idx], "item")
 				out = append(out, emitEvent("response.output_item.done", itemDone))
 			} else {
 				fcDone := []byte(`{"type":"response.function_call_arguments.done","sequence_number":0,"item_id":"","output_index":0,"arguments":""}`)
@@ -698,7 +698,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 					item = []byte(`{"id":"","type":"custom_tool_call","status":"completed","input":"","call_id":"","name":""}`)
 					item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("ctc_%s", callID))
 					item, _ = sjson.SetBytes(item, "input", unwrapResponsesCustomToolInput(args))
-					item, _ = sjson.SetBytes(item, "name", name)
+					item = applyResponsesFunctionCallNamespaceFields(item, reqBytes, name, "")
 				} else {
 					item = []byte(`{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}`)
 					item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("fc_%s", callID))
@@ -1039,7 +1039,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 				item = []byte(`{"id":"","type":"custom_tool_call","status":"completed","input":"","call_id":"","name":""}`)
 				item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("ctc_%s", st.id))
 				item, _ = sjson.SetBytes(item, "input", unwrapResponsesCustomToolInput(args))
-				item, _ = sjson.SetBytes(item, "name", st.name)
+				item = applyResponsesFunctionCallNamespaceFields(item, reqBytes, st.name, "")
 			} else {
 				item = []byte(`{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}`)
 				item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("fc_%s", st.id))

@@ -431,7 +431,7 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 					callID = genToolCallID()
 				}
 				callID = util.SanitizeClaudeToolID(callID)
-				name := item.Get("name").String()
+				name := qualifyResponsesNamespaceToolName(item.Get("namespace").String(), item.Get("name").String())
 				argsStr := item.Get("arguments").String()
 
 				toolUse := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
@@ -488,7 +488,7 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				callID = util.SanitizeClaudeToolID(callID)
 				toolUse := []byte(`{"type":"tool_use","id":"","name":"","input":{"input":""}}`)
 				toolUse, _ = sjson.SetBytes(toolUse, "id", callID)
-				toolUse, _ = sjson.SetBytes(toolUse, "name", item.Get("name").String())
+				toolUse, _ = sjson.SetBytes(toolUse, "name", qualifyResponsesNamespaceToolName(item.Get("namespace").String(), item.Get("name").String()))
 				toolUse, _ = sjson.SetBytes(toolUse, "input.input", item.Get("input").String())
 
 				// Same round-boundary rule as function_call above.
