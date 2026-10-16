@@ -225,6 +225,11 @@ func main() {
 
 	// Model mapping: per-upstream model name translation + auto-learning.
 	modelMapper := modelmapping.New(st)
+	if deleted, err := st.DeleteStaleAutoMappings(time.Now()); err != nil {
+		slog.Error("clean stale model mappings failed", "err", err)
+	} else if deleted > 0 {
+		slog.Info("cleaned stale model mappings", "deleted", deleted)
+	}
 	fwd.SetModelMapper(modelMapper)
 	// Adaptive first-byte timeout: use per-upstream P95 TTFT from routing stats.
 	fwd.SetTTFTEstimator(sched)
@@ -434,6 +439,11 @@ func runLogJanitor(ctx context.Context, st *store.Store, keepDays, probeKeepHour
 		} else if deleted > 0 {
 			slog.Info("billing snapshot janitor pruned", "deleted", deleted,
 				"keepDays", billingDays)
+		}
+		if deleted, err := st.DeleteStaleAutoMappings(time.Now()); err != nil {
+			slog.Error("model mapping janitor prune failed", "err", err)
+		} else if deleted > 0 {
+			slog.Info("model mapping janitor pruned", "deleted", deleted)
 		}
 	}
 	prune() // 启动即清一次，立刻收敛历史堆积
