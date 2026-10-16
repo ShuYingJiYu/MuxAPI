@@ -162,7 +162,7 @@ func TargetPath(format Format, originalPath string) (string, error) {
 func TargetPathForRequest(format Format, originalPath, model string, stream bool) (string, error) {
 	switch format {
 	case Passthrough:
-		return originalPath, nil
+		return rewriteModelPath(originalPath, model), nil
 	case OpenAI:
 		return "/v1/chat/completions", nil
 	case OpenAIResponses, Codex:
@@ -582,9 +582,48 @@ func normalizeResponsesInput(source Format, original []byte) []byte {
 	return rewritten
 }
 
+// rewriteModelPath replaces a model embedded in the request path. Native
+// Gemini URLs and OpenAI-compatible /models/{model}:action paths carry the
+// name there; passthrough keeps that path, so a static mapping has to rewrite
+// it or the upstream still sees the client model.
+func rewriteModelPath(path, model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return path
+	}
+	base, query, _ := strings.Cut(path, "?")
+	current, _, ok := GeminiRequest(base)
+	if !ok || current == model {
+		return path
+	}
+	prefix, action, ok := splitModelAction(base)
+	if !ok {
+		return path
+	}
+	rewritten := prefix + url.PathEscape(model) + ":" + action
+	if query != "" {
+		rewritten += "?" + query
+	}
+	return rewritten
+}
+
+func splitModelAction(path string) (prefix, action string, ok bool) {
+	for _, candidate := range []string{"/v1beta/models/", "/v1/models/", "/v1alpha/models/"} {
+		if strings.HasPrefix(path, candidate) {
+			rest := strings.TrimPrefix(path, candidate)
+			index := strings.LastIndexByte(rest, ':')
+			if index <= 0 || index == len(rest)-1 {
+				return "", "", false
+			}
+			return candidate, rest[index+1:], true
+		}
+	}
+	return "", "", false
+}
+
 // rewriteBodyModel replaces a JSON body's model field when the resolved
-// upstream name differs. Gemini native requests carry the model in the URL,
-// so a body without the field is left unchanged.
+// upstream name differs. A body without the field is left unchanged; Gemini
+// native requests carry the model in the URL and are rewritten there.
 func rewriteBodyModel(body []byte, model string) []byte {
 	model = strings.TrimSpace(model)
 	if model == "" || !json.Valid(body) {
