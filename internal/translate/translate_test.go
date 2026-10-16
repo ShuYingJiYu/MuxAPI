@@ -41,6 +41,13 @@ func TestGeminiRequestPathHelpers(t *testing.T) {
 	if got, err := TargetPathForRequest(Gemini, "/v1/responses", "gemini-2.5-flash", true); err != nil || got != "/v1beta/models/gemini-2.5-flash:streamGenerateContent" {
 		t.Fatalf("TargetPathForRequest() = %q, %v", got, err)
 	}
+	mapped := "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=secret"
+	if got, err := TargetPathForRequest(Passthrough, mapped, "gemini-2.5-flash-latest", true); err != nil || got != "/v1beta/models/gemini-2.5-flash-latest:streamGenerateContent?alt=sse&key=secret" {
+		t.Fatalf("passthrough mapped path = %q, %v", got, err)
+	}
+	if got, err := TargetPathForRequest(Passthrough, "/v1/chat/completions", "deepseek-v4.1-flash", false); err != nil || got != "/v1/chat/completions" {
+		t.Fatalf("passthrough body path = %q, %v", got, err)
+	}
 	query := TargetQuery(Gemini, Gemini, url.Values{"key": {"secret"}, "alt": {"sse"}, "trace": {"1"}}, true)
 	if strings.Contains(query, "secret") || !strings.Contains(query, "alt=sse") || !strings.Contains(query, "trace=1") {
 		t.Fatalf("TargetQuery() = %q", query)

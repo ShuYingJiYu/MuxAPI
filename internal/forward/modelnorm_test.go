@@ -144,6 +144,55 @@ func TestForwardPassthroughSendsStaticModelMapping(t *testing.T) {
 	}
 }
 
+func TestForwardPassthroughProtocolRewritesURLModel(t *testing.T) {
+	var gotPath, gotBodyModel string
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.RequestURI()
+		var payload struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		gotBodyModel = payload.Model
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}`)
+	}))
+	defer upstreamServer.Close()
+
+	st, err := store.Open("file::memory:?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.UpsertModelMapping(&store.ModelMapping{
+		UpstreamID:  9,
+		SourceModel: "gemini-2.5-flash",
+		TargetModel: "gemini-2.5-pro",
+		MappingType: store.MappingStatic,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ups := []*upstream.Upstream{{ID: 9, BaseURL: upstreamServer.URL, APIKey: "key", Protocol: "passthrough", Priority: 1, Weight: 1}}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 1)
+	fwd.SetModelMapper(modelmappingResolver{st: st})
+
+	body := []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
+	path := "/v1beta/models/gemini-2.5-flash:generateContent?alt=json"
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(string(body)))
+	result := fwd.Forward(recorder, request, body, 1, "")
+	if result.Status != http.StatusOK {
+		t.Fatalf("forward failed: %+v", result)
+	}
+	if gotPath != "/v1beta/models/gemini-2.5-pro:generateContent?alt=json" {
+		t.Fatalf("upstream path = %q", gotPath)
+	}
+	if gotBodyModel != "" {
+		t.Fatalf("body model = %q, want empty", gotBodyModel)
+	}
+}
+
 type modelmappingResolver struct {
 	st *store.Store
 }
