@@ -21,6 +21,10 @@ const (
 	// the system re-probes.
 	autoLearnTTL = 24 * time.Hour
 
+	// failureWindow bounds how far apart unsupported-model failures can be
+	// and still count toward one auto-learn streak.
+	failureWindow = 24 * time.Hour
+
 	// cacheTTL is how long resolved mappings are cached in memory.
 	cacheTTL = 30 * time.Second
 )
@@ -38,12 +42,18 @@ type ModelLister interface {
 	UpstreamModels(upstreamID int64) []string
 }
 
+type failureState struct {
+	count int
+	last  time.Time
+}
+
 // Service manages model name resolution with in-memory caching.
 type Service struct {
-	store  *store.Store
-	lister ModelLister
-	mu     sync.RWMutex
-	cache  map[cacheKey]cacheEntry
+	store    *store.Store
+	lister   ModelLister
+	mu       sync.RWMutex
+	cache    map[cacheKey]cacheEntry
+	failures map[cacheKey]failureState
 }
 
 type cacheKey struct {
@@ -54,8 +64,9 @@ type cacheKey struct {
 // New creates a model mapping service backed by the given store.
 func New(st *store.Store) *Service {
 	return &Service{
-		store: st,
-		cache: make(map[cacheKey]cacheEntry),
+		store:    st,
+		cache:    make(map[cacheKey]cacheEntry),
+		failures: make(map[cacheKey]failureState),
 	}
 }
 
@@ -99,59 +110,81 @@ func (s *Service) Resolve(upstreamID int64, model string) string {
 	return model
 }
 
-// RecordFailure records a model-unsupported failure for an upstream.
-// If the failure count exceeds the threshold, it creates an auto-learned
-// mapping to a derived fallback model name.
+// RecordFailure counts model-unsupported failures for an upstream.
+// A row is written only when a real fallback name exists. Failure streaks
+// that cannot be rewritten stay in memory and never become empty mappings.
 func (s *Service) RecordFailure(upstreamID int64, model string) {
 	model = strings.TrimSpace(model)
-	if model == "" {
+	if model == "" || upstreamID <= 0 {
+		return
+	}
+	existing, err := s.store.GetModelMapping(upstreamID, model)
+	if err != nil || (existing != nil && existing.MappingType == store.MappingStatic) {
 		return
 	}
 
-	count, err := s.store.IncrementMappingFailure(upstreamID, model)
-	if err != nil {
+	count := s.bumpFailure(upstreamID, model)
+	if count < autoLearnThreshold {
 		return
 	}
-
-	if count >= autoLearnThreshold {
-		fallback := deriveFallback(model)
-		if fallback == "" && s.lister != nil {
-			fallback = findPrefixMatch(model, s.lister.UpstreamModels(upstreamID))
-		}
-		if fallback != "" && fallback != model {
-			expires := time.Now().Add(autoLearnTTL)
-			s.store.UpsertModelMapping(&store.ModelMapping{
-				UpstreamID:   upstreamID,
-				SourceModel:  model,
-				TargetModel:  fallback,
-				MappingType:  store.MappingAuto,
-				FailureCount: count,
-				ExpiresAt:    &expires,
-			})
-			// Invalidate cache
-			s.invalidate(upstreamID, model)
-		}
+	fallback := deriveFallback(model)
+	if fallback == "" && s.lister != nil {
+		fallback = findPrefixMatch(model, s.lister.UpstreamModels(upstreamID))
 	}
+	if fallback == "" || fallback == model {
+		return
+	}
+	expires := time.Now().Add(autoLearnTTL)
+	if err := s.store.UpsertModelMapping(&store.ModelMapping{
+		UpstreamID:   upstreamID,
+		SourceModel:  model,
+		TargetModel:  fallback,
+		MappingType:  store.MappingAuto,
+		FailureCount: count,
+		ExpiresAt:    &expires,
+	}); err != nil {
+		return
+	}
+	s.invalidate(upstreamID, model)
 }
 
-// RecordSuccess clears any auto-learned mapping for a model that has been
-// confirmed working on an upstream.
+// RecordSuccess drops an auto-learned mapping after the source model works.
+// Static mappings are left untouched.
 func (s *Service) RecordSuccess(upstreamID int64, model string) {
 	model = strings.TrimSpace(model)
-	if model == "" {
+	if model == "" || upstreamID <= 0 {
 		return
 	}
-	// Only reset failure counters for auto-learned mappings
+	s.clearFailure(upstreamID, model)
 	existing, err := s.store.GetModelMapping(upstreamID, model)
-	if err != nil || existing == nil {
+	if err != nil || existing == nil || existing.MappingType != store.MappingAuto {
 		return
 	}
-	if existing.MappingType == store.MappingAuto && existing.FailureCount > 0 {
-		existing.FailureCount = 0
-		existing.TargetModel = ""
-		s.store.UpsertModelMapping(existing)
-		s.invalidate(upstreamID, model)
+	if err := s.store.DeleteModelMapping(existing.ID); err != nil {
+		return
 	}
+	s.invalidate(upstreamID, model)
+}
+
+func (s *Service) bumpFailure(upstreamID int64, model string) int {
+	key := cacheKey{upstreamID: upstreamID, model: model}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.failures[key]
+	if !state.last.IsZero() && now.Sub(state.last) > failureWindow {
+		state.count = 0
+	}
+	state.count++
+	state.last = now
+	s.failures[key] = state
+	return state.count
+}
+
+func (s *Service) clearFailure(upstreamID int64, model string) {
+	s.mu.Lock()
+	delete(s.failures, cacheKey{upstreamID: upstreamID, model: model})
+	s.mu.Unlock()
 }
 
 // InvalidateAll clears the entire in-memory cache.

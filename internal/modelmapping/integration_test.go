@@ -85,6 +85,11 @@ func TestServiceAutoLearn(t *testing.T) {
 	// Record failures below threshold - no mapping should be created
 	svc.RecordFailure(1, "claude-opus-4-6-thinking")
 	svc.RecordFailure(1, "claude-opus-4-6-thinking")
+	if mapping, err := st.GetModelMapping(1, "claude-opus-4-6-thinking"); err != nil {
+		t.Fatal(err)
+	} else if mapping != nil {
+		t.Fatalf("expected no row before a real fallback is learned, got %+v", mapping)
+	}
 	svc.InvalidateAll()
 	got := svc.Resolve(1, "claude-opus-4-6-thinking")
 	if got != "claude-opus-4-6-thinking" {
@@ -137,11 +142,68 @@ func TestServiceRecordSuccessResetsAuto(t *testing.T) {
 		t.Fatalf("expected auto-learned fallback, got %q", got)
 	}
 
-	// Record success clears the auto mapping
+	// Record success deletes the auto mapping instead of leaving an empty target.
 	svc.RecordSuccess(1, "claude-opus-4-6-thinking")
 	svc.InvalidateAll()
 	got = svc.Resolve(1, "claude-opus-4-6-thinking")
 	if got != "claude-opus-4-6-thinking" {
 		t.Fatalf("expected original model after success reset, got %q", got)
+	}
+	if mapping, err := st.GetModelMapping(1, "claude-opus-4-6-thinking"); err != nil {
+		t.Fatal(err)
+	} else if mapping != nil {
+		t.Fatalf("expected auto mapping to be deleted, got %+v", mapping)
+	}
+}
+
+func TestServiceNoEmptyMappingWithoutFallback(t *testing.T) {
+	st, err := store.Open("file::memory:?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	svc := New(st)
+	for i := 0; i < 5; i++ {
+		svc.RecordFailure(1, "claude-sonnet-4-6")
+	}
+	mapping, err := st.GetModelMapping(1, "claude-sonnet-4-6")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapping != nil {
+		t.Fatalf("expected no empty auto mapping, got %+v", mapping)
+	}
+	if got := svc.Resolve(1, "claude-sonnet-4-6"); got != "claude-sonnet-4-6" {
+		t.Fatalf("expected original model, got %q", got)
+	}
+}
+
+func TestServiceRecordSuccessKeepsStaticMapping(t *testing.T) {
+	st, err := store.Open("file::memory:?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	svc := New(st)
+	if err := st.UpsertModelMapping(&store.ModelMapping{
+		UpstreamID:  1,
+		SourceModel: "deepseek-flash",
+		TargetModel: "deepseek-v4.1-flash",
+		MappingType: store.MappingStatic,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	svc.RecordFailure(1, "deepseek-flash")
+	svc.RecordFailure(1, "deepseek-flash")
+	svc.RecordFailure(1, "deepseek-flash")
+	svc.RecordSuccess(1, "deepseek-flash")
+	svc.InvalidateAll()
+
+	got := svc.Resolve(1, "deepseek-flash")
+	if got != "deepseek-v4.1-flash" {
+		t.Fatalf("expected static mapping to survive, got %q", got)
 	}
 }

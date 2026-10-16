@@ -117,20 +117,17 @@ func (s *Store) DeleteModelMapping(id int64) error {
 	return s.gormDB.Delete(&ModelMappingModel{}, id).Error
 }
 
-// IncrementMappingFailure atomically increments the failure count for an
-// upstream+model pair, creating an auto-mapping if it doesn't exist.
-// Uses raw SQL for atomic UPSERT with RETURNING.
-func (s *Store) IncrementMappingFailure(upstreamID int64, sourceModel string) (int, error) {
-	now := time.Now()
-	var count int
-	err := s.queryRow(`INSERT INTO model_mappings(upstream_id, source_model, target_model, mapping_type, failure_count, created_at, updated_at)
-		VALUES(?, ?, '', 'auto', 1, ?, ?)
-		ON CONFLICT(upstream_id, source_model) DO UPDATE SET
-			failure_count=model_mappings.failure_count+1,
-			updated_at=excluded.updated_at
-		RETURNING failure_count`,
-		upstreamID, sourceModel, s.timeValue(now), s.timeValue(now)).Scan(&count)
-	return count, err
+// DeleteStaleAutoMappings removes auto-learned rows that have no target or
+// have passed their probe deadline. Static mappings are never touched.
+func (s *Store) DeleteStaleAutoMappings(now time.Time) (int64, error) {
+	result, err := s.exec(`DELETE FROM model_mappings
+		WHERE mapping_type='auto'
+		  AND (trim(target_model)='' OR (expires_at IS NOT NULL AND expires_at < ?))`,
+		s.timeValue(now))
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // ResolveModelMapping looks up the effective model name for a given upstream
@@ -162,12 +159,8 @@ func (s *Store) ResolveModelMapping(upstreamID int64, sourceModel string) (strin
 	return sourceModel, false
 }
 
-// CleanExpiredMappings removes auto-learned mappings that have expired.
+// CleanExpiredMappings removes auto-learned mappings that have expired or
+// were stored with an empty target.
 func (s *Store) CleanExpiredMappings() (int64, error) {
-	result, err := s.exec(`DELETE FROM model_mappings WHERE mapping_type='auto' AND expires_at IS NOT NULL AND expires_at < ?`,
-		s.timeValue(time.Now()))
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected()
+	return s.DeleteStaleAutoMappings(time.Now())
 }
