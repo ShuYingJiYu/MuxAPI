@@ -628,9 +628,17 @@ func TestDeleteUpstreamCascade(t *testing.T) {
 	st.AddMember(g1, uid, 1, 1)
 	st.CreateMonitor(&Monitor{UpstreamID: uid, Model: "m1", Enabled: true})
 	st.CreateMonitor(&Monitor{UpstreamID: uid, Model: "m2", Enabled: true})
+	if err := st.UpsertModelMapping(&ModelMapping{
+		UpstreamID:  uid,
+		SourceModel: "claude-haiku-4-5-20251001",
+		TargetModel: "claude-haiku-4-5",
+		MappingType: MappingAuto,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
-	// 删前：三表均有该上游相关行
-	if countRows(t, st, "upstreams") != 1 || countRows(t, st, "group_upstreams") != 1 || countRows(t, st, "monitors") != 2 {
+	// 删前：相关表均有该上游相关行
+	if countRows(t, st, "upstreams") != 1 || countRows(t, st, "group_upstreams") != 1 || countRows(t, st, "monitors") != 2 || countRows(t, st, "model_mappings") != 1 {
 		t.Fatal("前置数据未就绪")
 	}
 
@@ -646,6 +654,51 @@ func TestDeleteUpstreamCascade(t *testing.T) {
 	}
 	if n := countRows(t, st, "monitors"); n != 0 {
 		t.Fatalf("monitors 应清空，残留 %d", n)
+	}
+	if n := countRows(t, st, "model_mappings"); n != 0 {
+		t.Fatalf("model_mappings 应清空，残留 %d", n)
+	}
+}
+
+func TestDeleteStaleAutoMappingsKeepsStatic(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	past := time.Now().Add(-time.Hour)
+	if err := st.UpsertModelMapping(&ModelMapping{
+		UpstreamID: 1, SourceModel: "empty", TargetModel: "", MappingType: MappingAuto,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertModelMapping(&ModelMapping{
+		UpstreamID: 1, SourceModel: "expired", TargetModel: "other", MappingType: MappingAuto, ExpiresAt: &past,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(time.Hour)
+	if err := st.UpsertModelMapping(&ModelMapping{
+		UpstreamID: 1, SourceModel: "live", TargetModel: "live-target", MappingType: MappingAuto, ExpiresAt: &future,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertModelMapping(&ModelMapping{
+		UpstreamID: 1, SourceModel: "manual", TargetModel: "manual-target", MappingType: MappingStatic,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, err := st.DeleteStaleAutoMappings(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted = %d, want 2", deleted)
+	}
+	if n := countRows(t, st, "model_mappings"); n != 2 {
+		t.Fatalf("model_mappings = %d, want 2", n)
 	}
 }
 

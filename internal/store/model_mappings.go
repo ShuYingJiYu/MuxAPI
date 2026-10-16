@@ -230,12 +230,21 @@ func (s *Store) ResolveModelMapping(upstreamID int64, sourceModel string) (strin
 	return sourceModel, false
 }
 
-// CleanExpiredMappings removes auto-learned mappings that have expired.
-func (s *Store) CleanExpiredMappings() (int64, error) {
-	result, err := s.exec(`DELETE FROM model_mappings WHERE mapping_type='auto' AND expires_at IS NOT NULL AND expires_at < ?`,
-		s.timeValue(time.Now()))
+// DeleteStaleAutoMappings removes auto-learned rows that have no target or
+// have passed their probe deadline. Static mappings are never touched.
+func (s *Store) DeleteStaleAutoMappings(now time.Time) (int64, error) {
+	result, err := s.exec(`DELETE FROM model_mappings
+		WHERE mapping_type='auto'
+		  AND (trim(target_model)='' OR (expires_at IS NOT NULL AND expires_at < ?))`,
+		s.timeValue(now))
 	if err != nil {
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+// CleanExpiredMappings removes auto-learned mappings that have expired or
+// were stored with an empty target.
+func (s *Store) CleanExpiredMappings() (int64, error) {
+	return s.DeleteStaleAutoMappings(time.Now())
 }
