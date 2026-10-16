@@ -1,6 +1,7 @@
 package translate
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -61,6 +62,32 @@ func TestSourceFromRequestDetectsNativeCodex(t *testing.T) {
 	got, ok = SourceFromRequest("/v1/messages", header)
 	if !ok || got != Claude {
 		t.Fatalf("Claude source = %q, %v; want %q, true", got, ok, Claude)
+	}
+}
+
+func TestNewExchangePassthroughRewritesMappedModel(t *testing.T) {
+	original := []byte(`{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}],"stream":false}`)
+	exchange, err := NewExchange(OpenAI, OpenAI, "deepseek-v4.1-flash", false, original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(exchange.UpstreamRequest, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["model"] != "deepseek-v4.1-flash" {
+		t.Fatalf("passthrough model = %v", body["model"])
+	}
+	if !bytes.Contains(exchange.OriginalRequest, []byte(`"deepseek-flash"`)) {
+		t.Fatalf("original request was rewritten: %s", exchange.OriginalRequest)
+	}
+
+	same, err := NewExchange(OpenAI, OpenAI, "deepseek-flash", false, original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(same.UpstreamRequest) != string(original) {
+		t.Fatalf("unchanged model should keep the original body")
 	}
 }
 
