@@ -3,6 +3,7 @@
 package chat_completions
 
 import (
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -16,7 +17,12 @@ import (
 //
 // Returns:
 //   - []byte: The transformed request data in OpenAI API format
-func ConvertOpenAIRequestToOpenAI(modelName string, inputRawJSON []byte, _ bool) []byte {
+func ConvertOpenAIRequestToOpenAI(modelName string, inputRawJSON []byte, _ bool) ([]byte, error) {
+	currentModel := gjson.GetBytes(inputRawJSON, "model")
+	if currentModel.Type == gjson.String && currentModel.String() == modelName {
+		return inputRawJSON, nil
+	}
+
 	// Update the "model" field in the JSON payload with the provided modelName
 	// The sjson.SetBytes function returns a new byte slice with the updated JSON.
 	updatedJSON, err := sjson.SetBytes(inputRawJSON, "model", modelName)
@@ -24,7 +30,7 @@ func ConvertOpenAIRequestToOpenAI(modelName string, inputRawJSON []byte, _ bool)
 		// If there's an error, return the original JSON or handle the error appropriately.
 		// For now, we'll return the original, but in a real scenario, logging or a more robust error
 		// handling mechanism would be needed.
-		return inputRawJSON
+		return inputRawJSON, nil
 	}
-	return updatedJSON
+	return updatedJSON, nil
 }

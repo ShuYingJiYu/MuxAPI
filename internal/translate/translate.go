@@ -11,8 +11,8 @@ import (
 	"net/url"
 	"strings"
 
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/translator/muxbuiltin"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/translator/muxbuiltin"
 )
 
 // Format is a request/response schema understood by the CPA translator.
@@ -435,7 +435,16 @@ func NewExchange(source, target Format, model string, stream bool, original []by
 	// and namespaces. Keep the normalized source shape so definitions delivered
 	// through Codex Desktop's additional_tools remain visible on the way back.
 	exchange.OriginalRequest = append([]byte(nil), upstreamBody...)
-	translated := exchange.registry.TranslateRequest(from, to, model, upstreamBody, exchange.UpstreamStream)
+	request := exchange.registry.TranslateRequestEnvelope(context.Background(), from, to, sdktranslator.RequestEnvelope{
+		Format: sdktranslator.FromString(string(exchange.sdkSource)),
+		Model:  model,
+		Stream: exchange.UpstreamStream,
+		Body:   upstreamBody,
+	})
+	if request.Err != nil {
+		return nil, fmt.Errorf("translate request %s -> %s: %w", source, target, request.Err)
+	}
+	translated := request.Body
 	if !json.Valid(translated) {
 		return nil, fmt.Errorf("translate request %s -> %s: invalid JSON", source, target)
 	}

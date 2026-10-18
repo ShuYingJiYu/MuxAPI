@@ -3,293 +3,384 @@ package openai
 import (
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
-func TestCodexClientModelsResponse_InputModalitiesFromRegistry(t *testing.T) {
-	modelID := "mimo-v2.5-pro-codex-test"
-	textOnlyModelID := "mimo-text-only-codex-test"
+func TestCodexClientModelsResponseMultiAgentV2FollowsConfig(t *testing.T) {
+	modelID := "codex-client-multi-agent-v2-test"
+	clientID := "codex-client-multi-agent-v2-test-client"
 	modelRegistry := registry.GetGlobalRegistry()
-	modelRegistry.RegisterClient("codex-input-modalities-test", "openai-compatibility", []*registry.ModelInfo{
+	modelRegistry.RegisterClient(clientID, "openai-compatibility", []*registry.ModelInfo{{ID: modelID}})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(clientID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&config.SDKConfig{}, nil)
+	handler := NewOpenAIAPIHandler(base)
+	for _, tt := range []struct {
+		name    string
+		enabled bool
+	}{
+		{name: "disabled", enabled: false},
+		{name: "enabled", enabled: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			base.Cfg.Client.Codex.OptimizeMultiAgentV2 = tt.enabled
+			response := handler.codexClientModelsResponse()
+			models, ok := response["models"].([]map[string]any)
+			if !ok {
+				t.Fatalf("models type = %T, want []map[string]any", response["models"])
+			}
+			var entry map[string]any
+			for _, model := range models {
+				slug, _ := model["slug"].(string)
+				if slug == modelID {
+					entry = model
+					break
+				}
+			}
+			if entry == nil {
+				t.Fatalf("missing synthesized model %q", modelID)
+			}
+			value, exists := entry["multi_agent_version"]
+			if tt.enabled {
+				if !exists || value != "v2" {
+					t.Fatalf("multi_agent_version = %#v, want v2", value)
+				}
+				return
+			}
+			if !exists || value != nil {
+				t.Fatalf("multi_agent_version = %#v, want preserved null", value)
+			}
+		})
+	}
+}
+
+func TestCodexClientModelsResponseClientVersionFiltering(t *testing.T) {
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient("codex-version-filter-sdk-test", "openai-compatibility", []*registry.ModelInfo{
 		{
-			ID:                       modelID,
-			Object:                   "model",
-			OwnedBy:                  "mimo",
-			Type:                     "openai-compatibility",
-			DisplayName:              modelID,
-			SupportedInputModalities: []string{"text", "image"},
-		},
-		{
-			ID:                       textOnlyModelID,
-			Object:                   "model",
-			OwnedBy:                  "mimo",
-			Type:                     "openai-compatibility",
-			DisplayName:              textOnlyModelID,
-			SupportedInputModalities: []string{"text"},
-		},
-		{
-			ID:                       "mimo-mixed-modalities-codex-test",
-			Object:                   "model",
-			OwnedBy:                  "mimo",
-			Type:                     "openai-compatibility",
-			DisplayName:              "mimo-mixed-modalities-codex-test",
-			SupportedInputModalities: []string{"text", "image", "audio", "video", "TEXT", "IMAGE"},
-		},
-		{
-			ID:      "compat-image-only-codex-test",
-			Object:  "model",
-			OwnedBy: "mimo",
-			Type:    registry.OpenAIImageModelType,
+			ID:          "gpt-5.6-sol",
+			Object:      "model",
+			OwnedBy:     "openai",
+			DisplayName: "GPT-5.6-Sol",
 		},
 	})
 	t.Cleanup(func() {
-		modelRegistry.UnregisterClient("codex-input-modalities-test")
+		modelRegistry.UnregisterClient("codex-version-filter-sdk-test")
+	})
+
+	base := handlers.NewBaseAPIHandlers(&config.SDKConfig{}, nil)
+	handler := NewOpenAIAPIHandler(base)
+
+	// Test with older client version 0.137.0
+	respOld := handler.codexClientModelsResponse("0.137.0")
+	modelsOld, ok := respOld["models"].([]map[string]any)
+	if !ok {
+		t.Fatalf("models type = %T, want []map[string]any", respOld["models"])
+	}
+	foundOldSol := false
+	for _, m := range modelsOld {
+		if slug, _ := m["slug"].(string); slug == "gpt-5.6-sol" {
+			foundOldSol = true
+			levels, _ := m["supported_reasoning_levels"].([]any)
+			gotEfforts := make([]string, 0, len(levels))
+			for _, rawLevel := range levels {
+				level, _ := rawLevel.(map[string]any)
+				effort, _ := level["effort"].(string)
+				gotEfforts = append(gotEfforts, effort)
+				if effort == "max" || effort == "ultra" {
+					t.Fatalf("0.137.0 received unsupported reasoning effort %q", effort)
+				}
+			}
+			if len(gotEfforts) != 4 {
+				t.Fatalf("0.137.0 expected 4 legacy reasoning levels, got %#v", gotEfforts)
+			}
+		}
+	}
+	if !foundOldSol {
+		t.Fatal("0.137.0 expected gpt-5.6-sol in catalog")
+	}
+
+	// Test with newer client version 0.149.1
+	respNew := handler.codexClientModelsResponse("0.149.1")
+	modelsNew, ok := respNew["models"].([]map[string]any)
+	if !ok {
+		t.Fatalf("models type = %T, want []map[string]any", respNew["models"])
+	}
+	hasUltra := false
+	for _, m := range modelsNew {
+		if slug, _ := m["slug"].(string); slug == "gpt-5.6-sol" {
+			levels, _ := m["supported_reasoning_levels"].([]any)
+			for _, rawLevel := range levels {
+				level, _ := rawLevel.(map[string]any)
+				if effort, _ := level["effort"].(string); effort == "ultra" {
+					hasUltra = true
+				}
+			}
+		}
+	}
+	if !hasUltra {
+		t.Fatal("0.149.1 expected ultra reasoning effort to be preserved")
+	}
+}
+
+func TestOpenAIModels_DoesNotExposeMetadataModelID(t *testing.T) {
+	clientID := "openai-models-no-metadata-id-test"
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(clientID, "codex", []*registry.ModelInfo{
+		{
+			ID:              "codex-main",
+			MetadataModelID: "gpt-6-astra",
+			DisplayName:     "GPT 6.0 Astra",
+		},
+	})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(clientID)
 	})
 
 	openaiModels := modelRegistry.GetAvailableModels("openai")
-	resp := CodexClientModelsResponse(openaiModels)
-	models, ok := resp["models"].([]map[string]any)
-	if !ok {
-		t.Fatalf("models type = %T, want []map[string]any", resp["models"])
-	}
-
-	var visionEntry map[string]any
-	var textOnlyEntry map[string]any
-	var mixedEntry map[string]any
-	var imageEntry map[string]any
-	for _, entry := range models {
-		slug := stringModelValue(entry, "slug")
-		switch slug {
-		case modelID:
-			visionEntry = entry
-		case textOnlyModelID:
-			textOnlyEntry = entry
-		case "mimo-mixed-modalities-codex-test":
-			mixedEntry = entry
-		case "compat-image-only-codex-test":
-			imageEntry = entry
+	for _, m := range openaiModels {
+		if _, exists := m["metadata_model_id"]; exists {
+			t.Fatalf("model map exposed internal metadata_model_id: %#v", m)
+		}
+		if _, exists := m["MetadataModelID"]; exists {
+			t.Fatalf("model map exposed internal MetadataModelID: %#v", m)
 		}
 	}
-	if visionEntry == nil {
-		t.Fatalf("expected codex entry for %q", modelID)
-	}
-	modalities, ok := visionEntry["input_modalities"].([]any)
-	if !ok || len(modalities) != 2 {
-		t.Fatalf("input_modalities = %#v, want [text image]", visionEntry["input_modalities"])
-	}
-	if got, _ := modalities[0].(string); got != "text" {
-		t.Fatalf("input_modalities[0] = %q, want text", got)
-	}
-	if got, _ := modalities[1].(string); got != "image" {
-		t.Fatalf("input_modalities[1] = %q, want image", got)
-	}
-	if got, ok := visionEntry["supports_image_detail_original"].(bool); !ok || !got {
-		t.Fatalf("supports_image_detail_original = %#v, want true", visionEntry["supports_image_detail_original"])
-	}
-
-	if textOnlyEntry == nil {
-		t.Fatalf("expected codex entry for %q", textOnlyModelID)
-	}
-	textOnlyModalities, ok := textOnlyEntry["input_modalities"].([]any)
-	if !ok || len(textOnlyModalities) != 1 {
-		t.Fatalf("text-only input_modalities = %#v, want [text]", textOnlyEntry["input_modalities"])
-	}
-	if got, _ := textOnlyModalities[0].(string); got != "text" {
-		t.Fatalf("text-only input_modalities[0] = %q, want text", got)
-	}
-	if _, exists := textOnlyEntry["supports_image_detail_original"]; exists {
-		t.Fatalf("text-only model should not expose supports_image_detail_original: %#v", textOnlyEntry["supports_image_detail_original"])
-	}
-
-	if mixedEntry == nil {
-		t.Fatal("expected codex entry for mixed-modalities model")
-	}
-	mixedModalities, ok := mixedEntry["input_modalities"].([]any)
-	if !ok || len(mixedModalities) != 2 {
-		t.Fatalf("mixed input_modalities = %#v, want [text image]", mixedEntry["input_modalities"])
-	}
-	if got, _ := mixedModalities[0].(string); got != "text" {
-		t.Fatalf("mixed input_modalities[0] = %q, want text", got)
-	}
-	if got, _ := mixedModalities[1].(string); got != "image" {
-		t.Fatalf("mixed input_modalities[1] = %q, want image", got)
-	}
-	if got, ok := mixedEntry["supports_image_detail_original"].(bool); !ok || !got {
-		t.Fatalf("mixed supports_image_detail_original = %#v, want true", mixedEntry["supports_image_detail_original"])
-	}
-
-	if imageEntry == nil {
-		t.Fatal("expected codex entry for image-only compat model")
-	}
-	if got, _ := imageEntry["visibility"].(string); got != "hide" {
-		t.Fatalf("image model visibility = %q, want hide", got)
-	}
-	if _, exists := imageEntry["input_modalities"]; exists {
-		t.Fatalf("image endpoint model should not expose input_modalities from registry: %#v", imageEntry["input_modalities"])
-	}
 }
 
-func TestCodexClientModelsResponse_AppliesDisplayNameToTemplateModel(t *testing.T) {
-	resp := CodexClientModelsResponse([]map[string]any{{
-		"id":           "gpt-5.5",
-		"display_name": "Configured Codex Name",
-	}})
-	models, ok := resp["models"].([]map[string]any)
-	if !ok || len(models) != 1 {
-		t.Fatalf("models = %#v, want one model", resp["models"])
+func testIntModelValue(model map[string]any, key string) int {
+	if model == nil {
+		return 0
 	}
-	if got := stringModelValue(models[0], "display_name"); got != "Configured Codex Name" {
-		t.Fatalf("display_name = %q, want Configured Codex Name", got)
+	switch value := model[key].(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
 	}
+	return 0
 }
 
-func TestCodexClientModelsResponse_DisablesSearchToolForSynthesizedModels(t *testing.T) {
-	resp := CodexClientModelsResponse([]map[string]any{
-		{"id": "custom-openai-compatible-model"},
-		{"id": "gpt-5.5"},
+func TestCodexClientModelsResponse_OAuthAliasesIntegration(t *testing.T) {
+	clientID := "codex-client-models-integration-test"
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(clientID, "codex", []*registry.ModelInfo{
+		{
+			ID:              "codex-main",
+			MetadataModelID: "gpt-6-astra",
+			DisplayName:     "GPT 6.0 Astra",
+		},
+		{
+			ID:              "codex-luna",
+			MetadataModelID: "gpt-5.6-luna",
+			DisplayName:     "GPT 5.6 Luna",
+		},
 	})
-	models, ok := resp["models"].([]map[string]any)
-	if !ok {
-		t.Fatalf("models type = %T, want []map[string]any", resp["models"])
-	}
-
-	bySlug := make(map[string]map[string]any, len(models))
-	for _, model := range models {
-		bySlug[stringModelValue(model, "slug")] = model
-	}
-
-	custom := bySlug["custom-openai-compatible-model"]
-	if custom == nil {
-		t.Fatal("expected synthesized custom model entry")
-	}
-	if got, ok := custom["supports_search_tool"].(bool); !ok || got {
-		t.Fatalf("custom supports_search_tool = %#v, want false", custom["supports_search_tool"])
-	}
-
-	official := bySlug["gpt-5.5"]
-	if official == nil {
-		t.Fatal("expected official template model entry")
-	}
-	if got, ok := official["supports_search_tool"].(bool); !ok || !got {
-		t.Fatalf("official supports_search_tool = %#v, want true", official["supports_search_tool"])
-	}
-}
-
-func TestCodexClientModelsResponse_RequiresTemplateAndCodexProvidersForSearchTool(t *testing.T) {
-	providers := map[string][]string{
-		"new-codex-model": {"codex"},
-		"gpt-5.5":         {"openai-compatible-deepseek"},
-		"gpt-5.4":         {"codex", "xai"},
-		"gpt-5.6-sol":     {"codex"},
-	}
-	resp := codexClientModelsResponse([]map[string]any{
-		{"id": "new-codex-model"},
-		{"id": "gpt-5.5"},
-		{"id": "gpt-5.4"},
-		{"id": "gpt-5.6-sol"},
-	}, func(id string) []string {
-		return providers[id]
-	})
-	models, ok := resp["models"].([]map[string]any)
-	if !ok {
-		t.Fatalf("models type = %T, want []map[string]any", resp["models"])
-	}
-
-	bySlug := make(map[string]map[string]any, len(models))
-	for _, model := range models {
-		bySlug[stringModelValue(model, "slug")] = model
-	}
-
-	if got, ok := bySlug["gpt-5.6-sol"]["supports_search_tool"].(bool); !ok || !got {
-		t.Errorf("gpt-5.6-sol supports_search_tool = %#v, want true", bySlug["gpt-5.6-sol"]["supports_search_tool"])
-	}
-	for _, slug := range []string{"new-codex-model", "gpt-5.5", "gpt-5.4"} {
-		if got, ok := bySlug[slug]["supports_search_tool"].(bool); !ok || got {
-			t.Errorf("%s supports_search_tool = %#v, want false", slug, bySlug[slug]["supports_search_tool"])
-		}
-	}
-}
-
-func TestCodexClientModelsResponse_PreservesUltraReasoningEffort(t *testing.T) {
-	resp := CodexClientModelsResponse([]map[string]any{{"id": "gpt-5.6-sol"}})
-	models, ok := resp["models"].([]map[string]any)
-	if !ok {
-		t.Fatalf("models type = %T, want []map[string]any", resp["models"])
-	}
-
-	var sol map[string]any
-	for _, entry := range models {
-		if stringModelValue(entry, "slug") == "gpt-5.6-sol" {
-			sol = entry
-			break
-		}
-	}
-	if sol == nil {
-		t.Fatal("expected codex client entry for gpt-5.6-sol")
-	}
-
-	levels, ok := sol["supported_reasoning_levels"].([]any)
-	if !ok {
-		t.Fatalf("supported_reasoning_levels = %T, want []any", sol["supported_reasoning_levels"])
-	}
-	for _, rawLevel := range levels {
-		level, ok := rawLevel.(map[string]any)
-		if ok && stringModelValue(level, "effort") == "ultra" {
-			return
-		}
-	}
-
-	t.Fatalf("supported_reasoning_levels = %#v, want ultra", levels)
-}
-
-func TestLoadCodexClientModelTemplatesRefreshesOnRevision(t *testing.T) {
-	codexClientModelTemplatesMu.Lock()
-	previousLoaded := codexClientModelTemplatesLoaded
-	previousRevision := codexClientModelTemplatesRevision
-	previousTemplates := codexClientModelTemplates
-	previousDefault := codexClientDefaultTemplate
-	previousErr := codexClientModelTemplatesErr
-	codexClientModelTemplatesLoaded = false
-	codexClientModelTemplatesMu.Unlock()
 	t.Cleanup(func() {
-		codexClientModelTemplatesMu.Lock()
-		codexClientModelTemplatesLoaded = previousLoaded
-		codexClientModelTemplatesRevision = previousRevision
-		codexClientModelTemplates = previousTemplates
-		codexClientDefaultTemplate = previousDefault
-		codexClientModelTemplatesErr = previousErr
-		codexClientModelTemplatesMu.Unlock()
+		modelRegistry.UnregisterClient(clientID)
 	})
 
-	first := []byte(`{"models":[{"slug":"gpt-5.5","display_name":"First"}]}`)
-	templates, defaultTemplate, err := loadCodexClientModelTemplatesSnapshot(first, 100)
-	if err != nil {
-		t.Fatalf("load first snapshot: %v", err)
-	}
-	if got := stringModelValue(templates["gpt-5.5"], "display_name"); got != "First" {
-		t.Fatalf("first display_name = %q, want First", got)
-	}
-	if got := stringModelValue(defaultTemplate, "display_name"); got != "First" {
-		t.Fatalf("first default display_name = %q, want First", got)
+	base := handlers.NewBaseAPIHandlers(&config.SDKConfig{}, nil)
+	handler := NewOpenAIAPIHandler(base)
+	resp := handler.codexClientModelsResponse("0.153.4")
+	models, ok := resp["models"].([]map[string]any)
+	if !ok {
+		t.Fatalf("models type = %T, want []map[string]any", resp["models"])
 	}
 
-	second := []byte(`{"models":[{"slug":"gpt-5.5","display_name":"Second"}]}`)
-	templates, defaultTemplate, err = loadCodexClientModelTemplatesSnapshot(second, 101)
-	if err != nil {
-		t.Fatalf("load second snapshot: %v", err)
-	}
-	if got := stringModelValue(templates["gpt-5.5"], "display_name"); got != "Second" {
-		t.Fatalf("second display_name = %q, want Second", got)
-	}
-	if got := stringModelValue(defaultTemplate, "display_name"); got != "Second" {
-		t.Fatalf("second default display_name = %q, want Second", got)
+	entries := make(map[string]map[string]any, len(models))
+	for _, entry := range models {
+		if slug, ok := entry["slug"].(string); ok {
+			entries[slug] = entry
+		}
 	}
 
-	templates, _, err = loadCodexClientModelTemplatesSnapshot(first, 101)
-	if err != nil {
-		t.Fatalf("reload cached revision: %v", err)
+	if mainEntry := entries["codex-main"]; mainEntry == nil {
+		t.Fatal("missing codex-main entry")
+	} else {
+		if compHash, _ := mainEntry["comp_hash"].(string); compHash != "3000" {
+			t.Errorf("codex-main comp_hash = %q, want 3000", compHash)
+		}
+		if maxContext := testIntModelValue(mainEntry, "max_context_window"); maxContext != 872000 {
+			t.Errorf("codex-main max_context_window = %d, want 872000", maxContext)
+		}
+		if search, _ := mainEntry["supports_search_tool"].(bool); !search {
+			t.Errorf("codex-main supports_search_tool = %v, want true", search)
+		}
 	}
-	if got := stringModelValue(templates["gpt-5.5"], "display_name"); got != "Second" {
-		t.Fatalf("cached display_name = %q, want Second", got)
+
+	if lunaEntry := entries["codex-luna"]; lunaEntry == nil {
+		t.Fatal("missing codex-luna entry")
+	} else {
+		if compHash, _ := lunaEntry["comp_hash"].(string); compHash != "3000" {
+			t.Errorf("codex-luna comp_hash = %q, want 3000", compHash)
+		}
+		if maxContext := testIntModelValue(lunaEntry, "max_context_window"); maxContext != 872000 {
+			t.Errorf("codex-luna max_context_window = %d, want 872000", maxContext)
+		}
+		if search, _ := lunaEntry["supports_search_tool"].(bool); !search {
+			t.Errorf("codex-luna supports_search_tool = %v, want true", search)
+		}
 	}
+}
+
+func TestCodexClientModelsResponse_DevinDisplayName(t *testing.T) {
+	devinClientID := "test-sdk-devin-models"
+	openaiClientID := "test-sdk-openai-models"
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(devinClientID, "devin", []*registry.ModelInfo{
+		{
+			ID:          "devin/swe-2",
+			Object:      "model",
+			OwnedBy:     "cognition",
+			Type:        "devin",
+			DisplayName: "SWE-2",
+		},
+		{
+			ID:          "devin/gpt-6-astra",
+			Object:      "model",
+			OwnedBy:     "openai",
+			Type:        "devin",
+			DisplayName: "GPT-6 Astra",
+		},
+	})
+	modelRegistry.RegisterClient(openaiClientID, "openai", []*registry.ModelInfo{
+		{
+			ID:          "standard-model",
+			Object:      "model",
+			OwnedBy:     "openai",
+			Type:        "openai",
+			DisplayName: "Standard Model",
+		},
+	})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(devinClientID)
+		modelRegistry.UnregisterClient(openaiClientID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&config.SDKConfig{}, nil)
+	handler := NewOpenAIAPIHandler(base)
+	resp := handler.codexClientModelsResponse("0.153.4")
+	models, ok := resp["models"].([]map[string]any)
+	if !ok {
+		t.Fatalf("models type = %T, want []map[string]any", resp["models"])
+	}
+
+	bySlug := make(map[string]map[string]any, len(models))
+	for _, entry := range models {
+		if slug, ok := entry["slug"].(string); ok {
+			bySlug[slug] = entry
+		}
+	}
+
+	if swe2 := bySlug["devin/swe-2"]; swe2 == nil {
+		t.Fatal("missing devin/swe-2 entry")
+	} else if got, _ := swe2["display_name"].(string); got != "SWE-2 (Devin)" {
+		t.Errorf("devin/swe-2 display_name = %q, want SWE-2 (Devin)", got)
+	}
+
+	if astra := bySlug["devin/gpt-6-astra"]; astra == nil {
+		t.Fatal("missing devin/gpt-6-astra entry")
+	} else if got, _ := astra["display_name"].(string); got != "GPT-6 Astra (Devin)" {
+		t.Errorf("devin/gpt-6-astra display_name = %q, want GPT-6 Astra (Devin)", got)
+	}
+
+	if std := bySlug["standard-model"]; std == nil {
+		t.Fatal("missing standard-model entry")
+	} else if got, _ := std["display_name"].(string); got != "Standard Model" {
+		t.Errorf("standard-model display_name = %q, want Standard Model", got)
+	}
+}
+
+// catalogUnknownExecutor preserves the required executor ABI without opting in.
+type catalogUnknownExecutor struct{ auth.ProviderExecutor }
+
+type catalogUnsupportedExecutor struct{ auth.ProviderExecutor }
+
+func (catalogUnsupportedExecutor) SupportsApplyPatch() bool { return false }
+
+func TestCodexClientModelsApplyPatchRouting(t *testing.T) {
+	modelRegistry := registry.GetGlobalRegistry()
+	registrations := []struct {
+		provider string
+		models   []*registry.ModelInfo
+	}{
+		{"codex", []*registry.ModelInfo{{ID: "gpt-5.5"}, {ID: "gpt-reserve"}, {ID: "gpt-image-2"}, {ID: "catalog-patch-mixed"}, {ID: "catalog-patch-partial"}}},
+		{"catalog-custom", []*registry.ModelInfo{{ID: "catalog-patch-synthetic"}, {ID: "catalog-patch-mixed"}, {ID: "catalog-patch-alias", MetadataModelID: "gpt-5.5", SupportedInputModalities: []string{"text"}}}},
+		{"catalog-remote", []*registry.ModelInfo{{ID: "catalog-patch-partial"}, {ID: "catalog-patch-unknown", MetadataModelID: "gpt-5.5"}, {ID: "team/gpt-5.5"}}},
+		{"catalog-disabled", []*registry.ModelInfo{{ID: "catalog-patch-disabled"}}},
+	}
+	for _, registration := range registrations {
+		clientID := "sdk-patch-" + registration.provider
+		modelRegistry.RegisterClient(clientID, registration.provider, registration.models)
+		t.Cleanup(func() { modelRegistry.UnregisterClient(clientID) })
+	}
+	manager := auth.NewManager(nil, nil, nil)
+	handler := NewOpenAIAPIHandler(handlers.NewBaseAPIHandlers(&config.SDKConfig{}, manager))
+	assertPatch := func(t *testing.T, response map[string]any, id string, want any) {
+		t.Helper()
+		for _, entry := range response["models"].([]map[string]any) {
+			if entry["slug"] == id {
+				value, present := entry["apply_patch_tool_type"]
+				if !present || value != want {
+					t.Errorf("%s apply_patch_tool_type = %#v (present %v), want %#v", id, value, present, want)
+				}
+				return
+			}
+		}
+		t.Fatalf("missing model %q", id)
+	}
+	// Models that natively declare freeform apply_patch advertise it by default under pure Codex routes.
+	assertPatch(t, handler.codexClientModelsResponse("0.153.4"), "gpt-5.5", "freeform")
+	manager.RegisterExecutor(executor.NewCodexAutoExecutor(&config.Config{}))
+	manager.RegisterExecutor(executor.NewOpenAICompatExecutor("catalog-custom", &config.Config{}))
+	manager.RegisterExecutor(catalogUnknownExecutor{executor.NewOpenAICompatExecutor("catalog-remote", &config.Config{})})
+	manager.RegisterExecutor(catalogUnsupportedExecutor{executor.NewOpenAICompatExecutor("catalog-disabled", &config.Config{})})
+	enabledCfg := &config.SDKConfig{Client: config.ClientConfig{Codex: config.CodexClientConfig{EnableApplyPatch: true}}}
+	for _, cfg := range []*config.SDKConfig{nil, {}, enabledCfg, {}} {
+		handler.UpdateClients(cfg)
+		for _, version := range []string{"", "0.137.0", "0.153.4", "cpa"} {
+			response := handler.codexClientModelsResponse(version)
+			for _, entry := range response["models"].([]map[string]any) {
+				want := any(nil)
+				if cfg == enabledCfg {
+					switch entry["slug"] {
+					case "gpt-5.5", "gpt-reserve", "catalog-patch-synthetic", "catalog-patch-alias", "catalog-patch-mixed":
+						want = "freeform"
+					}
+				} else {
+					switch entry["slug"] {
+					case "gpt-5.5", "gpt-reserve":
+						want = "freeform"
+					}
+				}
+				assertPatch(t, response, entry["slug"].(string), want)
+			}
+		}
+	}
+	handler.UpdateClients(enabledCfg)
+	for _, version := range []string{"", "0.137.0", "0.153.4", "cpa"} {
+		t.Run(version, func(t *testing.T) {
+			response := handler.codexClientModelsResponse(version)
+			for _, id := range []string{"gpt-5.5", "gpt-reserve", "catalog-patch-synthetic", "catalog-patch-alias", "catalog-patch-mixed"} {
+				assertPatch(t, response, id, "freeform")
+			}
+			for _, id := range []string{"gpt-image-2", "catalog-patch-partial", "catalog-patch-unknown", "team/gpt-5.5", "catalog-patch-disabled"} {
+				assertPatch(t, response, id, nil)
+			}
+		})
+	}
+	manager.RegisterExecutor(catalogUnknownExecutor{executor.NewCodexAutoExecutor(&config.Config{})})
+	assertPatch(t, handler.codexClientModelsResponse("0.153.4"), "gpt-5.5", nil)
+	withoutManager := NewOpenAIAPIHandler(handlers.NewBaseAPIHandlers(enabledCfg, nil))
+	assertPatch(t, withoutManager.codexClientModelsResponse("0.153.4"), "catalog-patch-synthetic", nil)
+
 }

@@ -1,7 +1,7 @@
 # Third-party source
 
-`cliproxyapi/` contains CLIProxyAPI v7.2.80, sourced from
-`github.com/router-for-me/CLIProxyAPI/v7` at commit `09da52ad`.
+`cliproxyapi/` contains CLIProxyAPI v8.0.32, sourced from
+`github.com/router-for-me/CLIProxyAPI/v8`.
 
 MuxAPI uses its public translator SDK. The upstream MIT license is retained in
 `cliproxyapi/LICENSE`.

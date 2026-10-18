@@ -7,8 +7,10 @@ import (
 	"strings"
 	"time"
 
-	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	"github.com/google/uuid"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 func init() {
@@ -51,7 +53,27 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		authType = "unknown"
 	}
 	apiKey := strings.TrimSpace(record.APIKey)
+	accessProvider := strings.TrimSpace(record.AccessProvider)
+	if accessProvider == "" {
+		accessProvider = strings.TrimSpace(coreusage.AccessProviderFromContext(ctx))
+	}
+	isNativeKey := record.IsNativeKey
+	if !isNativeKey {
+		if nativeExplicit, ok := coreusage.IsNativeKeyFromContext(ctx); ok {
+			isNativeKey = nativeExplicit
+		} else if accessProvider != "" {
+			isNativeKey = coreusage.IsNativeAccessProvider(accessProvider)
+		}
+	}
 	requestID := strings.TrimSpace(internallogging.GetRequestID(ctx))
+	traceID := strings.TrimSpace(record.TraceID)
+	if traceID == "" {
+		traceID = requestID
+	}
+	executionID := strings.TrimSpace(record.RequestID)
+	if executionID == "" {
+		executionID = uuid.NewString()
+	}
 	reasoningEffort := strings.TrimSpace(record.ReasoningEffort)
 	if reasoningEffort == "" {
 		reasoningEffort = coreusage.ReasoningEffortFromContext(ctx)
@@ -64,22 +86,32 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		serviceTier = coreusage.ServiceTierFromContext(ctx)
 	}
 	responseServiceTier := strings.TrimSpace(record.ResponseServiceTier)
+	responseModel := strings.TrimSpace(record.ResponseModel)
+	clientRequestMetadata := internallogging.GetClientRequestMetadata(ctx)
+	sessionID := strings.TrimSpace(record.SessionID)
+	parentSessionID := strings.TrimSpace(record.ParentSessionID)
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(clientRequestMetadata.SessionID)
+		parentSessionID = strings.TrimSpace(clientRequestMetadata.ParentSessionID)
+	} else if parentSessionID == "" && sessionID == strings.TrimSpace(clientRequestMetadata.SessionID) {
+		parentSessionID = strings.TrimSpace(clientRequestMetadata.ParentSessionID)
+	}
+	sessionID = coresession.NormalizeToCanonicalUUID(sessionID)
+	parentSessionID = coresession.NormalizeToCanonicalUUID(parentSessionID)
+	if sessionID == "" || sessionID == parentSessionID {
+		parentSessionID = ""
+	}
 
+	usageDetail := coreusage.EnsureTokenBreakdownForProvider(record.Detail, record.Provider, record.ExecutorType)
 	tokens := tokenStats{
-		InputTokens:            record.Detail.InputTokens,
-		OutputTokens:           record.Detail.OutputTokens,
-		ReasoningTokens:        record.Detail.ReasoningTokens,
-		CachedTokens:           record.Detail.CachedTokens,
-		CacheReadTokens:        record.Detail.CacheReadTokens,
+		InputTokens:            usageDetail.InputTokens,
+		OutputTokens:           usageDetail.OutputTokens,
+		ReasoningTokens:        usageDetail.ReasoningTokens,
+		CachedTokens:           usageDetail.CachedTokens,
+		CacheReadTokens:        usageDetail.CacheReadTokens,
 		CacheReadTokensPresent: true,
-		CacheCreationTokens:    record.Detail.CacheCreationTokens,
-		TotalTokens:            record.Detail.TotalTokens,
-	}
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens
-	}
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens + tokens.CachedTokens
+		CacheCreationTokens:    usageDetail.CacheCreationTokens,
+		TotalTokens:            usageDetail.TotalTokens,
 	}
 
 	failed := record.Failed
@@ -88,21 +120,34 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 	}
 	fail := resolveFail(ctx, record, failed)
 
+	stream := record.Stream
+	if !stream {
+		stream = coreusage.StreamFromContext(ctx)
+	}
+
 	detail := requestDetail{
-		Timestamp:       timestamp,
-		LatencyMs:       record.Latency.Milliseconds(),
-		TTFTMs:          record.TTFT.Milliseconds(),
-		Source:          record.Source,
-		AuthIndex:       record.AuthIndex,
-		Tokens:          tokens,
-		Failed:          failed,
-		Generate:        coreusage.GenerateEnabled(record.Generate),
-		Fail:            fail,
-		ResponseHeaders: record.ResponseHeaders,
+		Timestamp:        timestamp,
+		LatencyMs:        record.Latency.Milliseconds(),
+		TTFTMs:           record.TTFT.Milliseconds(),
+		Source:           record.Source,
+		AuthIndex:        record.AuthIndex,
+		AccessTokenHash:  record.AccessTokenSHA256,
+		ClientIP:         clientRequestMetadata.ClientIP,
+		ResolvedClientIP: clientRequestMetadata.ResolvedClientIP,
+		XForwardedFor:    clientRequestMetadata.XForwardedFor,
+		UserAgent:        clientRequestMetadata.UserAgent,
+		Tokens:           tokens,
+		Failed:           failed,
+		Generate:         coreusage.GenerateEnabled(record.Generate),
+		Stream:           stream,
+		Fail:             fail,
+		ResponseHeaders:  record.ResponseHeaders,
 	}
 
 	payload, err := json.Marshal(queuedUsageDetail{
 		requestDetail:       detail,
+		AccountingVersion:   coreusage.TokenAccountingSchemaVersion,
+		TokenBreakdown:      usageDetail.TokenBreakdown,
 		Provider:            provider,
 		ExecutorType:        executorType,
 		Model:               modelName,
@@ -110,10 +155,20 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		Endpoint:            resolveEndpoint(ctx),
 		AuthType:            authType,
 		APIKey:              apiKey,
+		IsNativeKey:         isNativeKey,
+		AccessProvider:      accessProvider,
 		RequestID:           requestID,
+		ExecutionID:         executionID,
+		TraceID:             traceID,
+		SessionID:           sessionID,
+		ParentSessionID:     parentSessionID,
+		NodeKind:            strings.TrimSpace(clientRequestMetadata.NodeKind),
+		IsFork:              clientRequestMetadata.IsFork,
+		IsCompaction:        clientRequestMetadata.IsCompaction,
 		ReasoningEffort:     reasoningEffort,
 		ServiceTier:         serviceTier,
 		ResponseServiceTier: responseServiceTier,
+		ResponseModel:       responseModel,
 	})
 	if err != nil {
 		return
@@ -123,30 +178,48 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 
 type queuedUsageDetail struct {
 	requestDetail
-	Provider            string `json:"provider"`
-	ExecutorType        string `json:"executor_type"`
-	Model               string `json:"model"`
-	Alias               string `json:"alias"`
-	Endpoint            string `json:"endpoint"`
-	AuthType            string `json:"auth_type"`
-	APIKey              string `json:"api_key"`
-	RequestID           string `json:"request_id"`
-	ReasoningEffort     string `json:"reasoning_effort"`
-	ServiceTier         string `json:"service_tier"`
-	ResponseServiceTier string `json:"response_service_tier,omitempty"`
+	AccountingVersion   int                      `json:"accounting_version"`
+	TokenBreakdown      coreusage.TokenBreakdown `json:"token_breakdown"`
+	Provider            string                   `json:"provider"`
+	ExecutorType        string                   `json:"executor_type"`
+	Model               string                   `json:"model"`
+	Alias               string                   `json:"alias"`
+	Endpoint            string                   `json:"endpoint"`
+	AuthType            string                   `json:"auth_type"`
+	APIKey              string                   `json:"api_key"`
+	IsNativeKey         bool                     `json:"is_native_key"`
+	AccessProvider      string                   `json:"access_provider,omitempty"`
+	RequestID           string                   `json:"request_id"`
+	ExecutionID         string                   `json:"execution_id,omitempty"`
+	TraceID             string                   `json:"trace_id,omitempty"`
+	SessionID           string                   `json:"session_id,omitempty"`
+	ParentSessionID     string                   `json:"parent_session_id,omitempty"`
+	NodeKind            string                   `json:"node_kind,omitempty"`
+	IsFork              bool                     `json:"is_fork,omitempty"`
+	IsCompaction        bool                     `json:"is_compaction,omitempty"`
+	ReasoningEffort     string                   `json:"reasoning_effort"`
+	ServiceTier         string                   `json:"service_tier"`
+	ResponseServiceTier string                   `json:"response_service_tier,omitempty"`
+	ResponseModel       string                   `json:"response_model,omitempty"`
 }
 
 type requestDetail struct {
-	Timestamp       time.Time   `json:"timestamp"`
-	LatencyMs       int64       `json:"latency_ms"`
-	TTFTMs          int64       `json:"ttft_ms"`
-	Source          string      `json:"source"`
-	AuthIndex       string      `json:"auth_index"`
-	Tokens          tokenStats  `json:"tokens"`
-	Failed          bool        `json:"failed"`
-	Generate        bool        `json:"generate"`
-	Fail            failDetail  `json:"fail"`
-	ResponseHeaders http.Header `json:"response_headers,omitempty"`
+	Timestamp        time.Time   `json:"timestamp"`
+	LatencyMs        int64       `json:"latency_ms"`
+	TTFTMs           int64       `json:"ttft_ms"`
+	Source           string      `json:"source"`
+	AuthIndex        string      `json:"auth_index"`
+	AccessTokenHash  string      `json:"access_token_sha256,omitempty"`
+	ClientIP         string      `json:"client_ip"`
+	ResolvedClientIP string      `json:"resolved_client_ip"`
+	XForwardedFor    string      `json:"x_forwarded_for"`
+	UserAgent        string      `json:"user_agent"`
+	Tokens           tokenStats  `json:"tokens"`
+	Failed           bool        `json:"failed"`
+	Generate         bool        `json:"generate"`
+	Stream           bool        `json:"stream"`
+	Fail             failDetail  `json:"fail"`
+	ResponseHeaders  http.Header `json:"response_headers,omitempty"`
 }
 
 type tokenStats struct {
