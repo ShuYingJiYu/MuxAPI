@@ -201,10 +201,11 @@ async function loadMembers(gid) {
   if (ep === loadEpoch) members.value = data
 }
 const mhTitle = mh => {
-  const policy = mh.excluded_until ? `排除至 ${new Date(mh.excluded_until).toLocaleString()}` : '永久排除'
+  const kind = mh.kind === 'rate_limit' ? '模型限流' : mh.kind === 'transient' ? '模型临时故障' : '模型不支持'
+  const policy = mh.excluded_until ? `冷却至 ${new Date(mh.excluded_until).toLocaleString()}` : '永久排除'
   const count = mh.failure_count ? `，已确认 ${mh.failure_count} 次` : ''
   const status = mh.last_status ? `，HTTP ${mh.last_status}` : ''
-  return `${mh.model} · ${policy}${count}${status}；点击删除排除并重新启用`
+  return `${mh.model} · ${kind}，${policy}${count}${status}；点击清除状态并重新启用`
 }
 async function loadDetail(gid) {
   const ep = loadEpoch
@@ -1644,7 +1645,8 @@ const rtClass = h => rtUnprobed(h) ? 'nodata' : ({ CLOSED: 'closed', HALF_OPEN: 
 const rtRate = h => (h && h.reqs) ? (h.succ_rate * 100).toFixed(0) + '%' : '—'
 
 // 模型徽章表示持久能力排除或 TTL 到期后的待重探状态，不是独立熔断器。
-const mhClass = mh => mh?.state === 'UNSUPPORTED' ? 'open' : 'nodata'
+const mhClass = mh => ['rate_limit', 'transient'].includes(mh?.kind) ? 'half' : mh?.state === 'UNSUPPORTED' ? 'open' : 'nodata'
+const mhBadgeLabel = mh => mh?.kind === 'rate_limit' ? '限流' : mh?.kind === 'transient' ? '故障' : mh?.state === 'UNSUPPORTED' ? '不支持' : '重探'
 const visibleDots = item => item?.model_health || []
 
 // 分组卡片：只展示路由摘要；完整成员名称在分组详情页查看。
@@ -2523,7 +2525,7 @@ function logout() {
                   <td>
                     <span class="state-badge" :class="rtClass(m.health)">{{ m.enabled && m.group_enabled ? rtLabel(m.health) : '已停用' }}</span>
                     <div v-if="visibleDots(m).length" class="model-dots">
-                      <button v-for="mh in visibleDots(m)" :key="mh.model" type="button" class="model-dot model-dot-action" :class="mhClass(mh)" :title="mhTitle(mh)" :disabled="recoveringModels.has(`${m.upstream_id}:${mh.model}`)" @click="guard(() => recoverUpstreamModel(m, mh))">{{ mh.model }}</button>
+                      <button v-for="mh in visibleDots(m)" :key="mh.model" type="button" class="model-dot model-dot-action" :class="mhClass(mh)" :title="mhTitle(mh)" :disabled="recoveringModels.has(`${m.upstream_id}:${mh.model}`)" @click="guard(() => recoverUpstreamModel(m, mh))">{{ mhBadgeLabel(mh) }} {{ mh.model }}</button>
                     </div>
                   </td>
                   <td>{{ rtRate(m.health) }}</td>

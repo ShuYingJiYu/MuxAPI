@@ -35,6 +35,7 @@ func toHealthView(sn health.Snapshot, state string) healthView {
 type modelHealthView struct {
 	Model         string     `json:"model"`
 	State         string     `json:"state"`
+	Kind          string     `json:"kind,omitempty"`
 	ExcludedUntil *time.Time `json:"excluded_until,omitempty"`
 	FailureCount  int        `json:"failure_count"`
 	LastStatus    int        `json:"last_status"`
@@ -49,8 +50,12 @@ func toModelHealthViews(ms []health.ModelHealth) []modelHealthView {
 	}
 	out := make([]modelHealthView, 0, len(ms))
 	for _, mh := range ms {
+		kind := mh.Kind
+		if kind == "" {
+			kind = "unsupported"
+		}
 		out = append(out, modelHealthView{
-			Model: mh.Model, State: mh.State, ExcludedUntil: mh.ExcludedUntil,
+			Model: mh.Model, State: mh.State, Kind: kind, ExcludedUntil: mh.ExcludedUntil,
 			FailureCount: mh.FailureCount, LastStatus: mh.LastStatus,
 			LastReason: mh.LastReason, LastFailedAt: mh.LastFailedAt,
 		})

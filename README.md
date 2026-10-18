@@ -128,7 +128,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o muxapi-linux-amd64 ./cmd/muxap
 | `MUXAPI_ADDR` | `:8080` | 监听地址 |
 | `MUXAPI_DATABASE_URL` | （必填） | PostgreSQL 连接串，建议连接本机加密隧道或私网地址 |
 | `MUXAPI_TOKEN` | （空） | 管理后台鉴权 token，**留空则后台无鉴权，切勿对外暴露** |
-| `MUXAPI_FAIL_THRESHOLD` | `3` | 连续失败多少次熔断 |
+| `MUXAPI_FAIL_THRESHOLD` | `3` | 一分钟内渠道级失败多少次后熔断 |
 | `MUXAPI_COOLDOWN` | `30s` | 熔断冷却时长 |
 | `MUXAPI_MAX_RETRIES` | `6` | 单次下游请求最多尝试的上游数 |
 

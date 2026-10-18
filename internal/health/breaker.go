@@ -32,6 +32,8 @@ func (s State) String() string {
 type breaker struct {
 	state             State
 	fails             int
+	failureWindowFrom time.Time
+	lastTransportFail time.Time
 	openUntil         time.Time
 	generation        uint64
 	recoveryLease     uint64
@@ -73,6 +75,18 @@ type ModelExclusion struct {
 	reprobeLease  uint64
 }
 
+type modelRateLimit struct {
+	failedAt   time.Time
+	until      time.Time
+	failures   int
+	lastStatus int
+	lastReason string
+	kind       string
+	leaseToken uint64
+}
+
+const maxModelRateLimitCooldown = 24 * time.Hour
+
 // ModelExclusionStore is implemented by the persistence layer. The health
 // package intentionally depends on this small interface to avoid a store cycle.
 type ModelExclusionStore interface {
@@ -106,6 +120,13 @@ const (
 	ResultSuccess
 	ResultFailure
 	ResultModelUnsupported
+	// ResultScopedFailure records a failed request without attributing it to
+	// the whole channel, such as a model-scoped rate limit.
+	ResultScopedFailure
+	// ResultTransportFailure identifies a network/stream transport failure.
+	// A short burst is collapsed because one shared connection loss can fail
+	// many concurrent requests at once.
+	ResultTransportFailure
 )
 
 // Lease identifies one exact channel attempt. The manager validates its token
@@ -162,6 +183,8 @@ const (
 	defaultModelUnsupportedTTL = time.Duration(0)
 	defaultRecoverySuccessGoal = 2
 	defaultMaxCooldown         = 5 * time.Minute
+	defaultFailureWindow       = time.Minute
+	defaultFailureCollapse     = 3 * time.Second
 )
 
 // AlertEvent reports a channel breaker transition. Model is the request model
@@ -182,21 +205,24 @@ type Alerter interface {
 // Manager owns one breaker per upstream and a write-through negative model
 // capability cache. Model exclusions never participate in channel recovery.
 type Manager struct {
-	mu            sync.Mutex
-	breakers      map[int64]*breaker
-	unsupported   map[modelKey]*ModelExclusion
-	capLatest     map[modelKey]uint64
-	leases        map[uint64]leaseRecord
-	groupRecovery map[int64]*groupRecovery
-	nextToken     uint64
-	failThreshold int
-	cooldown      time.Duration
-	recoveryGoal  int
-	maxCooldown   time.Duration
-	modelTTL      time.Duration
-	persistModel  func(ModelExclusion) error
-	deleteModel   func(upstreamID int64, model string) error
-	alerter       Alerter
+	mu              sync.Mutex
+	breakers        map[int64]*breaker
+	unsupported     map[modelKey]*ModelExclusion
+	rateLimits      map[modelKey]*modelRateLimit
+	capLatest       map[modelKey]uint64
+	leases          map[uint64]leaseRecord
+	groupRecovery   map[int64]*groupRecovery
+	nextToken       uint64
+	failThreshold   int
+	cooldown        time.Duration
+	recoveryGoal    int
+	maxCooldown     time.Duration
+	failureWindow   time.Duration
+	failureCollapse time.Duration
+	modelTTL        time.Duration
+	persistModel    func(ModelExclusion) error
+	deleteModel     func(upstreamID int64, model string) error
+	alerter         Alerter
 }
 
 // New 创建渠道级健康管理器，并规范化失败阈值与冷却时间。
@@ -208,16 +234,19 @@ func New(failThreshold int, cooldown time.Duration) *Manager {
 		cooldown = 30 * time.Second
 	}
 	return &Manager{
-		breakers:      make(map[int64]*breaker),
-		unsupported:   make(map[modelKey]*ModelExclusion),
-		capLatest:     make(map[modelKey]uint64),
-		leases:        make(map[uint64]leaseRecord),
-		groupRecovery: make(map[int64]*groupRecovery),
-		failThreshold: failThreshold,
-		cooldown:      cooldown,
-		recoveryGoal:  defaultRecoverySuccessGoal,
-		maxCooldown:   defaultMaxCooldown,
-		modelTTL:      defaultModelUnsupportedTTL,
+		breakers:        make(map[int64]*breaker),
+		unsupported:     make(map[modelKey]*ModelExclusion),
+		rateLimits:      make(map[modelKey]*modelRateLimit),
+		capLatest:       make(map[modelKey]uint64),
+		leases:          make(map[uint64]leaseRecord),
+		groupRecovery:   make(map[int64]*groupRecovery),
+		failThreshold:   failThreshold,
+		cooldown:        cooldown,
+		recoveryGoal:    defaultRecoverySuccessGoal,
+		maxCooldown:     defaultMaxCooldown,
+		failureWindow:   defaultFailureWindow,
+		failureCollapse: defaultFailureCollapse,
+		modelTTL:        defaultModelUnsupportedTTL,
 	}
 }
 
@@ -293,6 +322,7 @@ func (m *Manager) RecoverModel(id int64, model string) error {
 	m.nextToken++
 	m.capLatest[key] = m.nextToken
 	delete(m.unsupported, key)
+	delete(m.rateLimits, key)
 	m.mu.Unlock()
 	return nil
 }
@@ -374,6 +404,22 @@ func (m *Manager) modelUnsupportedLocked(id int64, model string) bool {
 	return exclusion.reprobeLease != 0
 }
 
+func (m *Manager) modelRateLimitedLocked(id int64, model string) bool {
+	if model == "" {
+		return false
+	}
+	key := modelKey{id, model}
+	limit := m.rateLimits[key]
+	if limit == nil {
+		return false
+	}
+	if !time.Now().Before(limit.until) {
+		delete(m.rateLimits, key)
+		return false
+	}
+	return true
+}
+
 func (m *Manager) modelNeedsReprobeLocked(id int64, model string) bool {
 	exclusion := m.unsupported[modelKey{id, model}]
 	return exclusion != nil && exclusion.ExcludedUntil != nil &&
@@ -387,6 +433,9 @@ func (m *Manager) IsAvailable(id int64, model string) bool {
 	if m.modelUnsupportedLocked(id, model) {
 		return false
 	}
+	if m.modelRateLimitedLocked(id, model) {
+		return false
+	}
 	return m.canServe(m.get(id))
 }
 
@@ -396,6 +445,9 @@ func (m *Manager) Claim(groupID, id int64, model string) (Lease, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.modelUnsupportedLocked(id, model) {
+		return Lease{}, false
+	}
+	if m.modelRateLimitedLocked(id, model) {
 		return Lease{}, false
 	}
 	b := m.get(id)
@@ -426,7 +478,7 @@ func (m *Manager) Claim(groupID, id int64, model string) (Lease, bool) {
 func (m *Manager) ClaimLastResort(groupID, id int64, model string) (Lease, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.modelUnsupportedLocked(id, model) || !m.groupCanRecoverLocked(groupID) {
+	if m.modelUnsupportedLocked(id, model) || m.modelRateLimitedLocked(id, model) || !m.groupCanRecoverLocked(groupID) {
 		return Lease{}, false
 	}
 	b := m.get(id)
@@ -500,16 +552,34 @@ func (m *Manager) groupCanRecoverLocked(groupID int64) bool {
 // Complete records and releases one lease exactly once. Results from an older
 // breaker generation remain visible in statistics but cannot change state.
 func (m *Manager) Complete(lease Lease, result Result, latencyMs int64) {
-	m.complete(lease, result, latencyMs, 0, "")
+	m.complete(lease, result, latencyMs, 0, "", 0)
 }
 
 // CompleteModelUnsupported records the structured upstream failure details and
 // durably excludes this exact upstream/model pair.
 func (m *Manager) CompleteModelUnsupported(lease Lease, latencyMs int64, status int, reason string) {
-	m.complete(lease, ResultModelUnsupported, latencyMs, status, reason)
+	m.complete(lease, ResultModelUnsupported, latencyMs, status, reason, 0)
 }
 
-func (m *Manager) complete(lease Lease, result Result, latencyMs int64, status int, reason string) {
+// CompleteModelRateLimited cools down only the requested model on this
+// upstream. retryAfter is bounded by the configured maximum cooldown.
+func (m *Manager) CompleteModelRateLimited(lease Lease, latencyMs int64, retryAfter time.Duration, status int, reason string) {
+	m.completeScoped(lease, latencyMs, retryAfter, status, reason, "rate_limit")
+}
+
+func (m *Manager) CompleteModelTransientFailure(lease Lease, latencyMs int64, status int, reason string) {
+	m.completeScoped(lease, latencyMs, 0, status, reason, "transient")
+}
+
+func (m *Manager) completeScoped(lease Lease, latencyMs int64, retryAfter time.Duration, status int, reason, kind string) {
+	m.complete(lease, ResultScopedFailure, latencyMs, status, reason, retryAfter, kind)
+}
+
+func (m *Manager) CompleteTransportFailure(lease Lease, latencyMs int64) {
+	m.complete(lease, ResultTransportFailure, latencyMs, 0, "", 0)
+}
+
+func (m *Manager) complete(lease Lease, result Result, latencyMs int64, status int, reason string, retryAfter time.Duration, scopedKind ...string) {
 	m.mu.Lock()
 	record, ok := m.leases[lease.Token]
 	if !ok || record.upstreamID != lease.UpstreamID {
@@ -526,9 +596,9 @@ func (m *Manager) complete(lease Lease, result Result, latencyMs int64, status i
 	}
 	if record.probe {
 		b.lastProbe = time.Now()
-	} else if result == ResultSuccess || result == ResultFailure {
+	} else if result == ResultSuccess || result == ResultFailure || result == ResultScopedFailure || result == ResultTransportFailure {
 		b.reqs++
-		if result == ResultFailure {
+		if result == ResultFailure || result == ResultScopedFailure || result == ResultTransportFailure {
 			b.failReqs++
 		} else if latencyMs > 0 {
 			b.totLatency += latencyMs
@@ -548,6 +618,9 @@ func (m *Manager) complete(lease Lease, result Result, latencyMs int64, status i
 	}
 	if sameGeneration && record.model != "" && result == ResultSuccess && lease.Token >= m.capLatest[key] {
 		m.capLatest[key] = lease.Token
+		if rateLimit := m.rateLimits[key]; rateLimit != nil && lease.Token > rateLimit.leaseToken {
+			delete(m.rateLimits, key)
+		}
 		if record.modelReprobe {
 			delete(m.unsupported, key)
 			copy := key
@@ -555,6 +628,7 @@ func (m *Manager) complete(lease Lease, result Result, latencyMs int64, status i
 		}
 	} else if sameGeneration && record.model != "" && result == ResultModelUnsupported && lease.Token >= m.capLatest[key] {
 		m.capLatest[key] = lease.Token
+		delete(m.rateLimits, key)
 		now := time.Now()
 		exclusion := m.unsupported[key]
 		if exclusion == nil {
@@ -570,6 +644,39 @@ func (m *Manager) complete(lease Lease, result Result, latencyMs int64, status i
 		copy := exclusion.publicCopy()
 		persist = &copy
 	}
+	if sameGeneration && record.model != "" && result == ResultScopedFailure && lease.Token >= m.capLatest[key] {
+		if exclusion := m.unsupported[key]; exclusion != nil && exclusion.ExcludedUntil != nil && !time.Now().Before(*exclusion.ExcludedUntil) && record.modelReprobe {
+			delete(m.unsupported, key)
+			copy := key
+			remove = &copy
+		}
+		if m.rateLimits == nil {
+			m.rateLimits = make(map[modelKey]*modelRateLimit)
+		}
+		previous := m.rateLimits[key]
+		if (previous == nil || lease.Token >= previous.leaseToken) && lease.Token >= m.capLatest[key] {
+			failures := 1
+			if previous != nil && time.Now().Before(previous.until) {
+				failures = previous.failures + 1
+			}
+			if retryAfter <= 0 {
+				retryAfter = m.backoff(failures)
+			}
+			if retryAfter > maxModelRateLimitCooldown {
+				retryAfter = maxModelRateLimitCooldown
+			}
+			now := time.Now()
+			m.capLatest[key] = lease.Token
+			kind := "transient"
+			if len(scopedKind) > 0 && scopedKind[0] != "" {
+				kind = scopedKind[0]
+			}
+			m.rateLimits[key] = &modelRateLimit{
+				failedAt: now, until: now.Add(retryAfter), failures: failures, lastStatus: status,
+				lastReason: truncateModelReason(reason), kind: kind, leaseToken: lease.Token,
+			}
+		}
+	}
 
 	from, to := b.state, b.state
 	if sameGeneration && record.authoritative {
@@ -578,6 +685,24 @@ func (m *Manager) complete(lease Lease, result Result, latencyMs int64, status i
 			from, to = m.drive(b, true, 0)
 		case ResultFailure:
 			from, to = m.drive(b, false, 0)
+		case ResultTransportFailure:
+			now := time.Now()
+			// A failed half-open trial is direct evidence that recovery has not
+			// completed. Do not let burst coalescing suppress its reopen.
+			if record.recovery || b.lastTransportFail.IsZero() || now.Sub(b.lastTransportFail) >= m.failureCollapse || now.Before(b.lastTransportFail) {
+				b.lastTransportFail = now
+				from, to = m.drive(b, false, 0)
+			}
+		case ResultModelUnsupported, ResultScopedFailure:
+			if record.recovery {
+				from = b.state
+				b.state, b.fails, b.failureWindowFrom = Closed, 0, time.Time{}
+				b.openUntil = time.Time{}
+				b.recoverySuccesses = 0
+				b.reopenCount = 0
+				b.earlyTrial = false
+				to = Closed
+			}
 		}
 	}
 	if record.recovery && record.groupID != 0 {
@@ -589,6 +714,10 @@ func (m *Manager) complete(lease Lease, result Result, latencyMs int64, status i
 				delete(m.groupRecovery, record.groupID)
 			case ResultFailure:
 				g.notBefore = b.openUntil
+			case ResultTransportFailure:
+				g.notBefore = b.openUntil
+			case ResultModelUnsupported, ResultScopedFailure:
+				delete(m.groupRecovery, record.groupID)
 			default:
 				if !time.Now().Before(g.notBefore) {
 					delete(m.groupRecovery, record.groupID)
@@ -765,6 +894,11 @@ func (m *Manager) Forget(id int64) {
 			delete(m.unsupported, key)
 		}
 	}
+	for key := range m.rateLimits {
+		if key.upstreamID == id {
+			delete(m.rateLimits, key)
+		}
+	}
 	for key := range m.capLatest {
 		if key.upstreamID == id {
 			delete(m.capLatest, key)
@@ -782,6 +916,7 @@ func (m *Manager) ResetCircuit(id int64) {
 	b.generation++
 	b.state = Closed
 	b.fails = 0
+	b.failureWindowFrom = time.Time{}
 	b.openUntil = time.Time{}
 	b.recoveryLease = 0
 	b.earlyTrial = false
@@ -807,6 +942,8 @@ func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) (from, to State) {
 	from = b.state
 	if ok {
 		b.fails = 0
+		b.failureWindowFrom = time.Time{}
+		b.lastTransportFail = time.Time{}
 		switch b.state {
 		case Closed:
 			b.recoverySuccesses = 0
@@ -826,6 +963,11 @@ func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) (from, to State) {
 		return from, b.state
 	}
 
+	now := time.Now()
+	if b.failureWindowFrom.IsZero() || now.Before(b.failureWindowFrom) || now.Sub(b.failureWindowFrom) > m.failureWindow {
+		b.fails = 0
+		b.failureWindowFrom = now
+	}
 	b.fails++
 	b.recoverySuccesses = 0
 	switch {
@@ -945,10 +1087,11 @@ func (m *Manager) Snapshot(id int64) Snapshot {
 	return sn
 }
 
-// ModelHealth 表示一条模型能力排除记录，不是独立熔断器。
+// ModelHealth 表示模型级临时排除或限流状态，不是独立渠道熔断器。
 type ModelHealth struct {
 	Model         string     `json:"model"`
 	State         string     `json:"state"`
+	Kind          string     `json:"kind,omitempty"`
 	ExcludedUntil *time.Time `json:"excluded_until,omitempty"`
 	FailureCount  int        `json:"failure_count"`
 	LastStatus    int        `json:"last_status"`
@@ -973,6 +1116,17 @@ func (m *Manager) ModelStates(id int64) []ModelHealth {
 				LastReason: exclusion.LastReason, LastFailedAt: exclusion.LastFailedAt,
 			})
 		}
+	}
+	for key, limit := range m.rateLimits {
+		if key.upstreamID != id || !now.Before(limit.until) {
+			continue
+		}
+		until := limit.until
+		out = append(out, ModelHealth{
+			Model: key.model, State: "TEMPORARY_FAILURE", Kind: limit.kind,
+			ExcludedUntil: &until, FailureCount: limit.failures, LastStatus: limit.lastStatus,
+			LastReason: limit.lastReason, LastFailedAt: limit.failedAt,
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Model < out[j].Model })
 	return out

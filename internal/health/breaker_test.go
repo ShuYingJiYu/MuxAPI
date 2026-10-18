@@ -24,6 +24,139 @@ func TestChannelFailuresAccumulateAcrossModels(t *testing.T) {
 	}
 }
 
+func TestModelRateLimitDoesNotOpenChannelOrBlockOtherModels(t *testing.T) {
+	m := New(1, time.Hour)
+	limited, ok := m.Claim(1, 7, "gpt-5.6")
+	if !ok {
+		t.Fatal("claim failed")
+	}
+	m.CompleteModelRateLimited(limited, 12, time.Hour, 429, "rate limited")
+	if m.IsAvailable(7, "gpt-5.6") {
+		t.Fatal("rate-limited model should be temporarily unavailable")
+	}
+	if !m.IsAvailable(7, "gpt-5.5") || m.EffectiveState(7) != "CLOSED" {
+		t.Fatal("model rate limit must not block sibling models or open channel")
+	}
+	states := m.ModelStates(7)
+	if len(states) != 1 || states[0].State != "TEMPORARY_FAILURE" || states[0].Kind != "rate_limit" || states[0].LastStatus != 429 {
+		t.Fatalf("rate-limit state is not visible: %+v", states)
+	}
+}
+
+func TestModelRateLimitRetryAfterAndSuccessRecovery(t *testing.T) {
+	m := New(3, time.Second)
+	m.SetAdvancedPolicy(2, 5*time.Minute, 0)
+	lease, _ := m.Claim(1, 7, "gpt-5.6")
+	m.CompleteModelRateLimited(lease, 12, 20*time.Millisecond, 429, "retry later")
+	time.Sleep(30 * time.Millisecond)
+	if !m.IsAvailable(7, "gpt-5.6") {
+		t.Fatal("expired model cooldown should be removed")
+	}
+
+	lease, _ = m.Claim(1, 7, "gpt-5.6")
+	m.CompleteModelRateLimited(lease, 12, time.Hour, 429, "retry later")
+	lease, ok := m.Claim(1, 7, "gpt-5.5")
+	if !ok {
+		t.Fatal("sibling model should remain callable")
+	}
+	m.Complete(lease, ResultSuccess, 10)
+	if m.IsAvailable(7, "gpt-5.6") {
+		t.Fatal("success for another model must not clear the model cooldown")
+	}
+	if err := m.RecoverModel(7, "gpt-5.6"); err != nil {
+		t.Fatal(err)
+	}
+	if !m.IsAvailable(7, "gpt-5.6") {
+		t.Fatal("manual model recovery did not clear rate-limit state")
+	}
+}
+
+func TestExpiredUnsupportedProbeRateLimitReplacesStaleExclusion(t *testing.T) {
+	m := New(3, time.Hour)
+	m.SetAdvancedPolicy(2, time.Hour, time.Minute)
+	expires := time.Now().Add(-time.Second)
+	key := modelKey{upstreamID: 7, model: "gpt"}
+	m.unsupported[key] = &ModelExclusion{UpstreamID: 7, Model: "gpt", ExcludedUntil: &expires}
+	lease, ok := m.Claim(1, 7, "gpt")
+	if !ok {
+		t.Fatal("expired exclusion should allow a controlled re-probe")
+	}
+	m.CompleteModelRateLimited(lease, 10, time.Hour, 429, "rate limited")
+	states := m.ModelStates(7)
+	if len(states) != 1 || states[0].State != "TEMPORARY_FAILURE" {
+		t.Fatalf("rate limit should replace stale exclusion state: %+v", states)
+	}
+}
+
+func TestScopedStreamFailureDoesNotOpenChannel(t *testing.T) {
+	m := New(1, time.Hour)
+	lease, _ := m.Claim(1, 7, "gpt-5.6")
+	m.Complete(lease, ResultScopedFailure, 10)
+	if got := m.EffectiveState(7); got != "CLOSED" {
+		t.Fatalf("request-scoped stream error opened channel: %s", got)
+	}
+	if got := m.Snapshot(7); got.Reqs != 1 || got.FailReqs != 1 {
+		t.Fatalf("scoped failure should still count in traffic stats: %+v", got)
+	}
+}
+
+func TestTransportFailureBurstIsCollapsed(t *testing.T) {
+	m := New(3, time.Hour)
+	for i := 0; i < 10; i++ {
+		lease, ok := m.Claim(1, 7, "gpt")
+		if !ok {
+			t.Fatal("claim failed before channel opened")
+		}
+		m.CompleteTransportFailure(lease, 0)
+	}
+	if got := m.Snapshot(7); got.Fails != 1 || got.State != "CLOSED" {
+		t.Fatalf("one shared transport incident burst must count once: %+v", got)
+	}
+	if got := m.Snapshot(7); got.Reqs != 10 || got.FailReqs != 10 {
+		t.Fatalf("collapsed transport failures should remain visible in request stats: %+v", got)
+	}
+}
+
+func TestSuccessStartsNewTransportFailureBurst(t *testing.T) {
+	m := New(3, time.Hour)
+	first, _ := m.Claim(1, 7, "gpt")
+	m.CompleteTransportFailure(first, 0)
+	success, ok := m.Claim(1, 7, "gpt")
+	if !ok {
+		t.Fatal("channel should remain available below threshold")
+	}
+	m.Complete(success, ResultSuccess, 10)
+	next, ok := m.Claim(1, 7, "gpt")
+	if !ok {
+		t.Fatal("claim after success failed")
+	}
+	m.CompleteTransportFailure(next, 0)
+	if got := m.Snapshot(7); got.Fails != 1 || got.State != "CLOSED" {
+		t.Fatalf("failure after success should start a new burst and count once, got %+v", got)
+	}
+}
+
+func TestHalfOpenTransportFailureReopensDuringCollapseWindow(t *testing.T) {
+	m := New(1, 10*time.Millisecond)
+	initial, ok := m.Claim(1, 7, "gpt")
+	if !ok {
+		t.Fatal("initial claim failed")
+	}
+	m.CompleteTransportFailure(initial, 0)
+	if got := m.EffectiveState(7); got != "OPEN" {
+		t.Fatalf("expected initial failure to open channel, got %s", got)
+	}
+	time.Sleep(15 * time.Millisecond)
+	recovery, ok := m.Claim(1, 7, "gpt")
+	if !ok {
+		t.Fatal("expected half-open recovery claim")
+	}
+	m.CompleteTransportFailure(recovery, 0)
+	if got := m.EffectiveState(7); got != "OPEN" {
+		t.Fatalf("half-open transport failure must reopen despite burst coalescing, got %s", got)
+	}
+}
+
 func TestTimeoutUsesConfiguredFailureThreshold(t *testing.T) {
 	m := New(3, time.Hour)
 	m.ReportTimeout(1, "gpt-5.6", 120000)
@@ -38,6 +171,18 @@ func TestTimeoutUsesConfiguredFailureThreshold(t *testing.T) {
 	snapshot := m.Snapshot(1)
 	if snapshot.Reqs != 3 || snapshot.FailReqs != 3 {
 		t.Fatalf("timeouts should count as ordinary failed requests: %+v", snapshot)
+	}
+}
+
+func TestChannelFailureWindowExpiresOlderFailures(t *testing.T) {
+	m := New(3, time.Hour)
+	m.failureWindow = 15 * time.Millisecond
+	m.ReportTimeout(1, "gpt", 10)
+	m.ReportTimeout(1, "gpt", 10)
+	time.Sleep(20 * time.Millisecond)
+	m.ReportTimeout(1, "gpt", 10)
+	if got := m.Snapshot(1); got.Fails != 1 || got.State != "CLOSED" {
+		t.Fatalf("failures outside the active window must expire: %+v", got)
 	}
 }
 
@@ -104,6 +249,23 @@ func TestRecoveryFailureReopens(t *testing.T) {
 	m.ObserveProbe(1, "gpt", false, 0)
 	if got := m.EffectiveState(1); got != "OPEN" {
 		t.Fatalf("HALF_OPEN failure should reopen the channel, got %s", got)
+	}
+}
+
+func TestScopedRecoveryFailureDoesNotKeepChannelHalfOpen(t *testing.T) {
+	m := New(1, 5*time.Millisecond)
+	m.Report(1, "gpt", false, 0)
+	time.Sleep(10 * time.Millisecond)
+	lease, ok := m.Claim(1, 1, "gpt")
+	if !ok {
+		t.Fatal("recovery claim failed")
+	}
+	m.CompleteModelRateLimited(lease, 10, time.Hour, 429, "model limit")
+	if got := m.EffectiveState(1); got != "CLOSED" {
+		t.Fatalf("model-scoped recovery result left channel in %s", got)
+	}
+	if !m.IsAvailable(1, "other-model") {
+		t.Fatal("sibling model should be eligible after model-scoped recovery result")
 	}
 }
 

@@ -508,6 +508,64 @@ func TestForward403Failover(t *testing.T) {
 	}
 }
 
+func TestForward429CoolsOnlyRequestedModel(t *testing.T) {
+	limited := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+		io.WriteString(w, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)
+	}))
+	defer limited.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	defer backup.Close()
+
+	ups := []*upstream.Upstream{
+		{ID: 1, BaseURL: limited.URL, APIKey: "k", Protocol: "passthrough", Priority: 1, Enabled: true},
+		{ID: 2, BaseURL: backup.URL, APIKey: "k", Protocol: "passthrough", Priority: 2, Enabled: true},
+	}
+	hm := health.New(1, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 2)
+	body := []byte(`{"model":"limited-model"}`)
+	rec := httptest.NewRecorder()
+	result := fwd.Forward(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)), body, 1, "")
+	if result.Outcome != OutcomeSuccess || result.FinalUpstreamID != 2 {
+		t.Fatalf("429 should fail over to backup: %+v", result)
+	}
+	if got := hm.EffectiveState(1); got != "CLOSED" {
+		t.Fatalf("429 must not open channel breaker, got %s", got)
+	}
+	if hm.IsAvailable(1, "limited-model") || !hm.IsAvailable(1, "another-model") {
+		t.Fatal("429 should cool only requested model")
+	}
+	if states := hm.ModelStates(1); len(states) != 1 || states[0].LastReason == "" {
+		t.Fatalf("rate-limit reason should be available for UI/diagnostics: %+v", states)
+	}
+}
+
+func TestForwardSharedTransportFailureBurstCountsOnce(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	baseURL := primary.URL
+	primary.Close()
+	ups := []*upstream.Upstream{{ID: 1, BaseURL: baseURL, APIKey: "k", Protocol: "passthrough", Priority: 1, Enabled: true}}
+	hm := health.New(3, time.Hour)
+	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 1)
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			body := []byte(`{"model":"m","stream":true}`)
+			rec := httptest.NewRecorder()
+			fwd.Forward(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)), body, 0, "")
+		}()
+	}
+	wg.Wait()
+	if got := hm.Snapshot(1); got.Fails != 1 || got.State != "CLOSED" || got.Reqs != 10 || got.FailReqs != 10 {
+		t.Fatalf("one shared connection incident burst should not trip breaker: %+v", got)
+	}
+}
+
 // countingHealth 记录 Report 调用次数，并兼当 Picker 返回固定上游(避开 exclude)，
 // 用于断言「客户端断连不污染健康」。
 type countingHealth struct {
@@ -1376,6 +1434,12 @@ func (r *recordingHealth) Complete(lease health.Lease, result health.Result, lat
 	}
 	r.inner.Complete(lease, result, latencyMs)
 }
+func (r *recordingHealth) CompleteModelRateLimited(lease health.Lease, latencyMs int64, retryAfter time.Duration, status int, reason string) {
+	r.inner.CompleteModelRateLimited(lease, latencyMs, retryAfter, status, reason)
+}
+func (r *recordingHealth) CompleteTransportFailure(lease health.Lease, latencyMs int64) {
+	r.inner.CompleteTransportFailure(lease, latencyMs)
+}
 func (r *recordingHealth) EffectiveState(id int64) string { return r.inner.EffectiveState(id) }
 func (r *recordingHealth) reported() []bool {
 	r.mu.Lock()
@@ -1383,8 +1447,8 @@ func (r *recordingHealth) reported() []bool {
 	return append([]bool(nil), r.oks...)
 }
 
-// 上游以 200 开流后在流中投递 error 事件时，不得向熔断器报成功——
-// 否则一个总在半路报错的渠道会被当成健康渠道，熔断永不触发。
+// 上游以 200 开流后在流中投递 error 事件时，不得向熔断器报成功，
+// 也不得把单次模型级流错误升级成整条渠道熔断。
 // 注意：单纯「没有终止事件」不算失败（见 TestForwardSSECleanEOFAfterFirstByteIsTransparent），
 // 这里依据的是上游明确的 error 事件。
 func TestForwardErroredStreamIsNotReportedHealthy(t *testing.T) {
@@ -1420,6 +1484,9 @@ func TestForwardErroredStreamIsNotReportedHealthy(t *testing.T) {
 		if ok {
 			t.Fatalf("errored stream must not report success to the breaker, got reports %v", hm.reported())
 		}
+	}
+	if got := hm.inner.EffectiveState(1); got != "CLOSED" {
+		t.Fatalf("single structured stream error must not trip channel breaker, got %s", got)
 	}
 }
 

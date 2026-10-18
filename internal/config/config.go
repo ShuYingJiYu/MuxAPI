@@ -37,7 +37,7 @@ type Config struct {
 	DatabaseURL   string        // PostgreSQL 连接串
 	AdminToken    string        // 接入层鉴权 token（sub2api upstream key）
 	ReadOnly      bool          // 只读调试模式：不迁移、不写库、不启动后台写任务
-	FailThreshold int           // 连续失败多少次熔断
+	FailThreshold int           // 一分钟窗口内渠道级失败达到多少次熔断
 	Cooldown      time.Duration // 熔断冷却时长
 	MaxRetries    int           // 单次下游请求最多尝试的上游数
 	MaxBody       int64         // 请求体最大字节数（防 DoS），默认 32MB

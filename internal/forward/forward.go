@@ -36,6 +36,18 @@ type modelUnsupportedHealth interface {
 	CompleteModelUnsupported(lease healthpkg.Lease, latencyMs int64, status int, reason string)
 }
 
+type modelRateLimitedHealth interface {
+	CompleteModelRateLimited(lease healthpkg.Lease, latencyMs int64, retryAfter time.Duration, status int, reason string)
+}
+
+type modelTransientHealth interface {
+	CompleteModelTransientFailure(lease healthpkg.Lease, latencyMs int64, status int, reason string)
+}
+
+type transportFailureHealth interface {
+	CompleteTransportFailure(lease healthpkg.Lease, latencyMs int64)
+}
+
 // Picker 从指定分组选择一个未尝试且可用的上游。
 type Picker interface {
 	PickExcluding(groupID int64, model string, exclude map[int64]bool) (*upstream.Upstream, healthpkg.Lease, error)
@@ -394,6 +406,17 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			completed = true
 			f.health.Complete(lease, result, latencyMs)
 		}
+		completeTransportFailure := func(latencyMs int64) {
+			if completed {
+				return
+			}
+			completed = true
+			if transport, ok := f.health.(transportFailureHealth); ok {
+				transport.CompleteTransportFailure(lease, latencyMs)
+				return
+			}
+			f.health.Complete(lease, healthpkg.ResultFailure, latencyMs)
+		}
 		release := func() { complete(healthpkg.ResultNeutral, 0) }
 		attemptStarted := time.Now()
 		attemptNo := len(attempts) + 1
@@ -462,7 +485,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		upstreamAttempts++
 		req, err := candidate.BuildRequest(r.Method, targetPath, bytes.NewReader(exchange.UpstreamRequest), r.Header)
 		if err != nil {
-			complete(healthpkg.ResultFailure, 0)
+			completeTransportFailure(0)
 			attempts = append(attempts, attemptCtx.finish(f.health, 0, OutcomeFailed, relayResult{}, "request_build", "gateway", err.Error()))
 			lastErr = err
 			continue
@@ -491,7 +514,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			if errors.Is(cause, errFirstResponseTimeout) {
 				errorKind = "first_response_timeout"
 			}
-			complete(healthpkg.ResultFailure, 0)
+			completeTransportFailure(0)
 			attempts = append(attempts, attemptCtx.finish(f.health, 0, OutcomeFailed, relayResult{}, errorKind, "upstream", err.Error()))
 			lastErr = err
 			continue
@@ -516,7 +539,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 				if errors.Is(cause, errFirstResponseTimeout) {
 					errorKind = "first_response_timeout"
 				}
-				complete(healthpkg.ResultFailure, 0)
+				completeTransportFailure(0)
 				attempts = append(attempts, attemptCtx.finish(f.health, 0, OutcomeFailed, relayResult{}, errorKind, "upstream", readErr.Error()))
 				lastErr = readErr
 				continue
@@ -572,7 +595,26 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 			return withRouting(resultFromAttempt(finished, attempts))
 		}
 
-		// 认证、限流及 5xx 属于渠道失败：记录熔断反馈后尝试下一个上游。
+		// 模型限流单独冷却，不计入渠道熔断失败阈值。
+		if upstream.IsRateLimitStatus(resp.StatusCode) {
+			payload, _ := readLimitedBody(resp.Body, 64<<10, markOutput)
+			watchdog.stop()
+			resp.Body.Close()
+			cancel(nil)
+			latency := time.Since(start).Milliseconds()
+			if scoped, ok := f.health.(modelRateLimitedHealth); ok {
+				scoped.CompleteModelRateLimited(lease, latency, upstream.ParseRetryAfter(resp.Header.Get("Retry-After"), time.Now()), resp.StatusCode, string(payload))
+			} else {
+				complete(healthpkg.ResultScopedFailure, latency)
+			}
+			responseMeta := relayResult{ttftMs: latency, upstreamRequestID: upstreamRequestID(resp.Header)}
+			attempts = append(attempts, attemptCtx.finish(f.health, resp.StatusCode, OutcomeFailed,
+				responseMeta, "upstream_rate_limit", "upstream", string(payload)))
+			lastErr = errors.New(http.StatusText(resp.StatusCode))
+			continue
+		}
+
+		// 认证、余额、超时及 5xx 属于渠道级失败：记录熔断反馈后换源。
 		if upstream.IsFailureStatus(resp.StatusCode) {
 			payload, _ := readLimitedBody(resp.Body, 64<<10, markOutput)
 			watchdog.stop()
@@ -607,7 +649,24 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 				attempts = append(attempts, finished)
 				return withRouting(resultFromAttempt(finished, attempts))
 			}
-			complete(healthpkg.ResultFailure, result.ttftMs)
+			resultKind := healthpkg.ResultFailure
+			if result.streamErrored || errors.Is(result.err, errErrorPayload) {
+				// A structured 2xx stream error is request/model-scoped unless the
+				// provider supplied an HTTP-level signal to quarantine the channel.
+				resultKind = healthpkg.ResultScopedFailure
+			}
+			if errors.Is(result.err, errErrorPayload) {
+				if scoped, ok := f.health.(modelTransientHealth); ok {
+					completed = true
+					scoped.CompleteModelTransientFailure(lease, result.ttftMs, resp.StatusCode, result.err.Error())
+				} else {
+					complete(resultKind, result.ttftMs)
+				}
+			} else if resultKind == healthpkg.ResultFailure {
+				completeTransportFailure(result.ttftMs)
+			} else {
+				complete(resultKind, result.ttftMs)
+			}
 			outcome := OutcomeFailed
 			status := 0
 			if result.committed {
@@ -630,7 +689,12 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		// 注意：仅「缺少终止事件」不算失败，部分上游合法地不发终止标记。
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			if result.streamErrored {
-				complete(healthpkg.ResultFailure, result.ttftMs)
+				if scoped, ok := f.health.(modelTransientHealth); ok {
+					completed = true
+					scoped.CompleteModelTransientFailure(lease, result.ttftMs, resp.StatusCode, result.lastEvent)
+				} else {
+					complete(healthpkg.ResultScopedFailure, result.ttftMs)
+				}
 			} else {
 				if f.modelMapper != nil {
 					f.modelMapper.RecordSuccess(candidate.ID, model)
@@ -990,6 +1054,12 @@ func relayTranslatedSSEToBody(ctx context.Context, w http.ResponseWriter, resp *
 	if err := scanner.Err(); err != nil {
 		return relayResult{err: err, source: relayUpstream, ttftMs: ttft}
 	}
+	// Newer CPA translators intentionally ignore an upstream error event when
+	// aggregating a Claude stream. Keep the relay contract explicit: a 2xx SSE
+	// stream that contains a terminal error must fail over before translation.
+	if sseStreamHasError(rawStream.Bytes()) {
+		return relayResult{err: errErrorPayload, source: relayUpstream, ttftMs: ttft}
+	}
 	// Claude 转换器需要完整事件序列；其他转换器只需最后一个终态载荷。
 	translationInput := terminalPayload
 	if exchange.Target == translate.Claude {
@@ -1017,6 +1087,31 @@ func relayTranslatedSSEToBody(ctx context.Context, w http.ResponseWriter, resp *
 		return relayResult{err: err, source: relayDownstream, ttftMs: ttft, committed: true, bytesSent: int64(written)}
 	}
 	return relayResult{ttftMs: ttft, committed: true, bytesSent: int64(written)}
+}
+
+// sseStreamHasError detects protocol error events in an already aggregated SSE
+// stream. It accepts both event names and JSON type fields because providers
+// use either form for Claude/Responses streams.
+func sseStreamHasError(stream []byte) bool {
+	for _, block := range bytes.FieldsFunc(stream, func(r rune) bool { return r == '\n' }) {
+		line := bytes.TrimSpace(block)
+		if bytes.HasPrefix(line, []byte("event:")) && isStreamErrorEvent(string(bytes.TrimSpace(bytes.TrimPrefix(line, []byte("event:"))))) {
+			return true
+		}
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		var value map[string]json.RawMessage
+		if json.Unmarshal(payload, &value) != nil {
+			continue
+		}
+		var typ string
+		if json.Unmarshal(value["type"], &typ) == nil && isStreamErrorEvent(typ) {
+			return true
+		}
+	}
+	return false
 }
 
 // relayTranslatedBody 必须先读完整正文再转换，因此转换成功前不会提交响应。

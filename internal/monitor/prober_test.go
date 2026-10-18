@@ -12,6 +12,7 @@ import (
 
 	"github.com/mirainya/muxapi/internal/health"
 	"github.com/mirainya/muxapi/internal/store"
+	"github.com/mirainya/muxapi/internal/upstream"
 )
 
 type breakerCall struct {
@@ -32,6 +33,9 @@ func (f *fakeBreaker) BeginProbe(id int64, model string) health.Lease {
 }
 func (f *fakeBreaker) Complete(lease health.Lease, result health.Result, latencyMs int64) {
 	f.calls = append(f.calls, breakerCall{id: lease.UpstreamID, result: result, lat: latencyMs})
+}
+func (f *fakeBreaker) CompleteModelRateLimited(lease health.Lease, latencyMs int64, retryAfter time.Duration, status int, reason string) {
+	f.calls = append(f.calls, breakerCall{id: lease.UpstreamID, result: health.ResultScopedFailure, lat: latencyMs})
 }
 
 func TestBuildProbeBodyChat(t *testing.T) {
@@ -106,6 +110,74 @@ func TestProbeReportsChannelBreaker(t *testing.T) {
 	}
 	if call := fake.calls[0]; call.id != 7 || call.result != health.ResultSuccess {
 		t.Fatalf("unexpected channel call: %+v", call)
+	}
+}
+
+func TestProbeNetworkFailureReportsTransportFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	server.Close()
+	st, err := store.Open(filepath.Join(t.TempDir(), "probe-network-error.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	fake := &fakeBreaker{}
+	prober := NewProber(New(st), st, fake, nil, nil)
+	prober.Probe(context.Background(), &store.Monitor{ID: 1, UpstreamID: 7, Model: "gpt-x", BaseURL: server.URL})
+	if len(fake.calls) != 1 || fake.calls[0].result != health.ResultTransportFailure {
+		t.Fatalf("network error should be reported as transport failure: %+v", fake.calls)
+	}
+}
+
+func TestProbe429UsesModelScopedCooldown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	st, err := store.Open(filepath.Join(t.TempDir(), "probe-429.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	hm := health.New(1, time.Hour)
+	prober := NewProber(New(st), st, hm, nil, nil)
+	u := &upstream.Upstream{Name: "probe", BaseURL: server.URL, APIKey: "k", Protocol: "passthrough", Enabled: true}
+	if err := st.Create(u); err != nil {
+		t.Fatal(err)
+	}
+	monitor := &store.Monitor{UpstreamID: u.ID, Model: "limited-model", BaseURL: server.URL, APIKey: "k"}
+	if _, err := st.CreateMonitor(monitor); err != nil {
+		t.Fatal(err)
+	}
+	prober.Probe(context.Background(), monitor)
+	if got := hm.EffectiveState(u.ID); got != "CLOSED" {
+		t.Fatalf("429 probe must not open channel breaker, got %s", got)
+	}
+	if hm.IsAvailable(u.ID, "limited-model") || !hm.IsAvailable(u.ID, "another-model") {
+		t.Fatal("429 probe must cool only the probed model")
+	}
+	if got := prober.mgr.Snapshot(monitor.ID).State; got != "DEGRADED" {
+		t.Fatalf("monitor should still show rate limit as degraded, got %s", got)
+	}
+}
+
+func TestProbeRateLimitReporterGetsScopedResult(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	st, err := store.Open(filepath.Join(t.TempDir(), "probe-429-fake.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	fake := &fakeBreaker{}
+	prober := NewProber(New(st), st, fake, nil, nil)
+	prober.Probe(context.Background(), &store.Monitor{ID: 1, UpstreamID: 7, Model: "m", BaseURL: server.URL, APIKey: "k"})
+	if len(fake.calls) != 1 || fake.calls[0].result != health.ResultScopedFailure {
+		t.Fatalf("429 probe should report a scoped result: %+v", fake.calls)
 	}
 }
 

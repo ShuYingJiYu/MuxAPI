@@ -24,10 +24,18 @@ type breakerReporter interface {
 	Complete(lease health.Lease, result health.Result, latencyMs int64)
 }
 
+type modelRateLimitReporter interface {
+	CompleteModelRateLimited(lease health.Lease, latencyMs int64, retryAfter time.Duration, status int, reason string)
+}
+
+type modelTransientReporter interface {
+	CompleteModelTransientFailure(lease health.Lease, latencyMs int64, status int, reason string)
+}
+
 // Prober 监控探测器：按各监控项自带的渠道+模型+探测参数发最小请求。
 // 探测系统统一后，它是唯一的主动探测源，一次探测【双写】：
 //   - mgr.Record：记看板统计(成功率/延迟/趋势)，429 算「降级」
-//   - breaker.ObserveProbe：驱动路由熔断器，按熔断口径 429 算失败
+//   - breaker.ObserveProbe：驱动路由熔断器，按故障范围记录状态
 //
 // 每项可配自己的探测周期(interval_sec)、端点(path)、消息内容、max_tokens、是否流式；
 // 这些字段为空/0 时回退到内置默认(间隔 5m、路径 /v1/chat/completions)。
@@ -225,13 +233,13 @@ func (p *Prober) Probe(ctx context.Context, m *store.Monitor) {
 	start := time.Now()
 	resp, err := client.Do(req)
 	ttft := time.Since(start).Milliseconds()
-	if err != nil { // 网络错误：看板记故障 + 熔断器记模型级失败
+	if err != nil { // 网络错误：看板记故障；传输故障进入渠道熔断判定
 		if ctx.Err() != nil {
 			complete(health.ResultNeutral, 0)
 			return
 		}
 		p.mgr.Record(m.ID, statDown, 0)
-		complete(health.ResultFailure, 0)
+		complete(health.ResultTransportFailure, 0)
 		return
 	}
 	defer resp.Body.Close()
@@ -242,12 +250,20 @@ func (p *Prober) Probe(ctx context.Context, m *store.Monitor) {
 			return
 		}
 		p.mgr.Record(m.ID, statDown, 0)
-		complete(health.ResultFailure, 0)
+		complete(health.ResultTransportFailure, 0)
 		return
 	}
 	if upstream.IsModelUnsupported(resp.StatusCode, m.Model, string(payload)) {
 		p.mgr.Record(m.ID, statDown, ttft)
 		complete(health.ResultModelUnsupported, ttft)
+		return
+	}
+	if upstream.IsRateLimitStatus(resp.StatusCode) {
+		p.mgr.Record(m.ID, statDegraded, ttft)
+		if scoped, ok := p.breaker.(modelRateLimitReporter); ok && lease.Valid() {
+			scoped.CompleteModelRateLimited(lease, ttft, upstream.ParseRetryAfter(resp.Header.Get("Retry-After"), time.Now()), resp.StatusCode, string(payload))
+			lease = health.Lease{}
+		}
 		return
 	}
 	if upstream.IsFailureStatus(resp.StatusCode) {
@@ -259,6 +275,14 @@ func (p *Prober) Probe(ctx context.Context, m *store.Monitor) {
 		if validProbePayload(resp.Header.Get("Content-Type"), payload, m.Stream) {
 			p.mgr.Record(m.ID, statOK, ttft)
 			complete(health.ResultSuccess, ttft)
+			return
+		}
+		if upstream.IsErrorPayload(payload) {
+			p.mgr.Record(m.ID, statDegraded, ttft)
+			if scoped, ok := p.breaker.(modelTransientReporter); ok && lease.Valid() {
+				scoped.CompleteModelTransientFailure(lease, ttft, resp.StatusCode, string(payload))
+				lease = health.Lease{}
+			}
 			return
 		}
 		p.mgr.Record(m.ID, statDown, ttft)

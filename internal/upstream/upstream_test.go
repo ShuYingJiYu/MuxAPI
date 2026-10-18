@@ -101,7 +101,6 @@ func TestIsFailureStatus(t *testing.T) {
 		http.StatusPaymentRequired,     // 402 需付费
 		http.StatusForbidden,           // 403 余额不足/无权限
 		http.StatusRequestTimeout,      // 408 上游超时
-		http.StatusTooManyRequests,     // 429 限流
 		http.StatusInternalServerError, // 500
 		http.StatusBadGateway,          // 502
 		http.StatusServiceUnavailable,  // 503
@@ -111,6 +110,12 @@ func TestIsFailureStatus(t *testing.T) {
 		if !IsFailureStatus(c) {
 			t.Errorf("状态码 %d 应判为上游失败", c)
 		}
+	}
+	if !IsRateLimitStatus(http.StatusTooManyRequests) {
+		t.Fatal("429 must be handled by model-scoped rate-limit cooldown")
+	}
+	if IsFailureStatus(http.StatusTooManyRequests) {
+		t.Fatal("429 must not count as a channel-level circuit failure")
 	}
 	// 不应触发切换的状态码（成功 / 客户端请求本身的问题，透传给客户端）
 	pass := []int{
@@ -125,6 +130,22 @@ func TestIsFailureStatus(t *testing.T) {
 		if IsFailureStatus(c) {
 			t.Errorf("状态码 %d 不应判为上游失败", c)
 		}
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	if got := ParseRetryAfter("30", now); got != 30*time.Second {
+		t.Fatalf("delta retry-after = %v", got)
+	}
+	if got := ParseRetryAfter(now.Add(time.Minute).Format(http.TimeFormat), now); got != time.Minute {
+		t.Fatalf("date retry-after = %v", got)
+	}
+	if got := ParseRetryAfter("999999999999999999999999", now); got != 24*time.Hour {
+		t.Fatalf("oversized retry-after should cap to 24h, got %v", got)
+	}
+	if got := ParseRetryAfter("invalid", now); got != 0 {
+		t.Fatalf("invalid retry-after = %v", got)
 	}
 }
 

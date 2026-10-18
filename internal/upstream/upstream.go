@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -123,8 +124,9 @@ func SharedTransport(proxy string) *http.Transport {
 // NewTransport 该上游专属共享 Transport（含其代理出口），转发热路径复用以免连接泄漏。
 func (u *Upstream) NewTransport() *http.Transport { return SharedTransport(u.Proxy) }
 
-// IsFailureStatus reports channel-level failures that should trigger failover
-// and contribute to the single upstream breaker.
+// IsFailureStatus reports failures that should trigger failover and contribute
+// to the channel-level breaker. HTTP 429 is handled separately because its
+// cooldown is scoped to the requested model.
 func IsFailureStatus(code int) bool {
 	if code >= 500 {
 		return true
@@ -133,11 +135,51 @@ func IsFailureStatus(code int) bool {
 	case http.StatusUnauthorized, // 401
 		http.StatusPaymentRequired, // 402
 		http.StatusForbidden,       // 403
-		http.StatusRequestTimeout,  // 408
-		http.StatusTooManyRequests: // 429
+		http.StatusRequestTimeout:  // 408
 		return true
 	}
 	return false
+}
+
+// IsRateLimitStatus identifies temporary rate limiting handled by a narrower
+// upstream/model cooldown instead of the channel breaker.
+func IsRateLimitStatus(code int) bool { return code == http.StatusTooManyRequests }
+
+// ParseRetryAfter parses the delta-seconds and HTTP-date forms defined by
+// RFC 9110. Values are capped to avoid duration overflow and unbounded sleeps.
+func ParseRetryAfter(raw string, now time.Time) time.Duration {
+	const maxRetryAfter = 24 * time.Hour
+	raw = strings.TrimSpace(raw)
+	if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		if seconds > int64(maxRetryAfter/time.Second) {
+			return maxRetryAfter
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if raw != "" {
+		allDigits := true
+		for _, r := range raw {
+			if r < '0' || r > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			return maxRetryAfter
+		}
+	}
+	retryAt, err := http.ParseTime(raw)
+	if err != nil || !retryAt.After(now) {
+		return 0
+	}
+	if delay := retryAt.Sub(now); delay > maxRetryAfter {
+		return maxRetryAfter
+	} else {
+		return delay
+	}
 }
 
 // FailIsUpstreamLevel remains for compatibility. All breaker failures are now
