@@ -742,7 +742,7 @@ func TestNormalizeKimiToolMessageLinks_InheritsPreviousReasoningForAssistantTool
 	}
 }
 
-func TestNormalizeKimiToolMessageLinks_InsertsFallbackReasoningWhenMissing(t *testing.T) {
+func TestNormalizeKimiToolMessageLinks_DoesNotSynthesizeReasoningWhenMissing(t *testing.T) {
 	body := []byte(`{
 		"messages":[
 			{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"list_directory","arguments":"{}"}}]}
@@ -754,12 +754,8 @@ func TestNormalizeKimiToolMessageLinks_InsertsFallbackReasoningWhenMissing(t *te
 		t.Fatalf("normalizeKimiToolMessageLinks() error = %v", err)
 	}
 
-	reasoning := gjson.GetBytes(out, "messages.0.reasoning_content")
-	if !reasoning.Exists() {
-		t.Fatalf("messages.0.reasoning_content should exist")
-	}
-	if reasoning.String() != "[reasoning unavailable]" {
-		t.Fatalf("messages.0.reasoning_content = %q, want %q", reasoning.String(), "[reasoning unavailable]")
+	if reasoning := gjson.GetBytes(out, "messages.0.reasoning_content"); reasoning.Exists() {
+		t.Fatalf("messages.0.reasoning_content should not be synthesized, got %q", reasoning.String())
 	}
 }
 
@@ -779,6 +775,22 @@ func TestNormalizeKimiToolMessageLinks_DoesNotReuseUnavailableReasoning(t *testi
 	got := gjson.GetBytes(out, "messages.1.reasoning_content").String()
 	if got != "current summary" {
 		t.Fatalf("messages.1.reasoning_content = %q, want %q", got, "current summary")
+	}
+}
+
+func TestNormalizeKimiToolMessageLinks_RemovesUnavailableReasoningPlaceholder(t *testing.T) {
+	body := []byte(`{
+		"messages":[
+			{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"list_directory","arguments":"{}"}}],"reasoning_content":"[reasoning unavailable]"}
+		]
+	}`)
+
+	out, err := normalizeKimiToolMessageLinks(body)
+	if err != nil {
+		t.Fatalf("normalizeKimiToolMessageLinks() error = %v", err)
+	}
+	if reasoning := gjson.GetBytes(out, "messages.0.reasoning_content"); reasoning.Exists() {
+		t.Fatalf("unavailable reasoning placeholder was retained: %s", out)
 	}
 }
 

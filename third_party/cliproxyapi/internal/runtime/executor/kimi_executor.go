@@ -790,6 +790,7 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 		index        int
 		path         string
 		value        string
+		delete       bool
 		errorContext string
 	}
 
@@ -825,32 +826,41 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 		switch role {
 		case "assistant":
 			reasoning := msg.Get("reasoning_content")
+			reasoningText := reasoning.String()
+			reasoningUsable := reasoning.Exists() && isUsableKimiReasoning(reasoningText)
 			if reasoning.Exists() {
-				reasoningText := reasoning.String()
-				if isUsableKimiReasoning(reasoningText) {
+				if reasoningUsable {
 					latestReasoning = reasoningText
 					hasLatestReasoning = true
 				}
 			}
-
 			toolCalls := msg.Get("tool_calls")
-			if toolCalls.Exists() && toolCalls.IsArray() {
-				toolCallItems := toolCalls.Array()
-				if len(toolCallItems) > 0 {
-					if !reasoning.Exists() || !isUsableKimiReasoning(reasoning.String()) {
-						patches = append(patches, messagePatch{
-							index:        msgIndex,
-							path:         "reasoning_content",
-							value:        fallbackAssistantReasoning(msg, hasLatestReasoning, latestReasoning),
-							errorContext: "failed to set assistant reasoning_content",
-						})
-						patchedReasoning++
-					}
-					for _, toolCall := range toolCallItems {
-						id := strings.TrimSpace(toolCall.Get("id").String())
-						if id != "" {
-							pending = append(pending, id)
-						}
+			hasToolCalls := toolCalls.Exists() && toolCalls.IsArray() && len(toolCalls.Array()) > 0
+			if !reasoningUsable {
+				fallback := ""
+				if hasToolCalls {
+					fallback = fallbackAssistantReasoning(msg, hasLatestReasoning, latestReasoning)
+				}
+				if fallback != "" {
+					patches = append(patches, messagePatch{
+						index: msgIndex, path: "reasoning_content", value: fallback,
+						errorContext: "failed to replace unavailable assistant reasoning",
+					})
+					patchedReasoning++
+				} else if reasoning.Exists() {
+					patches = append(patches, messagePatch{
+						index: msgIndex, path: "reasoning_content", delete: true,
+						errorContext: "failed to remove unavailable assistant reasoning",
+					})
+					patchedReasoning++
+				}
+			}
+
+			if hasToolCalls {
+				for _, toolCall := range toolCalls.Array() {
+					id := strings.TrimSpace(toolCall.Get("id").String())
+					if id != "" {
+						pending = append(pending, id)
 					}
 				}
 			}
@@ -895,7 +905,13 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 	if dropped == 0 && len(patches) == 1 {
 		patch := patches[0]
 		path := fmt.Sprintf("messages.%d.%s", patch.index, patch.path)
-		updated, errSet := sjson.SetBytes(body, path, patch.value)
+		var updated []byte
+		var errSet error
+		if patch.delete {
+			updated, errSet = sjson.DeleteBytes(body, path)
+		} else {
+			updated, errSet = sjson.SetBytes(body, path, patch.value)
+		}
 		if errSet != nil {
 			return body, fmt.Errorf("kimi executor: %s: %w", patch.errorContext, errSet)
 		}
@@ -910,7 +926,13 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 			messageJSON := msg.Raw
 			for patchIndex < len(patches) && patches[patchIndex].index == msgIndex {
 				patch := patches[patchIndex]
-				next, errSet := sjson.SetBytes([]byte(messageJSON), patch.path, patch.value)
+				var next []byte
+				var errSet error
+				if patch.delete {
+					next, errSet = sjson.DeleteBytes([]byte(messageJSON), patch.path)
+				} else {
+					next, errSet = sjson.SetBytes([]byte(messageJSON), patch.path, patch.value)
+				}
 				if errSet != nil {
 					return body, fmt.Errorf("kimi executor: %s: %w", patch.errorContext, errSet)
 				}
@@ -1042,7 +1064,7 @@ func fallbackAssistantReasoning(msg gjson.Result, hasLatest bool, latest string)
 		}
 	}
 
-	return kimiReasoningUnavailable
+	return ""
 }
 
 // Refresh refreshes the Kimi token using the refresh token.

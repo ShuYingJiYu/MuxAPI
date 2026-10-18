@@ -124,33 +124,6 @@ func convertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			}
 		}
 
-		hasReasoningInSession := false
-		if effortRes := root.Get("reasoning.effort"); effortRes.Exists() {
-			effort := strings.ToLower(strings.TrimSpace(effortRes.String()))
-			if effort != "" && effort != "none" && effort != "0" && effort != "false" {
-				hasReasoningInSession = true
-			}
-		} else if effortRes := root.Get("reasoning_effort"); effortRes.Exists() {
-			effort := strings.ToLower(strings.TrimSpace(effortRes.String()))
-			if effort != "" && effort != "none" && effort != "0" && effort != "false" {
-				hasReasoningInSession = true
-			}
-		} else if reasoningObj := root.Get("reasoning"); reasoningObj.Exists() {
-			reasoningRaw := strings.ToLower(strings.TrimSpace(reasoningObj.String()))
-			if reasoningRaw != "" && reasoningRaw != "none" && reasoningRaw != "false" && reasoningRaw != "{}" {
-				hasReasoningInSession = true
-			}
-		}
-		if !hasReasoningInSession {
-			for _, item := range rawInputArray {
-				itemType := item.Get("type").String()
-				if itemType == "reasoning" || item.Get("reasoning_content").Exists() {
-					hasReasoningInSession = true
-					break
-				}
-			}
-		}
-
 		pendingToolCalls := make([]interface{}, 0)
 		pendingToolCallIDs := make([]string, 0)
 		pendingReasoningContent := ""
@@ -160,13 +133,7 @@ func convertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		mergeableAssistantIndex := -1
 
 		fallbackToolReasoning := func() string {
-			if latestReasoningContent != "" {
-				return latestReasoningContent
-			}
-			if hasReasoningInSession {
-				return "[reasoning unavailable]"
-			}
-			return ""
+			return latestReasoningContent
 		}
 
 		takePendingReasoningContent := func() string {
@@ -193,6 +160,8 @@ func convertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 						}
 					} else if fallback := fallbackToolReasoning(); fallback != "" {
 						updatedMessage, _ = sjson.SetBytes(updatedMessage, "reasoning_content", fallback)
+					} else if assistantMessage.Get("reasoning_content").Exists() {
+						updatedMessage, _ = sjson.DeleteBytes(updatedMessage, "reasoning_content")
 					}
 					messages[mergeableAssistantIndex] = updatedMessage
 					mergedIntoAssistant = true
@@ -201,11 +170,9 @@ func convertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			if !mergedIntoAssistant {
 				assistantMessage := []byte(`{"role":"assistant","tool_calls":[]}`)
 				assistantMessage, _ = sjson.SetBytes(assistantMessage, "tool_calls", pendingToolCalls)
-				if reasoningContent != "" {
+				if isUsableResponsesReasoning(reasoningContent) {
 					assistantMessage, _ = sjson.SetBytes(assistantMessage, "reasoning_content", reasoningContent)
-					if isUsableResponsesReasoning(reasoningContent) {
-						latestReasoningContent = reasoningContent
-					}
+					latestReasoningContent = reasoningContent
 				} else if fallback := fallbackToolReasoning(); fallback != "" {
 					assistantMessage, _ = sjson.SetBytes(assistantMessage, "reasoning_content", fallback)
 				}
@@ -799,7 +766,7 @@ func collectOpenAIResponsesReasoningContent(item gjson.Result) string {
 		})
 	}
 	if reasoningText.Len() == 0 {
-		return "[reasoning unavailable]"
+		return ""
 	}
 	return reasoningText.String()
 }
@@ -807,15 +774,21 @@ func collectOpenAIResponsesReasoningContent(item gjson.Result) string {
 func combineOpenAIResponsesReasoning(existing, incoming string) string {
 	existingTrimmed := strings.TrimSpace(existing)
 	incomingTrimmed := strings.TrimSpace(incoming)
+	if existingTrimmed == "[reasoning unavailable]" {
+		existing = ""
+		existingTrimmed = ""
+	}
+	if incomingTrimmed == "[reasoning unavailable]" {
+		incoming = ""
+		incomingTrimmed = ""
+	}
 
 	switch {
 	case existingTrimmed == "":
 		return incoming
 	case incomingTrimmed == "":
 		return existing
-	case existingTrimmed == "[reasoning unavailable]":
-		return incoming
-	case incomingTrimmed == "[reasoning unavailable]", existingTrimmed == incomingTrimmed:
+	case existingTrimmed == incomingTrimmed:
 		return existing
 	default:
 		return existing + "\n\n" + incoming

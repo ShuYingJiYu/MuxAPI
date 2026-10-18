@@ -503,7 +503,7 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_AttachesReasoningT
 	}
 }
 
-func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_KeepsReasoningBeforeUserMessage(t *testing.T) {
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DropsEmptyReasoningBeforeUserMessage(t *testing.T) {
 	raw := []byte(`{
 		"input": [
 			{"type": "reasoning", "id": "rs_empty", "summary": []},
@@ -515,17 +515,11 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_KeepsReasoningBefo
 	out, _ := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4-flash", raw, false)
 	t.Logf("output json:\n%s", prettyJSONForTest(out))
 
-	if got := gjson.GetBytes(out, "messages.#").Int(); got != 2 {
-		t.Fatalf("messages count = %d, want 2; output=%s", got, out)
+	if got := gjson.GetBytes(out, "messages.#").Int(); got != 1 {
+		t.Fatalf("messages count = %d, want 1; output=%s", got, out)
 	}
-	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "assistant" {
-		t.Fatalf("messages.0.role = %q, want assistant; output=%s", got, out)
-	}
-	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "[reasoning unavailable]" {
-		t.Fatalf("messages.0.reasoning_content = %q, want placeholder; output=%s", got, out)
-	}
-	if got := gjson.GetBytes(out, "messages.1.role").String(); got != "user" {
-		t.Fatalf("messages.1.role = %q, want user; output=%s", got, out)
+	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "user" {
+		t.Fatalf("messages.0.role = %q, want user; output=%s", got, out)
 	}
 }
 
@@ -579,7 +573,7 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesReasoning
 	}
 }
 
-func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_FallsBackToPlaceholderWhenNoPriorReasoning(t *testing.T) {
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DoesNotSynthesizeMissingToolReasoning(t *testing.T) {
 	raw := []byte(`{
 		"model": "deepseek-v4.1-flash",
 		"reasoning": {"effort": "high"},
@@ -595,8 +589,30 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_FallsBackToPlaceho
 	if len(messages) != 2 {
 		t.Fatalf("messages count = %d, want 2; output=%s", len(messages), out)
 	}
-	if got := messages[0].Get("reasoning_content").String(); got != "[reasoning unavailable]" {
-		t.Fatalf("messages.0 reasoning_content = %q, want %q; output=%s", got, "[reasoning unavailable]", out)
+	if reasoning := messages[0].Get("reasoning_content"); reasoning.Exists() {
+		t.Fatalf("messages.0 should not contain synthesized reasoning; output=%s", out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_RemovesUnavailableReasoningFromHistory(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type": "message", "role": "assistant", "content": "", "reasoning_content": "[reasoning unavailable]"},
+			{"type": "function_call", "call_id": "call_1", "name": "exec_command", "arguments": "{}"},
+			{"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+		]
+	}`)
+
+	out, _ := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4-flash", raw, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	if len(messages) != 2 {
+		t.Fatalf("messages count = %d, want 2; output=%s", len(messages), out)
+	}
+	if reasoning := messages[0].Get("reasoning_content"); reasoning.Exists() {
+		t.Fatalf("unavailable reasoning placeholder was retained: %s", out)
+	}
+	if got := messages[0].Get("tool_calls.0.id").String(); got != "call_1" {
+		t.Fatalf("tool call id = %q, want call_1; output=%s", got, out)
 	}
 }
 
@@ -671,8 +687,8 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_ResetsReasoningAcr
 	if got := messages[0].Get("reasoning_content").String(); got != "turn 1 plan" {
 		t.Fatalf("messages.0 reasoning_content = %q, want %q; output=%s", got, "turn 1 plan", out)
 	}
-	if got := messages[3].Get("reasoning_content").String(); got != "[reasoning unavailable]" {
-		t.Fatalf("messages.3 reasoning_content = %q, want %q; output=%s", got, "[reasoning unavailable]", out)
+	if reasoning := messages[3].Get("reasoning_content"); reasoning.Exists() {
+		t.Fatalf("messages.3 should not contain synthesized reasoning after a user boundary; output=%s", out)
 	}
 }
 
