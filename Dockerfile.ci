@@ -9,7 +9,7 @@ COPY web/ ./
 RUN npm run build
 
 # Go 版本必须 >= go.mod 的 1.26.3。同步上游后必须 grep go.mod 核对本行。
-FROM golang:1.26.3-alpine AS build
+FROM golang:1.26.10-alpine AS build
 ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -22,7 +22,7 @@ COPY --from=web /src/web/dist ./web/dist
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" -o /out/muxapi ./cmd/muxapi
 
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates tzdata \
+RUN apk add --no-cache --upgrade "ca-certificates>=20261020-r0" tzdata \
  && adduser -D -u 10001 muxapi
 COPY --from=build /out/muxapi /usr/local/bin/muxapi
 USER 10001
