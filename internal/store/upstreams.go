@@ -246,9 +246,9 @@ func (s *Store) Update(u *upstream.Upstream) error {
 		return err
 	}
 	defer tx.Rollback()
-	var oldBillingType, oldBaseURL, oldAPIKey string
-	if err := tx.QueryRow(`SELECT billing_type,base_url,api_key FROM upstreams WHERE id=?`, u.ID).
-		Scan(&oldBillingType, &oldBaseURL, &oldAPIKey); err != nil {
+	var oldBillingType, oldBaseURL, oldAPIKey, oldProtocol, oldProxy string
+	if err := tx.QueryRow(`SELECT billing_type,base_url,api_key,protocol,proxy FROM upstreams WHERE id=?`, u.ID).
+		Scan(&oldBillingType, &oldBaseURL, &oldAPIKey, &oldProtocol, &oldProxy); err != nil {
 		return err
 	}
 	if u.APIKey == "" { // 留空则不改凭证（对齐后台「留空则不修改」语义）
@@ -268,6 +268,11 @@ func (s *Store) Update(u *upstream.Upstream) error {
 			return err
 		}
 		if _, err := tx.Exec(`DELETE FROM upstream_billing_status WHERE upstream_id=?`, u.ID); err != nil {
+			return err
+		}
+	}
+	if oldBaseURL != u.BaseURL || oldProtocol != u.Protocol || oldProxy != u.Proxy || (u.APIKey != "" && oldAPIKey != u.APIKey) {
+		if _, err := tx.Exec(`DELETE FROM upstream_model_exclusions WHERE upstream_id=?`, u.ID); err != nil {
 			return err
 		}
 	}

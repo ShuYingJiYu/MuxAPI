@@ -22,7 +22,7 @@ func TestRelayTerminatesAtFinalEvent(t *testing.T) {
 		{"responses", "data: {\"type\":\"response.completed\"}\n\n", true, false, false},
 		{"claude", "data: {\"type\":\"message_stop\"}\n\n", true, false, false},
 		{"done", "data: {\"choices\":[]}\n\ndata: [DONE]\n\n", true, false, false},
-		{"failed", "data: {\"type\":\"response.failed\"}\n\ndata: [DONE]\n\n", true, true, false},
+		{"failed", "data: {\"type\":\"response.failed\"}\n\ndata: [DONE]\n\n", false, true, true},
 		{"partial_block", "data: {\"type\":\"content_block_stop\"}\n\n", false, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -37,6 +37,7 @@ type breaker struct {
 	openUntil         time.Time
 	generation        uint64
 	recoveryLease     uint64
+	trialNotBefore    time.Time
 	earlyTrial        bool
 	recoverySuccesses int
 	reopenCount       int
@@ -62,7 +63,7 @@ type modelKey struct {
 }
 
 // ModelExclusion is the storage-neutral representation of a durable negative
-// capability observation. A nil ExcludedUntil means permanent exclusion.
+// capability observation. Legacy records with no expiry use the default TTL.
 type ModelExclusion struct {
 	UpstreamID    int64
 	Model         string
@@ -76,13 +77,15 @@ type ModelExclusion struct {
 }
 
 type modelRateLimit struct {
-	failedAt   time.Time
-	until      time.Time
-	failures   int
-	lastStatus int
-	lastReason string
-	kind       string
-	leaseToken uint64
+	failedAt       time.Time
+	until          time.Time
+	failures       int
+	lastStatus     int
+	lastReason     string
+	kind           string
+	leaseToken     uint64
+	recoveryLease  uint64
+	trialNotBefore time.Time
 }
 
 const maxModelRateLimitCooldown = 24 * time.Hour
@@ -147,11 +150,7 @@ type leaseRecord struct {
 	authoritative bool
 	recovery      bool
 	modelReprobe  bool
-}
-
-type groupRecovery struct {
-	owner     uint64
-	notBefore time.Time
+	modelRecovery bool
 }
 
 // RecoveryCandidate contains only in-memory data used to pick a controlled
@@ -180,7 +179,7 @@ const (
 	trendCap     = 60
 	ewmaAlpha    = 0.3
 
-	defaultModelUnsupportedTTL = time.Duration(0)
+	defaultModelUnsupportedTTL = 5 * time.Minute
 	defaultRecoverySuccessGoal = 2
 	defaultMaxCooldown         = 5 * time.Minute
 	defaultFailureWindow       = time.Minute
@@ -206,12 +205,12 @@ type Alerter interface {
 // capability cache. Model exclusions never participate in channel recovery.
 type Manager struct {
 	mu              sync.Mutex
+	persistMu       sync.Mutex
 	breakers        map[int64]*breaker
 	unsupported     map[modelKey]*ModelExclusion
 	rateLimits      map[modelKey]*modelRateLimit
 	capLatest       map[modelKey]uint64
 	leases          map[uint64]leaseRecord
-	groupRecovery   map[int64]*groupRecovery
 	nextToken       uint64
 	failThreshold   int
 	cooldown        time.Duration
@@ -239,7 +238,6 @@ func New(failThreshold int, cooldown time.Duration) *Manager {
 		rateLimits:      make(map[modelKey]*modelRateLimit),
 		capLatest:       make(map[modelKey]uint64),
 		leases:          make(map[uint64]leaseRecord),
-		groupRecovery:   make(map[int64]*groupRecovery),
 		failThreshold:   failThreshold,
 		cooldown:        cooldown,
 		recoveryGoal:    defaultRecoverySuccessGoal,
@@ -259,7 +257,7 @@ func (m *Manager) SetAdvancedPolicy(recoveryGoal int, maxCooldown, modelTTL time
 	if maxCooldown <= 0 {
 		maxCooldown = defaultMaxCooldown
 	}
-	if modelTTL < 0 {
+	if modelTTL <= 0 {
 		modelTTL = defaultModelUnsupportedTTL
 	}
 	m.mu.Lock()
@@ -271,6 +269,8 @@ func (m *Manager) SetAdvancedPolicy(recoveryGoal int, maxCooldown, modelTTL time
 // startup. Expired TTL records remain in memory so Claim can admit only one
 // controlled re-probe at a time.
 func (m *Manager) SetModelExclusionStore(store ModelExclusionStore) error {
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
 	m.mu.Lock()
 	m.persistModel = nil
 	m.deleteModel = nil
@@ -292,6 +292,13 @@ func (m *Manager) SetModelExclusionStore(store ModelExclusionStore) error {
 		}
 		key := modelKey{record.UpstreamID, record.Model}
 		entry := record
+		if entry.ExcludedUntil == nil {
+			failedAt := entry.LastFailedAt
+			if failedAt.IsZero() {
+				failedAt = time.Now()
+			}
+			entry.ExcludedUntil = expiry(failedAt, m.modelTTL)
+		}
 		m.unsupported[key] = &entry
 		m.nextToken++
 		m.capLatest[key] = m.nextToken
@@ -299,6 +306,13 @@ func (m *Manager) SetModelExclusionStore(store ModelExclusionStore) error {
 	m.persistModel = store.UpsertModelExclusion
 	m.deleteModel = store.DeleteModelExclusion
 	m.mu.Unlock()
+	for _, record := range records {
+		if record.ExcludedUntil == nil {
+			if err := m.syncModelLocked(modelKey{record.UpstreamID, record.Model}); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -309,6 +323,8 @@ func (m *Manager) RecoverModel(id int64, model string) error {
 	if id <= 0 || model == "" {
 		return nil
 	}
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
 	m.mu.Lock()
 	deleteModel := m.deleteModel
 	m.mu.Unlock()
@@ -338,7 +354,7 @@ func (m *Manager) MarkModelsDiscovered(id int64, models []string) {
 		if key.model == "" {
 			continue
 		}
-		if exclusion := m.unsupported[key]; exclusion != nil && (exclusion.ExcludedUntil == nil || time.Now().Before(*exclusion.ExcludedUntil)) {
+		if m.unsupported[key] != nil || m.rateLimits[key] != nil {
 			continue
 		}
 		m.nextToken++
@@ -413,11 +429,7 @@ func (m *Manager) modelRateLimitedLocked(id int64, model string) bool {
 	if limit == nil {
 		return false
 	}
-	if !time.Now().Before(limit.until) {
-		delete(m.rateLimits, key)
-		return false
-	}
-	return true
+	return time.Now().Before(limit.until) || limit.recoveryLease != 0
 }
 
 func (m *Manager) modelNeedsReprobeLocked(id int64, model string) bool {
@@ -439,8 +451,8 @@ func (m *Manager) IsAvailable(id int64, model string) bool {
 	return m.canServe(m.get(id))
 }
 
-// Claim reserves a business request. Recovery requests are exclusive both for
-// the channel and for the group, while CLOSED channels remain concurrent.
+// Claim reserves a business request. Recovery ownership is shared across groups
+// for the affected channel/model; unrelated channels remain independent.
 func (m *Manager) Claim(groupID, id int64, model string) (Lease, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -455,65 +467,65 @@ func (m *Manager) Claim(groupID, id int64, model string) (Lease, bool) {
 		return Lease{}, false
 	}
 	recovery := b.state == HalfOpen
-	if recovery && !m.groupCanRecoverLocked(groupID) {
-		return Lease{}, false
-	}
 	lease := m.newLeaseLocked(groupID, id, model, false, true, recovery)
-	if m.modelNeedsReprobeLocked(id, model) {
-		key := modelKey{id, model}
-		m.unsupported[key].reprobeLease = lease.Token
-		record := m.leases[lease.Token]
-		record.modelReprobe = true
-		m.leases[lease.Token] = record
-	}
+	m.claimModelRecoveryLocked(lease, model)
 	return lease, true
 }
 
-// ClaimLastResort permits one group-scoped recovery trial after all normal
-// candidates have become unavailable. This deliberately includes OPEN
-// channels whose early trial was already consumed: when every channel is
-// OPEN, a real request is still useful evidence that one may have recovered.
-// A failed trial must wait for the regular exponential cooldown before another
-// recovery attempt.
+// ClaimLastResort admits a controlled real request when normal routes are
+// exhausted. Explicit rate limits and capability exclusions are never bypassed.
 func (m *Manager) ClaimLastResort(groupID, id int64, model string) (Lease, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.modelUnsupportedLocked(id, model) || m.modelRateLimitedLocked(id, model) || !m.groupCanRecoverLocked(groupID) {
+	if m.modelUnsupportedLocked(id, model) {
+		return Lease{}, false
+	}
+	limit := m.rateLimits[modelKey{id, model}]
+	if limit != nil && (limit.recoveryLease != 0 ||
+		(limit.kind == "rate_limit" && time.Now().Before(limit.until)) ||
+		time.Now().Before(limit.trialNotBefore)) {
 		return Lease{}, false
 	}
 	b := m.get(id)
-	if b.state != Open || b.recoveryLease != 0 {
+	if b.recoveryLease != 0 || time.Now().Before(b.trialNotBefore) {
 		return Lease{}, false
 	}
-	b.state = HalfOpen
-	b.recoverySuccesses = 0
-	b.earlyTrial = false
-	lease := m.newLeaseLocked(groupID, id, model, false, true, true)
-	if m.modelNeedsReprobeLocked(id, model) {
-		key := modelKey{id, model}
-		m.unsupported[key].reprobeLease = lease.Token
-		record := m.leases[lease.Token]
-		record.modelReprobe = true
-		m.leases[lease.Token] = record
+	recovery := b.state != Closed
+	if recovery {
+		b.state = HalfOpen
+		b.recoverySuccesses = 0
+		b.earlyTrial = false
 	}
+	lease := m.newLeaseLocked(groupID, id, model, false, true, recovery)
+	m.claimModelRecoveryLocked(lease, model)
 	return lease, true
 }
 
-// BeginProbe always returns an observation lease so monitoring remains useful.
-// An OPEN channel only grants state-changing recovery ownership after cooldown;
-// other concurrent or early probes may update monitoring data but not state.
+// BeginProbe skips model cooldowns and occupied recovery slots. An OPEN channel
+// grants state-changing recovery ownership only after its cooldown; earlier
+// probes may update monitoring data without changing channel state.
 func (m *Manager) BeginProbe(id int64, model string) Lease {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.modelUnsupportedLocked(id, model) || m.modelRateLimitedLocked(id, model) {
+		return Lease{}
+	}
 	b := m.get(id)
 	m.canServe(b)
+	if b.recoveryLease != 0 {
+		return Lease{}
+	}
 	authoritative := b.state == Closed
 	recovery := false
 	if b.state == HalfOpen && b.recoveryLease == 0 {
 		authoritative = true
 		recovery = true
 	}
-	return m.newLeaseLocked(0, id, model, true, authoritative, recovery)
+	lease := m.newLeaseLocked(0, id, model, true, authoritative, recovery)
+	if authoritative {
+		m.claimModelRecoveryLocked(lease, model)
+	}
+	return lease
 }
 
 func (m *Manager) newLeaseLocked(groupID, id int64, model string, probe, authoritative, recovery bool) Lease {
@@ -529,24 +541,22 @@ func (m *Manager) newLeaseLocked(groupID, id int64, model string, probe, authori
 	}
 	if recovery {
 		b.recoveryLease = token
-		if groupID != 0 {
-			g := m.groupRecovery[groupID]
-			if g == nil {
-				g = &groupRecovery{}
-				m.groupRecovery[groupID] = g
-			}
-			g.owner = token
-		}
 	}
 	return Lease{UpstreamID: id, Token: token}
 }
 
-func (m *Manager) groupCanRecoverLocked(groupID int64) bool {
-	if groupID == 0 {
-		return true
+func (m *Manager) claimModelRecoveryLocked(lease Lease, model string) {
+	key := modelKey{lease.UpstreamID, model}
+	record := m.leases[lease.Token]
+	if m.modelNeedsReprobeLocked(lease.UpstreamID, model) {
+		m.unsupported[key].reprobeLease = lease.Token
+		record.modelReprobe = true
 	}
-	g := m.groupRecovery[groupID]
-	return g == nil || (g.owner == 0 && !time.Now().Before(g.notBefore))
+	if limit := m.rateLimits[key]; limit != nil {
+		limit.recoveryLease = lease.Token
+		record.modelRecovery = true
+	}
+	m.leases[lease.Token] = record
 }
 
 // Complete records and releases one lease exactly once. Results from an older
@@ -605,28 +615,29 @@ func (m *Manager) complete(lease Lease, result Result, latencyMs int64, status i
 			b.latSamples++
 		}
 	}
-	if result == ResultSuccess {
+	sameGeneration := record.generation == b.generation
+	if result == ResultSuccess && sameGeneration && record.authoritative {
 		m.observeSuccessLocked(b, latencyMs)
 	}
-
-	sameGeneration := record.generation == b.generation
 	key := modelKey{record.upstreamID, record.model}
-	var persist *ModelExclusion
-	var remove *modelKey
+	syncModel := false
 	if exclusion := m.unsupported[key]; exclusion != nil && exclusion.reprobeLease == lease.Token {
 		exclusion.reprobeLease = 0
 	}
-	if sameGeneration && record.model != "" && result == ResultSuccess && lease.Token >= m.capLatest[key] {
+	if limit := m.rateLimits[key]; limit != nil && limit.recoveryLease == lease.Token {
+		limit.recoveryLease = 0
+	}
+	canUpdateModel := sameGeneration && record.authoritative && record.model != "" && lease.Token >= m.capLatest[key]
+	if canUpdateModel && result == ResultSuccess {
 		m.capLatest[key] = lease.Token
-		if rateLimit := m.rateLimits[key]; rateLimit != nil && lease.Token > rateLimit.leaseToken {
+		if rateLimit := m.rateLimits[key]; rateLimit != nil && record.modelRecovery && lease.Token > rateLimit.leaseToken {
 			delete(m.rateLimits, key)
 		}
 		if record.modelReprobe {
 			delete(m.unsupported, key)
-			copy := key
-			remove = &copy
+			syncModel = true
 		}
-	} else if sameGeneration && record.model != "" && result == ResultModelUnsupported && lease.Token >= m.capLatest[key] {
+	} else if canUpdateModel && result == ResultModelUnsupported {
 		m.capLatest[key] = lease.Token
 		delete(m.rateLimits, key)
 		now := time.Now()
@@ -641,14 +652,12 @@ func (m *Manager) complete(lease Lease, result Result, latencyMs int64, status i
 		exclusion.LastFailedAt = now
 		exclusion.UpdatedAt = now
 		exclusion.ExcludedUntil = expiry(now, m.modelTTL)
-		copy := exclusion.publicCopy()
-		persist = &copy
+		syncModel = true
 	}
-	if sameGeneration && record.model != "" && result == ResultScopedFailure && lease.Token >= m.capLatest[key] {
+	if canUpdateModel && result == ResultScopedFailure {
 		if exclusion := m.unsupported[key]; exclusion != nil && exclusion.ExcludedUntil != nil && !time.Now().Before(*exclusion.ExcludedUntil) && record.modelReprobe {
 			delete(m.unsupported, key)
-			copy := key
-			remove = &copy
+			syncModel = true
 		}
 		if m.rateLimits == nil {
 			m.rateLimits = make(map[modelKey]*modelRateLimit)
@@ -656,17 +665,21 @@ func (m *Manager) complete(lease Lease, result Result, latencyMs int64, status i
 		previous := m.rateLimits[key]
 		if (previous == nil || lease.Token >= previous.leaseToken) && lease.Token >= m.capLatest[key] {
 			failures := 1
-			if previous != nil && time.Now().Before(previous.until) {
+			if previous != nil {
 				failures = previous.failures + 1
 			}
 			if retryAfter <= 0 {
-				retryAfter = m.backoff(failures)
+				retryAfter = transientCooldown(failures)
 			}
 			if retryAfter > maxModelRateLimitCooldown {
 				retryAfter = maxModelRateLimitCooldown
 			}
 			now := time.Now()
 			m.capLatest[key] = lease.Token
+			trialNotBefore := time.Time{}
+			if previous != nil {
+				trialNotBefore = now.Add(min(retryAfter, transientCooldown(failures)))
+			}
 			kind := "transient"
 			if len(scopedKind) > 0 && scopedKind[0] != "" {
 				kind = scopedKind[0]
@@ -674,10 +687,26 @@ func (m *Manager) complete(lease Lease, result Result, latencyMs int64, status i
 			m.rateLimits[key] = &modelRateLimit{
 				failedAt: now, until: now.Add(retryAfter), failures: failures, lastStatus: status,
 				lastReason: truncateModelReason(reason), kind: kind, leaseToken: lease.Token,
+				trialNotBefore: trialNotBefore,
 			}
 		}
 	}
 
+	if canUpdateModel && (record.modelRecovery || record.modelReprobe) &&
+		(result == ResultFailure || result == ResultTransportFailure) {
+		failures := 1
+		if previous := m.rateLimits[key]; previous != nil {
+			failures += previous.failures
+		}
+		now := time.Now()
+		cooldown := transientCooldown(failures)
+		m.capLatest[key] = lease.Token
+		m.rateLimits[key] = &modelRateLimit{
+			failedAt: now, until: now.Add(cooldown), failures: failures, lastStatus: status,
+			lastReason: "upstream recovery request failed", kind: "transient", leaseToken: lease.Token,
+			trialNotBefore: now.Add(cooldown),
+		}
+	}
 	from, to := b.state, b.state
 	if sameGeneration && record.authoritative {
 		switch result {
@@ -701,40 +730,19 @@ func (m *Manager) complete(lease Lease, result Result, latencyMs int64, status i
 				b.recoverySuccesses = 0
 				b.reopenCount = 0
 				b.earlyTrial = false
+				b.trialNotBefore = time.Time{}
 				to = Closed
 			}
 		}
-	}
-	if record.recovery && record.groupID != 0 {
-		g := m.groupRecovery[record.groupID]
-		if g != nil && g.owner == lease.Token {
-			g.owner = 0
-			switch result {
-			case ResultSuccess:
-				delete(m.groupRecovery, record.groupID)
-			case ResultFailure:
-				g.notBefore = b.openUntil
-			case ResultTransportFailure:
-				g.notBefore = b.openUntil
-			case ResultModelUnsupported, ResultScopedFailure:
-				delete(m.groupRecovery, record.groupID)
-			default:
-				if !time.Now().Before(g.notBefore) {
-					delete(m.groupRecovery, record.groupID)
-				}
-			}
+		if record.recovery && (result == ResultFailure || result == ResultTransportFailure) {
+			b.trialNotBefore = time.Now().Add(transientCooldown(b.reopenCount))
 		}
 	}
 	ev, flipped := transitionEvent(record.upstreamID, record.model, from, to, b.fails)
 	m.mu.Unlock()
-	if persist != nil && m.persistModel != nil {
-		if err := m.persistModel(*persist); err != nil {
-			slog.Error("persist model exclusion failed", "upstream_id", persist.UpstreamID, "model", persist.Model, "err", err)
-		}
-	}
-	if remove != nil && m.deleteModel != nil {
-		if err := m.deleteModel(remove.upstreamID, remove.model); err != nil {
-			slog.Error("delete expired model exclusion after successful re-probe failed", "upstream_id", remove.upstreamID, "model", remove.model, "err", err)
+	if syncModel {
+		if err := m.syncModel(key); err != nil {
+			slog.Error("sync model exclusion failed", "upstream_id", key.upstreamID, "model", key.model, "err", err)
 		}
 	}
 	if flipped {
@@ -764,8 +772,8 @@ func (m *Manager) InFlight(id int64) int64 {
 	return m.get(id).inFlight
 }
 
-// MarkModelUnsupported excludes a deterministic model/channel mismatch without
-// changing channel health. It is permanent unless modelTTL is configured.
+// MarkModelUnsupported caches a deterministic model/channel mismatch without
+// changing channel health. The default lifetime is five minutes.
 func (m *Manager) MarkModelUnsupported(id int64, model string) {
 	m.MarkModelUnsupportedWithDetails(id, model, 0, "")
 }
@@ -791,12 +799,9 @@ func (m *Manager) MarkModelUnsupportedWithDetails(id int64, model string, status
 	exclusion.LastFailedAt = now
 	exclusion.UpdatedAt = now
 	exclusion.ExcludedUntil = expiry(now, m.modelTTL)
-	copy := exclusion.publicCopy()
 	m.mu.Unlock()
-	if m.persistModel != nil {
-		if err := m.persistModel(copy); err != nil {
-			slog.Error("persist model exclusion failed", "upstream_id", id, "model", model, "err", err)
-		}
+	if err := m.syncModel(key); err != nil {
+		slog.Error("persist model exclusion failed", "upstream_id", id, "model", model, "err", err)
 	}
 }
 
@@ -881,11 +886,6 @@ func (m *Manager) Forget(id int64) {
 		if record.upstreamID != id {
 			continue
 		}
-		if record.groupID != 0 {
-			if g := m.groupRecovery[record.groupID]; g != nil && g.owner == token {
-				delete(m.groupRecovery, record.groupID)
-			}
-		}
 		delete(m.leases, token)
 	}
 	delete(m.breakers, id)
@@ -912,24 +912,16 @@ func (m *Manager) ResetCircuit(id int64) {
 	m.mu.Lock()
 	b := m.get(id)
 	from := b.state
-	oldRecoveryLease := b.recoveryLease
 	b.generation++
 	b.state = Closed
 	b.fails = 0
 	b.failureWindowFrom = time.Time{}
 	b.openUntil = time.Time{}
 	b.recoveryLease = 0
+	b.trialNotBefore = time.Time{}
 	b.earlyTrial = false
 	b.recoverySuccesses = 0
 	b.reopenCount = 0
-	if oldRecoveryLease != 0 {
-		for _, g := range m.groupRecovery {
-			if g.owner == oldRecoveryLease {
-				g.owner = 0
-				g.notBefore = time.Time{}
-			}
-		}
-	}
 	ev, flipped := transitionEvent(id, "", from, Closed, 0)
 	m.mu.Unlock()
 	if flipped {
@@ -958,6 +950,7 @@ func (m *Manager) drive(b *breaker, ok bool, latencyMs int64) (from, to State) {
 				b.reopenCount = 0
 				b.openUntil = time.Time{}
 				b.earlyTrial = false
+				b.trialNotBefore = time.Time{}
 			}
 		}
 		return from, b.state
@@ -1118,12 +1111,19 @@ func (m *Manager) ModelStates(id int64) []ModelHealth {
 		}
 	}
 	for key, limit := range m.rateLimits {
-		if key.upstreamID != id || !now.Before(limit.until) {
+		if key.upstreamID != id {
 			continue
 		}
 		until := limit.until
+		state := "TEMPORARY_FAILURE"
+		if !now.Before(until) {
+			state = "REPROBE_PENDING"
+		}
+		if limit.recoveryLease != 0 {
+			state = "RECOVERING"
+		}
 		out = append(out, ModelHealth{
-			Model: key.model, State: "TEMPORARY_FAILURE", Kind: limit.kind,
+			Model: key.model, State: state, Kind: limit.kind,
 			ExcludedUntil: &until, FailureCount: limit.failures, LastStatus: limit.lastStatus,
 			LastReason: limit.lastReason, LastFailedAt: limit.failedAt,
 		})

@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -181,7 +182,7 @@ func TestAllOpen(t *testing.T) {
 		t.Fatalf("single open channel should receive one last-route trial, chosen=%v err=%v", chosen, err)
 	}
 	hm.Complete(lease, health.ResultFailure, 0)
-	if _, _, err := scheduler.Pick(1, "gpt"); err != ErrNoUpstream {
+	if _, _, err := scheduler.Pick(1, "gpt"); !errors.Is(err, ErrNoUpstream) {
 		t.Fatalf("failed last-route trial must respect cooldown, got %v", err)
 	}
 }

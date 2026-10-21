@@ -202,10 +202,13 @@ async function loadMembers(gid) {
 }
 const mhTitle = mh => {
   const kind = mh.kind === 'rate_limit' ? '模型限流' : mh.kind === 'transient' ? '模型临时故障' : '模型不支持'
-  const policy = mh.excluded_until ? `冷却至 ${new Date(mh.excluded_until).toLocaleString()}` : '永久排除'
+  const policy = mh.state === 'RECOVERING' ? '正在验证恢复'
+    : mh.state === 'REPROBE_PENDING' ? '等待请求验证'
+    : mh.excluded_until ? `冷却至 ${new Date(mh.excluded_until).toLocaleString()}` : '等待重新验证'
   const count = mh.failure_count ? `，已确认 ${mh.failure_count} 次` : ''
   const status = mh.last_status ? `，HTTP ${mh.last_status}` : ''
-  return `${mh.model} · ${kind}，${policy}${count}${status}；点击清除状态并重新启用`
+  const reason = mh.last_reason ? `；${mh.last_reason}` : ''
+  return `${mh.model} · ${kind}，${policy}${count}${status}${reason}；点击清除状态并重新启用`
 }
 async function loadDetail(gid) {
   const ep = loadEpoch
@@ -1646,7 +1649,7 @@ const rtRate = h => (h && h.reqs) ? (h.succ_rate * 100).toFixed(0) + '%' : '—'
 
 // 模型徽章表示持久能力排除或 TTL 到期后的待重探状态，不是独立熔断器。
 const mhClass = mh => ['rate_limit', 'transient'].includes(mh?.kind) ? 'half' : mh?.state === 'UNSUPPORTED' ? 'open' : 'nodata'
-const mhBadgeLabel = mh => mh?.kind === 'rate_limit' ? '限流' : mh?.kind === 'transient' ? '故障' : mh?.state === 'UNSUPPORTED' ? '不支持' : '重探'
+const mhBadgeLabel = mh => mh?.state === 'RECOVERING' ? '恢复中' : mh?.state === 'REPROBE_PENDING' ? '待验证' : mh?.kind === 'rate_limit' ? '限流' : mh?.kind === 'transient' ? '故障' : mh?.state === 'UNSUPPORTED' ? '不支持' : '重探'
 const visibleDots = item => item?.model_health || []
 
 // 分组卡片：只展示路由摘要；完整成员名称在分组详情页查看。
@@ -3008,7 +3011,7 @@ function logout() {
                 <div class="settings-fields">
                   <div class="field"><label>恢复所需连续成功</label><input v-model="breakerRecoverySuccesses" type="number" min="1" max="100" /></div>
                   <div class="field"><label>最大冷却时间</label><input v-model="breakerMaxCooldown" placeholder="5m" /></div>
-                  <div class="field"><label>模型排除有效期（0s=永久）</label><input v-model="modelUnsupportedTTL" placeholder="0s" /></div>
+                  <div class="field"><label>模型排除有效期（0s=默认 5 分钟）</label><input v-model="modelUnsupportedTTL" placeholder="5m" /></div>
                 </div>
                 <div class="settings-info">
                   <div><span>算法</span><b>{{ intelligentRoutingEnabled ? '智能成本路由' : '标准 P2C' }}</b><em>渠道级</em></div>

@@ -87,6 +87,10 @@ func (s *Scheduler) PickExcluding(groupID int64, model string, exclude map[int64
 	// 成员清单每次调用只读一次库：重试只为处理 Claim 竞争，与成员变化无关。
 	// 转发层每次换源都会重新调用本函数，故后台增删仍是下个请求即生效。
 	all := s.list(groupID)
+	return s.pickAvailable(groupID, model, all, blocked, exclude)
+}
+
+func (s *Scheduler) pickAvailable(groupID int64, model string, all []*upstream.Upstream, blocked, recoveryExcluded map[int64]bool) (*upstream.Upstream, health.Lease, error) {
 	for {
 		var healthy []*upstream.Upstream
 		for _, candidate := range all {
@@ -96,7 +100,7 @@ func (s *Scheduler) PickExcluding(groupID int64, model string, exclude map[int64
 			healthy = append(healthy, candidate)
 		}
 		if len(healthy) == 0 {
-			return s.pickLastResort(groupID, model, all, blocked)
+			return s.pickLastResort(groupID, model, all, recoveryExcluded)
 		}
 
 		topPriority := healthy[0].Priority
@@ -132,7 +136,7 @@ func (s *Scheduler) pickLastResort(groupID int64, model string, all []*upstream.
 			continue
 		}
 		info := s.health.RecoveryInfo(candidate.ID)
-		if info.State == health.Open.String() {
+		if info.State != "" {
 			options = append(options, recoverable{upstream: candidate, info: info})
 		}
 	}
@@ -154,7 +158,7 @@ func (s *Scheduler) pickLastResort(groupID int64, model string, all []*upstream.
 			return option.upstream, lease, nil
 		}
 	}
-	return nil, health.Lease{}, ErrNoUpstream
+	return nil, health.Lease{}, s.unavailableError(model, all, blocked)
 }
 
 // pickP2C performs two independent weighted draws. Drawing the same upstream

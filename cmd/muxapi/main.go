@@ -62,7 +62,7 @@ func main() {
 		"cooldown":              cfg.Cooldown.String(),
 		"max_upstream_attempts": strconv.Itoa(initialMaxAttempts),
 		"max_body_bytes":        strconv.FormatInt(cfg.MaxBody, 10),
-		"model_unsupported_ttl": "0s",
+		"model_unsupported_ttl": "5m",
 	}
 	storedSettings, err := st.Settings()
 	if err != nil {
@@ -166,7 +166,7 @@ func main() {
 	hm := health.New(failThreshold(), cooldown())
 	breakerRecoverySuccesses := settingInt("breaker_recovery_successes", 2)
 	breakerMaxCooldown := settingDuration("breaker_max_cooldown", 5*time.Minute)
-	modelUnsupportedTTL := settingDurationAllowZero("model_unsupported_ttl", 0)
+	modelUnsupportedTTL := settingDurationAllowZero("model_unsupported_ttl", 5*time.Minute)
 	hm.SetAdvancedPolicy(breakerRecoverySuccesses(), breakerMaxCooldown(), modelUnsupportedTTL())
 	if err := hm.SetModelExclusionStore(st); err != nil {
 		slog.Error("restore model exclusions failed", "err", err)

@@ -9,10 +9,13 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// RecordModelExclusion creates or refreshes one negative capability record.
-// FailureCount is incremented atomically so concurrent gateway failures are
-// not lost.
+// UpsertModelExclusion synchronizes an authoritative health snapshot. Repeated
+// synchronization is idempotent, including legacy-TTL normalization at startup.
 func (s *Store) UpsertModelExclusion(exclusion health.ModelExclusion) error {
+	return s.upsertModelExclusion(exclusion, false)
+}
+
+func (s *Store) upsertModelExclusion(exclusion health.ModelExclusion, increment bool) error {
 	exclusion.Model = strings.TrimSpace(exclusion.Model)
 	if exclusion.UpstreamID <= 0 || exclusion.Model == "" {
 		return nil
@@ -23,11 +26,15 @@ func (s *Store) UpsertModelExclusion(exclusion health.ModelExclusion) error {
 	if exclusion.UpdatedAt.IsZero() {
 		exclusion.UpdatedAt = exclusion.LastFailedAt
 	}
+	var count any = max(1, exclusion.FailureCount)
+	if increment {
+		count = gorm.Expr("failure_count + 1")
+	}
 	return s.gormDB.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "upstream_id"}, {Name: "model"}},
 		DoUpdates: clause.Assignments(map[string]any{
 			"excluded_until": exclusion.ExcludedUntil,
-			"failure_count":  gorm.Expr("failure_count + 1"),
+			"failure_count":  count,
 			"last_status":    exclusion.LastStatus,
 			"last_reason":    exclusion.LastReason,
 			"last_failed_at": exclusion.LastFailedAt,
@@ -44,9 +51,9 @@ func (s *Store) UpsertModelExclusion(exclusion health.ModelExclusion) error {
 // RecordModelExclusion is kept as a small compatibility helper for callers
 // outside the health package and for storage-layer tests.
 func (s *Store) RecordModelExclusion(upstreamID int64, model string, excludedUntil *time.Time, status int, reason string, failedAt time.Time) error {
-	return s.UpsertModelExclusion(health.ModelExclusion{UpstreamID: upstreamID, Model: model,
+	return s.upsertModelExclusion(health.ModelExclusion{UpstreamID: upstreamID, Model: model,
 		ExcludedUntil: excludedUntil, FailureCount: 1, LastStatus: status,
-		LastReason: reason, LastFailedAt: failedAt, UpdatedAt: failedAt})
+		LastReason: reason, LastFailedAt: failedAt, UpdatedAt: failedAt}, true)
 }
 
 // ListModelExclusions returns all durable records, including expired TTL rows.

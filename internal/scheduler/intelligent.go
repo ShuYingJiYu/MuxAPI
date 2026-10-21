@@ -83,8 +83,10 @@ func (r *intelligentRouter) pick(s *Scheduler, groupID int64, model string, feat
 		return nil, health.Lease{}, routing.Decision{}, ErrNoUpstream
 	}
 	blocked := make(map[int64]bool, len(exclude))
+	hardBlocked := make(map[int64]bool, len(exclude))
 	for id, value := range exclude {
 		blocked[id] = value
+		hardBlocked[id] = value
 	}
 	now := time.Now()
 	cfg := routing.DefaultConfig()
@@ -101,6 +103,7 @@ func (r *intelligentRouter) pick(s *Scheduler, groupID int64, model string, feat
 			Candidates: candidates, Config: cfg, Now: now,
 		})
 		blockHardLimitRejections(blocked, decision.Evaluations, cfg)
+		blockHardLimitRejections(hardBlocked, decision.Evaluations, cfg)
 		if err != nil {
 			break
 		}
@@ -117,7 +120,7 @@ func (r *intelligentRouter) pick(s *Scheduler, groupID int64, model string, feat
 	}
 	// Unknown price, a cold catalog, or a claim race must never make the
 	// gateway unavailable. Preserve the original scheduler behavior.
-	candidate, lease, err := s.PickExcluding(groupID, model, blocked)
+	candidate, lease, err := s.pickAvailable(groupID, model, all, blocked, hardBlocked)
 	if candidate == nil || err != nil {
 		return candidate, lease, routing.Decision{}, err
 	}

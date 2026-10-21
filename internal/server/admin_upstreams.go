@@ -171,9 +171,25 @@ func (s *Server) adminUpstreamItem(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		u.ID = id
-		if err := s.store.Update(u); err != nil {
+		previous, err := s.store.Get(id)
+		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
+		}
+		save := func() error { return s.store.Update(u) }
+		changed := previous.BaseURL != u.BaseURL || previous.Protocol != u.Protocol || previous.Proxy != u.Proxy ||
+			(u.APIKey != "" && previous.APIKey != u.APIKey)
+		if changed {
+			err = s.health.Reconfigure(id, save)
+		} else {
+			err = save()
+		}
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		if changed {
+			s.forgetUpstreamModels(id)
 		}
 		w.WriteHeader(204)
 	case http.MethodDelete:

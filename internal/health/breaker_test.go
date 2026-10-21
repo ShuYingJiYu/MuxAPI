@@ -396,9 +396,6 @@ func (s *memoryExclusionStore) UpsertModelExclusion(record ModelExclusion) error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := modelKey{record.UpstreamID, record.Model}
-	if previous, ok := s.records[key]; ok {
-		record.FailureCount = previous.FailureCount + 1
-	}
 	s.records[key] = record
 	return nil
 }
@@ -410,7 +407,7 @@ func (s *memoryExclusionStore) DeleteModelExclusion(upstreamID int64, model stri
 	return nil
 }
 
-func TestPermanentModelExclusionPersistsAcrossRestartAndSuccess(t *testing.T) {
+func TestModelExclusionCachePersistsAcrossRestartAndSuccess(t *testing.T) {
 	storage := newMemoryExclusionStore()
 	first := New(3, time.Hour)
 	first.SetAdvancedPolicy(2, time.Hour, 0)
@@ -423,7 +420,7 @@ func TestPermanentModelExclusionPersistsAcrossRestartAndSuccess(t *testing.T) {
 	first.CompleteModelUnsupported(failure, 12, 404, `{"error":{"code":"model_not_found"}}`)
 	first.Complete(lateSuccess, ResultSuccess, 10)
 	if !first.IsModelUnsupported(7, "glm-5") {
-		t.Fatal("ordinary success must not clear a newer permanent exclusion")
+		t.Fatal("ordinary success must not clear a newer cached exclusion")
 	}
 
 	restarted := New(3, time.Hour)
@@ -431,7 +428,7 @@ func TestPermanentModelExclusionPersistsAcrossRestartAndSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !restarted.IsModelUnsupported(7, "glm-5") || restarted.IsAvailable(7, "glm-5") {
-		t.Fatal("restart did not restore permanent model exclusion")
+		t.Fatal("restart did not restore cached model exclusion")
 	}
 	states := restarted.ModelStates(7)
 	if len(states) != 1 || states[0].Model != "glm-5" {
@@ -611,7 +608,7 @@ func TestOldGenerationResultsCannotChangeCircuit(t *testing.T) {
 	})
 }
 
-func TestRecoveryLeaseExcludesProbeAndGroupPeers(t *testing.T) {
+func TestRecoveryLeaseIsSharedAcrossGroupsButIndependentAcrossChannels(t *testing.T) {
 	m := New(1, 5*time.Millisecond)
 	m.Report(1, "gpt", false, 0)
 	m.Report(2, "gpt", false, 0)
@@ -621,9 +618,11 @@ func TestRecoveryLeaseExcludesProbeAndGroupPeers(t *testing.T) {
 	if !ok {
 		t.Fatal("first group recovery claim failed")
 	}
-	if _, ok := m.Claim(7, 2, "gpt"); ok {
-		t.Fatal("same group must not recover two channels concurrently")
+	second, ok := m.Claim(7, 2, "gpt")
+	if !ok {
+		t.Fatal("a different channel in the same group must recover independently")
 	}
+	defer m.Release(second)
 	if _, ok := m.Claim(8, 1, "gpt"); ok {
 		t.Fatal("same channel must not recover concurrently across groups")
 	}

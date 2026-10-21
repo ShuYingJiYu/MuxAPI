@@ -78,7 +78,7 @@ func TestValidProbePayload(t *testing.T) {
 		{"empty", "application/json", ``, false, false},
 		{"invalid-json", "application/json", `ok`, false, false},
 		{"json-error", "application/json", `{"error":{"message":"failed"}}`, false, false},
-		{"sse-complete", "text/event-stream", "data: {}\ndata: [DONE]\n", true, true},
+		{"sse-complete", "text/event-stream", "data: {}\n\ndata: [DONE]\n\n", true, true},
 		{"sse-incomplete", "text/event-stream", "data: {}\n", true, false},
 	}
 	for _, test := range cases {

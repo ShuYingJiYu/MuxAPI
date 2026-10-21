@@ -202,6 +202,9 @@ func (p *Prober) Probe(ctx context.Context, m *store.Monitor) {
 	var lease health.Lease
 	if p.breaker != nil {
 		lease = p.breaker.BeginProbe(m.UpstreamID, m.Model)
+		if !lease.Valid() {
+			return
+		}
 	}
 	complete := func(result health.Result, latencyMs int64) {
 		if p.breaker != nil && lease.Valid() {
@@ -253,36 +256,47 @@ func (p *Prober) Probe(ctx context.Context, m *store.Monitor) {
 		complete(health.ResultTransportFailure, 0)
 		return
 	}
-	if upstream.IsModelUnsupported(resp.StatusCode, m.Model, string(payload)) {
-		p.mgr.Record(m.ID, statDown, ttft)
-		complete(health.ResultModelUnsupported, ttft)
-		return
+	failure := upstream.ClassifyResponseError(resp.StatusCode, payload)
+	if failure == nil && resp.StatusCode < 400 && (m.Stream || strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream")) {
+		_, failure = upstream.InspectSSE(payload)
 	}
-	if upstream.IsRateLimitStatus(resp.StatusCode) {
+	if failure != nil {
 		p.mgr.Record(m.ID, statDegraded, ttft)
-		if scoped, ok := p.breaker.(modelRateLimitReporter); ok && lease.Valid() {
-			scoped.CompleteModelRateLimited(lease, ttft, upstream.ParseRetryAfter(resp.Header.Get("Retry-After"), time.Now()), resp.StatusCode, string(payload))
-			lease = health.Lease{}
+		switch failure.Kind {
+		case upstream.FailureClient:
+			complete(health.ResultNeutral, 0)
+		case upstream.FailureUnsupported:
+			if detailed, ok := p.breaker.(interface {
+				CompleteModelUnsupported(health.Lease, int64, int, string)
+			}); ok {
+				detailed.CompleteModelUnsupported(lease, ttft, failure.Status, failure.Error())
+				lease = health.Lease{}
+			} else {
+				complete(health.ResultModelUnsupported, ttft)
+			}
+		case upstream.FailureRateLimit:
+			if scoped, ok := p.breaker.(modelRateLimitReporter); ok {
+				scoped.CompleteModelRateLimited(lease, ttft, upstream.ParseRetryAfter(resp.Header.Get("Retry-After"), time.Now()), failure.Status, failure.Error())
+				lease = health.Lease{}
+			} else {
+				complete(health.ResultScopedFailure, ttft)
+			}
+		case upstream.FailureTransient:
+			if scoped, ok := p.breaker.(modelTransientReporter); ok {
+				scoped.CompleteModelTransientFailure(lease, ttft, failure.Status, failure.Error())
+				lease = health.Lease{}
+			} else {
+				complete(health.ResultScopedFailure, ttft)
+			}
+		default:
+			complete(health.ResultFailure, ttft)
 		}
-		return
-	}
-	if upstream.IsFailureStatus(resp.StatusCode) {
-		p.mgr.Record(m.ID, classify(resp.StatusCode), ttft)
-		complete(health.ResultFailure, ttft)
 		return
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		if validProbePayload(resp.Header.Get("Content-Type"), payload, m.Stream) {
 			p.mgr.Record(m.ID, statOK, ttft)
 			complete(health.ResultSuccess, ttft)
-			return
-		}
-		if upstream.IsErrorPayload(payload) {
-			p.mgr.Record(m.ID, statDegraded, ttft)
-			if scoped, ok := p.breaker.(modelTransientReporter); ok && lease.Valid() {
-				scoped.CompleteModelTransientFailure(lease, ttft, resp.StatusCode, string(payload))
-				lease = health.Lease{}
-			}
 			return
 		}
 		p.mgr.Record(m.ID, statDown, ttft)
@@ -300,16 +314,8 @@ func validProbePayload(contentType string, payload []byte, stream bool) bool {
 		return false
 	}
 	if stream || strings.HasPrefix(contentType, "text/event-stream") {
-		text := string(trimmed)
-		return strings.Contains(text, "data: [DONE]") ||
-			strings.Contains(text, "event: message_stop") ||
-			strings.Contains(text, "event: response.completed") ||
-			strings.Contains(text, `"type":"message_stop"`) ||
-			strings.Contains(text, `"type": "message_stop"`) ||
-			strings.Contains(text, `"type":"response.completed"`) ||
-			strings.Contains(text, `"type": "response.completed"`) ||
-			strings.Contains(text, `"finishReason":"`) ||
-			strings.Contains(text, `"finishReason": "`)
+		completed, failure := upstream.InspectSSE(trimmed)
+		return completed && failure == nil
 	}
 	return json.Valid(trimmed) && !upstream.IsErrorPayload(trimmed)
 }

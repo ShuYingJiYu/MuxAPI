@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/mirainya/muxapi/internal/upstream"
 )
 
 const maxAuditPayload = 2 << 20
@@ -51,6 +53,7 @@ type responseAudit struct {
 	streamTerminated bool
 	// streamErrored 表示上游在 2xx 流里投递过明确的错误事件。
 	streamErrored bool
+	failure       *upstream.ResponseError
 }
 
 // auditReadCloser 装饰上游正文，使所有转发分支共享同一套审计解析。
@@ -142,33 +145,22 @@ func nextSSEBlock(data []byte) (end, separatorLength int) {
 
 // consumeSSEBlock 兼容 event 字段、JSON type 字段和 [DONE] 三类完成标记。
 func (a *responseAudit) consumeSSEBlock(block []byte) {
-	var eventName string
-	var dataLines []string
-	for _, line := range strings.Split(strings.ReplaceAll(string(block), "\r\n", "\n"), "\n") {
-		line = strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(line, "event:"):
-			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-		case strings.HasPrefix(line, "data:"):
-			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
-		}
-	}
+	eventName, raw := upstream.ParseSSEBlock(block)
+	data := strings.TrimSpace(string(raw))
 	if eventName != "" {
 		a.lastEvent = clipLabel(eventName)
-		if isCompletionEvent(eventName) {
-			a.streamCompleted = true
-		}
-		if isStreamErrorEvent(eventName) {
-			a.streamErrored = true
-		}
 	}
-	data := strings.Join(dataLines, "\n")
+	_, failure := upstream.InspectSSEEvent(eventName, raw)
+	if failure != nil {
+		a.failure = failure
+		a.streamErrored, a.streamTerminated, a.streamCompleted = true, true, false
+	}
 	if data == "" {
 		return
 	}
 	if data == "[DONE]" {
 		a.lastEvent = "[DONE]"
-		a.streamCompleted = true
+		a.streamCompleted = !a.streamErrored
 		a.streamTerminated = true
 		return
 	}
@@ -179,7 +171,7 @@ func (a *responseAudit) consumeSSEBlock(block []byte) {
 	if typ, _ := payload["type"].(string); typ != "" {
 		a.lastEvent = clipLabel(typ)
 		if isCompletionEvent(typ) {
-			a.streamCompleted = true
+			a.streamCompleted = !a.streamErrored
 		}
 		if isStreamErrorEvent(typ) {
 			a.streamErrored = true
@@ -190,6 +182,9 @@ func (a *responseAudit) consumeSSEBlock(block []byte) {
 	}
 	if isCompletionEvent(eventName) || isStreamErrorEvent(eventName) {
 		a.streamTerminated = true
+		if isCompletionEvent(eventName) {
+			a.streamCompleted = !a.streamErrored
+		}
 	}
 	if geminiResponseComplete(payload) {
 		a.lastEvent = "generateContent.completed"

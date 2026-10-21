@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mirainya/muxapi/internal/health"
 	"github.com/mirainya/muxapi/internal/upstream"
 )
 
@@ -40,6 +41,35 @@ func TestModelExclusionPersistence(t *testing.T) {
 	}
 	if records, _ = st.ListModelExclusions(); len(records) != 0 {
 		t.Fatalf("manual recovery did not delete exclusion: %+v", records)
+	}
+}
+
+func TestModelExclusionSnapshotSynchronizationIsIdempotent(t *testing.T) {
+	st, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	item := &upstream.Upstream{Name: "provider", BaseURL: "https://example.com", APIKey: "key", Enabled: true}
+	if err := st.Create(item); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := health.ModelExclusion{UpstreamID: item.ID, Model: "model", FailureCount: 3, LastFailedAt: time.Now()}
+	for index := 0; index < 2; index++ {
+		if err := st.UpsertModelExclusion(snapshot); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager := health.New(3, time.Minute)
+	if err := manager.SetModelExclusionStore(st); err != nil {
+		t.Fatal(err)
+	}
+	records, err := st.ListModelExclusions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].FailureCount != 3 || records[0].ExcludedUntil == nil {
+		t.Fatalf("repeated state synchronization changed the observation count: %+v", records)
 	}
 }
 

@@ -216,23 +216,7 @@ func hasModelNotFoundCode(payload map[string]any) bool {
 // IsErrorPayload detects successful-status JSON envelopes that still contain
 // an upstream error. Null or empty error fields are not treated as failures.
 func IsErrorPayload(body []byte) bool {
-	var object map[string]json.RawMessage
-	if json.Unmarshal(body, &object) != nil {
-		return false
-	}
-	if raw, ok := object["error"]; ok {
-		value := strings.TrimSpace(string(raw))
-		switch value {
-		case "", "null", "false", `""`, "{}", "[]":
-		default:
-			return true
-		}
-	}
-	var responseType string
-	if raw, ok := object["type"]; ok && json.Unmarshal(raw, &responseType) == nil {
-		return strings.EqualFold(responseType, "error")
-	}
-	return false
+	return ClassifyResponseError(http.StatusOK, body) != nil
 }
 
 // BuildRequest 构建发往上游的请求：黑名单透传客户端请求头（保留 User-Agent/x-stainless-* 等），
