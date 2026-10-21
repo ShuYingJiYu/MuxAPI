@@ -1452,6 +1452,7 @@ func (r *recordingHealth) reported() []bool {
 // 注意：单纯「没有终止事件」不算失败（见 TestForwardSSECleanEOFAfterFirstByteIsTransparent），
 // 这里依据的是上游明确的 error 事件。
 func TestForwardErroredStreamIsNotReportedHealthy(t *testing.T) {
+	outputCommitted := make(chan struct{})
 	upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -1460,6 +1461,13 @@ func TestForwardErroredStreamIsNotReportedHealthy(t *testing.T) {
 		flusher.Flush()
 		io.WriteString(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\n")
 		flusher.Flush()
+		// Flush does not prevent the transport from coalescing events. Wait for
+		// actual downstream output before testing an error after commitment.
+		select {
+		case <-outputCommitted:
+		case <-r.Context().Done():
+			return
+		}
 		io.WriteString(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n")
 		flusher.Flush()
 	}))
@@ -1469,7 +1477,7 @@ func TestForwardErroredStreamIsNotReportedHealthy(t *testing.T) {
 	hm := &recordingHealth{inner: health.New(3, time.Hour)}
 	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm.inner), hm, 1)
 
-	recorder := httptest.NewRecorder()
+	recorder := &releaseOnOutputWriter{ResponseRecorder: httptest.NewRecorder(), release: outputCommitted}
 	body := []byte(`{"model":"claude-test","stream":true}`)
 	request := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
 	result := fwd.Forward(recorder, request, body, 1, "")
