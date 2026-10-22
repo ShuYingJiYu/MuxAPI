@@ -275,7 +275,7 @@ func TestCachePricingStatsIgnoreNewTurnAndAbsentCache(t *testing.T) {
 		}
 	}
 
-	coverage, err := st.CacheCoverageRatio(26)
+	coverage, err := st.CacheCoverageRatio(26, "claude-opus-5")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,5 +304,51 @@ func TestCachePricingStatsIgnoreNewTurnAndAbsentCache(t *testing.T) {
 	}
 	if present.Successes != 1 || present.CacheUses != 1 {
 		t.Fatalf("cache model evidence: %+v", present)
+	}
+}
+
+func TestCacheCoverageRatioSplitsByModel(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "coverage-by-model.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().Truncate(time.Second)
+	var observations []RoutingObservationRecord
+	for i := 0; i < 8; i++ {
+		observations = append(observations,
+			RoutingObservationRecord{RequestID: "full-" + strconv.Itoa(i), UpstreamID: 51, APIKeyHash: "k",
+				Model: "claude-opus-5-5", PrefixTokens: 100_000, CachedTokens: 100_000,
+				CacheHit: true, Success: true, ObservedAt: now.Add(-time.Duration(i+1) * time.Minute)},
+			RoutingObservationRecord{RequestID: "half-" + strconv.Itoa(i), UpstreamID: 51, APIKeyHash: "k",
+				Model: "claude-sonnet-5", PrefixTokens: 100_000, CachedTokens: 20_000,
+				CacheHit: true, Success: true, ObservedAt: now.Add(-time.Duration(i+1) * time.Minute)},
+		)
+	}
+	if err := st.SaveRoutingObservations(observations); err != nil {
+		t.Fatal(err)
+	}
+	full, err := st.CacheCoverageRatio(51, "claude-opus-5-5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(full-1) > 1e-9 {
+		t.Fatalf("full-cache model coverage = %v, want 1", full)
+	}
+	half, err := st.CacheCoverageRatio(51, "claude-sonnet-5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(half-0.2) > 1e-9 {
+		t.Fatalf("half-cache model coverage = %v, want 0.2", half)
+	}
+	// One hit is below the model sample floor, so an unseen model uses the
+	// channel blend: eight full hits and eight 0.2 hits average to 0.6.
+	fallback, err := st.CacheCoverageRatio(51, "claude-new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(fallback-0.6) > 1e-9 {
+		t.Fatalf("fallback coverage = %v, want 0.6", fallback)
 	}
 }
