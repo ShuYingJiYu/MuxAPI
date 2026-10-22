@@ -107,23 +107,57 @@ type UpstreamRoutingStats struct {
 // putting the new turn in the denominator made a fully cached prefix look
 // ~0.66 covered. The result is clamped to 1 because a prefix estimate can be
 // smaller than the provider's cached count.
-func (s *Store) CacheCoverageRatio(upstreamID int64) (float64, error) {
-	var ratio sql.NullFloat64
-	err := s.queryRow(`SELECT AVG(CASE
+// cacheCoverageMinSamples is the smallest model-specific hit sample that is
+// trusted on its own. Below it the channel-wide ratio is used, so a new model
+// does not inherit a one-off hit or an empty result.
+const cacheCoverageMinSamples = 8
+
+// CacheCoverageRatio returns the average fraction of the reusable prefix that
+// was actually served from cache for this upstream and, when the sample is
+// large enough, this model. Half-cache and full-cache behaviour differs by
+// model on the same channel. input_tokens is the uncached new turn and is
+// excluded. The result is clamped to 1 because a prefix estimate can be
+// smaller than the provider's cached count.
+func (s *Store) CacheCoverageRatio(upstreamID int64, model string) (float64, error) {
+	model = strings.TrimSpace(model)
+	if model != "" {
+		ratio, samples, err := s.cacheCoverageSample(upstreamID, model)
+		if err != nil {
+			return 0, err
+		}
+		if samples >= cacheCoverageMinSamples && ratio > 0 {
+			return ratio, nil
+		}
+	}
+	ratio, _, err := s.cacheCoverageSample(upstreamID, "")
+	return ratio, err
+}
+
+func (s *Store) cacheCoverageSample(upstreamID int64, model string) (float64, int64, error) {
+	query := `SELECT AVG(CASE
 			WHEN CAST(cached_tokens AS REAL) / prefix_tokens > 1 THEN 1
 			ELSE CAST(cached_tokens AS REAL) / prefix_tokens
-		END)
+		END), COUNT(*)
 		FROM (SELECT cached_tokens, prefix_tokens
 			FROM routing_observations
-			WHERE upstream_id=? AND success=TRUE AND cached_tokens > 0 AND prefix_tokens > 1024
-			ORDER BY observed_at DESC LIMIT 50) sub`, upstreamID).Scan(&ratio)
+			WHERE upstream_id=? AND success=TRUE AND cached_tokens > 0 AND prefix_tokens > 1024`
+	args := []any{upstreamID}
+	if model != "" {
+		query += ` AND model=?`
+		args = append(args, model)
+	}
+	query += `
+			ORDER BY observed_at DESC LIMIT 50) sub`
+	var ratio sql.NullFloat64
+	var samples int64
+	err := s.queryRow(query, args...).Scan(&ratio, &samples)
 	if err != nil || !ratio.Valid || ratio.Float64 <= 0 {
-		return 0, err
+		return 0, samples, err
 	}
 	if ratio.Float64 > 1 {
-		return 1, nil
+		return 1, samples, nil
 	}
-	return ratio.Float64, nil
+	return ratio.Float64, samples, nil
 }
 
 // CacheTokenAverages contains provider-reported token counts for recent
