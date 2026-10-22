@@ -163,7 +163,7 @@ func EstimateWindowCost(features RequestFeatures, forecast TrafficForecast, pric
 		result.Confidence = 0.5
 	}
 
-	result.NoCacheInputCost = n * float64(features.InputTokens) * input * multiplier
+	result.NoCacheInputCost = n * (float64(features.InputTokens) + prefix*extra) * input * multiplier
 	result.OutputCost = n * out * output * multiplier
 	result.NoCacheTotal = result.NoCacheInputCost + result.OutputCost
 
@@ -357,7 +357,7 @@ func breakEvenRequests(features RequestFeatures, forecast TrafficForecast, prici
 	if suffix < 0 {
 		suffix = 0
 	}
-	noCache := float64(features.InputTokens)*input + out
+	noCache := (float64(features.InputTokens)+prefix*extra)*input + out
 	h := cache.HitRate
 	if cache.HitRateSource == HitRateUnknown || cache.HitRateSource == "" {
 		h = 0
