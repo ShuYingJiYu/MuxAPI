@@ -174,8 +174,7 @@ type CacheProfile struct {
 	// 0 or 1 means assume full prefix is cached (the standard behavior).
 	CoverageRatio float64 `json:"coverage_ratio,omitempty"`
 	// ExtraCachedRatio is cached tokens beyond the router prefix estimate,
-	// as a fraction of that prefix. A short prompt can be reported as twice
-	// the estimate; clamping CoverageRatio to 1 would drop the surplus.
+	// as a fraction of that prefix. CoverageRatio stays at most 1.
 	ExtraCachedRatio float64    `json:"extra_cached_ratio,omitempty"`
 	Existing         CacheEntry `json:"existing"`
 	// PreferredTTL is the adaptive TTL selected by the scheduler based on
