@@ -225,13 +225,13 @@ func (s *Store) cacheTokenAveragesByModel(apiKeyHash string, upstreamID int64, m
 }
 
 // TokenInflationFactor returns how many extra tokens an upstream bills beyond
-// the router-visible input (prefix + new turn). Only the surplus is inflation:
-// the new turn is already in the denominator, so a rolling cache write cannot
-// masquerade as a stable injected system prompt. Values at or below 1 mean
-// "no inflation".
+// the router-visible input (prefix + new turn). Cached tokens above the prefix
+// are excluded: ExtraCachedRatio prices that surplus, and counting it here as
+// well billed it twice. A rolling cache write stays out because the new turn
+// is already in the denominator. Values at or below 1 mean "no inflation".
 func (s *Store) TokenInflationFactor(upstreamID int64) (float64, error) {
 	var factor sql.NullFloat64
-	err := s.queryRow(`SELECT AVG(CAST(input_tokens + cached_tokens + cache_creation_tokens AS REAL)
+	err := s.queryRow(`SELECT AVG(CAST(input_tokens + MIN(cached_tokens, prefix_tokens) + cache_creation_tokens AS REAL)
 			/ (prefix_tokens + input_tokens))
 		FROM (SELECT input_tokens, cached_tokens, cache_creation_tokens, prefix_tokens
 			FROM routing_observations

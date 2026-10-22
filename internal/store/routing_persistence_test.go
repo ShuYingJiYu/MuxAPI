@@ -278,7 +278,8 @@ func TestCachePricingStatsIgnoreNewTurnAndAbsentCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// (100k cached + 40k new turn + 3k write) / (100k prefix + 40k new turn) = 1.0214
+	// Cached tokens above the prefix are not inflation. (100k capped cached +
+	// 40k new turn + 3k write) / (100k prefix + 40k new turn) = 1.0214.
 	if math.Abs(inflation-143_000.0/140_000.0) > 1e-9 {
 		t.Fatalf("inflation = %v, want %v", inflation, 143_000.0/140_000.0)
 	}
@@ -401,5 +402,32 @@ func TestCacheCoverageRatioFollowsPrefixLength(t *testing.T) {
 	}
 	if math.Abs(over-2) > 1e-9 {
 		t.Fatalf("surplus coverage = %v, want 2", over)
+	}
+}
+
+func TestTokenInflationIgnoresCacheSurplus(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "inflation-surplus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().Truncate(time.Second)
+	var observations []RoutingObservationRecord
+	for i := 0; i < 8; i++ {
+		observations = append(observations, RoutingObservationRecord{
+			RequestID: "surplus-" + strconv.Itoa(i), UpstreamID: 26, APIKeyHash: "k",
+			Model: "claude-opus-5", PrefixTokens: 10_000, InputTokens: 0, CachedTokens: 20_000,
+			CacheHit: true, Success: true, ObservedAt: now.Add(-time.Duration(i+1) * time.Minute),
+		})
+	}
+	if err := st.SaveRoutingObservations(observations); err != nil {
+		t.Fatal(err)
+	}
+	inflation, err := st.TokenInflationFactor(26)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(inflation-1) > 1e-9 {
+		t.Fatalf("inflation = %v, want 1; cached tokens above the prefix belong to ExtraCachedRatio", inflation)
 	}
 }
