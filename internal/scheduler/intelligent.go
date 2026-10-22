@@ -3,6 +3,7 @@ package scheduler
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"math/bits"
 	"strings"
 	"sync"
 	"time"
@@ -79,8 +80,9 @@ type inflationCacheEntry struct {
 }
 
 type coverageCacheKey struct {
-	upstreamID int64
-	model      string
+	upstreamID   int64
+	model        string
+	prefixBucket int64
 }
 
 type coverageCacheEntry struct {
@@ -284,7 +286,7 @@ func (r *intelligentRouter) cache(item *upstream.Upstream, model string, feature
 	params := routing.CacheStateParams{
 		Supported:     true,
 		CacheMode:     string(cacheMode),
-		CoverageRatio: r.cacheCoverage(item.ID, model, now),
+		CoverageRatio: r.cacheCoverage(item.ID, model, features.ReusableInputTokens, now),
 		Protocol:      item.Protocol,
 	}
 	if observed {
@@ -355,9 +357,14 @@ func (r *intelligentRouter) lastKnownMultiplier(upstreamID int64) float64 {
 	return m
 }
 
-func (r *intelligentRouter) cacheCoverage(upstreamID int64, model string, now time.Time) float64 {
+func (r *intelligentRouter) cacheCoverage(upstreamID int64, model string, prefixTokens int64, now time.Time) float64 {
 	model = strings.TrimSpace(model)
-	key := coverageCacheKey{upstreamID: upstreamID, model: model}
+	// A 2x band is what the query uses, so one cache entry covers that band.
+	bucket := prefixTokens
+	if bucket > 1 {
+		bucket = 1 << (64 - bits.LeadingZeros64(uint64(bucket)))
+	}
+	key := coverageCacheKey{upstreamID: upstreamID, model: model, prefixBucket: bucket}
 	r.mu.Lock()
 	if r.coverage != nil {
 		if entry, ok := r.coverage[key]; ok && now.Before(entry.expires) {
@@ -366,7 +373,7 @@ func (r *intelligentRouter) cacheCoverage(upstreamID int64, model string, now ti
 		}
 	}
 	r.mu.Unlock()
-	ratio, err := r.store.CacheCoverageRatio(upstreamID, model)
+	ratio, err := r.store.CacheCoverageRatio(upstreamID, model, prefixTokens)
 	if err != nil || ratio <= 0 || ratio > 1 {
 		ratio = 1
 	}

@@ -99,27 +99,24 @@ type UpstreamRoutingStats struct {
 	P95DurationMs       int64   `json:"p95_duration_ms"`
 }
 
-// CacheCoverageRatio returns the average fraction of the reusable prefix that
-// was actually served from cache. input_tokens is the uncached new turn and is
-// excluded: rolling hits report both cached and cache_creation tokens, and
-// putting the new turn in the denominator made a fully cached prefix look
-// ~0.66 covered. The result is clamped to 1 because a prefix estimate can be
-// smaller than the provider's cached count.
 // cacheCoverageMinSamples is the smallest model-specific hit sample that is
 // trusted on its own. Below it the channel-wide ratio is used, so a new model
 // does not inherit a one-off hit or an empty result.
 const cacheCoverageMinSamples = 8
 
-// CacheCoverageRatio returns the average fraction of the reusable prefix that
-// was actually served from cache for this upstream and, when the sample is
-// large enough, this model. Half-cache and full-cache behaviour differs by
-// model on the same channel. input_tokens is the uncached new turn and is
-// excluded. The result is clamped to 1 because a prefix estimate can be
-// smaller than the provider's cached count.
-func (s *Store) CacheCoverageRatio(upstreamID int64, model string) (float64, error) {
+// CacheCoverageRatio returns the token-weighted fraction of the reusable prefix
+// served from cache, using hits whose prefix length is within 2x of
+// prefixTokens. The cached fraction moves with prefix length, so a ratio from
+// a much shorter or longer prompt must not be scaled onto this one. An empty
+// model or a model with fewer than cacheCoverageMinSamples comparable hits
+// falls back to the channel. The result is clamped to 1.
+func (s *Store) CacheCoverageRatio(upstreamID int64, model string, prefixTokens int64) (float64, error) {
 	model = strings.TrimSpace(model)
+	if prefixTokens < 1 {
+		prefixTokens = 1
+	}
 	if model != "" {
-		ratio, samples, err := s.cacheCoverageSample(upstreamID, model)
+		ratio, samples, err := s.cacheCoverageSample(upstreamID, model, prefixTokens)
 		if err != nil {
 			return 0, err
 		}
@@ -127,35 +124,39 @@ func (s *Store) CacheCoverageRatio(upstreamID int64, model string) (float64, err
 			return ratio, nil
 		}
 	}
-	ratio, _, err := s.cacheCoverageSample(upstreamID, "")
+	ratio, _, err := s.cacheCoverageSample(upstreamID, "", prefixTokens)
 	return ratio, err
 }
 
-func (s *Store) cacheCoverageSample(upstreamID int64, model string) (float64, int64, error) {
-	query := `SELECT AVG(CASE
-			WHEN CAST(cached_tokens AS REAL) / prefix_tokens > 1 THEN 1
-			ELSE CAST(cached_tokens AS REAL) / prefix_tokens
-		END), COUNT(*)
+func (s *Store) cacheCoverageSample(upstreamID int64, model string, prefixTokens int64) (float64, int64, error) {
+	low := prefixTokens / 2
+	if low < 1024 {
+		low = 1024
+	}
+	high := prefixTokens * 2
+	query := `SELECT SUM(cached_tokens), SUM(prefix_tokens), COUNT(*)
 		FROM (SELECT cached_tokens, prefix_tokens
 			FROM routing_observations
-			WHERE upstream_id=? AND success=TRUE AND cached_tokens > 0 AND prefix_tokens > 1024`
-	args := []any{upstreamID}
+			WHERE upstream_id=? AND success=TRUE AND cached_tokens > 0
+			  AND prefix_tokens >= ? AND prefix_tokens <= ?`
+	args := []any{upstreamID, low, high}
 	if model != "" {
 		query += ` AND model=?`
 		args = append(args, model)
 	}
 	query += `
 			ORDER BY observed_at DESC LIMIT 50) sub`
-	var ratio sql.NullFloat64
+	var cached, prefixes sql.NullFloat64
 	var samples int64
-	err := s.queryRow(query, args...).Scan(&ratio, &samples)
-	if err != nil || !ratio.Valid || ratio.Float64 <= 0 {
+	err := s.queryRow(query, args...).Scan(&cached, &prefixes, &samples)
+	if err != nil || !cached.Valid || !prefixes.Valid || prefixes.Float64 <= 0 {
 		return 0, samples, err
 	}
-	if ratio.Float64 > 1 {
+	ratio := cached.Float64 / prefixes.Float64
+	if ratio > 1 {
 		return 1, samples, nil
 	}
-	return ratio.Float64, samples, nil
+	return ratio, samples, nil
 }
 
 // TokenInflationFactor returns how many extra tokens an upstream bills beyond
