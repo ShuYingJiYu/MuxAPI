@@ -368,15 +368,16 @@ func (r *intelligentRouter) lastKnownMultiplier(upstreamID int64) float64 {
 	return m
 }
 
-// coverageBucket rounds a prefix down so every prefix in one bucket is within
-// about 1.25x of the others. A next-power-of-two bucket spans 2x, and the
-// query windows of its two ends barely overlap, so a ratio measured at one
-// end was reused for a prompt the query would not have sampled.
+// coverageBucket rounds a prefix down so every prefix in one bucket stays
+// within about 1.25x. Their [p/2, 2p] query windows then still overlap.
 func coverageBucket(prefix int64) int64 {
-	if prefix < 2048 {
-		return 2048
+	if prefix < 1 {
+		return 0
 	}
 	shift := bits.Len64(uint64(prefix)) - 3
+	if shift < 0 {
+		shift = 0
+	}
 	return int64(uint64(prefix) >> shift << shift)
 }
 
