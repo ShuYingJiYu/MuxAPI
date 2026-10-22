@@ -95,9 +95,16 @@ func EstimateWindowCost(features RequestFeatures, forecast TrafficForecast, pric
 	if coverage <= 0 || coverage > 1 || math.IsNaN(coverage) || math.IsInf(coverage, 0) {
 		coverage = 1
 	}
+	// InputInflation is deprecated upstream; provider-injected tokens are
+	// represented by ObservedInputTokens or by ExtraCachedRatio, never by
+	// scaling the whole request.
 	cacheable := prefix
-	cachedPortion := cacheable * coverage
-	uncachedPortion := cacheable - cachedPortion
+	extra := cache.ExtraCachedRatio
+	if extra < 0 || math.IsNaN(extra) || math.IsInf(extra, 0) {
+		extra = 0
+	}
+	cachedPortion := cacheable*coverage + prefix*extra
+	uncachedPortion := cacheable * (1 - coverage)
 	// Historical provider usage is more authoritative than assuming that the
 	// whole reusable prefix is written on every miss. Keep the values per
 	// request: cache reads and cache creations may coexist.
@@ -323,9 +330,16 @@ func breakEvenRequests(features RequestFeatures, forecast TrafficForecast, prici
 	if coverage <= 0 || coverage > 1 || math.IsNaN(coverage) || math.IsInf(coverage, 0) {
 		coverage = 1
 	}
+	// InputInflation is deprecated upstream; provider-injected tokens are
+	// represented by ObservedInputTokens or by ExtraCachedRatio, never by
+	// scaling the whole request.
 	cacheable := prefix
-	cachedPortion := cacheable * coverage
-	uncachedPortion := cacheable - cachedPortion
+	extra := cache.ExtraCachedRatio
+	if extra < 0 || math.IsNaN(extra) || math.IsInf(extra, 0) {
+		extra = 0
+	}
+	cachedPortion := cacheable*coverage + prefix*extra
+	uncachedPortion := cacheable * (1 - coverage)
 	readPortion := cachedPortion
 	writePortion := cachedPortion
 	if cache.ObservedCacheReadTokens > 0 && finite(cache.ObservedCacheReadTokens) {

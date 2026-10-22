@@ -172,8 +172,12 @@ type CacheProfile struct {
 	// CoverageRatio is the fraction of the reusable prefix that the upstream
 	// actually caches. Some proxied upstreams only cache ~77% of the prefix.
 	// 0 or 1 means assume full prefix is cached (the standard behavior).
-	CoverageRatio float64    `json:"coverage_ratio,omitempty"`
-	Existing      CacheEntry `json:"existing"`
+	CoverageRatio float64 `json:"coverage_ratio,omitempty"`
+	// ExtraCachedRatio is cached tokens beyond the router prefix estimate,
+	// as a fraction of that prefix. A short prompt can be reported as twice
+	// the estimate; clamping CoverageRatio to 1 would drop the surplus.
+	ExtraCachedRatio float64    `json:"extra_cached_ratio,omitempty"`
+	Existing         CacheEntry `json:"existing"`
 	// PreferredTTL is the adaptive TTL selected by the scheduler based on
 	// session behavior. When longer than the default 5min, the forwarder may
 	// inject cache_control hints into the upstream request.
