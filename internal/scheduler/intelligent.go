@@ -18,14 +18,16 @@ import (
 // caches reduce database work on the request hot path; PostgreSQL remains the
 // source of truth and the existing health manager supplies fast breaker state.
 type intelligentRouter struct {
-	store   *store.Store
-	config  func() routing.Config
-	mu      sync.Mutex
-	billing billingCacheEntry
-	prices  map[string]priceCacheEntry
-	stats   map[statsCacheKey]statsCacheEntry
-	prefix  map[prefixCacheKey]prefixCacheEntry
-	tokens  map[prefixCacheKey]tokenCacheEntry
+	store      *store.Store
+	config     func() routing.Config
+	mu         sync.Mutex
+	billing    billingCacheEntry
+	prices     map[string]priceCacheEntry
+	stats      map[statsCacheKey]statsCacheEntry
+	prefix     map[prefixCacheKey]prefixCacheEntry
+	tokens     map[prefixCacheKey]tokenCacheEntry
+	inflation  map[int64]inflationCacheEntry
+	modelCache map[modelCacheKey]modelCacheEntry
 }
 
 const (
@@ -76,6 +78,31 @@ type tokenCacheEntry struct {
 	value   store.CacheTokenAverages
 	err     error
 }
+
+type inflationCacheEntry struct {
+	expires time.Time
+	value   float64
+}
+
+type modelCacheKey struct {
+	upstreamID int64
+	model      string
+}
+
+type modelCacheEntry struct {
+	expires  time.Time
+	evidence store.ModelCacheEvidence
+	err      error
+}
+
+// modelCacheEvidenceWindow is long enough that a channel which never returns
+// cache usage for a model stops being priced as cache-capable, and short
+// enough that a provider which starts caching again is retried within a day.
+const modelCacheEvidenceWindow = 24 * time.Hour
+
+// modelCacheEvidenceMinSamples avoids declaring "no cache" from a handful of
+// successes. Below this the optimistic prior still applies.
+const modelCacheEvidenceMinSamples = int64(20)
 
 func (r *intelligentRouter) pick(s *Scheduler, groupID int64, model string, features routing.RequestFeatures, exclude map[int64]bool) (*upstream.Upstream, health.Lease, routing.Decision, error) {
 	all := s.list(groupID)
@@ -238,6 +265,12 @@ func (r *intelligentRouter) cache(item *upstream.Upstream, model string, feature
 	observed := err == nil
 	cacheObserved := observed && (stats.HitCount > 0 || stats.CreateCount > 0)
 	supported := cacheMode == upstream.CacheEnabled || cacheMode == upstream.CacheAuto || cacheObserved
+	if supported && cacheMode != upstream.CacheEnabled && !modelReturnsCache(r.modelCacheEvidence(item.ID, model, now)) {
+		// This model has enough recent successes and none of them reported
+		// cache usage. Price the channel as ordinary input so a cheaper
+		// no-cache tier cannot win on a stale hit rate from another model.
+		supported = false
+	}
 	if !supported {
 		return routing.CacheProfile{}
 	}
@@ -345,6 +378,58 @@ func (r *intelligentRouter) cacheTokens(apiKeyHash string, upstreamID int64, mod
 	r.tokens[key] = tokenCacheEntry{expires: now.Add(billingCacheTTL), value: value, err: err}
 	r.mu.Unlock()
 	return value
+}
+
+// modelReturnsCache is true unless the sample is large and uniformly
+// cache-free. A query error keeps the previous behaviour.
+func modelReturnsCache(evidence store.ModelCacheEvidence, err error) bool {
+	if err != nil {
+		return true
+	}
+	return evidence.Successes < modelCacheEvidenceMinSamples || evidence.CacheUses > 0
+}
+
+func (r *intelligentRouter) modelCacheEvidence(upstreamID int64, model string, now time.Time) (store.ModelCacheEvidence, error) {
+	model = strings.TrimSpace(model)
+	key := modelCacheKey{upstreamID: upstreamID, model: model}
+	r.mu.Lock()
+	if r.modelCache != nil {
+		if entry, ok := r.modelCache[key]; ok && now.Before(entry.expires) {
+			r.mu.Unlock()
+			return entry.evidence, entry.err
+		}
+	}
+	r.mu.Unlock()
+	evidence, err := r.store.RecentModelCacheEvidence(upstreamID, model, modelCacheEvidenceWindow, now)
+	r.mu.Lock()
+	if r.modelCache == nil {
+		r.modelCache = make(map[modelCacheKey]modelCacheEntry)
+	}
+	r.modelCache[key] = modelCacheEntry{expires: now.Add(routingCacheTTL), evidence: evidence, err: err}
+	r.mu.Unlock()
+	return evidence, err
+}
+
+func (r *intelligentRouter) tokenInflation(upstreamID int64, now time.Time) float64 {
+	r.mu.Lock()
+	if r.inflation != nil {
+		if entry, ok := r.inflation[upstreamID]; ok && now.Before(entry.expires) {
+			r.mu.Unlock()
+			return entry.value
+		}
+	}
+	r.mu.Unlock()
+	factor, _ := r.store.TokenInflationFactor(upstreamID)
+	if factor < 1 {
+		factor = 1
+	}
+	r.mu.Lock()
+	if r.inflation == nil {
+		r.inflation = make(map[int64]inflationCacheEntry)
+	}
+	r.inflation[upstreamID] = inflationCacheEntry{expires: now.Add(billingCacheTTL), value: factor}
+	r.mu.Unlock()
+	return factor
 }
 
 func (r *intelligentRouter) modelPricing(model string, now time.Time) (store.ModelPricing, error) {
