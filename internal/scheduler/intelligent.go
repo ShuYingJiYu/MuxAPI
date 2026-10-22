@@ -26,6 +26,7 @@ type intelligentRouter struct {
 	stats      map[statsCacheKey]statsCacheEntry
 	prefix     map[prefixCacheKey]prefixCacheEntry
 	inflation  map[int64]inflationCacheEntry
+	coverage   map[coverageCacheKey]coverageCacheEntry
 	modelCache map[modelCacheKey]modelCacheEntry
 }
 
@@ -73,6 +74,16 @@ type prefixCacheEntry struct {
 }
 
 type inflationCacheEntry struct {
+	expires time.Time
+	value   float64
+}
+
+type coverageCacheKey struct {
+	upstreamID int64
+	model      string
+}
+
+type coverageCacheEntry struct {
 	expires time.Time
 	value   float64
 }
@@ -273,7 +284,7 @@ func (r *intelligentRouter) cache(item *upstream.Upstream, model string, feature
 	params := routing.CacheStateParams{
 		Supported:     true,
 		CacheMode:     string(cacheMode),
-		CoverageRatio: r.cacheCoverage(item.ID),
+		CoverageRatio: r.cacheCoverage(item.ID, model, now),
 		Protocol:      item.Protocol,
 	}
 	if observed {
@@ -344,11 +355,27 @@ func (r *intelligentRouter) lastKnownMultiplier(upstreamID int64) float64 {
 	return m
 }
 
-func (r *intelligentRouter) cacheCoverage(upstreamID int64) float64 {
-	ratio, _ := r.store.CacheCoverageRatio(upstreamID)
-	if ratio <= 0 || ratio > 1 {
-		return 1
+func (r *intelligentRouter) cacheCoverage(upstreamID int64, model string, now time.Time) float64 {
+	model = strings.TrimSpace(model)
+	key := coverageCacheKey{upstreamID: upstreamID, model: model}
+	r.mu.Lock()
+	if r.coverage != nil {
+		if entry, ok := r.coverage[key]; ok && now.Before(entry.expires) {
+			r.mu.Unlock()
+			return entry.value
+		}
 	}
+	r.mu.Unlock()
+	ratio, err := r.store.CacheCoverageRatio(upstreamID, model)
+	if err != nil || ratio <= 0 || ratio > 1 {
+		ratio = 1
+	}
+	r.mu.Lock()
+	if r.coverage == nil {
+		r.coverage = make(map[coverageCacheKey]coverageCacheEntry)
+	}
+	r.coverage[key] = coverageCacheEntry{expires: now.Add(billingCacheTTL), value: ratio}
+	r.mu.Unlock()
 	return ratio
 }
 
