@@ -120,8 +120,12 @@ func EstimateWindowCost(features RequestFeatures, forecast TrafficForecast, pric
 	// cacheable tokens = reusable prefix + upstream-injected inflation. Both are
 	// stable across the session and share the provider cache lifecycle.
 	cacheable := prefix + inflationTokens
-	cachedPortion := cacheable * coverage
-	uncachedPortion := cacheable - cachedPortion
+	extra := cache.ExtraCachedRatio
+	if extra < 0 || math.IsNaN(extra) || math.IsInf(extra, 0) {
+		extra = 0
+	}
+	cachedPortion := cacheable*coverage + prefix*extra
+	uncachedPortion := cacheable * (1 - coverage)
 	// true suffix = the newly appended user turn, never cacheable.
 	suffix := float64(originalInputTokens) - prefix
 	if suffix < 0 {
@@ -341,8 +345,12 @@ func breakEvenRequests(features RequestFeatures, forecast TrafficForecast, prici
 		coverage = 1
 	}
 	cacheable := prefix + inflationTokens
-	cachedPortion := cacheable * coverage
-	uncachedPortion := cacheable - cachedPortion
+	extra := cache.ExtraCachedRatio
+	if extra < 0 || math.IsNaN(extra) || math.IsInf(extra, 0) {
+		extra = 0
+	}
+	cachedPortion := cacheable*coverage + prefix*extra
+	uncachedPortion := cacheable * (1 - coverage)
 	input := pricing.InputPerToken * multiplier
 	out := forecast.OutputTokensPerReq * pricing.OutputPerToken * multiplier
 	suffix := float64(originalInputTokens) - prefix

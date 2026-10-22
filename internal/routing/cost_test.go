@@ -255,3 +255,25 @@ func TestEstimateWindowCostTrueSuffixStillFullPrice(t *testing.T) {
 		t.Fatalf("CacheWriteCost=%.6f want 0.953125", cost.CacheWriteCost)
 	}
 }
+
+func TestEstimateWindowCostKeepsCacheSurplus(t *testing.T) {
+	features := RequestFeatures{InputTokens: 10_000, ReusableInputTokens: 10_000, EstimatedOutputTokens: 0}
+	price := Pricing{
+		InputPerToken: 5e-6, OutputPerToken: 25e-6,
+		CacheReadPerToken: 5e-7, CacheWritePerToken: 6.25e-6,
+		InputKnown: true, OutputKnown: true, CacheReadKnown: true, CacheWriteKnown: true,
+		Multiplier: 1,
+	}
+	cache := CacheProfile{
+		Supported: true, TTL: 5 * time.Minute,
+		HitRate: 1, HitRateSource: HitRateObserved,
+		CoverageRatio: 1, ExtraCachedRatio: 1,
+		Existing: CacheEntry{Valid: true, ExpiresAt: time.Now().Add(time.Hour)},
+	}
+	cost := EstimateWindowCost(features, TrafficForecast{Requests: 1, Window: 5 * time.Minute}, price, cache, time.Now(), 5*time.Minute)
+	// The provider cached twice the estimate. The surplus stays on the cache
+	// read price instead of disappearing when coverage is clamped to 1.
+	if math.Abs(cost.CacheReadCost-0.01) > 1e-9 {
+		t.Fatalf("CacheReadCost = %v, want 0.01", cost.CacheReadCost)
+	}
+}
