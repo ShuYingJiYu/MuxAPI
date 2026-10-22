@@ -267,7 +267,7 @@ func TestCachePricingStatsIgnoreNewTurnAndAbsentCache(t *testing.T) {
 		}
 	}
 
-	coverage, err := st.CacheCoverageRatio(26, "claude-opus-5")
+	coverage, err := st.CacheCoverageRatio(26, "claude-opus-5", 100_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,14 +320,14 @@ func TestCacheCoverageRatioSplitsByModel(t *testing.T) {
 	if err := st.SaveRoutingObservations(observations); err != nil {
 		t.Fatal(err)
 	}
-	full, err := st.CacheCoverageRatio(51, "claude-opus-5-5")
+	full, err := st.CacheCoverageRatio(51, "claude-opus-5-5", 100_000)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if math.Abs(full-1) > 1e-9 {
 		t.Fatalf("full-cache model coverage = %v, want 1", full)
 	}
-	half, err := st.CacheCoverageRatio(51, "claude-sonnet-5")
+	half, err := st.CacheCoverageRatio(51, "claude-sonnet-5", 100_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,11 +336,50 @@ func TestCacheCoverageRatioSplitsByModel(t *testing.T) {
 	}
 	// One hit is below the model sample floor, so an unseen model uses the
 	// channel blend: eight full hits and eight 0.2 hits average to 0.6.
-	fallback, err := st.CacheCoverageRatio(51, "claude-new")
+	fallback, err := st.CacheCoverageRatio(51, "claude-new", 100_000)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if math.Abs(fallback-0.6) > 1e-9 {
 		t.Fatalf("fallback coverage = %v, want 0.6", fallback)
+	}
+}
+
+func TestCacheCoverageRatioFollowsPrefixLength(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "coverage-by-length.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().Truncate(time.Second)
+	var observations []RoutingObservationRecord
+	for i := 0; i < 8; i++ {
+		observations = append(observations,
+			// Short prompts: a fixed 20k window is the whole prefix.
+			RoutingObservationRecord{RequestID: "short-" + strconv.Itoa(i), UpstreamID: 51, APIKeyHash: "k",
+				Model: "claude-opus-5-5", PrefixTokens: 20_000, CachedTokens: 20_000,
+				CacheHit: true, Success: true, ObservedAt: now.Add(-time.Duration(i+1) * time.Minute)},
+			// Long prompts: the same channel only covers 40k of a 160k prefix.
+			RoutingObservationRecord{RequestID: "long-" + strconv.Itoa(i), UpstreamID: 51, APIKeyHash: "k",
+				Model: "claude-opus-5-5", PrefixTokens: 160_000, CachedTokens: 40_000,
+				CacheHit: true, Success: true, ObservedAt: now.Add(-time.Duration(i+1) * time.Minute)},
+		)
+	}
+	if err := st.SaveRoutingObservations(observations); err != nil {
+		t.Fatal(err)
+	}
+	short, err := st.CacheCoverageRatio(51, "claude-opus-5-5", 24_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(short-1) > 1e-9 {
+		t.Fatalf("short prefix coverage = %v, want 1", short)
+	}
+	long, err := st.CacheCoverageRatio(51, "claude-opus-5-5", 150_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(long-0.25) > 1e-9 {
+		t.Fatalf("long prefix coverage = %v, want 0.25", long)
 	}
 }
