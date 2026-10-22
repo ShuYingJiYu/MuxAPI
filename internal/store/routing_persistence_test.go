@@ -382,4 +382,24 @@ func TestCacheCoverageRatioFollowsPrefixLength(t *testing.T) {
 	if math.Abs(long-0.25) > 1e-9 {
 		t.Fatalf("long prefix coverage = %v, want 0.25", long)
 	}
+	// Eight hits where the provider cached twice the router estimate. The
+	// surplus is returned rather than clamped, so the caller can price it.
+	var surplus []RoutingObservationRecord
+	for i := 0; i < 8; i++ {
+		surplus = append(surplus, RoutingObservationRecord{
+			RequestID: "surplus-" + strconv.Itoa(i), UpstreamID: 52, APIKeyHash: "k",
+			Model: "claude-opus-5-5", PrefixTokens: 10_000, CachedTokens: 20_000,
+			CacheHit: true, Success: true, ObservedAt: now.Add(-time.Duration(i+1) * time.Minute),
+		})
+	}
+	if err := st.SaveRoutingObservations(surplus); err != nil {
+		t.Fatal(err)
+	}
+	over, err := st.CacheCoverageRatio(52, "claude-opus-5-5", 10_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(over-2) > 1e-9 {
+		t.Fatalf("surplus coverage = %v, want 2", over)
+	}
 }

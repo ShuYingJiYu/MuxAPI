@@ -111,7 +111,9 @@ const cacheCoverageMinSamples = 8
 // prefixTokens. The cached fraction moves with prefix length, so a ratio from
 // a much shorter or longer prompt must not be scaled onto this one. An empty
 // model or a model with fewer than cacheCoverageMinSamples comparable hits
-// falls back to the channel. The result is clamped to 1.
+// falls back to the channel. The ratio is not clamped: a value above 1 means
+// the provider cached more tokens than the router estimated, and the caller
+// prices that surplus separately.
 func (s *Store) CacheCoverageRatio(upstreamID int64, model string, prefixTokens int64) (float64, error) {
 	model = strings.TrimSpace(model)
 	if prefixTokens < 1 {
@@ -154,11 +156,7 @@ func (s *Store) cacheCoverageSample(upstreamID int64, model string, prefixTokens
 	if err != nil || !cached.Valid || !prefixes.Valid || prefixes.Float64 <= 0 {
 		return 0, samples, err
 	}
-	ratio := cached.Float64 / prefixes.Float64
-	if ratio > 1 {
-		return 1, samples, nil
-	}
-	return ratio, samples, nil
+	return cached.Float64 / prefixes.Float64, samples, nil
 }
 
 // CacheTokenAverages contains provider-reported token counts for recent

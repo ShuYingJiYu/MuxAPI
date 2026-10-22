@@ -94,7 +94,8 @@ type coverageCacheKey struct {
 
 type coverageCacheEntry struct {
 	expires time.Time
-	value   float64
+	covered float64
+	extra   float64
 }
 
 type modelCacheKey struct {
@@ -291,7 +292,7 @@ func (r *intelligentRouter) cache(item *upstream.Upstream, model string, feature
 	params := routing.CacheStateParams{
 		Supported:     true,
 		CacheMode:     string(cacheMode),
-		CoverageRatio: r.cacheCoverage(item.ID, model, features.ReusableInputTokens, now),
+		CoverageRatio: 1,
 		Protocol:      item.Protocol,
 	}
 	if observed {
@@ -313,6 +314,8 @@ func (r *intelligentRouter) cache(item *upstream.Upstream, model string, feature
 	profile.ObservedCacheReadTokens = usage.CacheReadTokens
 	profile.ObservedCacheWriteTokens = usage.CacheWriteTokens
 	profile.ObservedCacheCreateRate = usage.CreateRate
+	profile.InputInflation = r.tokenInflation(item.ID, now)
+	profile.CoverageRatio, profile.ExtraCachedRatio = r.cacheCoverage(item.ID, model, features.ReusableInputTokens, now)
 	return profile
 }
 
@@ -365,33 +368,45 @@ func (r *intelligentRouter) lastKnownMultiplier(upstreamID int64) float64 {
 	return m
 }
 
-func (r *intelligentRouter) cacheCoverage(upstreamID int64, model string, prefixTokens int64, now time.Time) float64 {
-	model = strings.TrimSpace(model)
-	// A 2x band is what the query uses, so one cache entry covers that band.
-	bucket := prefixTokens
-	if bucket > 1 {
-		bucket = 1 << (64 - bits.LeadingZeros64(uint64(bucket)))
+// coverageBucket rounds a prefix down so every prefix in one bucket is within
+// about 1.25x of the others. A next-power-of-two bucket spans 2x, and the
+// query windows of its two ends barely overlap, so a ratio measured at one
+// end was reused for a prompt the query would not have sampled.
+func coverageBucket(prefix int64) int64 {
+	if prefix < 2048 {
+		return 2048
 	}
-	key := coverageCacheKey{upstreamID: upstreamID, model: model, prefixBucket: bucket}
+	shift := bits.Len64(uint64(prefix)) - 3
+	return int64(uint64(prefix) >> shift << shift)
+}
+
+func (r *intelligentRouter) cacheCoverage(upstreamID int64, model string, prefixTokens int64, now time.Time) (covered float64, extra float64) {
+	model = strings.TrimSpace(model)
+	key := coverageCacheKey{upstreamID: upstreamID, model: model, prefixBucket: coverageBucket(prefixTokens)}
 	r.mu.Lock()
 	if r.coverage != nil {
 		if entry, ok := r.coverage[key]; ok && now.Before(entry.expires) {
 			r.mu.Unlock()
-			return entry.value
+			return entry.covered, entry.extra
 		}
 	}
 	r.mu.Unlock()
 	ratio, err := r.store.CacheCoverageRatio(upstreamID, model, prefixTokens)
-	if err != nil || ratio <= 0 || ratio > 1 {
-		ratio = 1
+	covered, extra = 1, 0
+	if err == nil && ratio > 0 {
+		covered = ratio
+		if covered > 1 {
+			extra = covered - 1
+			covered = 1
+		}
 	}
 	r.mu.Lock()
 	if r.coverage == nil {
 		r.coverage = make(map[coverageCacheKey]coverageCacheEntry)
 	}
-	r.coverage[key] = coverageCacheEntry{expires: now.Add(billingCacheTTL), value: ratio}
+	r.coverage[key] = coverageCacheEntry{expires: now.Add(routingCacheTTL), covered: covered, extra: extra}
 	r.mu.Unlock()
-	return ratio
+	return covered, extra
 }
 
 func (r *intelligentRouter) cacheTokens(apiKeyHash string, upstreamID int64, model, prefixHash string, now time.Time) store.CacheTokenAverages {

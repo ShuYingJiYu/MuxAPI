@@ -46,3 +46,15 @@ func TestModelReturnsCache(t *testing.T) {
 		})
 	}
 }
+
+func TestCoverageBucketStaysInsideQueryBand(t *testing.T) {
+	for prefix := int64(2048); prefix <= 300_000; prefix += 1024 {
+		b := coverageBucket(prefix)
+		if prefix < b || prefix >= b+b/4 {
+			t.Fatalf("prefix %d bucket %d is wider than 1.25x", prefix, b)
+		}
+	}
+	if coverageBucket(1000) != 2048 {
+		t.Fatalf("short prefix bucket = %d", coverageBucket(1000))
+	}
+}
