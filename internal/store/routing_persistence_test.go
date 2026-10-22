@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -237,5 +239,70 @@ func TestAssumedCacheTTL(t *testing.T) {
 	// No observations → 5min default.
 	if got := AssumedCacheTTL("claude", 0, 0, 0, now); got != 5*time.Minute {
 		t.Fatalf("empty → %v want 5min", got)
+	}
+}
+
+func TestCachePricingStatsIgnoreNewTurnAndAbsentCache(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "cache-pricing.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().Truncate(time.Second)
+	// A rolling hit: the prefix is fully cached, the new turn is uncached,
+	// and a small rolling write lands in the same response. The old formulas
+	// counted the new turn as uncovered prefix and as permanent inflation.
+	observations := []RoutingObservationRecord{
+		{RequestID: "price-1", UpstreamID: 26, APIKeyHash: "key-a", Model: "claude-opus-5",
+			SessionKey: "s", PrefixHash: "p1", PrefixTokens: 100_000, InputTokens: 40_000,
+			CachedTokens: 100_000, CacheCreationTokens: 3_000,
+			CacheEligible: true, CacheHit: true, CacheCreated: true, Success: true,
+			ObservedAt: now.Add(-time.Minute)},
+		{RequestID: "price-2", UpstreamID: 24, APIKeyHash: "key-b", Model: "claude-opus-5",
+			SessionKey: "s", PrefixHash: "p2", PrefixTokens: 100_000, InputTokens: 40_000,
+			Success: true, ObservedAt: now.Add(-time.Minute)},
+	}
+	if err := st.SaveRoutingObservations(observations); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		if err := st.SaveRoutingObservation(RoutingObservationRecord{
+			RequestID: "nocache-" + strconv.Itoa(i), UpstreamID: 24, APIKeyHash: "key-b",
+			Model: "claude-opus-5", PrefixTokens: 100_000, InputTokens: 1_000, Success: true,
+			ObservedAt: now.Add(-time.Duration(i+1) * time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	coverage, err := st.CacheCoverageRatio(26)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(coverage-1) > 1e-9 {
+		t.Fatalf("coverage = %v, want 1 (cached prefix / prefix, clamped)", coverage)
+	}
+	inflation, err := st.TokenInflationFactor(26)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// (100k cached + 40k new turn + 3k write) / (100k prefix + 40k new turn) = 1.0214
+	if math.Abs(inflation-143_000.0/140_000.0) > 1e-9 {
+		t.Fatalf("inflation = %v, want %v", inflation, 143_000.0/140_000.0)
+	}
+
+	absent, err := st.RecentModelCacheEvidence(24, "claude-opus-5", 24*time.Hour, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if absent.Successes != 21 || absent.CacheUses != 0 {
+		t.Fatalf("no-cache model evidence: %+v", absent)
+	}
+	present, err := st.RecentModelCacheEvidence(26, "claude-opus-5", 24*time.Hour, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if present.Successes != 1 || present.CacheUses != 1 {
+		t.Fatalf("cache model evidence: %+v", present)
 	}
 }

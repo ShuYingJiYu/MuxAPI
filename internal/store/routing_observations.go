@@ -101,24 +101,29 @@ type UpstreamRoutingStats struct {
 	P95DurationMs       int64   `json:"p95_duration_ms"`
 }
 
-// CacheCoverageRatio returns the average fraction of tokens that were actually
-// cached (cached_tokens / total_tokens) for an upstream. This accounts for
-// proxied upstreams that only cache a portion of the prefix.
+// CacheCoverageRatio returns the average fraction of the reusable prefix that
+// was actually served from cache. input_tokens is the uncached new turn and is
+// excluded: rolling hits report both cached and cache_creation tokens, and
+// putting the new turn in the denominator made a fully cached prefix look
+// ~0.66 covered. The result is clamped to 1 because a prefix estimate can be
+// smaller than the provider's cached count.
 func (s *Store) CacheCoverageRatio(upstreamID int64) (float64, error) {
-	var ratio float64
-	err := s.queryRow(`SELECT AVG(CAST(cached_tokens AS REAL) / NULLIF(total_tokens, 0))
-		FROM (SELECT a.cached_tokens,
-			CASE WHEN a.input_tokens_normalized OR LOWER(COALESCE(a.protocol,u.protocol,'')) IN ('claude','anthropic','messages','anthropic-messages')
-				THEN a.cached_tokens+a.input_tokens+a.cache_creation_tokens
-				WHEN LOWER(COALESCE(a.protocol,u.protocol,'')) IN ('openai','chat','chat_completions','chat-completions','openai-response','openai_responses','responses','codex','gemini','google','generativelanguage','generatecontent')
-				THEN a.input_tokens+a.cache_creation_tokens ELSE a.input_tokens+a.cached_tokens+a.cache_creation_tokens END AS total_tokens
-			FROM request_attempts a LEFT JOIN upstreams u ON u.id=a.upstream_id
-			WHERE a.upstream_id=? AND a.status=200 AND a.cached_tokens > 0
-			ORDER BY a.id DESC LIMIT 50) sub`, upstreamID).Scan(&ratio)
-	if err != nil {
+	var ratio sql.NullFloat64
+	err := s.queryRow(`SELECT AVG(CASE
+			WHEN CAST(cached_tokens AS REAL) / prefix_tokens > 1 THEN 1
+			ELSE CAST(cached_tokens AS REAL) / prefix_tokens
+		END)
+		FROM (SELECT cached_tokens, prefix_tokens
+			FROM routing_observations
+			WHERE upstream_id=? AND success=TRUE AND cached_tokens > 0 AND prefix_tokens > 1024
+			ORDER BY observed_at DESC LIMIT 50) sub`, upstreamID).Scan(&ratio)
+	if err != nil || !ratio.Valid || ratio.Float64 <= 0 {
 		return 0, err
 	}
-	return ratio, nil
+	if ratio.Float64 > 1 {
+		return 1, nil
+	}
+	return ratio.Float64, nil
 }
 
 // CacheTokenAverages contains provider-reported token counts for recent
@@ -186,31 +191,60 @@ func (s *Store) cacheTokenAveragesByModel(apiKeyHash string, upstreamID int64, m
 	return out, err
 }
 
-// TokenInflationFactor is retained for compatibility with callers that used
-// the old diagnostic. It is no longer used by routing because multiplying the
-// whole request by this ratio confuses provider-injected input with cache
-// creation and can overstate a forecast by several times.
+// TokenInflationFactor returns how many extra tokens an upstream bills beyond
+// the router-visible input (prefix + new turn). Only the surplus is inflation:
+// the new turn is already in the denominator, so a rolling cache write cannot
+// masquerade as a stable injected system prompt. Values at or below 1 mean
+// "no inflation".
 func (s *Store) TokenInflationFactor(upstreamID int64) (float64, error) {
-	var factor float64
-	err := s.queryRow(`SELECT AVG(CAST(context_tokens AS REAL) / prefix_tokens)
-		FROM (SELECT ro.prefix_tokens,
-			CASE WHEN ro.input_tokens_normalized OR LOWER(COALESCE(NULLIF(a.protocol,''),NULLIF(u.protocol,''),rd.protocol,'')) IN ('claude','anthropic','messages','anthropic-messages')
-				THEN ro.input_tokens+ro.cached_tokens+ro.cache_creation_tokens
-				WHEN LOWER(COALESCE(NULLIF(a.protocol,''),NULLIF(u.protocol,''),rd.protocol,'')) IN ('openai','chat','chat_completions','chat-completions','openai-response','openai_responses','responses','codex','gemini','google','generativelanguage','generatecontent')
-				THEN ro.input_tokens+ro.cache_creation_tokens ELSE ro.input_tokens+ro.cached_tokens+ro.cache_creation_tokens END AS context_tokens
-			FROM routing_observations ro
-			LEFT JOIN request_attempts a ON a.request_id=ro.request_id AND a.attempt_no=ro.attempt_no
-			LEFT JOIN upstreams u ON u.id=ro.upstream_id
-			LEFT JOIN route_decisions rd ON rd.request_id=ro.request_id
-			WHERE ro.upstream_id=? AND ro.prefix_tokens > 1024 AND (ro.cached_tokens > 0 OR ro.cache_creation_tokens > 0)
-			ORDER BY ro.observed_at DESC LIMIT 50) sub`, upstreamID).Scan(&factor)
-	if err != nil {
+	var factor sql.NullFloat64
+	err := s.queryRow(`SELECT AVG(CAST(input_tokens + cached_tokens + cache_creation_tokens AS REAL)
+			/ (prefix_tokens + input_tokens))
+		FROM (SELECT input_tokens, cached_tokens, cache_creation_tokens, prefix_tokens
+			FROM routing_observations
+			WHERE upstream_id=? AND success=TRUE AND prefix_tokens > 1024
+			  AND (cached_tokens > 0 OR cache_creation_tokens > 0)
+			  AND prefix_tokens + input_tokens > 0
+			ORDER BY observed_at DESC LIMIT 50) sub`, upstreamID).Scan(&factor)
+	if err != nil || !factor.Valid {
 		return 1, err
 	}
-	if factor < 1 {
+	if factor.Float64 < 1 {
 		return 1, nil
 	}
-	return factor, nil
+	return factor.Float64, nil
+}
+
+// ModelCacheEvidence is whether recent successful attempts for one upstream
+// and model returned any prompt-cache usage.
+type ModelCacheEvidence struct {
+	Successes int64
+	CacheUses int64
+}
+
+// RecentModelCacheEvidence counts successful observations for this upstream
+// and model inside the window. CacheUses counts those that reported a cache
+// read or a cache write. A large Successes with CacheUses == 0 means the
+// channel does not cache this model, even if cache_mode is auto because some
+// other model once did.
+func (s *Store) RecentModelCacheEvidence(upstreamID int64, model string, window time.Duration, now time.Time) (ModelCacheEvidence, error) {
+	var evidence ModelCacheEvidence
+	model = strings.TrimSpace(model)
+	if upstreamID == 0 || model == "" {
+		return evidence, nil
+	}
+	if window <= 0 {
+		window = 24 * time.Hour
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	err := s.queryRow(`SELECT COUNT(*),
+		COALESCE(SUM(CASE WHEN cached_tokens > 0 OR cache_creation_tokens > 0 THEN 1 ELSE 0 END), 0)
+		FROM routing_observations
+		WHERE upstream_id=? AND model=? AND success=TRUE AND observed_at>=? AND observed_at<?`,
+		upstreamID, model, s.timeValue(now.Add(-window)), s.timeValue(now)).Scan(&evidence.Successes, &evidence.CacheUses)
+	return evidence, err
 }
 
 // UpstreamTokenInflationStats is a recent, weighted comparison between the
