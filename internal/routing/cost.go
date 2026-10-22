@@ -149,7 +149,7 @@ func EstimateWindowCost(features RequestFeatures, forecast TrafficForecast, pric
 		result.Confidence = 0.5
 	}
 
-	noCacheInputTokens := float64(features.InputTokens)
+	noCacheInputTokens := float64(features.InputTokens) + prefix*extra
 	if observedUsage {
 		// Ordinary input would resend the complete provider prompt. Include
 		// cache-read and cache-create portions in that baseline; omitting them
@@ -366,7 +366,7 @@ func breakEvenRequests(features RequestFeatures, forecast TrafficForecast, prici
 	if suffix < 0 {
 		suffix = 0
 	}
-	noCacheInputTokens := float64(features.InputTokens)
+	noCacheInputTokens := float64(features.InputTokens) + prefix*extra
 	if observedUsage {
 		noCacheInputTokens = cache.ObservedInputTokens + cache.ObservedCacheReadTokens + cache.ObservedCacheWriteTokens
 	}

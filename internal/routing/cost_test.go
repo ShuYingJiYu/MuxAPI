@@ -173,4 +173,9 @@ func TestEstimateWindowCostKeepsCacheSurplus(t *testing.T) {
 	if math.Abs(cost.CacheReadCost-0.01) > 1e-9 {
 		t.Fatalf("CacheReadCost = %v, want 0.01", cost.CacheReadCost)
 	}
+	// The same surplus is in the ordinary-input baseline once, not dropped
+	// and not added a second time through inflation.
+	if math.Abs(cost.NoCacheInputCost-0.1) > 1e-9 {
+		t.Fatalf("NoCacheInputCost = %v, want 0.1", cost.NoCacheInputCost)
+	}
 }
