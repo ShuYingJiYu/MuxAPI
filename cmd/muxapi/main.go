@@ -40,6 +40,11 @@ func main() {
 		return
 	}
 	cfg := config.Load()
+	// 在连接数据库或执行迁移前验证安全来源配置。
+	if err := (&server.Server{}).SetTrustedProxies(cfg.TrustedProxies); err != nil {
+		slog.Error("invalid MUXAPI_TRUSTED_PROXIES", "err", err)
+		return
+	}
 	if cfg.AdminToken == "" {
 		slog.Warn("MUXAPI_TOKEN 未设置：管理后台无鉴权，切勿对外暴露")
 	}
@@ -264,6 +269,10 @@ func main() {
 	maxBodyValue.Store(maxBodyBytes())
 	srv := server.New(fwd, cfg.AdminToken, st, hm, mon, monProber, maxBodyValue.Load())
 	srv.SetReadOnly(cfg.ReadOnly)
+	if err := srv.SetTrustedProxies(cfg.TrustedProxies); err != nil {
+		slog.Error("invalid MUXAPI_TRUSTED_PROXIES", "err", err)
+		return
+	}
 	srv.SetVersion(Version)
 	updateSvc := update.New(Version, update.HealthURL(cfg.Addr))
 	srv.SetUpdateService(updateSvc)
@@ -357,6 +366,18 @@ func runLogJanitor(ctx context.Context, st *store.Store, keepDays, probeKeepHour
 		maxBatches   = 10
 	)
 	prune := func() {
+		for batch := 0; batch < maxBatches; batch++ {
+			cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			deleted, err := st.PruneSecurityLogs(cleanupCtx)
+			cancel()
+			if err != nil {
+				slog.Error("security log janitor failed", "err", err)
+				break
+			}
+			if deleted < requestBatch {
+				break
+			}
+		}
 		days := keepDays()
 		if days > 0 {
 			for batch := 0; batch < maxBatches; batch++ {

@@ -359,7 +359,14 @@ func (s *Store) Delete(id int64) error {
 }
 
 func (s *Store) Close() error {
-	s.closeOnce.Do(func() { close(s.requestQueue) })
+	s.closeOnce.Do(func() {
+		close(s.requestQueue)
+		s.securityMu.Lock()
+		s.securityClosed = true
+		close(s.securityQueue)
+		s.securityMu.Unlock()
+	})
 	<-s.requestDone
+	<-s.securityDone
 	return s.sqlDB.Close()
 }

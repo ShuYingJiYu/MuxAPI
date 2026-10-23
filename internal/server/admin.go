@@ -20,6 +20,8 @@ var errBadMonitor = errors.New("monitor requires upstream_id and model")
 // 所有 admin 端点都是非流式 JSON，可以安全 gzip。
 func (s *Server) registerAdmin(mux *http.ServeMux) {
 	admin := func(h http.HandlerFunc) http.HandlerFunc { return gzipMiddleware(s.auth(h)) }
+	mux.HandleFunc("/admin/auth", admin(s.adminAuth))
+	mux.HandleFunc("/admin/security-logs", admin(s.adminSecurityLogs))
 	mux.HandleFunc("/admin/upstreams", admin(s.adminUpstreams))            // GET 全局池 / POST 新增
 	mux.HandleFunc("/admin/upstreams/", admin(s.adminUpstreamItem))        // PUT 改 / DELETE 删
 	mux.HandleFunc("/admin/tags", admin(s.adminTags))                      // GET 列表 / POST 新增

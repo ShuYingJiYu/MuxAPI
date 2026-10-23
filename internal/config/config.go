@@ -33,28 +33,30 @@ func loadDotEnv(path string) {
 
 // Config 全局配置，从环境变量加载（可选 .env 文件提供默认值）
 type Config struct {
-	Addr          string        // 监听地址
-	DatabaseURL   string        // PostgreSQL 连接串
-	AdminToken    string        // 接入层鉴权 token（sub2api upstream key）
-	ReadOnly      bool          // 只读调试模式：不迁移、不写库、不启动后台写任务
-	FailThreshold int           // 一分钟窗口内渠道级失败达到多少次熔断
-	Cooldown      time.Duration // 熔断冷却时长
-	MaxRetries    int           // 单次下游请求最多尝试的上游数
-	MaxBody       int64         // 请求体最大字节数（防 DoS），默认 32MB
-	ModelAliases  string        // 模型别名映射 "from=to,from=to"，转发前重写模型名
+	Addr           string        // 监听地址
+	DatabaseURL    string        // PostgreSQL 连接串
+	AdminToken     string        // 接入层鉴权 token（sub2api upstream key）
+	ReadOnly       bool          // 只读调试模式：不迁移、不写库、不启动后台写任务
+	TrustedProxies string        // 安全日志来源解析所信任的反向代理 IP/CIDR
+	FailThreshold  int           // 一分钟窗口内渠道级失败达到多少次熔断
+	Cooldown       time.Duration // 熔断冷却时长
+	MaxRetries     int           // 单次下游请求最多尝试的上游数
+	MaxBody        int64         // 请求体最大字节数（防 DoS），默认 32MB
+	ModelAliases   string        // 模型别名映射 "from=to,from=to"，转发前重写模型名
 }
 
 // Load 返回带默认值的启动配置；同名系统环境变量优先于 .env。
 func Load() *Config {
 	loadDotEnv(".env")
 	return &Config{
-		Addr:          env("MUXAPI_ADDR", ":8080"),
-		DatabaseURL:   env("MUXAPI_DATABASE_URL", ""),
-		AdminToken:    env("MUXAPI_TOKEN", ""),
-		ReadOnly:      envBool("MUXAPI_READ_ONLY", false),
-		FailThreshold: envInt("MUXAPI_FAIL_THRESHOLD", 3),
-		Cooldown:      envDur("MUXAPI_COOLDOWN", 30*time.Second),
-		MaxRetries:    envInt("MUXAPI_MAX_RETRIES", 6),
+		Addr:           env("MUXAPI_ADDR", ":8080"),
+		DatabaseURL:    env("MUXAPI_DATABASE_URL", ""),
+		AdminToken:     env("MUXAPI_TOKEN", ""),
+		ReadOnly:       envBool("MUXAPI_READ_ONLY", false),
+		TrustedProxies: env("MUXAPI_TRUSTED_PROXIES", ""),
+		FailThreshold:  envInt("MUXAPI_FAIL_THRESHOLD", 3),
+		Cooldown:       envDur("MUXAPI_COOLDOWN", 30*time.Second),
+		MaxRetries:     envInt("MUXAPI_MAX_RETRIES", 6),
 		// 请求体上限：防 io.ReadAll 无限读导致 OOM/DoS。默认 32MB，单位字节。
 		MaxBody:      envInt64("MUXAPI_MAX_BODY", 32<<20),
 		ModelAliases: env("MUXAPI_MODEL_ALIASES", ""),

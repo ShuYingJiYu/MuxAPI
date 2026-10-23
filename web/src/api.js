@@ -31,9 +31,9 @@ function timedAbortSignal(externalSignal, timeoutMs) {
   }
 }
 
-async function req(method, path, body, timeoutMs = REQUEST_TIMEOUT_MS, externalSignal) {
+async function req(method, path, body, timeoutMs = REQUEST_TIMEOUT_MS, externalSignal, tokenOverride) {
   const headers = { 'Content-Type': 'application/json' }
-  const t = token()
+  const t = tokenOverride ?? token()
   if (t) headers.Authorization = 'Bearer ' + t
   const requestControl = timedAbortSignal(externalSignal, timeoutMs)
   try {
@@ -170,6 +170,8 @@ export const api = {
   getToken: token,
   setToken: t => localStorage.setItem('muxapi_token', t),
   clearToken: () => localStorage.removeItem('muxapi_token'),
+  verifyLogin: (value, restore = false) => req(restore ? 'GET' : 'POST', '/auth', undefined, REQUEST_TIMEOUT_MS, undefined, value),
+  securityLogs: (params, signal) => req('GET', '/security-logs?' + new URLSearchParams(params), undefined, REQUEST_TIMEOUT_MS, signal),
   // 上游全局池
   upstreams: () => req('GET', '/upstreams', undefined, HEAVY_REQUEST_TIMEOUT_MS),
   overviewUpstreams: () => req('GET', '/upstreams?view=overview', undefined, HEAVY_REQUEST_TIMEOUT_MS),

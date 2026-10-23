@@ -30,24 +30,33 @@ type requestWrite struct {
 
 // Store 封装数据库访问；请求审计通过有界队列异步串行写入。
 type Store struct {
-	gormDB       *gorm.DB
-	sqlDB        *sql.DB
-	postgres     bool
-	requestQueue chan requestWrite
-	requestDone  chan struct{}
-	requestDrops atomic.Uint64
-	closeOnce    sync.Once
+	gormDB              *gorm.DB
+	sqlDB               *sql.DB
+	postgres            bool
+	requestQueue        chan requestWrite
+	requestDone         chan struct{}
+	requestDrops        atomic.Uint64
+	closeOnce           sync.Once
+	securityQueue       chan securityWrite
+	securityDone        chan struct{}
+	securityMu          sync.RWMutex
+	securityClosed      bool
+	securityDrops       atomic.Uint64
+	securityWriteFailed atomic.Bool
 }
 
 func newStore(gormDB *gorm.DB, sqlDB *sql.DB, pg bool) *Store {
 	s := &Store{
-		gormDB:       gormDB,
-		sqlDB:        sqlDB,
-		postgres:     pg,
-		requestQueue: make(chan requestWrite, requestQueueSize),
-		requestDone:  make(chan struct{}),
+		gormDB:        gormDB,
+		sqlDB:         sqlDB,
+		postgres:      pg,
+		requestQueue:  make(chan requestWrite, requestQueueSize),
+		requestDone:   make(chan struct{}),
+		securityQueue: make(chan securityWrite, 1024),
+		securityDone:  make(chan struct{}),
 	}
 	go s.runRequestWriter()
+	go s.runSecurityWriter()
 	return s
 }
 
@@ -105,6 +114,7 @@ func allModels() []any {
 		&ModelMappingModel{},
 		&UpstreamModelEntry{},
 		&ModelExclusion{},
+		&SecurityLog{},
 	}
 }
 

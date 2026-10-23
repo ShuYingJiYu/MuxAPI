@@ -10,6 +10,7 @@ import UpstreamPicker from './UpstreamPicker.vue'
 import Chart from './Chart.vue'
 import ThemePicker from './ThemePicker.vue'
 import RoutingView from './RoutingView.vue'
+import SecurityLogs from './SecurityLogs.vue'
 import { api } from './api.js'
 import { useLogs } from './composables/useLogs.js'
 import { useMonitorViews } from './composables/useMonitorViews.js'
@@ -44,7 +45,8 @@ const errorInfo = computed(() => {
   return { title: '操作未完成', detail: raw || '请求未能完成，请稍后重试。', code: status ? `HTTP ${status}` : '' }
 })
 function clearError() { err.value = ''; errStatus.value = 0 }
-const loggedIn = ref(!!api.getToken())
+const loggedIn = ref(false)
+const loginBusy = ref(false)
 const loginForm = reactive({ token: api.getToken() })
 // 页面级加载状态：首次进入或切换页面时保留稳定布局，避免慢查询期间出现大片空白。
 const pageLoading = ref(!!loggedIn.value)
@@ -223,9 +225,7 @@ async function guard(fn) {
   try { await fn() } catch (e) {
     errStatus.value = Number(e.status) || 0
     if (e.status === 401) {
-      loggedIn.value = false
-      api.clearToken()
-      err.value = '未授权，请输入管理 Token'
+      handleUnauthorized()
       return
     }
     err.value = String(e.message || e)
@@ -299,7 +299,7 @@ function onDocumentPointerDown(event) {
 onMounted(() => {
   fetch('/admin/version').then(r => r.json()).then(d => { appVersion.value = d.version || 'dev' }).catch(() => {})
   document.addEventListener('pointerdown', onDocumentPointerDown)
-  if (loggedIn.value) activatePage(page.value)
+  if (api.getToken()) verifyLogin(true)
 })
 
 // 看板自动刷新：探测间隔 5min，这里每 60s 拉一次快照即可，离开即停
@@ -2192,11 +2192,36 @@ function monitorGroupLeave(el, done) {
   window.setTimeout(() => { clearMonitorGroupStyles(el); done() }, 170)
 }
 
-function login() {
+function login() { return verifyLogin(false) }
+async function verifyLogin(restore) {
+  if (loginBusy.value) return
   if (!loginForm.token.trim()) { clearError(); err.value = '请输入管理 Token'; return }
-  api.setToken(loginForm.token.trim())
-  loggedIn.value = true
-  activatePage(page.value)
+  const value = loginForm.token.trim()
+  loginBusy.value = true
+  clearError()
+  try {
+    await api.verifyLogin(value, restore)
+    api.setToken(value)
+    loginForm.token = ''
+    loggedIn.value = true
+    activatePage(page.value)
+  } catch (e) {
+    errStatus.value = e.status === 401 ? 0 : Number(e.status) || 0
+    if (e.status === 401) api.clearToken()
+    err.value = e.status === 401 ? '管理 Token 无效，请检查后重试' : String(e.message || e)
+  } finally {
+    loginBusy.value = false
+  }
+}
+function handleUnauthorized() {
+  loggedIn.value = false
+  api.clearToken()
+  loginForm.token = ''
+  stopAllPoll()
+  stopBackupPoll()
+  pageLoading.value = false
+  errStatus.value = 401
+  err.value = '未授权，请输入管理 Token'
 }
 function logout() {
   abortUpstreamTestRequests()
@@ -2219,9 +2244,9 @@ function logout() {
       <div class="logo login-logo"><Icon name="bolt" :size="22" /><span class="logo-text">MuxAPI</span></div>
       <h1>管理后台登录</h1>
       <p>输入服务器环境变量 <code>MUXAPI_TOKEN</code>。</p>
-      <div class="field"><label>Token</label><input v-model="loginForm.token" type="password" placeholder="MUXAPI_TOKEN" @keyup.enter="login" autofocus /></div>
+      <div class="field"><label>Token</label><input v-model="loginForm.token" :disabled="loginBusy" type="password" placeholder="MUXAPI_TOKEN" @keyup.enter="login" autofocus /></div>
       <p v-if="err" class="err-banner">{{ errorInfo.detail }}</p>
-      <button class="btn login-btn" @click="login"><Icon name="check" :size="16" />进入后台</button>
+      <button class="btn login-btn" :disabled="loginBusy" @click="login"><Icon :name="loginBusy ? 'loader' : 'check'" :size="16" />{{ loginBusy ? '正在验证' : '进入后台' }}</button>
     </div>
   </div>
 
@@ -2933,6 +2958,9 @@ function logout() {
                 <small>运行策略与数据工具</small>
               </div>
               <nav class="settings-nav-list" aria-label="设置分类">
+                <button type="button" class="set-navitem" :class="{ active: settingsSection === 'security' }" @click="gotoSection('security')">
+                  <span class="set-navicon"><Icon name="key" :size="16" /></span><span class="set-navcopy"><strong>安全日志</strong><small>登录与管理访问</small></span><Icon class="set-navarrow" name="chevron-right" :size="14" />
+                </button>
                 <button type="button" class="set-navitem" :class="{ active: settingsSection === 'logs' }" @click="gotoSection('logs')">
                   <span class="set-navicon"><Icon name="refresh" :size="16" /></span><span class="set-navcopy"><strong>日志清理</strong><small>记录保存</small></span><Icon class="set-navarrow" name="chevron-right" :size="14" />
                 </button>
@@ -2955,10 +2983,11 @@ function logout() {
               <div class="set-navhint"><Icon name="alert" :size="14" /><span>探测间隔与路径已下放到「监控看板」逐项配置。</span></div>
             </aside>
             <div class="settings-body">
-              <header class="settings-body-head">
+              <header v-if="settingsSection !== 'security'" class="settings-body-head">
                 <div><span class="settings-body-kicker">RUNTIME CONFIGURATION</span><h2>运行设置</h2><p>修改后的参数会即时应用到新的请求。</p></div>
                 <span class="settings-live"><i></i>实时生效</span>
               </header>
+              <SecurityLogs v-if="settingsSection === 'security'" @unauthorized="handleUnauthorized" />
               <section id="set-logs" v-show="settingsSection === 'logs'" class="card settings-card">
                 <div class="settings-title"><h3>日志清理</h3><p>按完成时间保留请求记录；设为 0 可永久保留完整路由与计费历史。</p></div>
                 <div class="settings-fields">

@@ -54,6 +54,7 @@ type Server struct {
 	maxBodyProvider func() int64
 	settingsChanged func()
 	readOnly        bool
+	trustedProxies  []netip.Prefix
 
 	modelMu     sync.Mutex                // 保护 modelCache 与 modelFlight
 	modelCache  map[int64]modelCacheEntry // 按 upstream_id 缓存其 /v1/models 结果，TTL=modelsTTL
@@ -196,11 +197,14 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 			okBearer := subtle.ConstantTimeCompare([]byte(bearer), want) == 1
 			okKey := subtle.ConstantTimeCompare([]byte(r.Header.Get("x-api-key")), want) == 1
 			if !okBearer && !okKey {
+				s.recordSecurity(r, false)
+				w.Header().Set("Cache-Control", "no-store")
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
 		}
-		if s.readOnly && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		s.recordSecurity(r, true)
+		if s.readOnly && r.Method != http.MethodGet && r.Method != http.MethodHead && !(r.URL.Path == "/admin/auth" && r.Method == http.MethodPost) {
 			http.Error(w, "read-only mode", http.StatusLocked)
 			return
 		}
