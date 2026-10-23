@@ -200,6 +200,9 @@ func (s *Server) adminUpstreamItem(w http.ResponseWriter, r *http.Request) {
 		// 删库后同步丢弃内存态，否则熔断器与模型缓存会随删除累积。
 		s.health.Forget(id)
 		s.forgetUpstreamModels(id)
+		if modelMappingSvc != nil {
+			modelMappingSvc.InvalidateAll()
+		}
 		w.WriteHeader(204)
 	default:
 		http.Error(w, "method not allowed", 405)

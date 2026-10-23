@@ -11,6 +11,7 @@ import Chart from './Chart.vue'
 import ThemePicker from './ThemePicker.vue'
 import RoutingView from './RoutingView.vue'
 import SecurityLogs from './SecurityLogs.vue'
+import ModelMappings from './ModelMappings.vue'
 import { api } from './api.js'
 import { useLogs } from './composables/useLogs.js'
 import { useMonitorViews } from './composables/useMonitorViews.js'
@@ -346,7 +347,7 @@ function activatePage(p) {
     else if (p === 'upstreams') { await loadTags(); await loadGroups(); await loadUpstreams(); startRtPoll(loadUpstreams) }
     else if (p === 'monitors') { await loadTags(); await loadUpstreams(); await loadMonitors(); startMonPoll() }
     else if (p === 'logs') { await loadLogOptions(); await loadLogs(true); startLogPoll() }
-    else if (p === 'settings') { await loadSettings(); await Promise.all([loadBackupConfig(), loadBackupSchedule(), loadBackups(), loadUpstreams(), loadMappings()]) }
+    else if (p === 'settings') { await loadSettings(); await Promise.all([loadBackupConfig(), loadBackupSchedule(), loadBackups(), loadUpstreams()]) }
   }).finally(() => {
     if (epoch === pageLoadEpoch) pageLoading.value = false
   })
@@ -813,7 +814,7 @@ function saveUpstream() {
   })
 }
 function delUpstream(u) {
-  ask(`删除上游「${u.name}」？将同时从所有分组移除。`, () =>
+  ask(`删除上游「${u.name}」？将同时从所有分组移除，并删除其监控与专属模型映射；全局映射保留。`, () =>
     guard(async () => { await api.deleteUpstream(u.id); await loadUpstreams() }))
 }
 
@@ -1441,29 +1442,6 @@ function startBackupPoll() {
   }, 4000)
 }
 function stopBackupPoll() { clearInterval(_backupPollTimer); _backupPollTimer = null }
-
-// 模型映射
-const mappings = ref([])
-const mappingsLoading = ref(false)
-const showNewMapping = ref(false)
-const newMappingForm = reactive({ upstream_id: '', source_model: '', target_model: '' })
-async function loadMappings() {
-  mappingsLoading.value = true
-  try { mappings.value = (await api.modelMappings()) || [] }
-  finally { mappingsLoading.value = false }
-}
-async function saveNewMapping() {
-  if (!newMappingForm.source_model.trim() || !newMappingForm.target_model.trim()) return
-  await api.createModelMapping({
-    upstream_id: Number(newMappingForm.upstream_id) || 0,
-    source_model: newMappingForm.source_model.trim(),
-    target_model: newMappingForm.target_model.trim(),
-    mapping_type: 'static',
-  })
-  showNewMapping.value = false
-  Object.assign(newMappingForm, { upstream_id: '', source_model: '', target_model: '' })
-  await loadMappings()
-}
 
 async function loadBackupConfig() {
   backupConfig.value = (await api.backupConfig()) || { endpoint: '', region: '', bucket: '', access_key_id: '', secret_key: '', prefix: '', force_path_style: false }
@@ -2983,7 +2961,7 @@ function logout() {
               <div class="set-navhint"><Icon name="alert" :size="14" /><span>探测间隔与路径已下放到「监控看板」逐项配置。</span></div>
             </aside>
             <div class="settings-body">
-              <header v-if="settingsSection !== 'security'" class="settings-body-head">
+              <header v-if="!['security', 'mappings'].includes(settingsSection)" class="settings-body-head">
                 <div><span class="settings-body-kicker">RUNTIME CONFIGURATION</span><h2>运行设置</h2><p>修改后的参数会即时应用到新的请求。</p></div>
                 <span class="settings-live"><i></i>实时生效</span>
               </header>
@@ -3158,38 +3136,7 @@ function logout() {
               </section>
 
               <!-- 模型映射 -->
-              <section id="set-mappings" v-show="settingsSection === 'mappings'" class="card settings-card">
-                <div class="settings-title"><h3>模型映射</h3><p>管理请求模型名到上游实际模型名的映射规则。自动学习的映射由前缀匹配产生，可手动覆盖或删除。</p></div>
-                <div class="settings-actions mapping-actions">
-                  <button class="btn btn-sm" @click="loadMappings"><Icon name="refresh" :size="14" />刷新</button>
-                  <button class="btn btn-sm" @click="showNewMapping = true"><Icon name="plus" :size="14" />手动添加</button>
-                </div>
-                <div v-if="showNewMapping" class="mapping-form">
-                  <FancySelect v-model="newMappingForm.upstream_id" :options="upstreamSelectOptions" />
-                  <input v-model="newMappingForm.source_model" placeholder="请求模型名" />
-                  <span class="mapping-arrow"><Icon name="chevron-right" :size="15" /></span>
-                  <input v-model="newMappingForm.target_model" placeholder="上游实际模型名" />
-                  <div class="mapping-form-actions"><button class="btn btn-sm" @click="saveNewMapping">保存</button><button class="btn btn-ghost btn-sm" @click="showNewMapping = false">取消</button></div>
-                </div>
-                <div v-if="!mappings.length && !mappingsLoading" class="hint">暂无模型映射规则</div>
-                <div v-else-if="mappingsLoading" class="hint">加载中…</div>
-                <div v-else class="mapping-table-wrap">
-                  <table class="backup-table">
-                    <thead><tr><th>上游</th><th>请求模型</th><th></th><th>实际模型</th><th>类型</th><th>过期</th><th>操作</th></tr></thead>
-                    <tbody>
-                      <tr v-for="m in mappings" :key="m.id">
-                        <td>{{ upName(m.upstream_id) }}</td>
-                        <td><code>{{ m.source_model }}</code></td>
-                        <td class="mapping-table-arrow"><Icon name="chevron-right" :size="13" /></td>
-                        <td><code>{{ m.target_model }}</code></td>
-                        <td><span class="tag" :class="m.mapping_type === 'auto' ? 'on' : ''">{{ m.mapping_type === 'auto' ? '自动' : '手动' }}</span></td>
-                        <td class="mapping-expiry">{{ m.expires_at ? new Date(m.expires_at).toLocaleDateString() : '永久' }}</td>
-                        <td><button class="icon-btn danger" title="删除映射" @click="guard(async () => { await api.deleteModelMapping(m.id); await loadMappings() })"><Icon name="trash" :size="16" /></button></td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-              </section>
+              <ModelMappings v-if="settingsSection === 'mappings'" :upstreams="upstreams" @unauthorized="handleUnauthorized" />
             </div>
           </div>
         </template>

@@ -6,6 +6,7 @@ import (
 
 	"github.com/mirainya/muxapi/internal/upstream"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // --- 上游全局池 ---
@@ -344,7 +345,15 @@ func (s *Store) BatchUpdateUpstreams(ids []int64, update UpstreamBatchUpdate) er
 }
 
 func (s *Store) Delete(id int64) error {
+	if id <= 0 {
+		return sql.ErrNoRows
+	}
 	return s.gormDB.Transaction(func(tx *gorm.DB) error {
+		// 先锁住父记录，再清理子记录；映射写入也先锁父记录。
+		var item UpstreamModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&item, id).Error; err != nil {
+			return err
+		}
 		if err := tx.Where("upstream_id = ?", id).Delete(&GroupUpstreamModel{}).Error; err != nil {
 			return err
 		}
@@ -352,6 +361,9 @@ func (s *Store) Delete(id int64) error {
 			return err
 		}
 		if err := tx.Where("upstream_id = ?", id).Delete(&ModelExclusion{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("upstream_id = ?", id).Delete(&ModelMappingModel{}).Error; err != nil {
 			return err
 		}
 		return tx.Delete(&UpstreamModel{}, id).Error

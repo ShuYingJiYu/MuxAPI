@@ -5,7 +5,15 @@ import (
 	"time"
 
 	"github.com/mirainya/muxapi/internal/store"
+	"github.com/mirainya/muxapi/internal/upstream"
 )
+
+func createMappingTestUpstream(t *testing.T, st *store.Store) {
+	t.Helper()
+	if err := st.Create(&upstream.Upstream{Name: "mapping test", BaseURL: "http://example.test", APIKey: "test", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestServiceResolveWithStore(t *testing.T) {
 	st, err := store.Open("file::memory:?mode=memory&cache=shared")
@@ -13,6 +21,7 @@ func TestServiceResolveWithStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	createMappingTestUpstream(t, st)
 
 	svc := New(st)
 
@@ -79,6 +88,7 @@ func TestServiceAutoLearn(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	createMappingTestUpstream(t, st)
 
 	svc := New(st)
 
@@ -124,6 +134,7 @@ func TestServiceRecordSuccessResetsAuto(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	createMappingTestUpstream(t, st)
 
 	svc := New(st)
 

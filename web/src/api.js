@@ -355,7 +355,8 @@ export const api = {
   backupDownloadURL: id => req('GET', '/backup/records/' + id + '/download'),
 
   // 模型映射
-  modelMappings: (upstreamId) => req('GET', '/model-mappings' + (upstreamId ? '?upstream_id=' + upstreamId : '')),
+  modelMappings: (upstreamId, signal) => req('GET', '/model-mappings' + (upstreamId !== undefined ? '?upstream_id=' + upstreamId : ''), undefined, REQUEST_TIMEOUT_MS, signal),
   createModelMapping: payload => req('POST', '/model-mappings', payload),
   deleteModelMapping: id => req('DELETE', '/model-mappings/' + id),
+  cleanupModelMappings: ids => req('POST', '/model-mappings/cleanup', { ids }),
 }

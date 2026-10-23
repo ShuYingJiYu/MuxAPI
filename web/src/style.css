@@ -764,17 +764,6 @@ code { background: var(--g100); padding: 2px 7px; border-radius: 6px; font-size:
 .dw-stream-tag { margin-left: 6px; }
 .dialog .test-dialog-hint { margin: 0 0 10px; }
 .test-model-error { margin: 0 0 8px; }
-.mapping-actions { justify-content: flex-start; margin-top: -7px; margin-bottom: 13px; }
-.mapping-form { display: grid; grid-template-columns: minmax(150px, .9fr) minmax(130px, 1fr) 24px minmax(130px, 1fr) auto; align-items: center; gap: 8px; margin-bottom: 14px; padding: 11px; border: 1px solid var(--p100); border-radius: var(--r-nav); background: color-mix(in srgb, var(--p50) 62%, var(--surface)); }
-.mapping-form .fancy-select { min-width: 0; }
-.mapping-form input { width: 100%; min-width: 0; height: 38px; padding: 0 10px; border: 1px solid var(--control-border); border-radius: var(--r-control); outline: 0; background: var(--surface-raised); color: var(--g800); font-size: 12px; transition: border-color .16s, box-shadow .16s; }
-.mapping-form input:focus { border-color: var(--p500); box-shadow: 0 0 0 3px var(--selection-soft); }
-.mapping-arrow { display: grid; place-items: center; color: var(--p600); }
-.mapping-form-actions { display: flex; align-items: center; gap: 6px; }
-.mapping-table-wrap { overflow-x: auto; border-radius: var(--r-nav); border: 1px solid var(--line); background: var(--surface-muted); }
-.mapping-table-wrap .backup-table code { background: var(--surface-raised); border: 1px solid var(--divider); color: var(--p700); font-size: 10px; }
-.mapping-table-arrow { width: 28px; color: var(--p500); }
-.mapping-expiry { color: var(--g400); font-family: var(--font-data); font-size: 10px; white-space: nowrap; }
 
 /* 新增 */
 .count { font-size: 13px; color: var(--g500); font-weight: 500; }

@@ -10,6 +10,7 @@ const props = defineProps({
   variant: { type: String, default: '' },
   searchable: { type: Boolean, default: false },
   multiple: { type: Boolean, default: false },
+  teleportTarget: { type: [String, Object], default: 'body' },
 })
 
 const emit = defineEmits(['update:modelValue', 'change'])
@@ -77,14 +78,15 @@ function positionMenu() {
   const rect = trigger.value.getBoundingClientRect()
   const gap = 8
   const viewportPad = 12
+  const maxWidth = Math.min(Math.max(rect.width, 320), window.innerWidth - viewportPad * 2)
   const below = window.innerHeight - rect.bottom - gap - viewportPad
   const above = rect.top - gap - viewportPad
   const openAbove = below < 180 && above > below
   const available = Math.max(80, openAbove ? above : below)
   menuStyle.value = {
-    left: `${rect.left}px`,
-    minWidth: `${rect.width}px`,
-    maxWidth: `320px`,
+    left: `${Math.max(viewportPad, Math.min(rect.left, window.innerWidth - maxWidth - viewportPad))}px`,
+    minWidth: `${Math.min(rect.width, maxWidth)}px`,
+    maxWidth: `${maxWidth}px`,
     top: openAbove ? 'auto' : `${rect.bottom + gap}px`,
     bottom: openAbove ? `${window.innerHeight - rect.top + gap}px` : 'auto',
     maxHeight: `${Math.min(280, available)}px`,
@@ -115,7 +117,7 @@ onUnmounted(() => {
       <span class="fancy-selected-label"><i v-if="variant === 'tag'" class="fancy-tag-dot" :class="multiple ? 'all' : (selected?.color || 'all')"></i><span>{{ label }}</span></span>
       <Icon name="chevron-right" :size="15" class="fancy-select-arrow" />
     </button>
-    <Teleport to="body">
+    <Teleport :to="teleportTarget">
       <Transition name="fancy-pop">
         <div v-if="open" ref="menu" class="fancy-select-menu fancy-select-portal" :class="variant ? `fancy-select-menu-${variant}` : ''" role="listbox" :aria-multiselectable="multiple || undefined" :style="menuStyle">
         <div v-if="searchable" class="fancy-select-search"><Icon name="search" :size="14" /><input ref="searchInput" v-model="searchText" type="search" placeholder="搜索标签" @click.stop /></div>

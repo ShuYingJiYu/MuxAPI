@@ -1,7 +1,9 @@
 package server
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -34,6 +36,10 @@ func (s *Server) adminModelMappings(w http.ResponseWriter, r *http.Request) {
 // adminModelMappingItem handles PUT (update) and DELETE (remove) for a single mapping.
 func (s *Server) adminModelMappingItem(w http.ResponseWriter, r *http.Request) {
 	idStr := strings.TrimPrefix(r.URL.Path, "/admin/model-mappings/")
+	if idStr == "cleanup" {
+		s.cleanupModelMappings(w, r)
+		return
+	}
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil || id <= 0 {
 		http.Error(w, "invalid mapping id", http.StatusBadRequest)
@@ -51,9 +57,11 @@ func (s *Server) listModelMappings(w http.ResponseWriter, r *http.Request) {
 	var upstreamID *int64
 	if v := r.URL.Query().Get("upstream_id"); v != "" {
 		id, err := strconv.ParseInt(v, 10, 64)
-		if err == nil {
-			upstreamID = &id
+		if err != nil || id < 0 {
+			http.Error(w, "invalid upstream id", http.StatusBadRequest)
+			return
 		}
+		upstreamID = &id
 	}
 	mappings, err := s.store.ListModelMappings(upstreamID)
 	if err != nil {
@@ -97,6 +105,10 @@ func (s *Server) createModelMapping(w http.ResponseWriter, r *http.Request) {
 		mapping.ExpiresAt = &expires
 	}
 	if err := s.store.UpsertModelMapping(mapping); err != nil {
+		if errors.Is(err, store.ErrMappingUpstreamMissing) {
+			http.Error(w, "upstream no longer exists", http.StatusBadRequest)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -110,6 +122,10 @@ func (s *Server) createModelMapping(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) deleteModelMapping(w http.ResponseWriter, _ *http.Request, id int64) {
 	if err := s.store.DeleteModelMapping(id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "mapping not found", http.StatusNotFound)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -117,4 +133,34 @@ func (s *Server) deleteModelMapping(w http.ResponseWriter, _ *http.Request, id i
 		modelMappingSvc.InvalidateAll()
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) cleanupModelMappings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&req); err != nil || len(req.IDs) == 0 || len(req.IDs) > 1000 {
+		http.Error(w, "provide 1 to 1000 mapping ids", http.StatusBadRequest)
+		return
+	}
+	for _, id := range req.IDs {
+		if id <= 0 {
+			http.Error(w, "invalid mapping id", http.StatusBadRequest)
+			return
+		}
+	}
+	deleted, err := s.store.DeleteOrphanModelMappings(req.IDs)
+	if err != nil {
+		http.Error(w, "mapping cleanup failed", http.StatusInternalServerError)
+		return
+	}
+	if modelMappingSvc != nil {
+		modelMappingSvc.InvalidateAll()
+	}
+	writeJSON(w, map[string]int64{"deleted": deleted})
 }
