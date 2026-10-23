@@ -124,7 +124,13 @@ func (s *Server) adminSecurityLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	filter := store.SecurityFilter{IP: strings.TrimSpace(q.Get("ip")), Result: q.Get("result"), Page: 1, Size: 20}
+	filter := store.SecurityFilter{IP: strings.TrimSpace(q.Get("ip")), Result: q.Get("result"),
+		Kind: q.Get("kind"), View: q.Get("view"), Page: 1, Size: 20}
+	if (filter.Kind != "" && filter.Kind != "login" && filter.Kind != "access") ||
+		(filter.View != "" && filter.View != "events" && filter.View != "all") {
+		http.Error(w, "invalid event filter", http.StatusBadRequest)
+		return
+	}
 	if filter.IP != "" {
 		ip, err := netip.ParseAddr(filter.IP)
 		if err != nil || ip.Zone() != "" {
@@ -144,7 +150,7 @@ func (s *Server) adminSecurityLogs(w http.ResponseWriter, r *http.Request) {
 			n, err := strconv.Atoi(raw[0])
 			limit := 100
 			if name == "page" {
-				limit = 10000
+				limit = 1000000
 			}
 			if err != nil || n < 1 || n > limit {
 				http.Error(w, "invalid pagination", http.StatusBadRequest)
@@ -163,6 +169,17 @@ func (s *Server) adminSecurityLogs(w http.ResponseWriter, r *http.Request) {
 			*target = n
 		}
 	}
+	if raw, ok := q["range"]; ok {
+		// 第一次查询由服务器确定时间；之后翻页复用返回的 from/to。
+		durations := map[string]int64{"1h": 3600, "24h": 86400, "7d": 7 * 86400, "15d": 15 * 86400}
+		seconds, valid := durations[raw[0]]
+		if !valid || q.Has("from") || q.Has("to") {
+			http.Error(w, "invalid time range", http.StatusBadRequest)
+			return
+		}
+		filter.To = time.Now().Unix()
+		filter.From = filter.To - seconds
+	}
 	if filter.To != 0 && filter.From > filter.To {
 		http.Error(w, "invalid time range", http.StatusBadRequest)
 		return
@@ -177,7 +194,8 @@ func (s *Server) adminSecurityLogs(w http.ResponseWriter, r *http.Request) {
 	drops, failed := s.store.SecurityLogStatus()
 	writeJSON(w, map[string]any{
 		"entries": page.Entries, "total": page.Total, "summary": page.Summary,
-		"page": filter.Page, "size": filter.Size, "retention_days": store.SecurityRetentionDays,
+		"page": page.Page, "size": page.Size, "from": page.From, "to": page.To,
+		"retention_days":      store.SecurityRetentionDays,
 		"dropped_since_start": drops, "write_failed": failed,
 		"authentication_enabled": s.adminToken != "", "recording_enabled": !s.readOnly && s.adminToken != "",
 		"trusted_proxy_configured": len(s.trustedProxies) > 0,

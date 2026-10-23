@@ -7,7 +7,10 @@ import (
 	"gorm.io/gorm"
 )
 
-// SecurityLogs 查询的时间范围总是受 15 天保留期约束；摘要与列表使用同一筛选。
+const securityAttention = "(new_source OR new_browser OR after_failures OR frequent)"
+
+// SecurityLogs 列表应用全部筛选；概览仅按 IP 和时间统计，不将后台访问当成登录。
+// 时间范围受 15 天保留期约束；翻页返回实际页码，避免清理后出现空的末页。
 func (s *Store) SecurityLogs(ctx context.Context, filter SecurityFilter) (SecurityPage, error) {
 	page := SecurityPage{Entries: []SecurityLog{}}
 	now := time.Now().Unix()
@@ -15,10 +18,21 @@ func (s *Store) SecurityLogs(ctx context.Context, filter SecurityFilter) (Securi
 	if filter.To == 0 || filter.To > now {
 		filter.To = now
 	}
-	base := func() *gorm.DB {
+	page.From, page.To = filter.From, filter.To
+	contextQuery := func() *gorm.DB {
 		q := s.gormDB.WithContext(ctx).Model(&SecurityLog{}).Where("last_at >= ? AND first_at <= ?", filter.From, filter.To)
 		if filter.IP != "" {
 			q = q.Where("client_ip = ?", filter.IP)
+		}
+		return q
+	}
+	listQuery := func() *gorm.DB {
+		q := contextQuery()
+		if filter.View == "events" {
+			q = q.Where("(kind = ? OR NOT success OR "+securityAttention+")", "login")
+		}
+		if filter.Kind != "" {
+			q = q.Where("kind = ?", filter.Kind)
 		}
 		switch filter.Result {
 		case "success":
@@ -26,25 +40,28 @@ func (s *Store) SecurityLogs(ctx context.Context, filter SecurityFilter) (Securi
 		case "failure":
 			q = q.Where("success = ?", false)
 		case "attention":
-			q = q.Where("new_source OR new_browser OR after_failures OR frequent")
+			q = q.Where(securityAttention)
 		}
 		return q
 	}
-	if err := base().Count(&page.Total).Error; err != nil {
+	if err := listQuery().Count(&page.Total).Error; err != nil {
 		return page, err
 	}
-	if err := base().Where("success = ?", false).Select("COALESCE(SUM(count), 0)").Scan(&page.Summary.Failures).Error; err != nil {
-		return page, err
-	}
-	if err := base().Where("new_source OR new_browser OR after_failures OR frequent").Distinct("client_ip").Count(&page.Summary.AttentionIPs).Error; err != nil {
-		return page, err
-	}
-	if err := base().Where("success = ?", true).Select("COALESCE(MAX(last_at), 0)").Scan(&page.Summary.LatestSuccess).Error; err != nil {
+	if err := contextQuery().Select(`
+		COALESCE(SUM(CASE WHEN NOT success THEN count ELSE 0 END), 0) AS failures,
+		COUNT(DISTINCT CASE WHEN ` + securityAttention + ` THEN client_ip END) AS attention_ips,
+		COALESCE(MAX(CASE WHEN success THEN last_at ELSE 0 END), 0) AS latest_success,
+		COALESCE(SUM(CASE WHEN kind = 'login' AND success THEN count ELSE 0 END), 0) AS login_successes,
+		COALESCE(SUM(CASE WHEN kind = 'access' THEN count ELSE 0 END), 0) AS management_accesses,
+		COALESCE(MAX(CASE WHEN kind = 'login' AND success THEN last_at ELSE 0 END), 0) AS latest_login
+	`).Scan(&page.Summary).Error; err != nil {
 		return page, err
 	}
 	size := min(max(filter.Size, 1), 100)
-	offset := (min(max(filter.Page, 1), 10000) - 1) * size
-	err := base().Order("last_at DESC, id DESC").Offset(offset).Limit(size).Find(&page.Entries).Error
+	pageCount := max(1, int((page.Total+int64(size)-1)/int64(size)))
+	page.Page, page.Size = min(max(filter.Page, 1), pageCount), size
+	offset := (page.Page - 1) * size
+	err := listQuery().Order("last_at DESC, id DESC").Offset(offset).Limit(size).Find(&page.Entries).Error
 	return page, err
 }
 

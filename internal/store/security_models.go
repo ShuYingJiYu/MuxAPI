@@ -34,6 +34,8 @@ type securityWrite struct {
 type SecurityFilter struct {
 	IP     string
 	Result string
+	Kind   string
+	View   string
 	From   int64
 	To     int64
 	Page   int
@@ -41,13 +43,20 @@ type SecurityFilter struct {
 }
 
 type SecuritySummary struct {
-	Failures      int64 `json:"failures"`
-	AttentionIPs  int64 `json:"attention_ips"`
-	LatestSuccess int64 `json:"latest_success"`
+	Failures           int64 `json:"failures"`
+	AttentionIPs       int64 `json:"attention_ips"`
+	LatestSuccess      int64 `json:"latest_success"`
+	LoginSuccesses     int64 `json:"login_successes"`
+	ManagementAccesses int64 `json:"management_accesses"`
+	LatestLogin        int64 `json:"latest_login"`
 }
 
 type SecurityPage struct {
 	Entries []SecurityLog   `json:"entries"`
 	Total   int64           `json:"total"`
 	Summary SecuritySummary `json:"summary"`
+	Page    int             `json:"page"`
+	Size    int             `json:"size"`
+	From    int64           `json:"from"`
+	To      int64           `json:"to"`
 }
