@@ -173,6 +173,12 @@ type CacheTokenAverages struct {
 // CacheTokenAverages returns recent usage for one upstream/model/prefix. An
 // exact prefix match is preferred; when a conversation derives a new prefix
 // hash on every turn, it falls back to the same upstream and model.
+// request_attempts.request_id is UUID while route_decisions/routing_observations
+// request_id is TEXT on databases whose tables predate the versioned SQL
+// migrations (GORM created them with string columns, and the later
+// CREATE TABLE IF NOT EXISTS was a no-op). Joining the two raw raises
+// "operator does not exist: uuid = text" on Postgres while SQLite accepts it,
+// so every such join compares text on both sides.
 func (s *Store) CacheTokenAverages(apiKeyHash string, upstreamID int64, model, prefixHash string) (CacheTokenAverages, error) {
 	query := `SELECT COUNT(*),
 		COALESCE(AVG(CAST(input_tokens AS REAL)),0),
@@ -184,7 +190,7 @@ func (s *Store) CacheTokenAverages(apiKeyHash string, upstreamID int64, model, p
 			WHEN LOWER(COALESCE(a.protocol,u.protocol,'')) IN ('openai','chat','chat_completions','chat-completions','openai-response','openai_responses','responses','codex','gemini','google','generativelanguage','generatecontent')
 			THEN CASE WHEN ro.input_tokens>ro.cached_tokens THEN ro.input_tokens-ro.cached_tokens ELSE 0 END ELSE ro.input_tokens END AS input_tokens,
 			ro.cached_tokens,ro.cache_creation_tokens
-			FROM routing_observations ro LEFT JOIN request_attempts a ON a.request_id=ro.request_id AND a.attempt_no=ro.attempt_no
+			FROM routing_observations ro LEFT JOIN request_attempts a ON CAST(a.request_id AS TEXT)=CAST(ro.request_id AS TEXT) AND a.attempt_no=ro.attempt_no
 			LEFT JOIN upstreams u ON u.id=ro.upstream_id
 			WHERE ro.api_key_hash=? AND ro.upstream_id=? AND ro.model=?
 				AND (ro.prefix_hash=? OR ro.session_key=?) AND ro.cache_eligible=TRUE
@@ -213,7 +219,7 @@ func (s *Store) cacheTokenAveragesByModel(apiKeyHash string, upstreamID int64, m
 			WHEN LOWER(COALESCE(a.protocol,u.protocol,'')) IN ('openai','chat','chat_completions','chat-completions','openai-response','openai_responses','responses','codex','gemini','google','generativelanguage','generatecontent')
 			THEN CASE WHEN ro.input_tokens>ro.cached_tokens THEN ro.input_tokens-ro.cached_tokens ELSE 0 END ELSE ro.input_tokens END AS input_tokens,
 			ro.cached_tokens,ro.cache_creation_tokens
-			FROM routing_observations ro LEFT JOIN request_attempts a ON a.request_id=ro.request_id AND a.attempt_no=ro.attempt_no
+			FROM routing_observations ro LEFT JOIN request_attempts a ON CAST(a.request_id AS TEXT)=CAST(ro.request_id AS TEXT) AND a.attempt_no=ro.attempt_no
 			LEFT JOIN upstreams u ON u.id=ro.upstream_id
 			WHERE ro.api_key_hash=? AND ro.upstream_id=? AND ro.model=? AND ro.cache_eligible=TRUE
 				AND (ro.input_tokens>0 OR ro.cached_tokens>0 OR ro.cache_creation_tokens>0)
@@ -309,8 +315,8 @@ func (s *Store) ListUpstreamTokenInflationStats(window time.Duration, now time.T
 			THEN ro.input_tokens+ro.cache_creation_tokens ELSE ro.input_tokens+ro.cached_tokens+ro.cache_creation_tokens END AS REAL)),0),
 		COALESCE(SUM(CAST(rd.estimated_input_tokens AS REAL)),0)
 		FROM routing_observations ro
-		JOIN route_decisions rd ON rd.request_id=ro.request_id
-		LEFT JOIN request_attempts a ON a.request_id=ro.request_id AND a.attempt_no=ro.attempt_no
+		JOIN route_decisions rd ON CAST(rd.request_id AS TEXT)=CAST(ro.request_id AS TEXT)
+		LEFT JOIN request_attempts a ON CAST(a.request_id AS TEXT)=CAST(ro.request_id AS TEXT) AND a.attempt_no=ro.attempt_no
 		LEFT JOIN upstreams u ON u.id=ro.upstream_id
 		WHERE ro.observed_at>=? AND ro.observed_at<?
 			AND rd.estimated_input_tokens>0
