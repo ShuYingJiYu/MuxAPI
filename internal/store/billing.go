@@ -103,11 +103,13 @@ func billingTimestamp(value int64, fallback time.Time) time.Time {
 }
 
 // SaveBillingSuccess atomically replaces the latest state and appends a history snapshot.
-// A successful collection is authoritative: an empty billing group or a missing
-// multiplier replaces the previous value. Keeping the old value made a provider
-// change invisible until the operator switched the billing platform, which
-// deletes the row, and switched it back so the next refresh inserted a fresh one.
-// SaveBillingFailure still preserves the last successful counters.
+// A refresh that cannot identify the billing group or multiplier keeps the
+// previous values: partial collection is common on this fleet and providers
+// intermittently omit group metadata, so treating a blank field as
+// authoritative would erase a known identity on every such refresh. The fork's
+// original "always replace" behaviour (a6fcad2) is intentionally NOT carried
+// over — it contradicts upstream's `partial refresh must preserve known
+// billing fields` contract. SaveBillingFailure still preserves the counters.
 func (s *Store) SaveBillingSuccess(state BillingStatus) error {
 	now := time.Now()
 	observed := billingTimestamp(state.ObservedAt, now)
