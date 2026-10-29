@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mirainya/muxapi/internal/forward"
 	"github.com/mirainya/muxapi/internal/upstream"
 )
 
@@ -21,19 +20,19 @@ func TestPassiveStatsUsesRequestAndAttemptSemantics(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	if ok := st.EnqueueRequest(RequestRecord{
 		RequestID: "passive-retry", FinalUpstreamID: 7, Model: "client-model", Status: 200,
-		Outcome: forward.OutcomeSuccess, TTFTMs: 100, DurationMs: 300,
+		Outcome: "success", TTFTMs: 100, DurationMs: 300,
 		CreatedAt: now.Add(-10 * time.Minute), CompletedAt: now.Add(-9 * time.Minute),
 		Attempts: []RequestAttemptRecord{
-			{AttemptNo: 1, UpstreamID: 7, MappedModel: "", Status: 503, Outcome: forward.OutcomeFailed, DurationMs: 50, CreatedAt: now.Add(-10 * time.Minute), CompletedAt: now.Add(-10 * time.Minute)},
-			{AttemptNo: 2, UpstreamID: 7, MappedModel: "provider-model", Status: 200, Outcome: forward.OutcomeSuccess, TTFTMs: 100, DurationMs: 200, CreatedAt: now.Add(-10 * time.Minute), CompletedAt: now.Add(-9 * time.Minute)},
+			{AttemptNo: 1, UpstreamID: 7, MappedModel: "", Status: 503, Outcome: "failed", DurationMs: 50, CreatedAt: now.Add(-10 * time.Minute), CompletedAt: now.Add(-10 * time.Minute)},
+			{AttemptNo: 2, UpstreamID: 7, MappedModel: "provider-model", Status: 200, Outcome: "success", TTFTMs: 100, DurationMs: 200, CreatedAt: now.Add(-10 * time.Minute), CompletedAt: now.Add(-9 * time.Minute)},
 		},
 	}); !ok {
 		t.Fatal("enqueue retry request failed")
 	}
 	if ok := st.EnqueueRequest(RequestRecord{
 		RequestID: "passive-neutral", FinalUpstreamID: 7, Model: "client-model", Status: 499,
-		Outcome: forward.OutcomeCanceled, CreatedAt: now.Add(-5 * time.Minute), CompletedAt: now.Add(-5 * time.Minute),
-		Attempts: []RequestAttemptRecord{{AttemptNo: 1, UpstreamID: 7, MappedModel: "provider-model", Status: 499, Outcome: forward.OutcomeCanceled, CreatedAt: now.Add(-5 * time.Minute), CompletedAt: now.Add(-5 * time.Minute)}},
+		Outcome: "canceled", CreatedAt: now.Add(-5 * time.Minute), CompletedAt: now.Add(-5 * time.Minute),
+		Attempts: []RequestAttemptRecord{{AttemptNo: 1, UpstreamID: 7, MappedModel: "provider-model", Status: 499, Outcome: "canceled", CreatedAt: now.Add(-5 * time.Minute), CompletedAt: now.Add(-5 * time.Minute)}},
 	}); !ok {
 		t.Fatal("enqueue neutral request failed")
 	}
@@ -41,8 +40,8 @@ func TestPassiveStatsUsesRequestAndAttemptSemantics(t *testing.T) {
 	// follows the parent request timestamp, not an individual attempt timestamp.
 	if ok := st.EnqueueRequest(RequestRecord{
 		RequestID: "passive-boundary", FinalUpstreamID: 7, Model: "boundary-model", Status: 200,
-		Outcome: forward.OutcomeSuccess, CreatedAt: now.Add(-2 * time.Hour), CompletedAt: now.Add(-2 * time.Hour),
-		Attempts: []RequestAttemptRecord{{AttemptNo: 1, UpstreamID: 7, MappedModel: "boundary-model", Status: 200, Outcome: forward.OutcomeSuccess, CreatedAt: now.Add(-30 * time.Minute), CompletedAt: now.Add(-30 * time.Minute)}},
+		Outcome: "success", CreatedAt: now.Add(-2 * time.Hour), CompletedAt: now.Add(-2 * time.Hour),
+		Attempts: []RequestAttemptRecord{{AttemptNo: 1, UpstreamID: 7, MappedModel: "boundary-model", Status: 200, Outcome: "success", CreatedAt: now.Add(-30 * time.Minute), CompletedAt: now.Add(-30 * time.Minute)}},
 	}); !ok {
 		t.Fatal("enqueue boundary request failed")
 	}
