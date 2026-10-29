@@ -22,6 +22,15 @@ func TestResponseErrorClassification(t *testing.T) {
 		// the upstream online.
 		{"temporary capacity", 503, `{"error":{"code":"model_not_found","type":"invalid_request_error"}}`, FailureUnsupported},
 		{"bare 503", 503, `{"error":{"message":"upstream unavailable"}}`, FailureChannel},
+		// New API also denies one model with a plain-text body and no code at
+		// all. Treating that as a channel failure opens the breaker and takes
+		// every other model on the upstream offline (seen in production on
+		// 2026-10-29, when 403s for one model blacked out a healthy one).
+		{"plain 403 no model access", 403, `This token has no access to model deepseek-v4.1-flash (request id: 202610291105084588698478268d9d6778LEK5x)`, FailureUnsupported},
+		{"plain 503 no channel for model", 503, `No available channel for model deepseek-v4.1-flash under group default (distributor) (request id: 202610291107274238232748268d9d6lcMSXNGV)`, FailureUnsupported},
+		{"403 without model reference stays channel", 403, `Forbidden`, FailureChannel},
+		{"403 invalid key stays channel", 403, `{"error":{"code":"invalid_api_key","message":"invalid token for model access"}}`, FailureChannel},
+		{"500 mentioning a model stays channel", 500, `internal error while handling model deepseek-v4.1-flash`, FailureChannel},
 		{"normal invalid request", 422, `{"message":"invalid input"}`, FailureClient},
 	} {
 		t.Run(test.name, func(t *testing.T) {
