@@ -17,7 +17,11 @@ func TestResponseErrorClassification(t *testing.T) {
 		{"rate limit", 200, `{"error":{"type":"rate_limit_error"}}`, FailureRateLimit},
 		{"invalid key", 200, `{"error":{"code":"invalid_api_key"}}`, FailureChannel},
 		{"quota", 429, `{"error":{"code":"insufficient_quota"}}`, FailureChannel},
-		{"temporary capacity", 503, `{"error":{"code":"model_not_found","type":"invalid_request_error"}}`, FailureChannel},
+		// Gateways (New API) answer "no route for this model" with 503 plus a
+		// structured model_not_found; excluding only the model keeps the rest of
+		// the upstream online.
+		{"temporary capacity", 503, `{"error":{"code":"model_not_found","type":"invalid_request_error"}}`, FailureUnsupported},
+		{"bare 503", 503, `{"error":{"message":"upstream unavailable"}}`, FailureChannel},
 		{"normal invalid request", 422, `{"message":"invalid input"}`, FailureClient},
 	} {
 		t.Run(test.name, func(t *testing.T) {
