@@ -154,3 +154,106 @@ func TestListModelsKeepsAdvertisedModelUntilEveryProviderIsExcluded(t *testing.T
 		t.Fatalf("fully excluded model should be hidden: %v", got)
 	}
 }
+
+// 回归：映射的 source（客户端别名）与 target（落到的上游名）都必须出现在
+// /v1/models，否则客户端按清单发现模型时永远拿不到映射出来的名字。
+// 别名即使被 model_unsupported 排除也要列出——映射是运维显式配置，能否成功由请求期判定。
+func TestListModelsIncludesMappedNames(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"data":[{"id":"deepseek-v4.1-flash"}]}`))
+	}))
+	defer provider.Close()
+
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, name := range []string{"member", "outsider"} {
+		if err := st.Create(&upstream.Upstream{Name: name, BaseURL: provider.URL, APIKey: "k", Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ups, _ := st.List()
+	groupID, _ := st.CreateGroup("wild", "")
+	if err := st.AddMember(groupID, ups[0].ID, 50, 1); err != nil {
+		t.Fatal(err)
+	}
+	key, _ := st.CreateKey("client", groupID)
+
+	for _, mapping := range []*store.ModelMapping{
+		{UpstreamID: ups[0].ID, SourceModel: "deepseek-flash", TargetModel: "deepseek-v4.1-flash", MappingType: store.MappingStatic},
+		// 失败计数器留下的空目标行不是映射，不能变成空名字进清单。
+		{UpstreamID: ups[0].ID, SourceModel: "counter-only", TargetModel: "", MappingType: store.MappingAuto},
+		// 非本组成员的映射不得泄漏到本组清单。
+		{UpstreamID: ups[1].ID, SourceModel: "outsider-alias", TargetModel: "outsider-target", MappingType: store.MappingStatic},
+	} {
+		if err := st.UpsertModelMapping(mapping); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	hm := health.New(3, time.Hour)
+	if err := hm.SetModelExclusionStore(st); err != nil {
+		t.Fatal(err)
+	}
+	sched := scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm)
+	srv := New(forward.New(sched, hm, 3), "", st, hm, monitor.New(st), nil, 32<<20)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	fetch := func() []string {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/models", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var payload struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		ids := make([]string, 0, len(payload.Data))
+		for _, item := range payload.Data {
+			ids = append(ids, item.ID)
+		}
+		return ids
+	}
+
+	// 别名被永久排除后仍要列出，否则清单会把可用的映射名藏起来。
+	hm.MarkModelUnsupported(ups[0].ID, "deepseek-flash")
+	want := []string{"deepseek-flash", "deepseek-v4.1-flash"}
+	if got := fetch(); len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("mapped source and target must both be advertised: got %v want %v", got, want)
+	}
+
+	// Gemini 原生清单走同一个 groupModelIDs，别名同样要出现。
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1beta/models", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var gemini struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&gemini); err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(gemini.Models))
+	for _, item := range gemini.Models {
+		names = append(names, item.Name)
+	}
+	if len(names) != 2 || names[0] != "models/deepseek-flash" || names[1] != "models/deepseek-v4.1-flash" {
+		t.Fatalf("gemini discovery must include the mapped alias: %v", names)
+	}
+}
