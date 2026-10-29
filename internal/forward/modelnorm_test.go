@@ -115,6 +115,10 @@ func TestForwardPassthroughSendsStaticModelMapping(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	// Mapping writes are guarded against orphaned upstreams.
+	if err := st.Create(&upstream.Upstream{ID: 7, Name: "mapping test", BaseURL: "http://example.test", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.UpsertModelMapping(&store.ModelMapping{
 		UpstreamID:  7,
 		SourceModel: "deepseek-flash",
@@ -163,6 +167,10 @@ func TestForwardPassthroughProtocolRewritesURLModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	// Mapping writes are guarded against orphaned upstreams.
+	if err := st.Create(&upstream.Upstream{ID: 9, Name: "mapping test", BaseURL: "http://example.test", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.UpsertModelMapping(&store.ModelMapping{
 		UpstreamID:  9,
 		SourceModel: "gemini-2.5-flash",

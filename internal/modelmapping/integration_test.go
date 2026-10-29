@@ -196,6 +196,7 @@ func TestServiceRecordSuccessKeepsStaticMapping(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	createMappingTestUpstream(t, st)
 
 	svc := New(st)
 	if err := st.UpsertModelMapping(&store.ModelMapping{
