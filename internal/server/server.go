@@ -542,8 +542,49 @@ func (s *Server) groupModelIDs(r *http.Request) ([]string, int, error) {
 			ids = append(ids, m)
 		}
 	}
+	// 映射名补全：source_model 是客户端可用的别名，target_model 是它落到上游的名字。
+	// 清单原本只反映上游自报的模型，别名因此永远发现不了；这里把本组启用上游上配置过
+	// 的映射两端都补进来，且不受模型排除表影响——映射是运维显式配置，能否成功由请求期
+	// 判定，不该在发现阶段静默消失。空目标行是失败计数器而非映射，必须跳过。
+	ids = s.appendMappedModelIDs(ids, ups)
 	sort.Strings(ids)
 	return ids, http.StatusOK, nil
+}
+
+// appendMappedModelIDs 把本组启用上游上配置的映射两端并入清单。
+// 上游集合取自 ListEnabledByGroup，与并集口径一致：非本组成员或已停用的上游
+// 不会把它的映射名带出来。库读取失败只跳过补全，不影响上游自报的模型。
+func (s *Server) appendMappedModelIDs(ids []string, ups []*upstream.Upstream) []string {
+	mappings, err := s.store.ListModelMappings(nil)
+	if err != nil {
+		return ids
+	}
+	enabled := make(map[int64]bool, len(ups))
+	for _, u := range ups {
+		enabled[u.ID] = true
+	}
+	present := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		present[id] = true
+	}
+	for _, m := range mappings {
+		if !enabled[m.UpstreamID] {
+			continue
+		}
+		source, target := strings.TrimSpace(m.SourceModel), strings.TrimSpace(m.TargetModel)
+		// 任一端为空的行是失败计数器（自动学习推不出回退名时留下），不是映射。
+		if source == "" || target == "" {
+			continue
+		}
+		for _, name := range [2]string{source, target} {
+			if present[name] {
+				continue
+			}
+			present[name] = true
+			ids = append(ids, name)
+		}
+	}
+	return ids
 }
 
 // forgetUpstreamModels 丢弃某上游的模型清单缓存，供上游删除后调用。
