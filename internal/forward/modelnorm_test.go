@@ -116,11 +116,12 @@ func TestForwardPassthroughSendsStaticModelMapping(t *testing.T) {
 	}
 	defer st.Close()
 	// Mapping writes are guarded against orphaned upstreams.
-	if err := st.Create(&upstream.Upstream{ID: 7, Name: "mapping test", BaseURL: "http://example.test", Enabled: true}); err != nil {
+	created := &upstream.Upstream{Name: "mapping test", BaseURL: "http://example.test", Enabled: true}
+	if err := st.Create(created); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.UpsertModelMapping(&store.ModelMapping{
-		UpstreamID:  7,
+		UpstreamID:  created.ID,
 		SourceModel: "deepseek-flash",
 		TargetModel: "deepseek-v4.1-flash",
 		MappingType: store.MappingStatic,
@@ -128,7 +129,7 @@ func TestForwardPassthroughSendsStaticModelMapping(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ups := []*upstream.Upstream{{ID: 7, BaseURL: upstreamServer.URL, APIKey: "key", Protocol: "openai", Priority: 1, Weight: 1}}
+	ups := []*upstream.Upstream{{ID: created.ID, BaseURL: upstreamServer.URL, APIKey: "key", Protocol: "openai", Priority: 1, Weight: 1}}
 	hm := health.New(3, time.Hour)
 	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 1)
 	fwd.SetModelMapper(modelmappingResolver{st: st})
@@ -168,11 +169,12 @@ func TestForwardPassthroughProtocolRewritesURLModel(t *testing.T) {
 	}
 	defer st.Close()
 	// Mapping writes are guarded against orphaned upstreams.
-	if err := st.Create(&upstream.Upstream{ID: 9, Name: "mapping test", BaseURL: "http://example.test", Enabled: true}); err != nil {
+	created := &upstream.Upstream{Name: "mapping test", BaseURL: "http://example.test", Enabled: true}
+	if err := st.Create(created); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.UpsertModelMapping(&store.ModelMapping{
-		UpstreamID:  9,
+		UpstreamID:  created.ID,
 		SourceModel: "gemini-2.5-flash",
 		TargetModel: "gemini-2.5-pro",
 		MappingType: store.MappingStatic,
@@ -180,7 +182,7 @@ func TestForwardPassthroughProtocolRewritesURLModel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ups := []*upstream.Upstream{{ID: 9, BaseURL: upstreamServer.URL, APIKey: "key", Protocol: "passthrough", Priority: 1, Weight: 1}}
+	ups := []*upstream.Upstream{{ID: created.ID, BaseURL: upstreamServer.URL, APIKey: "key", Protocol: "passthrough", Priority: 1, Weight: 1}}
 	hm := health.New(3, time.Hour)
 	fwd := New(scheduler.New(func(int64) []*upstream.Upstream { return ups }, hm), hm, 1)
 	fwd.SetModelMapper(modelmappingResolver{st: st})
