@@ -70,6 +70,16 @@ func ClassifyResponseError(status int, payload []byte) *ResponseError {
 		message = strings.TrimSpace(string(payload))
 	}
 	result := &ResponseError{Status: status, Code: code, Message: message}
+	// New API reports a group with no route for one model as HTTP 503 plus a
+	// structured model_not_found code ("No available channel for model …").
+	// That is a capability gap of this credential, not an outage of the whole
+	// upstream: counting it as a channel failure opens the breaker and takes
+	// every other model on that upstream offline. Bare 503s stay failures.
+	if status == http.StatusServiceUnavailable &&
+		(strings.EqualFold(strings.TrimSpace(code), "model_not_found") || strings.EqualFold(strings.TrimSpace(typ), "model_not_found")) {
+		result.Kind = FailureUnsupported
+		return result
+	}
 	if IsFailureStatus(status) {
 		result.Kind = FailureChannel
 		return result

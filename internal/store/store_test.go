@@ -666,6 +666,10 @@ func TestDeleteStaleAutoMappingsKeepsStatic(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	// Mapping writes are guarded against orphaned upstreams.
+	if err := st.Create(&upstream.Upstream{ID: 1, Name: "mapping test", BaseURL: "http://example.test", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
 
 	past := time.Now().Add(-time.Hour)
 	if err := st.UpsertModelMapping(&ModelMapping{
