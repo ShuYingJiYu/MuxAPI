@@ -104,6 +104,9 @@ func (s *Store) requestWhere(filter RequestFilter, includeCursor bool) (string, 
 	return where.String(), args
 }
 
+// route_decisions.request_id is TEXT on databases that predate the versioned
+// SQL migrations and UUID on fresh ones; compare as text (see
+// routing_observations.go for the full explanation).
 func (s *Store) requestSelect(where string) string {
 	return fmt.Sprintf(`SELECT r.id,r.request_id,r.group_id,COALESCE(g.name,''),
 		r.final_upstream_id,COALESCE(u.name,''),r.model,r.endpoint,r.key_name,r.client_ip,r.user_agent,r.status,r.outcome,
@@ -123,7 +126,7 @@ func (s *Store) requestSelect(where string) string {
 		FROM requests r
 		LEFT JOIN upstreams u ON u.id=r.final_upstream_id
 		LEFT JOIN groups g ON g.id=r.group_id
-		LEFT JOIN route_decisions rd ON rd.request_id=r.request_id%s`,
+		LEFT JOIN route_decisions rd ON CAST(rd.request_id AS TEXT)=CAST(r.request_id AS TEXT)%s`,
 		s.unixExpr("r.created_at"), s.unixExpr("r.completed_at"), where)
 }
 
