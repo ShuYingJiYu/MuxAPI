@@ -80,6 +80,16 @@ func ClassifyResponseError(status int, payload []byte) *ResponseError {
 		result.Kind = FailureUnsupported
 		return result
 	}
+	// Some gateways deny a single model with a plain-text body and no error
+	// code at all: 403 "This token has no access to model X" or 503 "No
+	// available channel for model X under group …". Both are capability gaps
+	// of this credential for one model. Counting them as channel failures
+	// opens the breaker and takes every other model on that upstream offline,
+	// which is exactly the collateral 403s are known to cause here.
+	if isModelScopedDenial(status, code, typ, message) {
+		result.Kind, result.Status = FailureUnsupported, http.StatusNotFound
+		return result
+	}
 	if IsFailureStatus(status) {
 		result.Kind = FailureChannel
 		return result
@@ -128,6 +138,47 @@ func meaningfulError(raw json.RawMessage) bool {
 	default:
 		return true
 	}
+}
+
+// modelScopedDenialPatterns are the plain-text phrasings New API and similar
+// gateways use when one credential lacks access to one model. They must match
+// a model reference so a channel-wide outage is never downgraded by accident.
+var modelScopedDenialPatterns = []string{
+	"has no access to model",
+	"no access to model",
+	"no available channel for model",
+	"does not have access to model",
+	"model is not allowed",
+	"model not allowed for this token",
+}
+
+// isModelScopedDenial reports whether this failure denies one model rather
+// than breaking the whole upstream. Only 4xx capability statuses qualify: a
+// 500-level body that happens to mention a model stays a channel failure.
+func isModelScopedDenial(status int, code, typ, message string) bool {
+	if status != http.StatusForbidden && status != http.StatusBadRequest && status != http.StatusNotFound && status != http.StatusServiceUnavailable {
+		return false
+	}
+	// A structured auth/quota/billing code means the credential itself is
+	// broken, which affects every model, not just the one in the message.
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "invalid_api_key", "authentication_error", "permission_error", "permission_denied", "insufficient_quota", "billing_hard_limit_reached":
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(typ)) {
+	case "invalid_api_key", "authentication_error", "insufficient_quota", "billing_hard_limit_reached":
+		return false
+	}
+	text := strings.ToLower(message)
+	if !strings.Contains(text, "model") {
+		return false
+	}
+	for _, pattern := range modelScopedDenialPatterns {
+		if strings.Contains(text, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 // InspectSSEEvent is shared by forwarding and active monitoring. Error wins
