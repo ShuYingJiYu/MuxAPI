@@ -40,6 +40,7 @@ func (s *Server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/logs/", admin(s.adminLogItem))                  // GET 单条请求完整尝试链
 	mux.HandleFunc("/admin/routing/decisions", admin(s.adminRouteDecisions))
 	mux.HandleFunc("/admin/routing/decisions/", admin(s.adminRouteDecisionItem))
+	mux.HandleFunc("/admin/routing/calibration", admin(s.adminRoutingCalibration))
 	mux.HandleFunc("/admin/overview/summary", admin(s.adminOverviewSummary)) // GET 今日请求/本周费用汇总
 	mux.HandleFunc("/admin/overview/trends", admin(s.adminOverviewTrends))   // GET 总览余额/成功率趋势
 	mux.HandleFunc("/admin/settings", admin(s.adminSettings))                // GET/PUT 运行时设置
@@ -69,6 +70,38 @@ func (s *Server) adminPassiveHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, stats)
+}
+
+// adminRoutingCalibration compares the per-request forecast cost with the
+// cost observed after forwarding. Read-only: it never triggers probes.
+func (s *Server) adminRoutingCalibration(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	duration, err := parsePassiveWindow(r.URL.Query().Get("window"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var groupID int64
+	if value := strings.TrimSpace(r.URL.Query().Get("group_id")); value != "" {
+		groupID, err = strconv.ParseInt(value, 10, 64)
+		if err != nil || groupID <= 0 {
+			http.Error(w, "invalid group_id", http.StatusBadRequest)
+			return
+		}
+	}
+	calibration, err := s.store.RoutingCalibrationSummary(store.RoutingCalibrationFilter{
+		Since:   time.Now().Add(-duration),
+		GroupID: groupID,
+		Model:   strings.TrimSpace(r.URL.Query().Get("model")),
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, calibration)
 }
 
 func parsePassiveWindow(value string) (time.Duration, error) {
