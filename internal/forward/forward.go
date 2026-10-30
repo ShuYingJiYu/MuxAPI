@@ -510,7 +510,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		if query := translate.TargetQuery(sourceFormat, targetFormat, r.URL.Query(), exchange.UpstreamStream); query != "" {
 			targetPath += "?" + query
 		}
-		attemptCtx.estimate = routing.EstimateOutboundInput(exchange.UpstreamRequest, upstreamModel, candidate.Protocol)
+		attemptCtx.estimate = routing.EstimateOutboundInput(exchange.UpstreamRequest, upstreamModel, wireProtocol(targetFormat, sourceFormat))
 		upstreamAttempts++
 		req, err := candidate.BuildRequest(r.Method, targetPath, bytes.NewReader(exchange.UpstreamRequest), r.Header)
 		if err != nil {
@@ -586,7 +586,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 					resp.Header.Set("Content-Type", "application/json")
 				}
 				resp.Body = io.NopCloser(bytes.NewReader(clientPayload))
-				result := relayResponse(w, resp, start, nil, candidate.Protocol)
+				result := relayResponse(w, resp, start, nil, wireProtocol(targetFormat, sourceFormat))
 				outcome, kind, source := OutcomeClientError, "client_request", "client"
 				if result.err != nil {
 					outcome, kind = OutcomeCanceled, "downstream_write"
@@ -605,7 +605,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		}
 
 		// relayResult.committed 表示响应是否已写出；只有未写出时才能安全换源。
-		result := relayTranslatedResponse(r.Context(), w, resp, start, markOutput, exchange, string(targetFormat))
+		result := relayTranslatedResponse(r.Context(), w, resp, start, markOutput, exchange, wireProtocol(targetFormat, sourceFormat))
 		watchdog.stop()
 		cause := context.Cause(ctx)
 		cancel(nil)

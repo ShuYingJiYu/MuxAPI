@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/mirainya/muxapi/internal/tokenusage"
+	"github.com/mirainya/muxapi/internal/translate"
 	"github.com/mirainya/muxapi/internal/upstream"
 )
 
@@ -369,6 +370,17 @@ func usageProtocolHint(protocol ...string) string {
 		return ""
 	}
 	return strings.ToLower(strings.TrimSpace(protocol[0]))
+}
+
+// wireProtocol resolves the protocol actually spoken on the wire for the
+// request that was just built. Passthrough keeps the client's own format, so
+// the estimate must be keyed by that format rather than by the literal
+// "passthrough" channel setting, which carries no schema information.
+func wireProtocol(target, source translate.Format) string {
+	if target == translate.Passthrough {
+		return string(source)
+	}
+	return string(target)
 }
 
 func inferUsageProtocol(object map[string]any) string {
