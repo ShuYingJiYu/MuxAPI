@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import Icon from './Icon.vue'
 import { api } from './api.js'
+import { tokenRatioText, tokenAccountingReason, tokenCountSource, reportedInputText, outboundInputText, uncachedInputText } from './tokenAccounting.js'
 import { normalizeTs } from './api.generated.js'
 
 const decisions = ref([])
@@ -109,25 +110,6 @@ function costWidth(item) { const max = Math.max(...candidates.value.filter(row =
 function fmtCost(value) { const n = number(value); if (!n) return '$0'; if (n < .001) return '<$0.001'; return n < 1 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}` }
 function fmtNumber(value) { return number(value).toLocaleString('zh-CN') }
 function fmtTokens(value) { const n = number(value); if (!n) return '—'; return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}K` : fmtNumber(n) }
-function actualPromptTokens(item) {
-  const measured = number(item?.actual_prompt_tokens)
-  return measured || number(item?.actual_input_tokens) + number(item?.actual_cached_tokens) + number(item?.actual_cache_creation_tokens)
-}
-function tokenInflation(item) {
-  const estimated = number(item?.estimated_input_tokens)
-  const actual = actualPromptTokens(item)
-  return estimated > 0 && actual > 0 ? actual / estimated : 0
-}
-function tokenInflationText(item) {
-  const ratio = tokenInflation(item)
-  if (!ratio) return '—'
-  const delta = actualPromptTokens(item) - number(item.estimated_input_tokens)
-  return `${ratio.toFixed(2)}x · ${delta >= 0 ? '+' : ''}${fmtTokens(delta)}`
-}
-function tokenInflationClass(item) {
-  const ratio = tokenInflation(item)
-  return ratio >= 1.2 ? 'high' : ratio > 1.05 ? 'medium' : ''
-}
 function fmtConfidence(value) { return `${Math.round(number(value) * 100)}%` }
 function confidenceClass(value) { const n = number(value); return n >= .8 ? 'high' : n >= .5 ? 'medium' : 'low' }
 function formatTime(value) { const ms = normalizeTs(value); return ms ? new Date(ms).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—' }
@@ -200,13 +182,15 @@ function timeAgo(value) { const ms = normalizeTs(value); if (!ms) return '—'; 
 
         <section class="routing-drawer-section"><header><h4>请求上下文</h4></header><dl class="routing-detail-grid"><div><dt>策略</dt><dd>{{ detail.strategy || 'cost' }}</dd></div><div><dt>协议</dt><dd>{{ detail.protocol || '—' }}</dd></div><div><dt>输入 Token</dt><dd>{{ fmtTokens(detail.estimated_input_tokens) }}</dd></div><div><dt>可复用前缀</dt><dd>{{ fmtTokens(detail.reusable_prefix_tokens) }}</dd></div><div><dt>预估输出</dt><dd>{{ fmtTokens(detail.estimated_output_tokens) }}</dd></div><div><dt>窗口预测总额</dt><dd>{{ detail.selected_cost == null ? '—' : fmtCost(detail.selected_cost) }}</dd></div></dl></section>
 
-        <section class="routing-drawer-section"><header><h4>实际结果</h4><span class="routing-outcome" :class="outcomeClass(detail.actual_outcome)"><i></i>{{ outcomeLabel(detail.actual_outcome) }}</span></header><dl class="routing-detail-grid"><div><dt>按实际用量重算</dt><dd>{{ detail.actual_cost == null ? '—' : fmtCost(detail.actual_cost) }}</dd></div><div><dt>实际输入 Token</dt><dd>{{ fmtTokens(actualPromptTokens(detail)) }}</dd></div><div><dt>Token 膨胀系数</dt><dd class="token-inflation" :class="tokenInflationClass(detail)" title="实际输入上下文 ÷ 客户端估算输入">{{ tokenInflationText(detail) }}</dd></div><div><dt>未缓存输入</dt><dd>{{ fmtTokens(detail.actual_input_tokens) }}</dd></div><div><dt>输出 Token</dt><dd>{{ fmtTokens(detail.actual_output_tokens) }}</dd></div><div><dt>缓存读取</dt><dd>{{ fmtTokens(detail.actual_cached_tokens) }}</dd></div><div><dt>缓存创建</dt><dd>{{ fmtTokens(detail.actual_cache_creation_tokens) }}</dd></div><div><dt>请求 ID</dt><dd class="routing-request-id" :title="detail.request_id">{{ detail.request_id || '—' }}</dd></div></dl></section>
+        <section class="routing-drawer-section"><header><h4>实际结果</h4><span class="routing-outcome" :class="outcomeClass(detail.actual_outcome)"><i></i>{{ outcomeLabel(detail.actual_outcome) }}</span></header><dl class="routing-detail-grid"><div><dt>按已报告用量重算</dt><dd>{{ detail.actual_cost == null ? '—' : fmtCost(detail.actual_cost) }}</dd></div><div><dt>上游报告输入</dt><dd>{{ reportedInputText(detail) }}</dd></div><div><dt>出站估算输入</dt><dd>{{ outboundInputText(detail) }}</dd></div><div><dt>输入量偏差（估算）</dt><dd>{{ tokenRatioText(detail) }}</dd></div><div><dt>计数来源</dt><dd>{{ tokenCountSource(detail) }}</dd></div><div class="token-accounting-note"><dt>比较说明</dt><dd>{{ tokenAccountingReason(detail) }}</dd></div><div><dt>未缓存输入</dt><dd>{{ uncachedInputText(detail) }}</dd></div><div><dt>输出 Token</dt><dd>{{ fmtTokens(detail.actual_output_tokens) }}</dd></div><div><dt>缓存读取</dt><dd>{{ fmtTokens(detail.actual_cached_tokens) }}</dd></div><div><dt>缓存创建</dt><dd>{{ fmtTokens(detail.actual_cache_creation_tokens) }}</dd></div><div><dt>请求 ID</dt><dd class="routing-request-id" :title="detail.request_id">{{ detail.request_id || '—' }}</dd></div></dl></section>
       </div>
     </aside>
   </div>
 </template>
 
 <style scoped>
+.token-accounting-note { grid-column: 1 / -1; }
+.token-accounting-note dd { white-space: normal; overflow-wrap: anywhere; }
 .routing-page { min-width: 0; display: flex; flex-direction: column; gap: 16px; padding-bottom: 28px; }
 .routing-page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding: 4px 2px 2px; }
 .routing-kicker { display: inline-flex; align-items: center; gap: 7px; color: var(--g400); font-family: var(--font-data); font-size: 9px; font-weight: 700; letter-spacing: .08em; }

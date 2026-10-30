@@ -65,17 +65,6 @@ func (s *Server) adminUpstreams(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		var inflationStats map[int64]store.UpstreamTokenInflationStats
-		// The overview endpoint only needs lightweight billing data. Keep the
-		// token comparison on the full upstream-pool view to avoid adding a
-		// history scan to dashboard refreshes.
-		if r.URL.Query().Get("view") != "overview" {
-			inflationStats, err = s.store.ListUpstreamTokenInflationStats(24*time.Hour, time.Now())
-			if err != nil {
-				http.Error(w, err.Error(), 500)
-				return
-			}
-		}
 		out := make([]upstreamDTO, 0, len(list))
 		for _, u := range list {
 			item := upstreamDTO{
@@ -84,10 +73,6 @@ func (s *Server) adminUpstreams(w http.ResponseWriter, r *http.Request) {
 				Masked: mask(u.APIKey), Enabled: u.Enabled, ChannelProbe: u.ChannelProbe, CreditRatio: u.CreditRatio,
 				Health:      toHealthView(s.health.Snapshot(u.ID), s.health.EffectiveState(u.ID)),
 				ModelHealth: toModelHealthViews(s.health.ModelStates(u.ID)),
-			}
-			if stats, ok := inflationStats[u.ID]; ok {
-				item.TokenInflation = stats.TokenInflation
-				item.TokenInflationSamples = stats.TokenInflationSamples
 			}
 			if u.BillingType != upstream.BillingNone {
 				state, ok := billingStates[u.ID]

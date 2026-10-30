@@ -13,6 +13,7 @@ import RoutingView from './RoutingView.vue'
 import SecurityLogs from './SecurityLogs.vue'
 import ModelMappings from './ModelMappings.vue'
 import { api } from './api.js'
+import { tokenAccountingReason, tokenCountSource, reportedInputText, outboundInputText } from './tokenAccounting.js'
 import { useLogs } from './composables/useLogs.js'
 import { useMonitorViews } from './composables/useMonitorViews.js'
 
@@ -2002,7 +2003,7 @@ const {
   fmtBytes, fmtNum, requestOutcomeText, requestOutcomeClass, errorKindText,
   errorSourceText, selectionText, streamStateText, outcomeText, fmtTime, fmtTimeFull, statusText,
   fmtEndpoint, clientName, cacheRateText, cacheSummary, cacheRateWidth,
-  billedInputTokens, tokenInflation, tokenInflationText, tokenInflationClass,
+  billedInputTokens, tokenInflation, tokenInflationText,
 } = useLogs({ page, guard })
 // 监控项 CRUD
 const monModels = ref([])  // 当前对话框选中渠道的可选模型（datalist）
@@ -2893,7 +2894,7 @@ function logout() {
                   </td>
                   <td><span class="log-status" :class="requestOutcomeClass(l)">{{ requestOutcomeText(l) }} · {{ statusText(l.status) }}</span><span v-if="l.error_kind" class="log-sub error-kind">{{ errorKindText(l.error_kind) }}</span></td>
                   <td><b class="log-metric">{{ fmtMs(l.ttft_ms) }}</b><span class="log-sub">总计 {{ fmtMs(l.duration_ms) }}</span></td>
-                  <td><b class="log-metric">{{ fmtNum(l.input_tokens) }} / {{ fmtNum(l.output_tokens) }}</b><span class="log-sub">{{ cacheSummary(l) }}</span><span v-if="tokenInflation(l)" class="log-sub token-inflation" :class="tokenInflationClass(l)" title="实际计费输入 ÷ 客户端估算输入">膨胀 {{ tokenInflationText(l) }}</span></td>
+                  <td><b class="log-metric">{{ fmtNum(l.input_tokens) }} / {{ fmtNum(l.output_tokens) }}</b><span class="log-sub">{{ cacheSummary(l) }}</span><span v-if="tokenInflation(l) !== null" class="log-sub token-comparison" :title="tokenAccountingReason(l)">输入偏差 {{ tokenInflationText(l) }}</span></td>
                   <td><b class="log-metric">{{ fmtBytes(l.response_bytes) }}</b><span class="log-sub">{{ streamStateText(l) }}</span></td>
                 </tr>
                 <tr v-if="!logs.length"><td colspan="9" class="empty-cell">{{ logLoading ? '加载中…' : '没有符合条件的请求记录。' }}</td></tr>
@@ -3212,9 +3213,11 @@ function logout() {
               <div><span>请求体</span><b>{{ fmtBytes(logDetail.request_bytes) }}</b></div>
               <div><span>响应体</span><b>{{ fmtBytes(logDetail.response_bytes) }}</b></div>
               <div><span>输入 Token</span><b>{{ fmtNum(logDetail.input_tokens) }}</b></div>
-              <div><span>实际输入 Token</span><b>{{ billedInputTokens(logDetail) ? fmtNum(billedInputTokens(logDetail)) : '—' }}</b></div>
-              <div><span>客户端估算输入</span><b>{{ logDetail.estimated_input_tokens ? fmtNum(logDetail.estimated_input_tokens) : '—' }}</b></div>
-              <div><span>Token 膨胀系数</span><b class="token-inflation" :class="tokenInflationClass(logDetail)">{{ tokenInflationText(logDetail) }}</b></div>
+              <div><span>上游报告输入</span><b>{{ reportedInputText(logDetail) }}</b></div>
+              <div><span>出站估算输入</span><b>{{ outboundInputText(logDetail) }}</b></div>
+              <div><span>输入量偏差（估算）</span><b class="token-comparison">{{ tokenInflationText(logDetail) }}</b></div>
+              <div><span>计数来源</span><b>{{ tokenCountSource(logDetail) }}</b></div>
+              <div class="token-accounting-note"><span>比较说明</span><b>{{ tokenAccountingReason(logDetail) }}</b></div>
               <div><span>输出 Token</span><b>{{ fmtNum(logDetail.output_tokens) }}</b></div>
               <div><span>缓存 Token / 命中率</span><b>{{ fmtNum(logDetail.cached_tokens) }} / {{ cacheRateText(logDetail) }}</b></div>
               <div><span>流结束</span><b>{{ streamStateText(logDetail) }}</b></div>

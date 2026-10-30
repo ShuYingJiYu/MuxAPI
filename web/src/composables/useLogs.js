@@ -1,5 +1,6 @@
 import { computed, ref } from 'vue'
 import { api } from '../api.js'
+import { tokenRatio, tokenRatioText } from '../tokenAccounting.js'
 
 // 管理请求记录的筛选、分页、详情和自动刷新生命周期。
 export function useLogs({ page, guard }) {
@@ -237,20 +238,8 @@ export function useLogs({ page, guard }) {
   // not the amount charged at the ordinary input rate.
   const billedInputTokens = entry => Number(entry?.cache_input_tokens) ||
     (Number(entry?.input_tokens) || 0)
-  // Stored by the server from the routing estimate and provider usage. A
-  // missing/zero value means this request predates routing audit data.
-  const tokenInflation = entry => {
-    const value = Number(entry?.token_inflation)
-    return Number.isFinite(value) && value > 0 ? value : 0
-  }
-  const tokenInflationText = entry => {
-    const value = tokenInflation(entry)
-    return value ? `${value.toFixed(2)}x` : '—'
-  }
-  const tokenInflationClass = entry => {
-    const value = tokenInflation(entry)
-    return value >= 1.2 ? 'high' : value > 1.05 ? 'medium' : value ? 'normal' : ''
-  }
+  const tokenInflation = tokenRatio
+  const tokenInflationText = tokenRatioText
   const outcomeText = outcome => ({
     success: '成功', failed: '失败', canceled: '已取消', partial: '流中断',
     client_error: '请求错误', unsupported: '不支持', unavailable: '无可用渠道',
@@ -321,6 +310,6 @@ export function useLogs({ page, guard }) {
     fmtBytes, fmtNum, requestOutcomeText, requestOutcomeClass, errorKindText,
     errorSourceText, selectionText, streamStateText, outcomeText, fmtTime, fmtTimeFull, statusText,
     fmtEndpoint, clientName, cacheRateText, cacheSummary, cacheRateWidth,
-    billedInputTokens, tokenInflation, tokenInflationText, tokenInflationClass,
+    billedInputTokens, tokenInflation, tokenInflationText,
   }
 }

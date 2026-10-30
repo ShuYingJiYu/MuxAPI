@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"time"
+
+	"github.com/mirainya/muxapi/internal/tokenusage"
 )
 
 // --- 请求审计 ---
@@ -26,6 +28,7 @@ type RequestAttemptRecord struct {
 	StreamCompleted       bool
 	LastEvent             string
 	InputTokens           int64
+	TokenAccounting       *tokenusage.Measurement `json:"token_accounting,omitempty"`
 	InputTokensNormalized bool
 	OutputTokens          int64
 	CachedTokens          int64
@@ -51,7 +54,8 @@ type RequestRecord struct {
 	RequestBytes          int64
 	ResponseBytes         int64
 	InputTokens           int64
-	InputTokensNormalized bool `json:"-"`
+	TokenAccounting       *tokenusage.Measurement `json:"token_accounting,omitempty"`
+	InputTokensNormalized bool                    `json:"-"`
 	OutputTokens          int64
 	CachedTokens          int64
 	CacheCreationTokens   int64
@@ -71,36 +75,37 @@ type RequestRecord struct {
 }
 
 type RequestAttemptEntry struct {
-	ID                    int64   `json:"id"`
-	AttemptNo             int     `json:"attempt_no"`
-	UpstreamID            int64   `json:"upstream_id"`
-	UpstreamName          string  `json:"upstream_name"`
-	MappedModel           string  `json:"mapped_model,omitempty"`
-	Priority              int     `json:"priority"`
-	SelectionReason       string  `json:"selection_reason"`
-	HealthBefore          string  `json:"health_before"`
-	HealthAfter           string  `json:"health_after"`
-	Status                int     `json:"status"`
-	Outcome               string  `json:"outcome"`
-	TTFTMs                int64   `json:"ttft_ms"`
-	DurationMs            int64   `json:"duration_ms"`
-	ResponseBytes         int64   `json:"response_bytes"`
-	Stream                bool    `json:"stream"`
-	StreamCompleted       bool    `json:"stream_completed"`
-	LastEvent             string  `json:"last_event"`
-	InputTokens           int64   `json:"input_tokens"`
-	InputTokensNormalized bool    `json:"-"`
-	OutputTokens          int64   `json:"output_tokens"`
-	CachedTokens          int64   `json:"cached_tokens"`
-	CacheCreationTokens   int64   `json:"cache_creation_tokens"`
-	CacheInputTokens      int64   `json:"cache_input_tokens"`
-	CacheRate             float64 `json:"cache_rate"`
-	UpstreamRequestID     string  `json:"upstream_request_id"`
-	ErrorKind             string  `json:"error_kind"`
-	ErrorSource           string  `json:"error_source"`
-	CreatedAt             int64   `json:"created_at"`
-	CompletedAt           int64   `json:"completed_at"`
-	Error                 string  `json:"error"`
+	ID                    int64                   `json:"id"`
+	AttemptNo             int                     `json:"attempt_no"`
+	UpstreamID            int64                   `json:"upstream_id"`
+	UpstreamName          string                  `json:"upstream_name"`
+	MappedModel           string                  `json:"mapped_model,omitempty"`
+	Priority              int                     `json:"priority"`
+	SelectionReason       string                  `json:"selection_reason"`
+	HealthBefore          string                  `json:"health_before"`
+	HealthAfter           string                  `json:"health_after"`
+	Status                int                     `json:"status"`
+	Outcome               string                  `json:"outcome"`
+	TTFTMs                int64                   `json:"ttft_ms"`
+	DurationMs            int64                   `json:"duration_ms"`
+	ResponseBytes         int64                   `json:"response_bytes"`
+	Stream                bool                    `json:"stream"`
+	StreamCompleted       bool                    `json:"stream_completed"`
+	LastEvent             string                  `json:"last_event"`
+	InputTokens           int64                   `json:"input_tokens"`
+	TokenAccounting       *tokenusage.Measurement `json:"token_accounting,omitempty"`
+	InputTokensNormalized bool                    `json:"-"`
+	OutputTokens          int64                   `json:"output_tokens"`
+	CachedTokens          int64                   `json:"cached_tokens"`
+	CacheCreationTokens   int64                   `json:"cache_creation_tokens"`
+	CacheInputTokens      int64                   `json:"cache_input_tokens"`
+	CacheRate             float64                 `json:"cache_rate"`
+	UpstreamRequestID     string                  `json:"upstream_request_id"`
+	ErrorKind             string                  `json:"error_kind"`
+	ErrorSource           string                  `json:"error_source"`
+	CreatedAt             int64                   `json:"created_at"`
+	CompletedAt           int64                   `json:"completed_at"`
+	Error                 string                  `json:"error"`
 }
 
 type RequestRouteStep struct {
@@ -113,30 +118,30 @@ type RequestRouteStep struct {
 }
 
 type RequestEntry struct {
-	ID                    int64   `json:"id"`
-	RequestID             string  `json:"request_id"`
-	GroupID               int64   `json:"group_id"`
-	GroupName             string  `json:"group_name"`
-	FinalUpstreamID       int64   `json:"final_upstream_id"`
-	FinalUpstreamName     string  `json:"final_upstream_name"`
-	Model                 string  `json:"model"`
-	Endpoint              string  `json:"endpoint"`
-	KeyName               string  `json:"key_name"`
-	ClientIP              string  `json:"client_ip"`
-	UserAgent             string  `json:"user_agent"`
-	Stream                bool    `json:"stream"`
-	RequestBytes          int64   `json:"request_bytes"`
-	ResponseBytes         int64   `json:"response_bytes"`
-	InputTokens           int64   `json:"input_tokens"`
-	InputTokensNormalized bool    `json:"-"`
-	OutputTokens          int64   `json:"output_tokens"`
-	CachedTokens          int64   `json:"cached_tokens"`
-	CacheCreationTokens   int64   `json:"cache_creation_tokens"`
-	CacheInputTokens      int64   `json:"cache_input_tokens"`
-	CacheRate             float64 `json:"cache_rate"`
-	// EstimatedInputTokens comes from the routing decision captured for this
-	// request. TokenInflation is actual provider prompt context divided by that
-	// client-side estimate; zero means no comparable sample is available.
+	ID                    int64                   `json:"id"`
+	RequestID             string                  `json:"request_id"`
+	GroupID               int64                   `json:"group_id"`
+	GroupName             string                  `json:"group_name"`
+	FinalUpstreamID       int64                   `json:"final_upstream_id"`
+	FinalUpstreamName     string                  `json:"final_upstream_name"`
+	Model                 string                  `json:"model"`
+	Endpoint              string                  `json:"endpoint"`
+	KeyName               string                  `json:"key_name"`
+	ClientIP              string                  `json:"client_ip"`
+	UserAgent             string                  `json:"user_agent"`
+	Stream                bool                    `json:"stream"`
+	RequestBytes          int64                   `json:"request_bytes"`
+	ResponseBytes         int64                   `json:"response_bytes"`
+	InputTokens           int64                   `json:"input_tokens"`
+	TokenAccounting       *tokenusage.Measurement `json:"token_accounting,omitempty"`
+	InputTokensNormalized bool                    `json:"-"`
+	OutputTokens          int64                   `json:"output_tokens"`
+	CachedTokens          int64                   `json:"cached_tokens"`
+	CacheCreationTokens   int64                   `json:"cache_creation_tokens"`
+	CacheInputTokens      int64                   `json:"cache_input_tokens"`
+	CacheRate             float64                 `json:"cache_rate"`
+	// EstimatedInputTokens remains the pre-routing client estimate. Deprecated
+	// TokenInflation mirrors comparable token_accounting ratios only.
 	EstimatedInputTokens int64                  `json:"estimated_input_tokens"`
 	TokenInflation       float64                `json:"token_inflation"`
 	StreamCompleted      bool                   `json:"stream_completed"`
@@ -220,14 +225,14 @@ func (s *Store) writeRequest(record RequestRecord) error {
 		request_id,group_id,final_upstream_id,model,endpoint,key_name,client_ip,user_agent,status,outcome,
 		ttft_ms,duration_ms,attempt_count,created_at,completed_at,error_text,stream,
 		request_bytes,response_bytes,input_tokens,input_tokens_normalized,output_tokens,cached_tokens,cache_creation_tokens,stream_completed,
-		last_event,upstream_request_id,error_kind,error_source)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		last_event,upstream_request_id,error_kind,error_source,token_accounting)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		record.RequestID, record.GroupID, record.FinalUpstreamID, record.Model, record.Endpoint,
 		record.KeyName, record.ClientIP, record.UserAgent, record.Status, record.Outcome, record.TTFTMs, record.DurationMs,
 		len(record.Attempts), s.timeValue(record.CreatedAt), s.timeValue(record.CompletedAt), record.Error,
 		record.Stream, record.RequestBytes, record.ResponseBytes, record.InputTokens, record.InputTokensNormalized, record.OutputTokens,
 		record.CachedTokens, record.CacheCreationTokens, record.StreamCompleted, record.LastEvent, record.UpstreamRequestID,
-		record.ErrorKind, record.ErrorSource)
+		record.ErrorKind, record.ErrorSource, tokenusage.Encode(record.TokenAccounting))
 	if err != nil {
 		return err
 	}
@@ -236,15 +241,15 @@ func (s *Store) writeRequest(record RequestRecord) error {
 			request_id,attempt_no,upstream_id,status,outcome,ttft_ms,duration_ms,created_at,completed_at,error_text,
 			priority,selection_reason,health_before,health_after,response_bytes,stream,stream_completed,last_event,
 			input_tokens,input_tokens_normalized,output_tokens,cached_tokens,cache_creation_tokens,upstream_request_id,error_kind,error_source,
-			protocol,mapped_model)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			protocol,mapped_model,token_accounting)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			record.RequestID, attempt.AttemptNo, attempt.UpstreamID, attempt.Status, attempt.Outcome,
 			attempt.TTFTMs, attempt.DurationMs, s.timeValue(attempt.CreatedAt),
 			s.timeValue(attempt.CompletedAt), attempt.Error, attempt.Priority, attempt.SelectionReason,
 			attempt.HealthBefore, attempt.HealthAfter, attempt.ResponseBytes, attempt.Stream,
 			attempt.StreamCompleted, attempt.LastEvent, attempt.InputTokens, attempt.InputTokensNormalized, attempt.OutputTokens,
 			attempt.CachedTokens, attempt.CacheCreationTokens, attempt.UpstreamRequestID, attempt.ErrorKind, attempt.ErrorSource,
-			attempt.Protocol, attempt.MappedModel)
+			attempt.Protocol, attempt.MappedModel, tokenusage.Encode(attempt.TokenAccounting))
 		if err != nil {
 			return err
 		}

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/mirainya/muxapi/internal/tokenusage"
 )
 
 type RequestFilter struct {
@@ -109,17 +111,12 @@ func (s *Store) requestSelect(where string) string {
 		r.final_upstream_id,COALESCE(u.name,''),r.model,r.endpoint,r.key_name,r.client_ip,r.user_agent,r.status,r.outcome,
 		r.ttft_ms,r.duration_ms,r.attempt_count,%s,%s,r.error_text,r.stream,r.request_bytes,
 		r.response_bytes,r.input_tokens,r.input_tokens_normalized,r.output_tokens,r.cached_tokens,r.cache_creation_tokens,
-		CASE WHEN r.input_tokens_normalized OR LOWER(COALESCE(u.protocol,'')) IN ('claude','anthropic','messages','anthropic-messages')
-			THEN r.input_tokens+r.cached_tokens+r.cache_creation_tokens
-			WHEN LOWER(COALESCE(u.protocol,'')) IN ('openai','chat','chat_completions','chat-completions','openai-response','openai_responses','responses','codex','gemini','google','generativelanguage','generatecontent')
-			THEN r.input_tokens+r.cache_creation_tokens ELSE r.input_tokens+r.cached_tokens+r.cache_creation_tokens END,
+		r.input_tokens,
 		r.stream_completed,r.last_event,
 		r.upstream_request_id,r.error_kind,r.error_source,
 		COALESCE(rd.estimated_input_tokens,0),
-		CASE WHEN rd.estimated_input_tokens>0 AND
-			(r.input_tokens+r.cached_tokens+r.cache_creation_tokens)>0
-			THEN CAST(r.input_tokens+r.cached_tokens+r.cache_creation_tokens AS REAL) /
-				rd.estimated_input_tokens ELSE 0 END
+		r.token_accounting,
+        COALESCE((SELECT a.protocol FROM request_attempts a WHERE a.request_id=r.request_id ORDER BY a.attempt_no DESC LIMIT 1),'')
 		FROM requests r
 		LEFT JOIN upstreams u ON u.id=r.final_upstream_id
 		LEFT JOIN groups g ON g.id=r.group_id
@@ -133,6 +130,7 @@ type rowScanner interface {
 
 func scanRequestEntry(row rowScanner) (*RequestEntry, error) {
 	e := &RequestEntry{}
+	var raw, protocol string
 	err := row.Scan(
 		&e.ID, &e.RequestID, &e.GroupID, &e.GroupName, &e.FinalUpstreamID,
 		&e.FinalUpstreamName, &e.Model, &e.Endpoint, &e.KeyName, &e.ClientIP, &e.UserAgent, &e.Status, &e.Outcome,
@@ -140,8 +138,19 @@ func scanRequestEntry(row rowScanner) (*RequestEntry, error) {
 		&e.Stream, &e.RequestBytes, &e.ResponseBytes, &e.InputTokens, &e.InputTokensNormalized, &e.OutputTokens,
 		&e.CachedTokens, &e.CacheCreationTokens, &e.CacheInputTokens,
 		&e.StreamCompleted, &e.LastEvent, &e.UpstreamRequestID,
-		&e.ErrorKind, &e.ErrorSource, &e.EstimatedInputTokens, &e.TokenInflation,
+		&e.ErrorKind, &e.ErrorSource, &e.EstimatedInputTokens, &raw, &protocol,
 	)
+	e.TokenAccounting = tokenusage.Decode(raw)
+	if e.TokenAccounting == nil {
+		e.TokenAccounting = tokenusage.Legacy(e.InputTokens, e.CachedTokens, e.CacheCreationTokens, e.InputTokensNormalized, protocol)
+	}
+	e.CacheInputTokens = 0
+	if total := e.TokenAccounting.Report.InputTotal; total != nil {
+		e.CacheInputTokens = *total
+	}
+	if e.TokenAccounting.Ratio != nil {
+		e.TokenInflation = *e.TokenAccounting.Ratio
+	}
 	e.CacheRate = tokenCacheRate(e.CachedTokens, e.CacheInputTokens)
 	return e, err
 }
@@ -237,11 +246,8 @@ func (s *Store) listRequestAttempts(requestID string) ([]*RequestAttemptEntry, e
 		a.ttft_ms,a.duration_ms,%s,%s,a.error_text,a.priority,a.selection_reason,a.health_before,
 		a.health_after,a.response_bytes,a.stream,a.stream_completed,a.last_event,a.input_tokens,
 		a.output_tokens,a.cached_tokens,a.cache_creation_tokens,
-		CASE WHEN a.input_tokens_normalized OR LOWER(COALESCE(u.protocol,'')) IN ('claude','anthropic','messages','anthropic-messages')
-			THEN a.input_tokens+a.cached_tokens+a.cache_creation_tokens
-			WHEN LOWER(COALESCE(u.protocol,'')) IN ('openai','chat','chat_completions','chat-completions','openai-response','openai_responses','responses','codex','gemini','google','generativelanguage','generatecontent')
-			THEN a.input_tokens+a.cache_creation_tokens ELSE a.input_tokens+a.cached_tokens+a.cache_creation_tokens END,
-		a.upstream_request_id,a.error_kind,a.error_source
+		a.input_tokens,a.upstream_request_id,a.error_kind,a.error_source,
+        a.input_tokens_normalized,a.protocol,a.token_accounting
 		FROM request_attempts a LEFT JOIN upstreams u ON u.id=a.upstream_id
 		WHERE a.request_id=? ORDER BY a.attempt_no`,
 		s.unixExpr("a.created_at"), s.unixExpr("a.completed_at"))
@@ -253,13 +259,22 @@ func (s *Store) listRequestAttempts(requestID string) ([]*RequestAttemptEntry, e
 	out := []*RequestAttemptEntry{}
 	for rows.Next() {
 		e := &RequestAttemptEntry{}
+		var raw, protocol string
 		if err := rows.Scan(&e.ID, &e.AttemptNo, &e.UpstreamID, &e.UpstreamName, &e.MappedModel, &e.Status,
 			&e.Outcome, &e.TTFTMs, &e.DurationMs, &e.CreatedAt, &e.CompletedAt, &e.Error,
 			&e.Priority, &e.SelectionReason, &e.HealthBefore, &e.HealthAfter, &e.ResponseBytes,
 			&e.Stream, &e.StreamCompleted, &e.LastEvent, &e.InputTokens, &e.OutputTokens,
 			&e.CachedTokens, &e.CacheCreationTokens, &e.CacheInputTokens,
-			&e.UpstreamRequestID, &e.ErrorKind, &e.ErrorSource); err != nil {
+			&e.UpstreamRequestID, &e.ErrorKind, &e.ErrorSource, &e.InputTokensNormalized, &protocol, &raw); err != nil {
 			return nil, err
+		}
+		e.TokenAccounting = tokenusage.Decode(raw)
+		if e.TokenAccounting == nil {
+			e.TokenAccounting = tokenusage.Legacy(e.InputTokens, e.CachedTokens, e.CacheCreationTokens, e.InputTokensNormalized, protocol)
+		}
+		e.CacheInputTokens = 0
+		if total := e.TokenAccounting.Report.InputTotal; total != nil {
+			e.CacheInputTokens = *total
 		}
 		e.CacheRate = tokenCacheRate(e.CachedTokens, e.CacheInputTokens)
 		out = append(out, e)

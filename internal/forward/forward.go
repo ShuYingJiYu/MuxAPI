@@ -20,6 +20,7 @@ import (
 
 	healthpkg "github.com/mirainya/muxapi/internal/health"
 	"github.com/mirainya/muxapi/internal/routing"
+	"github.com/mirainya/muxapi/internal/tokenusage"
 	"github.com/mirainya/muxapi/internal/translate"
 	"github.com/mirainya/muxapi/internal/upstream"
 	"github.com/tidwall/sjson"
@@ -243,6 +244,7 @@ type AttemptResult struct {
 	StreamCompleted bool
 	LastEvent       string
 	InputTokens     int64
+	TokenAccounting *tokenusage.Measurement
 	// InputTokensNormalized indicates that InputTokens excludes cached and
 	// cache-creation tokens. It lets storage distinguish new canonical rows
 	// from legacy OpenAI/Responses rows where input_tokens was inclusive.
@@ -270,6 +272,7 @@ type Result struct {
 	StreamCompleted       bool
 	LastEvent             string
 	InputTokens           int64
+	TokenAccounting       *tokenusage.Measurement
 	InputTokensNormalized bool
 	OutputTokens          int64
 	CachedTokens          int64
@@ -284,6 +287,7 @@ type Result struct {
 }
 
 type attemptContext struct {
+	estimate        tokenusage.Estimate
 	number          int
 	protocol        string
 	mappedModel     string
@@ -310,7 +314,8 @@ func healthState(h Health, id int64) string {
 func (a attemptContext) finish(h Health, status int, outcome string, relay relayResult, errorKind, errorSource, errText string) AttemptResult {
 	completed := time.Now()
 	return AttemptResult{
-		AttemptNo: a.number, Protocol: a.protocol, MappedModel: a.mappedModel,
+		TokenAccounting: tokenusage.New(a.estimate, relay.usage.report),
+		AttemptNo:       a.number, Protocol: a.protocol, MappedModel: a.mappedModel,
 		UpstreamID: a.upstreamID, Priority: a.priority,
 		SelectionReason: a.selectionReason, HealthBefore: a.healthBefore, HealthAfter: healthState(h, a.upstreamID),
 		Status: status, Outcome: outcome, TTFTMs: relay.ttftMs, DurationMs: completed.Sub(a.started).Milliseconds(),
@@ -326,7 +331,8 @@ func (a attemptContext) finish(h Health, status int, outcome string, relay relay
 
 func resultFromAttempt(attempt AttemptResult, attempts []AttemptResult) Result {
 	return Result{
-		Status: attempt.Status, Outcome: attempt.Outcome, FinalUpstreamID: attempt.UpstreamID,
+		TokenAccounting: attempt.TokenAccounting,
+		Status:          attempt.Status, Outcome: attempt.Outcome, FinalUpstreamID: attempt.UpstreamID,
 		TTFTMs: attempt.TTFTMs, ResponseBytes: attempt.ResponseBytes,
 		StreamCompleted: attempt.StreamCompleted, LastEvent: attempt.LastEvent,
 		InputTokens: attempt.InputTokens, InputTokensNormalized: attempt.InputTokensNormalized, OutputTokens: attempt.OutputTokens, CachedTokens: attempt.CachedTokens,
@@ -484,6 +490,7 @@ func (f *Forwarder) Forward(w http.ResponseWriter, r *http.Request, body []byte,
 		if query := translate.TargetQuery(sourceFormat, targetFormat, r.URL.Query(), exchange.UpstreamStream); query != "" {
 			targetPath += "?" + query
 		}
+		attemptCtx.estimate = routing.EstimateOutboundInput(exchange.UpstreamRequest, upstreamModel, candidate.Protocol)
 		upstreamAttempts++
 		req, err := candidate.BuildRequest(r.Method, targetPath, bytes.NewReader(exchange.UpstreamRequest), r.Header)
 		if err != nil {

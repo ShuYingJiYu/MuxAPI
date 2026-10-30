@@ -327,7 +327,8 @@ func (s *Server) recordRequest(requestID string, started time.Time, groupID int6
 	attempts := make([]store.RequestAttemptRecord, len(result.Attempts))
 	for i, attempt := range result.Attempts {
 		attempts[i] = store.RequestAttemptRecord{
-			AttemptNo: attempt.AttemptNo, Protocol: attempt.Protocol, MappedModel: attempt.MappedModel,
+			TokenAccounting: attempt.TokenAccounting,
+			AttemptNo:       attempt.AttemptNo, Protocol: attempt.Protocol, MappedModel: attempt.MappedModel,
 			UpstreamID: attempt.UpstreamID, Priority: attempt.Priority,
 			SelectionReason: attempt.SelectionReason, HealthBefore: attempt.HealthBefore, HealthAfter: attempt.HealthAfter,
 			Status: attempt.Status, Outcome: attempt.Outcome, TTFTMs: attempt.TTFTMs, DurationMs: attempt.DurationMs,
@@ -340,7 +341,8 @@ func (s *Server) recordRequest(requestID string, started time.Time, groupID int6
 		}
 	}
 	s.store.EnqueueRequest(store.RequestRecord{
-		RequestID: requestID, GroupID: groupID, FinalUpstreamID: result.FinalUpstreamID,
+		TokenAccounting: result.TokenAccounting,
+		RequestID:       requestID, GroupID: groupID, FinalUpstreamID: result.FinalUpstreamID,
 		Model: model, Endpoint: endpoint, KeyName: keyName, ClientIP: clientIP, UserAgent: userAgent,
 		Stream: stream, RequestBytes: requestBytes,
 		ResponseBytes: result.ResponseBytes, InputTokens: result.InputTokens, InputTokensNormalized: result.InputTokensNormalized, OutputTokens: result.OutputTokens,

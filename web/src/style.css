@@ -1705,3 +1705,7 @@ table.matrix th, table.matrix td { padding: 0; }
 @media (prefers-reduced-motion: reduce) {
   .page-loading, .page-loading-status::before, .page-loading-icon svg, .loading-line, .loading-chip, .loading-row > *, .loading-chart-bars i, .monitor-group-content, .source-chevron, .subnav-item, .subnav-item::before, .subnav-item > svg, .subnav-item span, .mask, .dialog { animation: none; transition: none; }
 }
+
+.token-comparison { color: var(--g500); }
+.log-detail-metrics .token-accounting-note { grid-column: 1 / -1; }
+.token-accounting-note b { white-space: normal; overflow-wrap: anywhere; }

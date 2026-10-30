@@ -31,6 +31,8 @@
  * @property {boolean} exploration
  * @property {number=} actual_cost
  * @property {number=} actual_input_tokens
+ * @property {Object=} token_accounting
+ * @property {number=} actual_prompt_tokens
  * @property {number=} actual_output_tokens
  * @property {number=} actual_cached_tokens
  * @property {number=} actual_cache_creation_tokens
@@ -69,6 +71,8 @@ export const ROUTE_DECISION_ENTRY_FIELDS = Object.freeze({
   Exploration: 'exploration',
   ActualCost: 'actual_cost',
   ActualInputTokens: 'actual_input_tokens',
+  TokenAccounting: 'token_accounting',
+  ActualPromptTokens: 'actual_prompt_tokens',
   ActualOutputTokens: 'actual_output_tokens',
   ActualCachedTokens: 'actual_cached_tokens',
   ActualCacheCreationTokens: 'actual_cache_creation_tokens',

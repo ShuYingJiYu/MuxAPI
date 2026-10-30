@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/mirainya/muxapi/internal/tokenusage"
 	"github.com/mirainya/muxapi/internal/upstream"
 )
 
@@ -19,23 +20,25 @@ type tokenUsage struct {
 	cached        int64
 	cacheCreation int64
 	normalized    bool
+	report        tokenusage.Report
+	fields        map[string]any
 }
 
 func (u *tokenUsage) merge(other tokenUsage) {
-	// 流式协议通常重复发送累计值，取最大值可避免重复计数。
-	if other.input > u.input {
-		u.input = other.input
+	if !other.report.Present {
+		return
 	}
-	if other.output > u.output {
-		u.output = other.output
+	model := u.report.ResponseModel
+	if other.report.Protocol == "claude" && u.fields != nil {
+		// Claude splits input and output across events. Only fields actually
+		// present in an update replace earlier values, including explicit zero.
+		for key, value := range other.fields {
+			u.fields[key] = value
+		}
+		other = parseUsageObject(u.fields, "claude")
 	}
-	if other.cached > u.cached {
-		u.cached = other.cached
-	}
-	if other.cacheCreation > u.cacheCreation {
-		u.cacheCreation = other.cacheCreation
-	}
-	u.normalized = u.normalized || other.normalized
+	*u = other
+	u.report.ResponseModel = model
 }
 
 // responseAudit 在不影响响应转发的前提下提取完成状态和用量。
@@ -54,6 +57,8 @@ type responseAudit struct {
 	// streamErrored 表示上游在 2xx 流里投递过明确的错误事件。
 	streamErrored bool
 	failure       *upstream.ResponseError
+	finalUsage    bool
+	bodyFinished  bool
 }
 
 // auditReadCloser 装饰上游正文，使所有转发分支共享同一套审计解析。
@@ -79,10 +84,12 @@ func (r *auditReadCloser) Read(p []byte) (int, error) {
 		r.audit.feed(p[:n])
 	}
 	if err == io.EOF {
+		r.audit.bodyFinished = true
 		r.audit.finish()
 	}
 	// 完整终止事件之后不再等待 TCP 关闭。写入错误仍由转发层单独处理。
 	if r.audit.streamTerminated {
+		r.audit.bodyFinished = true
 		err = io.EOF
 	}
 	return n, err
@@ -101,7 +108,8 @@ func (a *responseAudit) feed(chunk []byte) {
 			a.sseBuffer = a.sseBuffer[end+skip:]
 		}
 		if len(a.sseBuffer) > maxAuditPayload {
-			a.sseBuffer = append([]byte(nil), a.sseBuffer[len(a.sseBuffer)-maxAuditPayload:]...)
+			a.overflow = true
+			a.sseBuffer = nil
 		}
 		return
 	}
@@ -117,6 +125,15 @@ func (a *responseAudit) feed(chunk []byte) {
 }
 
 func (a *responseAudit) finish() {
+	defer func() {
+		a.usage.report.Complete = a.usage.report.Present && !a.overflow && ((!a.stream && a.bodyFinished) || (a.stream && a.streamCompleted))
+		if a.stream && a.usage.report.Protocol != "gemini" && !a.finalUsage {
+			a.usage.report.Complete = false
+		}
+		if a.stream && a.usage.report.Protocol == "gemini" && !a.bodyFinished {
+			a.usage.report.Complete = false
+		}
+	}()
 	if a.stream {
 		if len(bytes.TrimSpace(a.sseBuffer)) > 0 {
 			a.consumeSSEBlock(a.sseBuffer)
@@ -126,6 +143,10 @@ func (a *responseAudit) finish() {
 	}
 	if !a.overflow {
 		a.usage.merge(usageFromJSON(a.body, a.protocol))
+		var payload map[string]any
+		if json.Unmarshal(a.body, &payload) == nil {
+			a.captureResponseModel(payload)
+		}
 	}
 }
 
@@ -145,6 +166,9 @@ func nextSSEBlock(data []byte) (end, separatorLength int) {
 
 // consumeSSEBlock 兼容 event 字段、JSON type 字段和 [DONE] 三类完成标记。
 func (a *responseAudit) consumeSSEBlock(block []byte) {
+	if a.streamTerminated {
+		return
+	}
 	eventName, raw := upstream.ParseSSEBlock(block)
 	data := strings.TrimSpace(string(raw))
 	if eventName != "" {
@@ -165,7 +189,9 @@ func (a *responseAudit) consumeSSEBlock(block []byte) {
 		return
 	}
 	var payload map[string]any
-	if json.Unmarshal([]byte(data), &payload) != nil {
+	decoder := json.NewDecoder(strings.NewReader(data))
+	decoder.UseNumber()
+	if decoder.Decode(&payload) != nil {
 		return
 	}
 	if typ, _ := payload["type"].(string); typ != "" {
@@ -190,7 +216,41 @@ func (a *responseAudit) consumeSSEBlock(block []byte) {
 		a.lastEvent = "generateContent.completed"
 		a.streamCompleted = true
 	}
-	a.usage.merge(usageFromValue(payload, a.protocol))
+	update := usageFromValue(payload, a.protocol)
+	if update.report.Present {
+		switch update.report.Protocol {
+		case "responses":
+			a.finalUsage = a.streamCompleted
+		case "openai":
+			a.finalUsage = false
+			if choices, ok := payload["choices"].([]any); ok {
+				a.finalUsage = len(choices) == 0
+				for _, value := range choices {
+					choice, _ := value.(map[string]any)
+					if reason, _ := choice["finish_reason"].(string); reason != "" {
+						a.finalUsage = true
+					}
+				}
+			}
+		case "claude":
+			if typ, _ := payload["type"].(string); typ == "message_delta" || eventName == "message_delta" {
+				_, a.finalUsage = update.report.Raw["output_tokens"]
+			}
+		}
+	}
+	a.usage.merge(update)
+	a.captureResponseModel(payload)
+}
+
+func (a *responseAudit) captureResponseModel(payload map[string]any) {
+	for _, key := range []string{"response", "message"} {
+		if nested, ok := payload[key].(map[string]any); ok {
+			a.captureResponseModel(nested)
+		}
+	}
+	if model, ok := payload["model"].(string); ok && model != "" {
+		a.usage.report.ResponseModel = clipLabel(model)
+	}
 }
 
 func geminiResponseComplete(payload map[string]any) bool {
@@ -237,7 +297,9 @@ func clipLabel(value string) string {
 
 func usageFromJSON(data []byte, protocol ...string) tokenUsage {
 	var value any
-	if len(bytes.TrimSpace(data)) == 0 || json.Unmarshal(data, &value) != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if len(bytes.TrimSpace(data)) == 0 || decoder.Decode(&value) != nil {
 		return tokenUsage{}
 	}
 	return usageFromValue(value, protocol...)
@@ -297,28 +359,9 @@ func usageFromValue(value any, protocol ...string) tokenUsage {
 // input 列在所有协议下保持"uncached"这个不变量。下游缓存用量统计依赖这个
 // 不变量；不做归一会把 cached 重复计入 input。
 func parseUsageObject(usage map[string]any, protocol ...string) tokenUsage {
-	inputTokens := maxInt64(number(usage["input_tokens"]), number(usage["prompt_tokens"]))
-	inputTokens = maxInt64(inputTokens, number(usage["promptTokenCount"]))
-	output := maxInt64(maxInt64(maxInt64(number(usage["output_tokens"]), number(usage["completion_tokens"])), number(usage["candidatesTokenCount"])), number(usage["thoughtsTokenCount"]))
-	cached := maxInt64(maxInt64(number(usage["cached_tokens"]), number(usage["cache_read_input_tokens"])), number(usage["cachedContentTokenCount"]))
-	cacheCreation := maxInt64(number(usage["cache_creation_tokens"]), number(usage["cache_creation_input_tokens"]))
-	for _, key := range []string{"input_tokens_details", "prompt_tokens_details"} {
-		if details, ok := usage[key].(map[string]any); ok {
-			cached = maxInt64(cached, number(details["cached_tokens"]))
-		}
-	}
-	input := inputTokens
-	hint := usageProtocolHint(protocol...)
-	if hint == "" {
-		hint = inferUsageProtocol(usage)
-	}
-	if usageInputInclusive(hint, usage) {
-		input -= cached
-		if input < 0 {
-			input = 0
-		}
-	}
-	return tokenUsage{input: input, output: output, cached: cached, cacheCreation: cacheCreation, normalized: hint != ""}
+	report := tokenusage.Parse(usage, usageProtocolHint(protocol...))
+	return tokenUsage{input: report.UncachedInput, output: report.Output, cached: report.CacheRead,
+		cacheCreation: report.CacheWrite, normalized: report.Normalized, report: report, fields: usage}
 }
 
 func usageProtocolHint(protocol ...string) string {
@@ -341,20 +384,6 @@ func inferUsageProtocol(object map[string]any) string {
 	return ""
 }
 
-func usageInputInclusive(protocol string, usage map[string]any) bool {
-	switch protocol {
-	case "claude", "anthropic", "messages", "anthropic-messages":
-		return false
-	case "gemini", "google", "generativelanguage", "generatecontent",
-		"responses", "openai-response", "openai_responses", "codex":
-		return true
-	case "openai", "chat", "chat_completions", "chat-completions":
-		return number(usage["prompt_tokens"]) > 0 || usage["prompt_tokens_details"] != nil || usage["input_tokens_details"] != nil || number(usage["cached_tokens"]) > 0
-	default:
-		return number(usage["prompt_tokens"]) > 0 || number(usage["promptTokenCount"]) > 0 || usage["input_tokens_details"] != nil || usage["prompt_tokens_details"] != nil
-	}
-}
-
 func number(value any) int64 {
 	switch n := value.(type) {
 	case float64:
@@ -365,13 +394,6 @@ func number(value any) int64 {
 	default:
 		return 0
 	}
-}
-
-func maxInt64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 // upstreamRequestID 按常见网关头的优先顺序提取链路标识。

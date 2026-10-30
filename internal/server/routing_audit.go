@@ -59,6 +59,7 @@ func (s *Server) persistRoutingAudit(requestID string, started time.Time, groupI
 			// selected_upstream_id misattributes failover requests to the
 			// upstream that failed.
 			complete := store.RouteDecisionOutcome{
+				TokenAccounting:   result.TokenAccounting,
 				ActualInputTokens: optionalInt64Ptr(result.InputTokens), ActualOutputTokens: optionalInt64Ptr(result.OutputTokens),
 				ActualCachedTokens: optionalInt64Ptr(result.CachedTokens), ActualCacheCreationTokens: optionalInt64Ptr(result.CacheCreationTokens),
 				ActualUpstreamID: result.FinalUpstreamID,
@@ -107,6 +108,10 @@ func (s *Server) persistRoutingAudit(requestID string, started time.Time, groupI
 
 func routeActualCost(decision *routing.Decision, result forward.Result) (float64, bool) {
 	if decision == nil {
+		return 0, false
+	}
+	// Malformed or ambiguous buckets cannot produce an authoritative cost.
+	if m := result.TokenAccounting; m != nil && (!m.Report.Present || m.Report.Quality != "valid") {
 		return 0, false
 	}
 	target := result.FinalUpstreamID

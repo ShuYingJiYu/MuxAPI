@@ -109,6 +109,14 @@ func TestRouteDecisionPromptTokensDistinguishLegacyAndCanonicalUsage(t *testing.
 			t.Fatal(err)
 		}
 	}
+	// The outgoing protocol belongs to the attempt, not the client route.
+	for _, id := range []string{"legacy-prompt", "canonical-prompt"} {
+		if err := st.writeRequest(RequestRecord{RequestID: id, CreatedAt: now, CompletedAt: now,
+			Attempts: []RequestAttemptRecord{{AttemptNo: 1, Protocol: "codex", CreatedAt: now, CompletedAt: now}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	input, cached := int64(100), int64(50)
 	if err := st.CompleteRouteDecision("legacy-prompt", RouteDecisionOutcome{
 		ActualInputTokens: &input, ActualCachedTokens: &cached, Outcome: "success", CompletedAt: now,

@@ -118,6 +118,40 @@ func TestUsageAuditClampsNegativeUncached(t *testing.T) {
 	if usage.input != 0 || usage.cached != 50 {
 		t.Fatalf("negative uncached must clamp to zero: %+v", usage)
 	}
+	if usage.report.Quality != "inconsistent" || usage.report.Raw["cached_tokens"] != "50" {
+		t.Fatal("invalid usage must retain evidence and cannot be considered comparable")
+	}
+}
+
+func TestUsageSnapshotsDoNotMixMaxima(t *testing.T) {
+	for _, tc := range []struct {
+		name, protocol, body string
+		input, cached        int64
+		complete             bool
+	}{
+		{"chat", "openai", "data: {\"usage\":{\"prompt_tokens\":1000,\"prompt_tokens_details\":{\"cached_tokens\":0}}}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"prompt_tokens_details\":{\"cached_tokens\":900}}}\n\ndata: [DONE]\n\n", 100, 900, true},
+		{"claude_partial_fields", "claude", "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4\",\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":900}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":10}}\n\ndata: {\"type\":\"message_stop\"}\n\n", 100, 900, true},
+		{"claude_explicit_zero", "claude", "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":900}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":0,\"output_tokens\":10}}\n\ndata: {\"type\":\"message_stop\"}\n\n", 0, 900, true},
+		{"chat_intermediate_only", "openai", "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}],\"usage\":{\"prompt_tokens\":1000}}\n\ndata: [DONE]\n\n", 1000, 0, false},
+		{"incomplete", "openai", "data: {\"usage\":{\"prompt_tokens\":1000}}\n\n", 1000, 0, false},
+		{"responses_without_final_usage", "responses", "data: {\"type\":\"response.in_progress\",\"response\":{\"usage\":{\"input_tokens\":1000}}}\n\ndata: {\"type\":\"response.completed\"}\n\n", 1000, 0, false},
+		{"duplicate_final", "responses", "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":1000,\"input_tokens_details\":{\"cached_tokens\":900}}}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1900}}}\n\n", 100, 900, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newAuditReadCloser(io.NopCloser(strings.NewReader(tc.body)), true, tc.protocol)
+			if _, err := io.Copy(io.Discard, a); err != nil {
+				t.Fatal(err)
+			}
+			a.audit.finish()
+			u := a.audit.usage
+			if u.input != tc.input || u.cached != tc.cached || u.report.Complete != tc.complete {
+				t.Fatalf("snapshot mismatch: %+v", u)
+			}
+			if tc.name == "duplicate_final" && u.report.ResponseModel != "gpt-5" {
+				t.Fatal("response model lost")
+			}
+		})
+	}
 }
 
 func TestContentBlockStopIsNotWholeStreamCompletion(t *testing.T) {

@@ -32,6 +32,7 @@ type RouteDecisionModel struct {
 	Exploration                 bool       `gorm:"not null;default:false"`
 	ActualCost                  *float64   `gorm:"column:actual_cost;type:real"`
 	ActualInputTokens           *int64     `gorm:"column:actual_input_tokens;type:integer"`
+	TokenAccounting             string     `gorm:"column:token_accounting;type:text;not null;default:''"`
 	ActualInputTokensNormalized bool       `gorm:"column:actual_input_tokens_normalized;not null;default:false"`
 	ActualOutputTokens          *int64     `gorm:"column:actual_output_tokens;type:integer"`
 	ActualCachedTokens          *int64     `gorm:"column:actual_cached_tokens;type:integer"`

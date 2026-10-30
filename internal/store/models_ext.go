@@ -93,6 +93,7 @@ type RequestModel struct {
 	RequestBytes          int64     `gorm:"column:request_bytes;type:integer;not null;default:0"`
 	ResponseBytes         int64     `gorm:"column:response_bytes;type:integer;not null;default:0"`
 	InputTokens           int64     `gorm:"column:input_tokens;type:integer;not null;default:0"`
+	TokenAccounting       string    `gorm:"column:token_accounting;type:text;not null;default:''"`
 	InputTokensNormalized bool      `gorm:"column:input_tokens_normalized;not null;default:false"`
 	OutputTokens          int64     `gorm:"column:output_tokens;type:integer;not null;default:0"`
 	CachedTokens          int64     `gorm:"column:cached_tokens;type:integer;not null;default:0"`
@@ -127,6 +128,7 @@ type RequestAttemptModel struct {
 	StreamCompleted       bool      `gorm:"column:stream_completed;not null;default:false"`
 	LastEvent             string    `gorm:"column:last_event;type:text;not null;default:''"`
 	InputTokens           int64     `gorm:"column:input_tokens;type:integer;not null;default:0"`
+	TokenAccounting       string    `gorm:"column:token_accounting;type:text;not null;default:''"`
 	InputTokensNormalized bool      `gorm:"column:input_tokens_normalized;not null;default:false"`
 	OutputTokens          int64     `gorm:"column:output_tokens;type:integer;not null;default:0"`
 	CachedTokens          int64     `gorm:"column:cached_tokens;type:integer;not null;default:0"`
