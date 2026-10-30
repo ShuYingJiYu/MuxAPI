@@ -18,16 +18,32 @@ func (s *Server) persistRoutingAudit(requestID string, started time.Time, groupI
 	// Emit structured audit log for every request (JSON, greppable by "route_audit").
 	s.emitRouteAuditLog(requestID, started, model, endpoint, features, decision, result)
 	if decision != nil && decision.SelectedID != 0 {
+		// A forecast cost of zero means "not computed", not "free". Without
+		// this distinction a P2C fallback row reports $0 instead of "—" and
+		// drags down every cost aggregate it appears in. The selected
+		// candidate's evaluation is the only authoritative source: no entry
+		// means no price was ever resolved for this channel.
+		costKnown := false
+		for _, evaluation := range decision.Evaluations {
+			if evaluation.CandidateID == decision.SelectedID {
+				costKnown = true
+				break
+			}
+		}
 		record := store.RouteDecisionRecord{
 			RequestID: requestID, GroupID: groupID, Model: model, Protocol: features.Protocol,
 			Endpoint: endpoint, SessionKey: features.SessionID, PrefixHash: features.CacheKey,
-			CacheKey: features.CacheKey, Strategy: "cost", Reason: decision.Reason,
+			CacheKey: features.CacheKey, Strategy: decisionStrategy(decision), Reason: decision.Reason,
 			SelectedUpstreamID: decision.SelectedID, ForecastWindow: decision.Forecast.Window,
 			ForecastRequests: decision.Forecast.Requests, EstimatedInputTokens: features.InputTokens,
 			ReusablePrefixTokens: features.ReusableInputTokens, EstimatedOutputTokens: features.EstimatedOutputTokens,
-			SelectedCost: floatPtr(decision.EffectiveCost), NoCacheCost: floatPtr(decision.Cost.NoCacheTotal),
-			CacheCost: floatPtr(decision.Cost.CacheTotal), EstimatedSavings: floatPtr(decision.EstimatedSavings),
 			Confidence: decision.Confidence, CacheSelected: decision.Cost.CacheUsed, Exploration: decision.Exploration, CreatedAt: started,
+		}
+		if costKnown {
+			record.SelectedCost = new(decision.EffectiveCost)
+			record.NoCacheCost = new(decision.Cost.NoCacheTotal)
+			record.CacheCost = new(decision.Cost.CacheTotal)
+			record.EstimatedSavings = new(decision.EstimatedSavings)
 		}
 		for _, evaluation := range decision.Evaluations {
 			details, _ := json.Marshal(evaluation)
@@ -39,9 +55,9 @@ func (s *Server) persistRoutingAudit(requestID string, started time.Time, groupI
 				PricingConfidence: evaluation.Cost.Confidence, CacheSupported: evaluation.Cost.CacheEligible,
 				CacheExisting: evaluation.CacheExisting, CacheSelected: evaluation.Cost.CacheUsed,
 				CacheHitRate:      evaluation.CacheHitRate,
-				ForecastTotalCost: floatPtr(evaluation.Cost.SelectedTotal), ForecastNoCacheCost: floatPtr(evaluation.Cost.NoCacheTotal),
-				ForecastCacheCost: floatPtr(evaluation.Cost.CacheTotal), EstimatedSavings: floatPtr(evaluation.Cost.Savings),
-				BreakEvenRequests: floatPtr(evaluation.Cost.BreakEvenRequests), ExpectedHits: evaluation.Cost.ExpectedHits,
+				ForecastTotalCost: new(evaluation.Cost.SelectedTotal), ForecastNoCacheCost: new(evaluation.Cost.NoCacheTotal),
+				ForecastCacheCost: new(evaluation.Cost.CacheTotal), EstimatedSavings: new(evaluation.Cost.Savings),
+				BreakEvenRequests: new(evaluation.Cost.BreakEvenRequests), ExpectedHits: evaluation.Cost.ExpectedHits,
 				ExpectedMisses: evaluation.Cost.ExpectedMisses, ExpectedCreates: evaluation.Cost.ExpectedCreates,
 				EstimatedTTFTMs: evaluation.P95TTFTMs, EstimatedDurationMs: evaluation.P95DurationMs,
 				SuccessRate: evaluation.SuccessRate,
@@ -137,7 +153,16 @@ func routingAttemptSucceeded(outcome string) bool {
 	}
 }
 
-func floatPtr(value float64) *float64 { return &value }
+// decisionStrategy labels how the upstream was chosen. Every row used to be
+// stored as "cost", including P2C fallbacks where no cost model was applied.
+// Rows without a selected upstream are never persisted, so there is no
+// "no candidate" value to record.
+func decisionStrategy(decision *routing.Decision) string {
+	if strings.HasPrefix(decision.Reason, "fallback:") {
+		return "p2c-fallback"
+	}
+	return "cost"
+}
 
 func optionalInt64Ptr(value int64) *int64 {
 	if value <= 0 {

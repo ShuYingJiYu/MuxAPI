@@ -3,9 +3,11 @@ package scheduler
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/mirainya/muxapi/internal/routing"
 	"github.com/mirainya/muxapi/internal/store"
+	"github.com/mirainya/muxapi/internal/upstream"
 )
 
 func TestBlockHardLimitRejectionsPreservesOrdinaryFallbacks(t *testing.T) {
@@ -60,5 +62,41 @@ func TestCoverageBucketStaysInsideQueryBand(t *testing.T) {
 	}
 	if coverageBucket(600) == coverageBucket(2559) {
 		t.Fatalf("short prefix shares the 2048 bucket: %d", coverageBucket(600))
+	}
+}
+
+func TestFallbackDecisionKeepsEvaluationsAndCost(t *testing.T) {
+	last := routing.Decision{
+		SelectedID: 9, SelectedName: "unclaimed",
+		Reason: "cost",
+		Evaluations: []routing.CandidateEvaluation{
+			{CandidateID: 1, CandidateName: "rejected", RejectReason: "OPEN circuit", Cost: routing.CostEstimate{SelectedTotal: 3.5}},
+			{CandidateID: 7, CandidateName: "p2c", Cost: routing.CostEstimate{SelectedTotal: 1.25}, EffectiveCost: 1.1},
+		},
+		Forecast: routing.TrafficForecast{Window: time.Minute, Requests: 4},
+	}
+	got := fallbackDecision(last, &upstream.Upstream{ID: 7, Name: "p2c"}, time.Hour)
+
+	if got.SelectedID != 7 || got.SelectedName != "p2c" {
+		t.Fatalf("fallback must select the P2C candidate: %+v", got)
+	}
+	if len(got.Evaluations) != len(last.Evaluations) {
+		t.Fatalf("fallback dropped the rejected candidates: %+v", got.Evaluations)
+	}
+	if got.EffectiveCost != 1.1 || got.Cost.SelectedTotal != 1.25 {
+		t.Fatalf("fallback must carry the selected candidate's cost: %+v", got)
+	}
+	if got.Forecast.Window != time.Minute || got.Forecast.Requests != 4 {
+		t.Fatalf("fallback must keep the computed forecast: %+v", got.Forecast)
+	}
+}
+
+func TestFallbackDecisionWithoutPriorEvaluationStaysEmpty(t *testing.T) {
+	got := fallbackDecision(routing.Decision{}, &upstream.Upstream{ID: 3, Name: "p2c"}, time.Hour)
+	if got.SelectedID != 3 || got.Reason == "" {
+		t.Fatalf("fallback must still choose the candidate: %+v", got)
+	}
+	if len(got.Evaluations) != 0 || got.Forecast.Window != time.Hour {
+		t.Fatalf("no prior evaluation must yield no candidates and a window-only forecast: %+v", got)
 	}
 }
