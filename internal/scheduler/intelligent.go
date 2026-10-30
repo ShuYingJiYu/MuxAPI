@@ -134,6 +134,7 @@ func (r *intelligentRouter) pick(s *Scheduler, groupID int64, model string, feat
 	if r.config != nil {
 		cfg = r.config()
 	}
+	var lastDecision routing.Decision
 	for attempts := 0; attempts < len(all); attempts++ {
 		candidates := r.candidates(s, all, model, features, blocked, now, cfg)
 		if len(candidates) == 0 {
@@ -143,6 +144,7 @@ func (r *intelligentRouter) pick(s *Scheduler, groupID int64, model string, feat
 			Features: features, Forecast: r.forecast(all, model, features, cfg, now),
 			Candidates: candidates, Config: cfg, Now: now,
 		})
+		lastDecision = decision
 		blockHardLimitRejections(blocked, decision.Evaluations, cfg)
 		blockHardLimitRejections(hardBlocked, decision.Evaluations, cfg)
 		if err != nil {
@@ -165,11 +167,37 @@ func (r *intelligentRouter) pick(s *Scheduler, groupID int64, model string, feat
 	if candidate == nil || err != nil {
 		return candidate, lease, routing.Decision{}, err
 	}
-	return candidate, lease, routing.Decision{
-		SelectedID: candidate.ID, SelectedName: candidate.Name,
-		Reason:   "fallback: cost data incomplete; standard health/P2C scheduler",
-		Forecast: routing.TrafficForecast{Window: cfg.Window},
-	}, nil
+	// Preserve the intelligent evaluations when falling back to P2C. The
+	// selected fallback candidate may carry no cost forecast, but keeping the
+	// rejected candidates makes the decision auditable after the request:
+	// route_decisions.candidate_count and actual_cost both read them.
+	decision := fallbackDecision(lastDecision, candidate, cfg.Window)
+	return candidate, lease, decision, nil
+}
+
+// fallbackDecision rebuilds a P2C fallback decision from the last intelligent
+// evaluation. Without it the returned Decision is empty, so routeActualCost
+// cannot resolve a Pricing and every fallback request is stored with a NULL
+// actual_cost and zero candidate rows.
+func fallbackDecision(last routing.Decision, candidate *upstream.Upstream, window time.Duration) routing.Decision {
+	decision := last
+	decision.SelectedID = candidate.ID
+	decision.SelectedName = candidate.Name
+	decision.Reason = "fallback: cost data incomplete; standard health/P2C scheduler"
+	decision.Exploration = false
+	if decision.Forecast.Window <= 0 {
+		decision.Forecast = routing.TrafficForecast{Window: window}
+	}
+	for _, evaluation := range decision.Evaluations {
+		if evaluation.CandidateID != candidate.ID {
+			continue
+		}
+		decision.Cost = evaluation.Cost
+		decision.EffectiveCost = evaluation.EffectiveCost
+		decision.Confidence = evaluation.Cost.Confidence
+		break
+	}
+	return decision
 }
 
 func blockHardLimitRejections(blocked map[int64]bool, evaluations []routing.CandidateEvaluation, cfg routing.Config) {
