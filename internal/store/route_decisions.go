@@ -327,12 +327,13 @@ func (s *Store) CompleteRouteDecision(requestID string, outcome RouteDecisionOut
 }
 
 func (s *Store) routeDecisionSelect(where string) string {
-	// request_attempts.request_id is UUID everywhere, but route_decisions
-	// .request_id is TEXT on databases that predate the versioned SQL
-	// migrations (the CREATE TABLE IF NOT EXISTS in 20260902 was a no-op there
-	// and GORM does not alter existing column types). Postgres rejects the join
-	// with "operator does not exist: uuid = text", so compare as text on both
-	// sides — see requests.go and routing_observations.go for the same rule.
+	// SQLite stores both IDs as TEXT. PostgreSQL routing tables may retain
+	// legacy TEXT IDs alongside UUID attempts; the text expression index
+	// supports that comparison without converting historical routing IDs.
+	requestIDMatch := "a.request_id=rd.request_id"
+	if s.postgres {
+		requestIDMatch = "CAST(a.request_id AS TEXT)=CAST(rd.request_id AS TEXT)"
+	}
 	return `SELECT rd.id,rd.request_id,rd.group_id,rd.model,rd.protocol,rd.endpoint,rd.session_key,rd.prefix_hash,rd.cache_key,rd.strategy,
 		rd.reason,rd.selected_upstream_id,COALESCE(u.name,''),rd.candidate_count,rd.forecast_window_seconds,rd.forecast_requests,
 		rd.estimated_input_tokens,rd.reusable_prefix_tokens,rd.estimated_output_tokens,rd.selected_cost,rd.no_cache_cost,
@@ -340,7 +341,7 @@ func (s *Store) routeDecisionSelect(where string) string {
 		rd.actual_input_tokens_normalized,rd.actual_input_tokens,
 		rd.actual_output_tokens,rd.actual_cached_tokens,rd.actual_cache_creation_tokens,rd.actual_outcome,` +
 		s.unixExpr("rd.created_at") + `,COALESCE(` + s.unixExpr("rd.completed_at") + `,0),rd.token_accounting,
- COALESCE((SELECT a.protocol FROM request_attempts a WHERE CAST(a.request_id AS TEXT)=CAST(rd.request_id AS TEXT) ORDER BY a.attempt_no DESC LIMIT 1),'')
+ COALESCE((SELECT a.protocol FROM request_attempts a WHERE ` + requestIDMatch + ` ORDER BY a.attempt_no DESC LIMIT 1),'')
 		FROM route_decisions rd LEFT JOIN upstreams u ON u.id=rd.selected_upstream_id` + where
 }
 

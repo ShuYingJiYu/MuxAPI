@@ -82,6 +82,16 @@ Token 数量与费用独立计算：各互斥分类分别乘对应有效单价�
 旧记录优先使用当次保存的协议和归一化标记，修正可确定的缓存重复。
 缺少当次协议、出站基准或覆盖信息的旧记录标记历史估算/无法比较；不使用上游当前配置重写历史事实。
 
+路由历史读取最新 `attempt_no` 的尝试协议。PostgreSQL 升级库的路由 ID 可能是 TEXT、
+尝试 ID 是 UUID，因此比较两侧的文本值，并由 `idx_attempts_request_text`
+表达式索引（`request_id::text, attempt_no DESC`）支持查找；SQLite 使用原生 TEXT 比较。
+新增迁移负责建索引，启动时也会检查本地索引，避免逻辑复制只传递迁移版本而未传递 DDL。
+此修复不转换历史 ID，也不改变计量快照优先级。
+
+PostgreSQL 回归测试使用 `MUXAPI_TEST_PG` 连接到专用测试库，在独立随机 schema 中
+运行真实迁移并清理；CI 的 Go checks 提供 PostgreSQL 17 service，确保测试实际执行。
+本地未设置该变量时跳过这组集成测试；SQLite 测试不能代替 UUID/TEXT 类型兼容性验证。
+
 ## 验收样例
 
 - OpenAI 输入 1,000、缓存读取 900：未缓存 100，总输入 1,000；基准 1,000 时为 1.00 倍。

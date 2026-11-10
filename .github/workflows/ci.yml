@@ -16,6 +16,22 @@ jobs:
     name: Go checks
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: muxapi
+          POSTGRES_PASSWORD: muxapi-test
+          POSTGRES_DB: muxapi_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U muxapi -d muxapi_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      MUXAPI_TEST_PG: postgres://muxapi:muxapi-test@localhost:5432/muxapi_test?sslmode=disable
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

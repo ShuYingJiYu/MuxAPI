@@ -274,6 +274,12 @@ func runPostgresMigrations(ctx context.Context, db *sql.DB) error {
 		ON upstream_model_exclusions(updated_at DESC)`); err != nil {
 		return fmt.Errorf("ensure upstream model exclusions index: %w", err)
 	}
+	// Migration versions replicate between peers, but indexes do not. Ensure
+	// the local lookup index even if its version arrived before local DDL.
+	if _, err := db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_attempts_request_text
+		ON request_attempts ((CAST(request_id AS TEXT)), attempt_no DESC)`); err != nil {
+		return fmt.Errorf("ensure attempt request text index: %w", err)
+	}
 	return nil
 }
 
