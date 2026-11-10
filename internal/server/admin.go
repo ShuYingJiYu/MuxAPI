@@ -72,8 +72,8 @@ func (s *Server) adminPassiveHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, stats)
 }
 
-// adminRoutingCalibration compares the per-request forecast cost with the
-// cost observed after forwarding. Read-only: it never triggers probes.
+// adminRoutingCalibration compares candidate window averages with usage-derived
+// audit costs. It does not measure actual charges or trigger upstream requests.
 func (s *Server) adminRoutingCalibration(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
